@@ -383,7 +383,8 @@ def test_fake_display_rolls_back_a_started_helper_when_publication_fails():
     display.ownership.inject_failure("write", occurrence=2)
     result = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()))
     assert isinstance(result, Err)
-    assert [stage for _, stage in display.stage_log] == ["reserved"]
+    # The rollback publishes removal intent before any destructive step.
+    assert [stage for _, stage in display.stage_log] == ["reserved", "removing"]
     (helper,) = [identity for identity in display.process.terminated]
     assert display.process.alive(helper) is False
     assert display.process.spawned[0].env[FakeProcess.OWNER_TOKEN_ENV]
@@ -405,7 +406,7 @@ def test_fake_display_reconciles_an_orphan_and_requires_confirmation_to_remove()
     t = target()
     handle = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context())).value
     display.process.exit(handle.helper)
-    items = display.reconcile()
+    items = run(display.reconcile())
     assert [item.kind for item in items] == ["orphan"]
     assert items[0].handle is not None
     assert run(display.approve_orphan(handle.owner_uuid, False, context())) == Ok(value=None)
@@ -450,6 +451,10 @@ def test_fake_capture_offers_only_physical_monitors():
         assert isinstance(result, Err)
         assert result.error.code is ErrorCode.unsupported_source
     assert capture.rejected == ["screen-cast-window:1", "Virtual-1", "HDMI-9"]
+    # Registration enumerates, so it refuses a non-physical descriptor outright.
+    assert capture.refused == ["screen-cast-window:1", "Virtual-1"]
+    listed = run(capture.list_physical()).value
+    assert listed == (monitor,)
     assert run(capture.verify(monitor)) == Ok(value=None)
     assert isinstance(run(capture.verify(physical("HDMI-1"))), Err)
     assert run(capture.release(monitor)) == Ok(value=None)
@@ -579,10 +584,10 @@ def test_memory_stores_round_trip_and_keep_latest_values():
     sessions = MemorySessionStore()
     snapshot = SessionSnapshot.idle(receiver, online=True)
     assert run(sessions.save(snapshot)) == Ok(value=None)
-    assert run(sessions.load_all()) == Ok(value=(snapshot,))
+    assert run(sessions.load_all()) == (snapshot,)
     updated = replace(snapshot, session_generation=1)
     assert run(sessions.save(updated)) == Ok(value=None)
-    assert run(sessions.load_all()) == Ok(value=(updated,))
+    assert run(sessions.load_all()) == (updated,)
     receivers = MemoryReceiverStore()
     saved = SavedReceiver(
         receiver_id=receiver, service_metadata=(), display_name="Living Room",
@@ -799,6 +804,13 @@ def test_scripted_results_cover_every_adapter_method():
         assert await pairing.retry_revocation(t.receiver_id, context()) is key
         store.queue_result("revoke_pairing", key)
         assert await store.revoke_pairing(t.receiver_id) is key
+        # ``DiscoveryPort.close`` declares ``None`` success, so its scripting seam
+        # controls only completion timing (see the deferred-close test).
+        discovery.queue_result("close", None)
+        assert discovery.pending("close") == 1
+        await discovery.close()
+        assert discovery.pending("close") == 0
+        assert discovery.closed is True
         store.queue_result("mark_invalid", key)
         assert await store.mark_invalid(t.receiver_id) is key
         sessions.queue_result("save", key)
@@ -931,7 +943,7 @@ def test_fake_display_disappearance_and_cleanup_required_events_are_emittable():
     )
     display.emit(removed)
     assert received == [removed]
-    (item,) = display.reconcile()
+    (item,) = run(display.reconcile())
     assert item.kind == "orphan"
     assert item.record.desired_state == "active"
 
@@ -996,7 +1008,7 @@ def test_fake_display_crash_at_each_stage_leaves_a_reconcilable_record():
         assert crashed.error.code is ErrorCode.helper_failed
         (owner_uuid, recorded) = display.crashes[0]
         assert recorded == stage
-        (item,) = display.reconcile()
+        (item,) = run(display.reconcile())
         assert item.record.owner_uuid == owner_uuid
         assert item.record.stage == stage
         assert item.record.desired_state == "active"
@@ -1064,3 +1076,688 @@ def test_fakes_satisfy_their_domain_protocols():
             ]
             actual = list(_inspect.signature(getattr(fake, name)).parameters)
             assert expected == actual, (protocol.__name__, name, expected, actual)
+
+# ------------------------------------------------------------------ F-1 and F-15
+# The teardown gate fences pending creation, and the durable removing stage never
+# becomes a ``DisplayEvent`` kind that the frozen union does not declare.
+
+
+def test_prepare_teardown_fences_a_create_suspended_before_reservation():
+    async def scenario():
+        display = FakeDisplay()
+        t = target()
+        suspended = Deferred()
+        display.queue_result("create", suspended)
+        create_call = asyncio.ensure_future(
+            display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()),
+        )
+        await asyncio.sleep(0)
+        # The gate acknowledges removal while the create still has no owner UUID.
+        assert await display.prepare_teardown(t.receiver_id, None, context()) == Ok(value=())
+        suspended.resolve(Ok(value=virtual_handle(owner=7, output="v7")))
+        result = await create_call
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_event
+        # The fenced completion is durably recorded as removing, never active.
+        records = (await display.ownership.all()).value
+        assert [(record.desired_state, record.stage) for record in records] == [
+            ("removing", "removing"),
+        ]
+        assert [item.kind for item in await display.reconcile()] == ["removing"]
+        # The output was acquired but never became an active, owned display.
+        [handle] = display.created
+        assert handle.owner_uuid == records[0].owner_uuid
+        assert handle.owner_uuid not in display.handles
+        # It is still releasable by exact handle rather than left dangling.
+        assert await display.remove(handle.owner_uuid, context()) == Ok(value=None)
+
+    run(scenario())
+
+
+def test_prepare_teardown_fences_a_create_suspended_during_a_stage_write():
+    async def scenario():
+        display = FakeDisplay()
+        t = target()
+        suspended = Deferred()
+        # The reserved write completes immediately; helper_started suspends.
+        display.ownership.queue_result("write", Ok(value=None))
+        display.ownership.queue_result("write", suspended)
+        create_call = asyncio.ensure_future(
+            display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()),
+        )
+        while display.ownership.pending("write") == 0 and not display.process.spawned:
+            await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        # Only the pre-existing reservation is admitted; the suspended stage is fenced.
+        admitted = await display.prepare_teardown(t.receiver_id, None, context())
+        assert isinstance(admitted, Ok)
+        assert len(admitted.value) == 1
+        assert display.process.spawned
+        suspended.resolve(Ok(value=None))
+        result = await create_call
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_event
+        # The suspended helper_started stage never promoted the output to active.
+        records = (await display.ownership.all()).value
+        assert all(record.desired_state == "removing" for record in records)
+        assert display.handles == {}
+        assert display.created == []
+        assert display.process.spawned
+        # The fenced helper was cleaned up rather than abandoned.
+        assert display.process.environments() == {}
+
+    run(scenario())
+
+
+def test_display_never_emits_an_undeclared_display_event_kind():
+    from airplay_linux.testing.adapters import DISPLAY_EVENT_KINDS
+
+    assert "removing" not in DISPLAY_EVENT_KINDS
+    display = FakeDisplay()
+    t = target()
+    received = []
+    handle = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context())).value
+    display.subscribe(received.append)
+    assert run(display.prepare_teardown(t.receiver_id, None, context())) == Ok(
+        value=(handle.owner_uuid,),
+    )
+    # The removing stage stays in ownership metadata and the journal, not events.
+    assert received == []
+    assert run(display.ownership.all()).value[0].stage == "removing"
+    stages = [arguments["stage"] for arguments in display.journal.calls("display.stage")]
+    assert stages == ["removing"]
+    assert run(display.remove(handle.owner_uuid, context())) == Ok(value=None)
+    assert {event.kind for event in received} <= DISPLAY_EVENT_KINDS
+    assert [event.kind for event in received] == ["removed"]
+
+
+# ------------------------------------------------------------------ F-2
+# Rollback publishes removal intent first, propagates failures, and never models
+# an unconfirmed cleanup as a released resource.
+
+
+
+def test_rollback_blocks_destructive_teardown_when_removal_intent_cannot_publish():
+    display = FakeDisplay()
+    t = target()
+    # reserved and helper_started publish; output_observed and the rollback's
+    # removal intent both fail durably.
+    display.ownership.queue_result("write", Ok(value=None))
+    display.ownership.queue_result("write", Ok(value=None))
+    display.ownership.queue_result(
+        "write", failure(ErrorCode.persistence_failed, "output stage"),
+    )
+    display.ownership.queue_result(
+        "write", failure(ErrorCode.persistence_failed, "removal intent"),
+    )
+    result = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.persistence_failed
+    # Removal intent never became durable, so nothing destructive ran.
+    assert display.process.terminated == []
+    assert display.process.environments() != {}
+    # The last durable record still names the live helper, so it stays recoverable.
+    records = run(display.ownership.all()).value
+    assert len(records) == 1
+    assert records[0].stage == "helper_started"
+    assert records[0].helper is not None
+    assert display.process.alive(records[0].helper) is True
+    assert display.handles == {}
+
+
+def test_rollback_propagates_termination_failure_and_keeps_the_record_recoverable():
+    display = FakeDisplay()
+    t = target()
+    # Second atomic write is the helper_started stage; make it fail so rollback runs.
+    display.ownership.inject_failure("write", occurrence=2)
+    display.process.queue_result(
+        "terminate", failure(ErrorCode.cleanup_timeout, "helper did not exit"),
+    )
+    result = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    # The surviving helper keeps its durable identity; the record is not deleted.
+    records = run(display.ownership.all()).value
+    assert len(records) == 1
+    assert records[0].desired_state == "removing"
+    assert records[0].helper is not None
+    assert display.process.alive(records[0].helper) is True
+    assert display.created == []
+    [item] = run(display.reconcile())
+    assert item.kind == "removing"
+
+
+def test_rollback_publishes_removal_intent_before_terminating_the_helper():
+    display = FakeDisplay()
+    t = target()
+    display.ownership.inject_failure("write", occurrence=2)
+    run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()))
+    intents = [
+        arguments for arguments in display.ownership.journal.calls("ownership_store.write")
+        if arguments["record"]["desired_state"] == "removing"
+    ]
+    assert intents, display.ownership.journal.names()
+    # The removal-intent write is journaled, and the removing stage is visible in
+    # ownership metadata rather than as an undeclared display event.
+    assert [arguments["stage"] for arguments in display.journal.calls("display.stage")] == [
+        "removing",
+    ]
+    assert display.process.terminated
+
+
+# ------------------------------------------------------------------ F-3
+CANARY_STDIN = b"canary-stdin-pin-8496"
+
+
+def test_process_stdin_is_redacted_in_the_journal_and_its_representation():
+    process = FakeProcess()
+    spec = ports.CommandSpec(argv=("doubletake", "-pin-stdin"), env={})
+    assert run(process.run(spec, 5.0, stdin=CANARY_STDIN)) == Ok(
+        value=ports.CommandOutput(exit_code=0, stdout=b"", stderr=b""),
+    )
+    recorded = process.journal.calls("process.run")[-1]
+    assert recorded["stdin"] == Redacted(kind=f"stdin[{len(CANARY_STDIN)} bytes]")
+    assert CANARY_STDIN.decode() not in repr(process.journal.entries)
+    assert "canary-stdin-pin-8496" not in repr(process.journal)
+    # A call without stdin still journals the absence clearly.
+    run(process.run(spec, 5.0))
+    assert process.journal.calls("process.run")[-1]["stdin"] is None
+
+
+# ------------------------------------------------------------------ F-4
+def test_display_reconcile_is_a_deferred_async_operation():
+    async def scenario():
+        display = FakeDisplay()
+        t = target()
+        handle = (await display.create(
+            t.receiver_id, t.endpoint_fingerprint, MONITOR, context(),
+        )).value
+        suspended = Deferred()
+        display.queue_result("reconcile", suspended)
+        call = asyncio.ensure_future(display.reconcile())
+        await asyncio.sleep(0)
+        assert display.pending("reconcile") == 0
+        assert not call.done()
+        assert suspended.resolved is False
+        suspended.resolve(())
+        assert await call == ()
+        # The unscripted path is a coroutine returning the declared tuple.
+        recovered = await display.reconcile()
+        assert isinstance(recovered, tuple)
+        assert [item.record.owner_uuid for item in recovered] == [handle.owner_uuid]
+
+    run(scenario())
+
+
+# ------------------------------------------------------------------ F-5
+def test_session_store_load_all_returns_the_frozen_unwrapped_tuple():
+    store = MemorySessionStore()
+    receiver = target().receiver_id
+    snapshot = SessionSnapshot.idle(receiver, online=True)
+    assert run(store.save(snapshot)) == Ok(value=None)
+    loaded = run(store.load_all())
+    assert isinstance(loaded, tuple)
+    assert tuple(loaded) == (snapshot,)
+    # A scripted failure is reported on the diagnostic seam while the declared
+    # return shape keeps its last durable contents instead of a wrapper.
+    store.queue_result("load_all", failure(ErrorCode.persistence_failed, "corrupt"))
+    assert run(store.load_all()) == (snapshot,)
+    assert store.load_error is not None
+    assert store.load_error.error.code is ErrorCode.persistence_failed
+    # A scripted success still selects which sessions the port returns.
+    store.queue_result("load_all", Ok(value=()))
+    assert run(store.load_all()) == ()
+
+
+# ------------------------------------------------------------------ F-6
+def test_cancelling_an_already_fired_deadline_is_a_harmless_noop():
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    seen = []
+    handle = scheduler.call_at(1, lambda: seen.append("fired"))
+    scheduler.advance(1)
+    assert seen == ["fired"]
+    handle.cancel()
+    handle.cancel()
+    handle.close()
+    assert scheduler.pending() == ()
+    assert clock.now() == 1
+
+
+def test_a_callback_can_cancel_its_own_handle_and_its_successors():
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    seen = []
+    following = scheduler.call_at(2, lambda: seen.append("following"))
+    holder = {}
+
+    def first():
+        seen.append("first")
+        holder["handle"].cancel()
+        following.cancel()
+
+    holder["handle"] = scheduler.call_at(1, first)
+    scheduler.advance(5)
+    assert seen == ["first"]
+    assert scheduler.pending() == ()
+    assert clock.now() == 5
+
+
+# ------------------------------------------------------------------ F-7
+def test_scripted_immediate_stream_success_is_releasable_by_exact_handle():
+    transport = FakeTransport()
+    t = target()
+    transport.update_target(t, t.receiver_id)
+    handle = stream_handle()
+    transport.queue_result("start_stream", Ok(value=handle))
+    assert run(transport.start_stream(t, physical(), AudioPolicy(), context())) == Ok(value=handle)
+    assert transport.streams[handle.lease_id] == handle
+    assert run(transport.stop_stream(handle, context())) == Ok(value=None)
+    assert transport.streams == {}
+
+
+def test_scripted_late_stream_success_stays_releasable_after_cancellation():
+    async def scenario():
+        transport = FakeTransport()
+        t = target()
+        transport.update_target(t, t.receiver_id)
+        deferred = Deferred()
+        transport.queue_result("start_stream", deferred)
+        call = asyncio.ensure_future(
+            transport.start_stream(t, physical(), AudioPolicy(), context()),
+        )
+        await asyncio.sleep(0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        handle = stream_handle(lease=77)
+        deferred.resolve(Ok(value=handle))
+        assert transport.streams[handle.lease_id] == handle
+        assert await transport.stop_stream(handle, context()) == Ok(value=None)
+        assert transport.streams == {}
+
+    run(scenario())
+
+
+def test_scripted_process_identity_is_owned_and_terminable():
+    process = FakeProcess()
+    owner = UUID(int=1)
+    runtime = "/run/user/1000/airplay-linux/instances/fake"
+    spec = ports.CommandSpec(argv=("krfb-virtualmonitor",), env=FakeProcess.owner_environment(owner, runtime))
+    identity = ProcessIdentity(pid=5555, start_ticks=31337)
+    process.queue_result("spawn", Ok(value=identity))
+    assert run(process.spawn(spec)) == Ok(value=identity)
+    assert process.owned(identity, owner, runtime) is True
+    assert process.spawned == [spec]
+    assert run(process.terminate(identity, owner, runtime, deadline=5.0)) == Ok(value=None)
+    assert process.alive(identity) is False
+
+
+def test_scripted_late_process_identity_is_adopted_for_exact_termination():
+    async def scenario():
+        process = FakeProcess()
+        owner = UUID(int=1)
+        runtime = "/run/user/1000/airplay-linux/instances/fake"
+        spec = ports.CommandSpec(argv=("krfb-virtualmonitor",), env=FakeProcess.owner_environment(owner, runtime))
+        deferred = Deferred()
+        process.queue_result("spawn", deferred)
+        call = asyncio.ensure_future(process.spawn(spec))
+        await asyncio.sleep(0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        identity = ProcessIdentity(pid=6666, start_ticks=4242)
+        deferred.resolve(Ok(value=identity))
+        assert process.owned(identity, owner, runtime) is True
+        assert await process.terminate(identity, owner, runtime, deadline=5.0) == Ok(value=None)
+
+    run(scenario())
+
+
+def test_scripted_display_handle_is_registered_and_removable():
+    display = FakeDisplay()
+    t = target()
+    handle = virtual_handle(owner=3, output="v3")
+    display.queue_result("create", Ok(value=handle))
+    assert run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context())) == Ok(
+        value=handle,
+    )
+    (record,) = run(display.ownership.all()).value
+    assert record.owner_uuid == handle.owner_uuid
+    assert record.helper == handle.helper
+    assert record.connector == handle.source.connector
+    assert display.outputs[handle.source.kscreen_output_id] == handle.source.connector
+    assert run(display.prepare_teardown(t.receiver_id, None, context())) == Ok(
+        value=(handle.owner_uuid,),
+    )
+    assert run(display.remove(handle.owner_uuid, context())) == Ok(value=None)
+    assert run(display.ownership.all()).value == ()
+    assert handle.source.kscreen_output_id not in display.outputs
+
+
+def test_scripted_late_display_success_is_removable_after_cancellation():
+    async def scenario():
+        display = FakeDisplay()
+        t = target()
+        deferred = Deferred()
+        display.queue_result("create", deferred)
+        call = asyncio.ensure_future(
+            display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()),
+        )
+        await asyncio.sleep(0)
+        call.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await call
+        handle = virtual_handle(owner=4, output="v4")
+        deferred.resolve(Ok(value=handle))
+        assert (await display.ownership.all()).value != ()
+        assert await display.prepare_teardown(t.receiver_id, None, context()) == Ok(
+            value=(handle.owner_uuid,),
+        )
+        assert await display.remove(handle.owner_uuid, context()) == Ok(value=None)
+        assert (await display.ownership.all()).value == ()
+
+    run(scenario())
+
+
+# ------------------------------------------------------------------ F-8
+# Active controls require a currently matching endpoint; exact-handle cleanup
+# keeps working across endpoint replacement and receiver removal.
+
+
+def test_active_controls_reject_a_superseded_endpoint_but_stop_still_cleans_up():
+    transport = FakeTransport()
+    first = target("a", endpoint_generation=1)
+    transport.update_target(first, first.receiver_id)
+    handle = run(transport.start_stream(first, physical(), AudioPolicy(), context())).value
+    second = target("a", endpoint_generation=2)
+    transport.update_target(second, second.receiver_id)
+    for result in (
+        run(transport.set_muted(handle, True, context(endpoint_generation=2))),
+        run(transport.start_audio(handle, context(endpoint_generation=2))),
+    ):
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_target
+    assert transport.muted == {} and transport.audio_started == {}
+    # The exact handle is still releasable: cleanup is the documented exception.
+    assert run(transport.stop_stream(handle, context(endpoint_generation=2))) == Ok(value=None)
+    assert transport.streams == {}
+
+
+def test_active_controls_reject_an_absent_receiver_and_a_stale_context():
+    transport = FakeTransport()
+    t = target()
+    transport.update_target(t, t.receiver_id)
+    handle = run(transport.start_stream(t, physical(), AudioPolicy(), context())).value
+    # A context bound to another endpoint generation cannot drive this stream.
+    mismatched = run(transport.set_muted(handle, True, context(endpoint_generation=2)))
+    assert isinstance(mismatched, Err)
+    assert mismatched.error.code is ErrorCode.stale_target
+    assert run(transport.start_audio(handle, context(endpoint_generation=2))).error.code is (
+        ErrorCode.stale_target
+    )
+    transport.update_target(None, t.receiver_id)
+    for result in (
+        run(transport.set_muted(handle, True, context())),
+        run(transport.start_audio(handle, context())),
+    ):
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_target
+    assert run(transport.stop_stream(handle, context())) == Ok(value=None)
+
+
+# ------------------------------------------------------------------ F-9
+def test_forget_invalidates_active_challenges_so_late_trust_cannot_be_promoted():
+    pairing = FakePairing(clock=FakeClock())
+    t = target()
+    challenge = run(pairing.begin_pairing(t, context())).value
+    assert run(pairing.forget_trust(t.receiver_id, context())) == Ok(value=None)
+    late = run(pairing.submit_pairing(challenge.challenge_id, SensitiveText("1234"), context()))
+    assert late.kind == "Cancelled"
+    assert late.diagnostic.code is ErrorCode.stale_event
+    assert pairing.trusted == {}
+
+
+def test_forget_during_a_suspended_submission_revokes_the_late_success():
+    async def scenario():
+        pairing = FakePairing(clock=FakeClock())
+        t = target()
+        challenge = (await pairing.begin_pairing(t, context())).value
+        suspended = Deferred()
+        pairing.queue_result(
+            "submit_pairing",
+            suspended,
+        )
+        submit = asyncio.ensure_future(
+            pairing.submit_pairing(challenge.challenge_id, SensitiveText("1234"), context()),
+        )
+        await asyncio.sleep(0)
+        assert await pairing.forget_trust(t.receiver_id, context()) == Ok(value=None)
+        credential = OpaqueCredentialRef("late-credential")
+        suspended.resolve(
+            PairingResult(kind="Trusted", credential_ref=credential, diagnostic=None),
+        )
+        result = await submit
+        assert result.kind == "Cancelled"
+        assert result.diagnostic.code is ErrorCode.stale_event
+        assert pairing.trusted == {}
+        # The late success was compensated rather than silently dropped.
+        assert pairing.revocations == [t.receiver_id]
+
+    run(scenario())
+
+
+def test_cancel_during_a_suspended_submission_reports_unconfirmed_revocation():
+    async def scenario():
+        pairing = FakePairing(clock=FakeClock())
+        t = target()
+        challenge = (await pairing.begin_pairing(t, context())).value
+        suspended = Deferred()
+        pairing.queue_result("submit_pairing", suspended)
+        pairing.queue_result(
+            "revoke_trust", failure(ErrorCode.trust_cleanup_required, "revocation unconfirmed"),
+        )
+        submit = asyncio.ensure_future(
+            pairing.submit_pairing(challenge.challenge_id, SensitiveText("1234"), context()),
+        )
+        await asyncio.sleep(0)
+        assert await pairing.cancel_pairing(t.receiver_id, challenge.challenge_id, context()) == (
+            Ok(value=None)
+        )
+        suspended.resolve(
+            PairingResult(
+                kind="Trusted",
+                credential_ref=OpaqueCredentialRef("late"),
+                diagnostic=None,
+            ),
+        )
+        result = await submit
+        assert result.kind == "TrustCleanupRequired"
+        assert result.diagnostic.code is ErrorCode.trust_cleanup_required
+        assert result.diagnostic.recovery == (RecoveryAction.retry_revocation,)
+        assert pairing.trusted == {}
+
+    run(scenario())
+
+
+def test_mark_invalid_also_invalidates_an_active_challenge():
+    pairing = FakePairing(clock=FakeClock())
+    t = target()
+    challenge = run(pairing.begin_pairing(t, context())).value
+    assert run(pairing.mark_invalid(t.receiver_id, context())) == Ok(value=None)
+    assert run(pairing.submit_pairing(challenge.challenge_id, SensitiveText("1234"), context())).kind == (
+        "Cancelled"
+    )
+    assert pairing.trusted == {}
+
+
+# ------------------------------------------------------------------ F-10
+def test_credential_revocation_works_for_both_union_variants():
+    store = FakeCredentialStore()
+    t = target()
+    challenge = run(FakePairing().begin_pairing(t, context())).value
+    provisional = run(store.prepare_pairing(challenge, challenge.backend_token)).value
+    # The provisional variant is a runtime object, not a string identifier.
+    assert run(store.revoke_pairing(provisional)) == Ok(value=None)
+    assert provisional not in store.provisional_owner
+    # The receiver variant removes any remembered credential for that receiver.
+    store.seed_trusted(t.receiver_id)
+    assert run(store.revoke_pairing(t.receiver_id)) == Ok(value=None)
+    assert t.receiver_id not in store.stored
+    assert store.revoked == [provisional, t.receiver_id]
+
+
+# ------------------------------------------------------------------ F-11
+def test_credential_transaction_publishes_the_committed_reference_for_its_receiver():
+    store = FakeCredentialStore()
+    t = target()
+    challenge = run(FakePairing().begin_pairing(t, context())).value
+    provisional = run(store.prepare_pairing(challenge, challenge.backend_token)).value
+    committed = run(store.commit_pairing(provisional, trust_generation=3)).value
+    assert store.committed[committed] == 3
+    loaded = run(store.load_credential_ref(t.receiver_id)).value
+    assert loaded == committed
+    assert store.provisional == {}
+    assert store.provisional_owner == {}
+
+
+def test_credential_commit_rejects_cancelled_and_unknown_provisional_references():
+    store = FakeCredentialStore()
+    t = target()
+    challenge = run(FakePairing().begin_pairing(t, context())).value
+    provisional = run(store.prepare_pairing(challenge, challenge.backend_token)).value
+    assert run(store.cancel_pairing(challenge)) == Ok(value=None)
+    cancelled = run(store.commit_pairing(provisional, trust_generation=1))
+    assert isinstance(cancelled, Err)
+    assert cancelled.error.code is ErrorCode.keyring_unavailable
+    unknown = run(
+        store.commit_pairing(
+            OpaqueProvisionalCredentialRef("never-prepared"), trust_generation=1,
+        ),
+    )
+    assert isinstance(unknown, Err)
+    assert unknown.error.code is ErrorCode.keyring_unavailable
+    assert store.stored == {}
+    assert run(store.load_credential_ref(t.receiver_id)).value is not None
+
+
+# ------------------------------------------------------------------ F-12
+def test_remove_refuses_to_delete_an_unrelated_output_that_reused_an_id():
+    display = FakeDisplay()
+    t = target()
+    handle = run(display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context())).value
+    output_id = handle.source.kscreen_output_id
+    display.process.exit(handle.helper)
+    run(display.prepare_teardown(t.receiver_id, None, context()))
+    # An unrelated physical connector adopted the same output id.
+    display.outputs[output_id] = "DP-9"
+    result = run(display.remove(handle.owner_uuid, context()))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert display.outputs[output_id] == "DP-9"
+    assert run(display.ownership.all()).value != ()
+    assert display.removed == []
+
+
+def test_rollback_also_refuses_to_delete_a_reused_output_id():
+    async def scenario():
+        display = FakeDisplay()
+        t = target()
+        suspended = Deferred()
+        # reserved and helper_started publish; output_observed suspends then fails.
+        display.ownership.queue_result("write", Ok(value=None))
+        display.ownership.queue_result("write", Ok(value=None))
+        display.ownership.queue_result("write", suspended)
+        call = asyncio.ensure_future(
+            display.create(t.receiver_id, t.endpoint_fingerprint, MONITOR, context()),
+        )
+        while display.ownership.pending("write") != 0 or not display.outputs:
+            await asyncio.sleep(0)
+        # An unrelated physical connector adopted the same output id meanwhile.
+        for output_id in list(display.outputs):
+            display.outputs[output_id] = "DP-9"
+        suspended.resolve(failure(ErrorCode.persistence_failed, "output stage"))
+        result = await call
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.ownership_mismatch
+        assert set(display.outputs.values()) == {"DP-9"}
+        assert (await display.ownership.all()).value != ()
+
+    run(scenario())
+
+
+# ------------------------------------------------------------------ F-13
+def test_capture_rejects_non_physical_sources_through_registration_and_listing():
+    capture = FakeCapture()
+    monitor = physical("DP-1")
+    capture.add_physical(monitor)
+    capture.add_physical(physical("virtual-1"))
+    capture.add_physical(physical("screen-cast-window:2"))
+    listed = run(capture.list_physical()).value
+    assert listed == (monitor,)
+    assert capture.refused == ["virtual-1", "screen-cast-window:2"]
+    for rejected in ("virtual-1", "screen-cast-window:2"):
+        assert run(capture.select(rejected)).error.code is ErrorCode.unsupported_source
+        assert run(capture.verify(physical(rejected))).error.code is ErrorCode.unsupported_source
+
+
+# ------------------------------------------------------------------ F-14
+def test_discovery_close_remains_pending_until_its_deferred_completes():
+    async def scenario():
+        discovery = FakeDiscovery()
+        suspended = Deferred()
+        discovery.queue_result("close", suspended)
+        call = asyncio.ensure_future(discovery.close())
+        await asyncio.sleep(0)
+        assert not call.done()
+        assert discovery.closed is False
+        assert discovery.pending("close") == 0
+        suspended.resolve(None)
+        assert await call is None
+        assert discovery.closed is True
+
+    run(scenario())
+
+
+def test_prepare_teardown_fences_the_explicit_superseded_operation():
+    async def scenario():
+        display = FakeDisplay()
+        receiver = target("a")
+        other = target("b")
+        superseded = context(generation=1)
+        suspended = Deferred()
+        display.queue_result("create", suspended)
+        call = asyncio.ensure_future(
+            display.create(receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, superseded),
+        )
+        await asyncio.sleep(0)
+        # The gate names the superseded operation even for another receiver's scope.
+        admitted = await display.prepare_teardown(
+            other.receiver_id, superseded.operation_id, context(generation=2),
+        )
+        assert admitted == Ok(value=())
+        suspended.resolve(Ok(value=virtual_handle(owner=9, output="v9")))
+        result = await call
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_event
+        assert superseded.operation_id in display.fenced_operations
+        # A fresh operation is still admitted normally.
+        fresh = context(generation=2)
+        assert isinstance(
+            await display.create(
+                receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, fresh,
+            ),
+            Ok,
+        )
+        # Only the live create is active before the gate runs.
+        active = {
+            record.owner_uuid for record in (await display.ownership.all()).value
+            if record.desired_state == "active"
+        }
+        assert len(active) == 1
+        admitted = await display.prepare_teardown(
+            receiver.receiver_id, None, context(generation=2),
+        )
+        assert admitted == Ok(value=tuple(active))
+
+    run(scenario())

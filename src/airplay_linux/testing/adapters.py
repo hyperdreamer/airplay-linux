@@ -12,9 +12,9 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar, get_args
 from uuid import UUID
 
 from airplay_linux.domain import messages, ports, resources
@@ -23,7 +23,6 @@ from airplay_linux.domain.identity import (
     ReceiverRecordSet,
     ReceiverTarget,
     ReceiverView,
-    ServiceRecord,
 )
 from airplay_linux.domain.operations import (
     ChallengeId,
@@ -84,6 +83,18 @@ PAIRING_LIFETIME = 120.0
 CONTROL_TIMEOUT = 5.0
 
 
+def _display_event_kinds() -> frozenset[str]:
+    """The frozen ``DisplayEvent.kind`` union, read from the domain DTO itself."""
+    literal = messages.DisplayEvent.__annotations__["kind"]
+    if not isinstance(literal, str):
+        return frozenset(get_args(literal))
+    return frozenset(get_args(eval(literal, {"Literal": Literal})))
+
+
+DISPLAY_EVENT_KINDS = _display_event_kinds()
+"""Kinds a display double may emit; ``removing`` is a durable stage, not an event."""
+
+
 def _failure(code: ErrorCode, message: str, detail: str | None = None) -> Err:
     return Err(
         error=Diagnostic(
@@ -137,6 +148,8 @@ class RedactedRecord:
 
 def redact(value: Any) -> Any:
     """Project a value onto a secret-free shape that is safe to print or compare."""
+    if isinstance(value, Redacted):
+        return value
     if isinstance(value, PRIVATE_TYPES):
         return Redacted(kind=type(value).__name__)
     if is_dataclass(value) and not isinstance(value, type):
@@ -150,6 +163,13 @@ def redact(value: Any) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return type(value)(redact(item) for item in value)
     return value
+
+
+def _redact_stdin(stdin: bytes | None) -> Any:
+    """Replace process stdin payload with a sentinel; the bytes never reach a journal."""
+    if stdin is None:
+        return None
+    return Redacted(kind=f"stdin[{len(stdin)} bytes]")
 
 
 class Journal:
@@ -276,27 +296,33 @@ class _Scripted:
         self.journal.record(f"{self.journal_prefix}.{method}", **arguments)
 
     async def _take(
-        self, method: str, on_late: Callable[[Any], None] | None = None,
+        self, method: str, adopt: Callable[[Any], None] | None = None,
     ) -> Any:
-        """Return the next scripted outcome; ``on_late`` observes a deferred one.
+        """Return the next scripted outcome; ``adopt`` observes the completion.
 
-        A deferred outcome is owned by the test, so a caller that was cancelled
-        leaves it intact: ``on_late`` still sees the late backend result and can
-        keep its resource releasable.
+        A scripted acquisition is owned by the completion rather than by the
+        waiter: an immediate result is adopted before it is returned, and a
+        deferred one is adopted when the test resolves it, so a caller that was
+        cancelled still leaves the acquired resource releasable.
         """
         queued = self._scripted.get(method)
         if not queued:
             return _UNSET
         item = queued.popleft()
         if isinstance(item, Deferred):
-            if on_late is not None:
-                item.add_done_callback(on_late)
+            if adopt is not None:
+                item.add_done_callback(adopt)
             return await item.wait()
+        if adopt is not None:
+            adopt(item)
         return item
 
-    async def _call(self, method: str, default: Callable[[], Any], **arguments: Any) -> Any:
+    async def _call(
+        self, method: str, default: Callable[[], Any], *, adopt: Callable[[Any], None] | None = None,
+        **arguments: Any,
+    ) -> Any:
         self._record(method, **arguments)
-        scripted = await self._take(method)
+        scripted = await self._take(method, adopt)
         return await default() if scripted is _UNSET else scripted
 
 
@@ -344,11 +370,32 @@ class FakeTransport(_Scripted, _EventSource):
     def _fresh(self, target: ReceiverTarget) -> bool:
         return self.targets.get(target.receiver_id) == target
 
-    def _stale_stream(self, handle: StreamHandle) -> Err | None:
+    def _stale_stream(
+        self, handle: StreamHandle, context: OperationContext | None = None,
+        *, active_control: bool = False,
+    ) -> Err | None:
+        """Fence the exact handle, the daemon, and (for controls) the endpoint.
+
+        ``stop_stream`` is the cleanup exception: an exact handle must stay
+        releasable after its receiver endpoint was replaced or removed, so only
+        active controls require a currently matching target.
+        """
         if self.streams.get(handle.lease_id) != handle:
             return _failure(ErrorCode.stale_event, "Stream handle is not owned by this transport")
         if handle.daemon_instance_uuid != self.daemon_instance_uuid:
             return _failure(ErrorCode.stale_event, "Stream belongs to a previous daemon instance")
+        if not active_control:
+            return None
+        current = self.targets.get(handle.receiver_id)
+        if current is None:
+            return _failure(ErrorCode.stale_target, "Receiver endpoint is no longer present")
+        if (
+            current.endpoint_fingerprint != handle.endpoint_fingerprint
+            or current.endpoint_generation != handle.endpoint_generation
+        ):
+            return _failure(ErrorCode.stale_target, "Stream belongs to a superseded endpoint")
+        if context is not None and context.endpoint_generation != handle.endpoint_generation:
+            return _failure(ErrorCode.stale_target, "Operation targets another endpoint generation")
         return None
 
     def _adopt_stream(self, result: Any) -> None:
@@ -392,7 +439,7 @@ class FakeTransport(_Scripted, _EventSource):
             return _failure(ErrorCode.stale_target, "Receiver endpoint is no longer current")
         if not isinstance(source, (PhysicalMonitorSource, VirtualOutputSource)):
             return _failure(ErrorCode.unsupported_source, "Capture source is not a monitor")
-        scripted = await self._take("start_stream", on_late=self._adopt_stream)
+        scripted = await self._take("start_stream", adopt=self._adopt_stream)
         if scripted is _UNSET:
             return Ok(value=self._new_handle(target, context))
         return scripted
@@ -414,7 +461,7 @@ class FakeTransport(_Scripted, _EventSource):
         self, handle: StreamHandle, muted: bool, context: OperationContext,
     ) -> Result[None]:
         self._record("set_muted", handle=handle, muted=muted, context=context)
-        stale = self._stale_stream(handle)
+        stale = self._stale_stream(handle, context, active_control=True)
         if stale is not None:
             return stale
         scripted = await self._take("set_muted")
@@ -425,7 +472,7 @@ class FakeTransport(_Scripted, _EventSource):
 
     async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
         self._record("start_audio", handle=handle, context=context)
-        stale = self._stale_stream(handle)
+        stale = self._stale_stream(handle, context, active_control=True)
         if stale is not None:
             return stale
         scripted = await self._take("start_audio")
@@ -456,7 +503,28 @@ class FakePairing(_Scripted):
         self.trusted: dict[ReceiverId, OpaqueCredentialRef] = {}
         self.challenges: dict[ChallengeId, PairingChallenge] = {}
         self.invalid_submissions: dict[ChallengeId, int] = {}
+        self.revocations: list[ReceiverId] = []
+        self._invalidations: dict[ReceiverId, int] = {}
+        self._challenge_epoch: dict[ChallengeId, int] = {}
         self._ids = SequenceIds(seed=700)
+
+    # -- invalidation -------------------------------------------------------
+
+    def _invalidate(self, receiver_id: ReceiverId) -> None:
+        """Retire trust and every receiver challenge, before any suspension.
+
+        The per-receiver epoch is authoritative: a submission that was already
+        awaiting its backend answer still sees the invalidation when it resumes.
+        """
+        self._invalidations[receiver_id] = self._invalidations.get(receiver_id, 0) + 1
+        self.trusted.pop(receiver_id, None)
+        for identifier, challenge in tuple(self.challenges.items()):
+            if challenge.receiver_id == receiver_id:
+                del self.challenges[identifier]
+
+    def _invalidated(self, challenge: PairingChallenge) -> bool:
+        epoch = self._invalidations.get(challenge.receiver_id, 0)
+        return epoch != self._challenge_epoch.get(challenge.challenge_id, 0)
 
     def script_challenge(self, target: ReceiverTarget, context: OperationContext) -> PairingChallenge:
         """Publish a receiver-requested challenge without inventing a mode."""
@@ -475,6 +543,9 @@ class FakePairing(_Scripted):
             backend_token=OpaqueBackendToken(f"fake-pairing-token-{self._ids.new()}"),
         )
         self.challenges[challenge.challenge_id] = challenge
+        self._challenge_epoch[challenge.challenge_id] = self._invalidations.get(
+            challenge.receiver_id, 0,
+        )
         return challenge
 
     async def begin_pairing(
@@ -494,6 +565,9 @@ class FakePairing(_Scripted):
         challenge = self.challenges.get(challenge_id)
         if challenge is None:
             return _cancelled(ErrorCode.stale_event, "Pairing challenge is not active")
+        if self._invalidated(challenge):
+            del self.challenges[challenge_id]
+            return _cancelled(ErrorCode.stale_event, "Pairing challenge was invalidated")
         superseded = (
             challenge.session_generation != context.session_generation
             or challenge.endpoint_generation != context.endpoint_generation
@@ -505,6 +579,10 @@ class FakePairing(_Scripted):
             del self.challenges[challenge_id]
             return _cancelled(ErrorCode.pairing_expired, "Pairing challenge expired")
         scripted = await self._take("submit_pairing")
+        # Recheck the fence after the suspension: cancel or Forget may have run
+        # while the backend answer was outstanding.
+        if self.challenges.get(challenge_id) is not challenge or self._invalidated(challenge):
+            return await self._compensate(challenge, scripted)
         if scripted is not _UNSET:
             return scripted
         if value.reveal_for_backend() == "":
@@ -513,6 +591,32 @@ class FakePairing(_Scripted):
         credential = OpaqueCredentialRef(f"fake-credential-{challenge.receiver_id}")
         self.trusted[challenge.receiver_id] = credential
         return PairingResult(kind="Trusted", credential_ref=credential, diagnostic=None)
+
+    async def _compensate(self, challenge: PairingChallenge, scripted: Any) -> PairingResult:
+        """Resolve a submission that resumed after its challenge was fenced.
+
+        A late ``Trusted`` answer is revoked rather than exposed; if that
+        revocation cannot be confirmed the coordinator must report
+        ``TrustCleanupRequired`` instead of pretending trust is clean.
+        """
+        if not (isinstance(scripted, PairingResult) and scripted.kind == "Trusted"):
+            return _cancelled(ErrorCode.stale_event, "Pairing challenge was invalidated")
+        self.trusted.pop(challenge.receiver_id, None)
+        outcome = await self._take("revoke_trust")
+        self.revocations.append(challenge.receiver_id)
+        if outcome is _UNSET or isinstance(outcome, Ok):
+            return _cancelled(
+                ErrorCode.stale_event, "Pairing challenge was invalidated; late trust revoked",
+            )
+        return PairingResult(
+            kind="TrustCleanupRequired",
+            credential_ref=None,
+            diagnostic=Diagnostic(
+                code=ErrorCode.trust_cleanup_required,
+                message="Late trust could not be revoked",
+                recovery=(RecoveryAction.retry_revocation,),
+            ),
+        )
 
     def _reject_submission(self, challenge_id: ChallengeId) -> PairingResult:
         invalid = self.invalid_submissions.get(challenge_id, 0) + 1
@@ -557,15 +661,18 @@ class FakePairing(_Scripted):
 
     async def forget_trust(self, receiver_id: ReceiverId, context: OperationContext) -> Result[None]:
         self._record("forget_trust", receiver_id=receiver_id, context=context)
-        self.trusted.pop(receiver_id, None)
+        # Invalidate before the first suspension, so a concurrent submission
+        # cannot commit trust that Forget already retired.
+        self._invalidate(receiver_id)
         scripted = await self._take("forget_trust")
         return _ok() if scripted is _UNSET else scripted
 
     async def mark_invalid(self, receiver_id: ReceiverId, context: OperationContext) -> Result[None]:
         async def default() -> Result[None]:
-            self.trusted.pop(receiver_id, None)
             return Ok(value=None)
 
+        # Invalidate before the first suspension, exactly like Forget.
+        self._invalidate(receiver_id)
         return await self._call("mark_invalid", default, receiver_id=receiver_id, context=context)
 
     async def retry_revocation(
@@ -597,6 +704,8 @@ class FakeCredentialStore(_Scripted):
         super().__init__()
         self.stored: dict[ReceiverId, OpaqueCredentialRef] = {}
         self.provisional: dict[ChallengeId, OpaqueProvisionalCredentialRef] = {}
+        self.provisional_receivers: dict[ChallengeId, ReceiverId] = {}
+        self.provisional_owner: dict[OpaqueProvisionalCredentialRef, ChallengeId] = {}
         self.committed: dict[OpaqueCredentialRef, int] = {}
         self.revoked: list[Any] = []
         self.invalid: list[ReceiverId] = []
@@ -622,7 +731,11 @@ class FakeCredentialStore(_Scripted):
     ) -> Result[OpaqueProvisionalCredentialRef]:
         async def default() -> Result[OpaqueProvisionalCredentialRef]:
             provisional = OpaqueProvisionalCredentialRef(f"fake-provisional-{self._ids.new()}")
+            # Keep the receiver association: commit must publish the credential
+            # for that receiver, not for a stranger that loads first.
             self.provisional[challenge.challenge_id] = provisional
+            self.provisional_receivers[challenge.challenge_id] = challenge.receiver_id
+            self.provisional_owner[provisional] = challenge.challenge_id
             return Ok(value=provisional)
 
         return await self._call(
@@ -633,8 +746,21 @@ class FakeCredentialStore(_Scripted):
         self, provisional_ref: OpaqueProvisionalCredentialRef, trust_generation: int,
     ) -> Result[OpaqueCredentialRef]:
         async def default() -> Result[OpaqueCredentialRef]:
+            if not isinstance(provisional_ref, OpaqueProvisionalCredentialRef):
+                return _failure(ErrorCode.keyring_unavailable, "Unknown provisional reference")
+            challenge_id = self.provisional_owner.pop(provisional_ref, None)
+            if challenge_id is None or self.provisional.get(challenge_id) != provisional_ref:
+                return _failure(
+                    ErrorCode.keyring_unavailable,
+                    "Provisional reference was cancelled or never prepared",
+                )
+            receiver_id = self.provisional_receivers.pop(challenge_id, None)
+            del self.provisional[challenge_id]
+            if receiver_id is None:
+                return _failure(ErrorCode.keyring_unavailable, "Provisional reference was orphaned")
             credential = OpaqueCredentialRef(f"fake-credential-{self._ids.new()}")
             self.committed[credential] = trust_generation
+            self.stored[receiver_id] = credential
             return Ok(value=credential)
 
         return await self._call(
@@ -644,7 +770,10 @@ class FakeCredentialStore(_Scripted):
 
     async def cancel_pairing(self, challenge: PairingChallenge) -> Result[None]:
         async def default() -> Result[None]:
-            self.provisional.pop(challenge.challenge_id, None)
+            provisional = self.provisional.pop(challenge.challenge_id, None)
+            self.provisional_receivers.pop(challenge.challenge_id, None)
+            if provisional is not None:
+                self.provisional_owner.pop(provisional, None)
             return Ok(value=None)
 
         return await self._call("cancel_pairing", default, challenge=challenge)
@@ -654,13 +783,19 @@ class FakeCredentialStore(_Scripted):
     ) -> Result[None]:
         async def default() -> Result[None]:
             self.revoked.append(ref_or_receiver)
-            if isinstance(ref_or_receiver, ReceiverId):
+            # ``ReceiverId`` is a ``NewType``: only the runtime type distinguishes
+            # an identifier string from an opaque provisional reference object.
+            if type(ref_or_receiver) is str:
                 self.stored.pop(ref_or_receiver, None)
-            else:
-                self.stored = {
-                    key: value for key, value in self.stored.items()
-                    if value != ref_or_receiver
-                }
+                return Ok(value=None)
+            challenge_id = self.provisional_owner.pop(ref_or_receiver, None)
+            if challenge_id is not None:
+                del self.provisional[challenge_id]
+                self.provisional_receivers.pop(challenge_id, None)
+            self.stored = {
+                key: value for key, value in self.stored.items()
+                if value != ref_or_receiver
+            }
             return Ok(value=None)
 
         return await self._call("revoke_pairing", default, ref_or_receiver=ref_or_receiver)
@@ -687,10 +822,20 @@ class FakeCapture(_Scripted):
         super().__init__()
         self.monitors: dict[str, PhysicalMonitorSource] = {}
         self.rejected: list[str] = []
+        self.refused: list[str] = []
         self.selections: list[str] = []
         self.released: list[PhysicalMonitorSource] = []
 
     def add_physical(self, source: PhysicalMonitorSource) -> None:
+        """Register a source; a non-physical descriptor is refused at the door.
+
+        Registration feeds enumeration, so the same physical-only rule that
+        guards ``select`` and ``verify`` applies here: no consumer may obtain a
+        virtual output or window from any public capture path.
+        """
+        if not self.is_physical_connector(source.connector):
+            self.refused.append(source.connector)
+            return
         self.monitors[source.connector] = source
 
     @classmethod
@@ -700,7 +845,12 @@ class FakeCapture(_Scripted):
 
     async def list_physical(self) -> Result[tuple[PhysicalMonitorSource, ...]]:
         async def default() -> Result[tuple[PhysicalMonitorSource, ...]]:
-            return Ok(value=tuple(self.monitors.values()))
+            return Ok(
+                value=tuple(
+                    source for source in self.monitors.values()
+                    if self.is_physical_connector(source.connector)
+                ),
+            )
 
         return await self._call("list_physical", default)
 
@@ -720,6 +870,12 @@ class FakeCapture(_Scripted):
 
     async def verify(self, source: PhysicalMonitorSource) -> Result[None]:
         async def default() -> Result[None]:
+            if not self.is_physical_connector(source.connector):
+                self.rejected.append(source.connector)
+                return _failure(
+                    ErrorCode.unsupported_source,
+                    "Only a physical monitor source can be captured",
+                )
             known = self.monitors.get(source.connector)
             if known is None or known != source:
                 return _failure(
@@ -780,7 +936,11 @@ class FakeProcess(_Scripted, _EventSource):
         async def default() -> Result[ports.CommandOutput]:
             return Ok(value=ports.CommandOutput(exit_code=0, stdout=b"", stderr=b""))
 
-        return await self._call("run", default, spec=spec, timeout=timeout, stdin=stdin)
+        # Stdin can carry a PIN or backend secret: journal only that bytes crossed
+        # this boundary, never the bytes themselves.
+        return await self._call(
+            "run", default, spec=spec, timeout=timeout, stdin=_redact_stdin(stdin),
+        )
 
     async def spawn(self, spec: ports.CommandSpec) -> Result[ProcessIdentity]:
         async def default() -> Result[ProcessIdentity]:
@@ -791,7 +951,21 @@ class FakeProcess(_Scripted, _EventSource):
             self.register(identity, spec.env)
             return Ok(value=identity)
 
-        return await self._call("spawn", default, spec=spec)
+        def adopt(result: Any) -> None:
+            self._adopt_identity(result, spec)
+
+        return await self._call("spawn", default, adopt=adopt, spec=spec)
+
+    def _adopt_identity(self, result: Any, spec: ports.CommandSpec) -> None:
+        """Publish a scripted spawn success so ``owned``/``terminate`` can use it.
+
+        The simulated launch data comes from the spec that produced it, so a late
+        success resolved after its caller was cancelled is adopted the same way.
+        """
+        if not isinstance(result, Ok) or not isinstance(result.value, ProcessIdentity):
+            return
+        self.spawned.append(spec)
+        self.register(result.value, spec.env)
 
     def identity(self, pid: int) -> ProcessIdentity | None:
         return self._identities.get(pid)
@@ -853,6 +1027,7 @@ class MemorySessionStore(_Scripted):
     def __init__(self) -> None:
         super().__init__()
         self.saved: dict[ReceiverId, SessionSnapshot] = {}
+        self.load_error: Err | None = None
 
     async def save(self, snapshot: SessionSnapshot) -> Result[None]:
         async def default() -> Result[None]:
@@ -861,11 +1036,23 @@ class MemorySessionStore(_Scripted):
 
         return await self._call("save", default, snapshot=snapshot)
 
-    async def load_all(self) -> Result[tuple[SessionSnapshot, ...]]:
-        async def default() -> Result[tuple[SessionSnapshot, ...]]:
-            return Ok(value=tuple(self.saved.values()))
+    async def load_all(self) -> tuple[SessionSnapshot, ...]:
+        """The frozen ``SessionStore`` interface returns an unwrapped tuple.
 
-        return await self._call("load_all", default)
+        A scripted outcome controls *which* sessions are loaded, never the return
+        shape; a scripted failure is retained on ``load_error`` and the last
+        durable contents are returned rather than a wrapper the port never had.
+        """
+        self._record("load_all")
+        if self.pending("load_all"):
+            scripted = await self._take("load_all")
+            if isinstance(scripted, Err):
+                self.load_error = scripted
+                return tuple(self.saved.values())
+            if isinstance(scripted, Ok):
+                return tuple(scripted.value)
+            return tuple(scripted)
+        return tuple(self.saved.values())
 
 
 class MemoryReceiverStore(_Scripted):
@@ -925,8 +1112,10 @@ class MemoryOwnershipStore(_Scripted):
     async def write(self, record: OwnershipRecord) -> Result[None]:
         self._record("write", record=record)
         scripted = await self._take("write")
-        if scripted is not _UNSET:
+        if isinstance(scripted, Err):
             return scripted
+        # A scripted success controls *when* the write completes, not whether it
+        # is durable: the record is still published through the atomic sequence.
         failure: str | None = None
         if self._next_failure is not None:
             step, remaining = self._next_failure
@@ -1144,10 +1333,31 @@ class FakeDiscovery(_Scripted, _EventSource):
 
     async def close(self) -> None:
         self._record("close")
+        # ``close`` declares ``None`` success, so the scripting seam controls only
+        # when shutdown happens, never what it returns: a queued ``Deferred``
+        # keeps the close outstanding until the test resolves it.
+        await self._take("close")
         self.closed = True
 
 
 # --------------------------------------------------------------------------- display
+
+
+class _Creation:
+    """One in-flight ``create`` call, fenced by receiver and by operation.
+
+    The teardown gate has to fence a creation *before* it owns an output, so the
+    operation identity — not only an owner UUID — is the fence key it can use.
+    """
+
+    __slots__ = ("receiver_id", "operation_id", "owner_uuid", "fenced", "settled")
+
+    def __init__(self, receiver_id: ReceiverId, operation_id: OperationId) -> None:
+        self.receiver_id = receiver_id
+        self.operation_id = operation_id
+        self.owner_uuid: OwnerId | None = None
+        self.fenced = False
+        self.settled = False
 
 
 class FakeDisplay(_Scripted, _EventSource):
@@ -1167,6 +1377,8 @@ class FakeDisplay(_Scripted, _EventSource):
         self.removed: list[OwnerId] = []
         self.max_concurrent_creations = 0
         self.crashes: list[tuple[OwnerId, str]] = []
+        self.fenced_operations: set[OperationId] = set()
+        self._creations: list[_Creation] = []
         self._creation_lock = asyncio.Lock()
         self._in_flight = 0
         self._crash_at: str | None = None
@@ -1204,6 +1416,27 @@ class FakeDisplay(_Scripted, _EventSource):
         self._crash_at = None
         self.crashes.append((record.owner_uuid, stage))
         return True
+
+    # -- fencing ------------------------------------------------------------
+
+    def _fenced(self, creation: _Creation) -> bool:
+        return creation.fenced or creation.operation_id in self.fenced_operations
+
+    def _fence_pending(self, receiver_id: ReceiverId) -> None:
+        """Fence every create for ``receiver_id`` that has not settled yet.
+
+        A create whose caller was cancelled still appears here: its completion is
+        owned by the test's deferred, so the gate has to be able to fence an
+        outcome that has not arrived.
+        """
+        for creation in self._creations:
+            if creation.receiver_id == receiver_id and not creation.settled:
+                creation.fenced = True
+
+    def _settle(self, creation: _Creation) -> None:
+        creation.settled = True
+        if creation in self._creations:
+            self._creations.remove(creation)
 
     # -- record bookkeeping -------------------------------------------------
 
@@ -1256,7 +1489,19 @@ class FakeDisplay(_Scripted, _EventSource):
             helper=record.helper or ProcessIdentity(pid=0, start_ticks=0),
         )
 
+    def _note_stage(self, record: OwnershipRecord, stage: str) -> None:
+        """Record a durable stage transition that has no typed event variant.
+
+        ``removing`` is a published ownership stage, not a ``DisplayEvent`` kind:
+        the frozen union in ``domain/messages.py`` has no such variant, so the
+        observability lives in ownership metadata and the journal instead.
+        """
+        self.stage_log.append((record.owner_uuid, stage))
+        self._record("stage", owner_uuid=record.owner_uuid, stage=stage)
+
     def _emit_stage(self, kind: str, record: OwnershipRecord, handle: DisplayHandle | None = None) -> None:
+        if kind not in DISPLAY_EVENT_KINDS:
+            raise ValueError(f"{kind!r} is not a DisplayEvent kind in the frozen domain contract")
         self.stage_log.append((record.owner_uuid, kind))
         self.emit(
             messages.DisplayEvent(
@@ -1283,19 +1528,60 @@ class FakeDisplay(_Scripted, _EventSource):
             env=self.process.owner_environment(record.owner_uuid, record.runtime_directory),
         )
 
-    async def _discard(self, record: OwnershipRecord) -> None:
-        """Return a partially created reservation to a clean, unowned state."""
-        if record.helper is not None and self.process.owned(
-            record.helper, record.owner_uuid, record.runtime_directory,
+    def _release_output(self, record: OwnershipRecord) -> Err | None:
+        """Delete only an output whose identity still matches this owner's evidence.
+
+        An output id can be recycled by an unrelated output after the helper died;
+        deleting that entry would model automatic removal of something unowned.
+        """
+        if record.output_id is None:
+            return None
+        observed = self.outputs.get(record.output_id)
+        if observed is not None and observed != record.connector:
+            return _failure(
+                ErrorCode.ownership_mismatch,
+                "Output id was reused by an unrelated output; ownership is uncertain",
+            )
+        self.outputs.pop(record.output_id, None)
+        return None
+
+    async def _discard(self, record: OwnershipRecord) -> Result[None]:
+        """Publish removal intent, then release whatever this owner actually created.
+
+        A failure anywhere in the sequence leaves a durable, recoverable record:
+        the fake never models an unconfirmed release as a released resource.
+        """
+        durable = self.ownership.records.get(record.owner_uuid)
+        # In-memory evidence wins over a durable record written before the helper
+        # existed: a process that did start has to be named before teardown, or
+        # the rollback would forget a live helper.
+        known = record if record.helper is not None else (durable or record)
+        if known.desired_state != "removing" or known.stage != "removing":
+            known = self._next_record(known, "removing", "removing")
+            written = await self.ownership.write(known)
+            if isinstance(written, Err):
+                # Removal intent is not durable: destructive teardown must not run.
+                return written
+            self._note_stage(known, "removing")
+        helper = known.helper
+        if helper is not None and self.process.owned(
+            helper, known.owner_uuid, known.runtime_directory,
         ):
-            await self.process.terminate(
-                record.helper, record.owner_uuid, record.runtime_directory,
+            terminated = await self.process.terminate(
+                helper, known.owner_uuid, known.runtime_directory,
                 deadline=CONTROL_TIMEOUT,
             )
-        if record.output_id is not None:
-            self.outputs.pop(record.output_id, None)
-        self.handles.pop(record.owner_uuid, None)
-        await self.ownership.delete(record.owner_uuid)
+            if isinstance(terminated, Err):
+                return terminated
+        released = self._release_output(known)
+        if released is not None:
+            return released
+        self.handles.pop(known.owner_uuid, None)
+        deleted = await self.ownership.delete(known.owner_uuid)
+        if isinstance(deleted, Err):
+            return deleted
+        self._record("discarded", owner_uuid=known.owner_uuid)
+        return _ok()
 
     # -- DisplayPort --------------------------------------------------------
 
@@ -1307,44 +1593,102 @@ class FakeDisplay(_Scripted, _EventSource):
             "create", receiver_id=receiver_id, endpoint_fingerprint=endpoint_fingerprint,
             size=size, context=context,
         )
-        scripted = await self._take("create")
+        creation = _Creation(receiver_id=receiver_id, operation_id=context.operation_id)
+        self._creations.append(creation)
+        scripted = await self._take(
+            "create",
+            adopt=lambda result: self._register_scripted(
+                creation, result, endpoint_fingerprint, size,
+            ),
+        )
         if scripted is not _UNSET:
+            if isinstance(scripted, Ok) and self._fenced(creation):
+                # The teardown gate ran while this acquisition was in flight.
+                return _failure(ErrorCode.stale_event, "Creation was superseded by teardown")
             return scripted
         async with self._creation_lock:  # provider-wide; spans baseline to publication
             self._in_flight += 1
-            self.max_concurrent_creations = max(self.max_concurrent_creations, self._in_flight)
+            self.max_concurrent_creations = max(
+                self.max_concurrent_creations, self._in_flight,
+            )
             try:
                 return await self._create_locked(
-                    receiver_id, endpoint_fingerprint, size, context,
+                    creation, receiver_id, endpoint_fingerprint, size, context,
                 )
             finally:
                 self._in_flight -= 1
+                self._settle(creation)
+
+    def _register_scripted(
+        self, creation: _Creation, result: Any, endpoint_fingerprint: str, size: Size,
+    ) -> None:
+        """Adopt a scripted acquisition so its exact handle stays releasable.
+
+        Bookkeeping belongs to the completion rather than to the waiter: a
+        deferred success resolved after the caller was cancelled is registered
+        the same way, and a success that arrives after the teardown gate is
+        recorded as removal-intent rather than active.
+        """
+        if not isinstance(result, Ok) or not isinstance(result.value, DisplayHandle):
+            self._settle(creation)
+            return
+        handle = result.value
+        fenced = self._fenced(creation)
+        record = self._ownership_record(
+            handle.owner_uuid, creation.receiver_id, endpoint_fingerprint, size,
+            creation.operation_id, "removing" if fenced else "published",
+            "removing" if fenced else "active",
+            helper=handle.helper, connector=handle.source.connector,
+            output_id=handle.source.kscreen_output_id, observed=handle.source.size,
+        )
+        self.ownership.records[handle.owner_uuid] = record
+        if not fenced:
+            # A fenced acquisition never becomes an active owned display; its
+            # exact handle stays releasable through the ownership record alone.
+            self.handles[handle.owner_uuid] = handle
+        self.outputs[handle.source.kscreen_output_id] = handle.source.connector
+        if handle not in self.created:
+            self.created.append(handle)
+        self._settle(creation)
 
     async def _create_locked(
-        self, receiver_id: ReceiverId, endpoint_fingerprint: str,
-        size: Size, context: OperationContext,
+        self, creation: _Creation, receiver_id: ReceiverId,
+        endpoint_fingerprint: str, size: Size, context: OperationContext,
     ) -> Result[DisplayHandle]:
+        if self._fenced(creation):
+            return _failure(
+                ErrorCode.stale_event, "Creation was superseded by teardown before reservation",
+            )
         owner_uuid = OwnerId(self._ids.new())
+        creation.owner_uuid = owner_uuid
         reserved = self._ownership_record(
             owner_uuid, receiver_id, endpoint_fingerprint, size,
             context.operation_id, "reserved", "active",
         )
+        superseded = _failure(ErrorCode.stale_event, "Creation was superseded by teardown")
         written = await self.ownership.write(reserved)
         if isinstance(written, Err):
+            # Nothing durable exists yet, so there is nothing to roll back.
             return written
+        if self._fenced(creation):
+            return await self._abort(reserved, superseded)
         self._emit_stage("reserved", reserved)
         spawned = await self.process.spawn(self._helper_spec(reserved))
         if isinstance(spawned, Err):
-            await self._discard(reserved)
-            return spawned
+            return await self._abort(reserved, spawned)
+        if self._fenced(creation):
+            return await self._abort(
+                self._with(reserved, helper=spawned.value), superseded,
+            )
         started = self._ownership_record(
             owner_uuid, receiver_id, endpoint_fingerprint, size,
             context.operation_id, "helper_started", "active", helper=spawned.value,
         )
         written = await self.ownership.write(started)
         if isinstance(written, Err):
-            await self._discard(started)
-            return written
+            return await self._abort(started, written)
+        if self._fenced(creation):
+            return await self._abort(started, superseded)
         self._emit_stage("helper_started", started)
         if self._maybe_crash("helper_started", started):
             return _failure(ErrorCode.helper_failed, "Provider crashed after helper start")
@@ -1359,8 +1703,9 @@ class FakeDisplay(_Scripted, _EventSource):
         )
         written = await self.ownership.write(observed)
         if isinstance(written, Err):
-            await self._discard(observed)
-            return written
+            return await self._abort(observed, written)
+        if self._fenced(creation):
+            return await self._abort(observed, superseded)
         self._emit_stage("output_observed", observed)
         if self._maybe_crash("output_observed", observed):
             return _failure(ErrorCode.helper_failed, "Provider crashed after output observation")
@@ -1371,8 +1716,9 @@ class FakeDisplay(_Scripted, _EventSource):
         )
         written = await self.ownership.write(published)
         if isinstance(written, Err):
-            await self._discard(published)
-            return written
+            return await self._abort(published, written)
+        if self._fenced(creation):
+            return await self._abort(published, superseded)
         handle = self._handle(published)
         self.handles[owner_uuid] = handle
         self.created.append(handle)
@@ -1380,6 +1726,19 @@ class FakeDisplay(_Scripted, _EventSource):
         if self._maybe_crash("published", published):
             return _failure(ErrorCode.helper_failed, "Provider crashed after publication")
         return Ok(value=handle)
+
+    @staticmethod
+    def _with(record: OwnershipRecord, helper: ProcessIdentity) -> OwnershipRecord:
+        return replace(record, helper=helper)
+
+    async def _abort(self, record: OwnershipRecord, reason: Result[Any]) -> Result[DisplayHandle]:
+        """Roll back a failed or fenced reservation, reporting the rollback first."""
+        cleaned = await self._discard(record)
+        if isinstance(cleaned, Err):
+            return cleaned
+        if isinstance(reason, Err):
+            return reason
+        return _failure(ErrorCode.helper_failed, "Creation did not complete")
 
     async def prepare_teardown(
         self, receiver_id: ReceiverId, superseded_operation_id: OperationId | None,
@@ -1392,6 +1751,11 @@ class FakeDisplay(_Scripted, _EventSource):
         scripted = await self._take("prepare_teardown")
         if scripted is not _UNSET:
             return scripted
+        # Fence first: a create that has no owner UUID yet must not be able to
+        # reserve or publish an active output once this gate has acknowledged.
+        if superseded_operation_id is not None:
+            self.fenced_operations.add(superseded_operation_id)
+        self._fence_pending(receiver_id)
         admitted: list[OwnerId] = []
         for record in list(self.ownership.records.values()):
             if record.receiver_id != receiver_id or record.desired_state != "active":
@@ -1400,7 +1764,7 @@ class FakeDisplay(_Scripted, _EventSource):
             written = await self.ownership.write(removing)
             if isinstance(written, Err):
                 return written
-            self._emit_stage("removing", removing)
+            self._note_stage(removing, "removing")
             admitted.append(record.owner_uuid)
         return Ok(value=tuple(admitted))
 
@@ -1412,7 +1776,11 @@ class FakeDisplay(_Scripted, _EventSource):
         scripted = await self._take("mark_removing")
         if scripted is not _UNSET:
             return scripted
-        return await self.ownership.write(self._next_record(record, "removing", "removing"))
+        removing = self._next_record(record, "removing", "removing")
+        written = await self.ownership.write(removing)
+        if isinstance(written, Ok):
+            self._note_stage(removing, "removing")
+        return written
 
     async def remove(self, owner_uuid: OwnerId, context: OperationContext) -> Result[None]:
         self._record("remove", owner_uuid=owner_uuid, context=context)
@@ -1439,8 +1807,9 @@ class FakeDisplay(_Scripted, _EventSource):
             )
             if isinstance(terminated, Err):
                 return terminated
-        if record.output_id is not None:
-            self.outputs.pop(record.output_id, None)
+        released = self._release_output(record)
+        if released is not None:
+            return released
         self.handles.pop(owner_uuid, None)
         self.removed.append(owner_uuid)
         deleted = await self.ownership.delete(owner_uuid)
@@ -1449,7 +1818,11 @@ class FakeDisplay(_Scripted, _EventSource):
         self._emit_stage("removed", self._next_record(record, "removing", "removing"))
         return _ok()
 
-    def reconcile(self) -> tuple[RecoveryItem, ...]:
+    async def reconcile(self) -> tuple[RecoveryItem, ...]:
+        self._record("reconcile")
+        scripted = await self._take("reconcile")
+        if scripted is not _UNSET:
+            return scripted
         items: list[RecoveryItem] = []
         for record in self.ownership.records.values():
             if record.desired_state == "removing":

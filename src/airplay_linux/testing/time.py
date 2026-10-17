@@ -54,42 +54,64 @@ class FakeClock:
         self._now = float(value)
 
 
+class _Entry:
+    """One scheduled deadline with a lifecycle independent of heap membership.
+
+    A fired entry is popped from the heap, so cancellation has to work from the
+    entry itself rather than by locating it in the heap; a handle that outlives
+    its deadline (or that cancels itself from inside its own callback) is a
+    harmless no-op.
+    """
+
+    __slots__ = ("deadline", "sequence", "callback", "cancelled", "fired")
+
+    def __init__(self, deadline: float, sequence: int, callback: Callable[[], None]) -> None:
+        self.deadline = deadline
+        self.sequence = sequence
+        self.callback = callback
+        self.cancelled = False
+        self.fired = False
+
+
 class FakeScheduler:
-    """A heap of ``(deadline, sequence, callback)`` with stable FIFO ordering."""
+    """A heap of ``(deadline, sequence, entry)`` with stable FIFO ordering."""
 
     def __init__(self, clock: FakeClock) -> None:
         self._clock = clock
-        self._heap: list[tuple[float, int, Callable[[], None], bool]] = []
+        self._heap: list[tuple[float, int, _Entry]] = []
         self._sequence = 0
 
     def call_at(self, when: float, callback: Callable[[], None]) -> _CancelHandle:
         deadline = float(when)
         self._sequence += 1
-        entry: tuple[float, int, Callable[[], None], bool] = (deadline, self._sequence, callback, False)
-        heapq.heappush(self._heap, entry)
+        entry = _Entry(deadline, self._sequence, callback)
+        heapq.heappush(self._heap, (deadline, entry.sequence, entry))
         return _CancelHandle(lambda: self._cancel(entry))
 
     def pending(self) -> tuple[float, ...]:
-        return tuple(deadline for deadline, _, _, cancelled in sorted(self._heap) if not cancelled)
+        return tuple(
+            sorted(
+                entry.deadline
+                for _, _, entry in self._heap
+                if not entry.cancelled and not entry.fired
+            )
+        )
 
     def advance(self, seconds: float) -> None:
         if seconds < 0:
             raise ValueError("fake time cannot move backwards")
         self._drain(self._clock.now() + float(seconds))
 
-    def _cancel(self, entry: tuple[float, int, Callable[[], None], bool]) -> None:
-        """Mark a pending deadline cancelled; ``entry`` is replaced in the heap."""
-        index = self._heap.index(entry)
-        deadline, sequence, callback, _ = entry
-        self._heap[index] = (deadline, sequence, callback, True)
-        heapq.heapify(self._heap)
+    def _cancel(self, entry: _Entry) -> None:
+        entry.cancelled = True
 
     def _drain(self, target: float) -> None:
         while self._heap and self._heap[0][0] <= target:
-            deadline, _, callback, cancelled = heapq.heappop(self._heap)
-            if cancelled:
+            _, _, entry = heapq.heappop(self._heap)
+            if entry.cancelled:
                 continue
-            self._clock._set(min(max(deadline, self._clock.now()), target))
-            callback()
+            entry.fired = True
+            self._clock._set(min(max(entry.deadline, self._clock.now()), target))
+            entry.callback()
         if self._clock.now() < target:
             self._clock._set(target)
