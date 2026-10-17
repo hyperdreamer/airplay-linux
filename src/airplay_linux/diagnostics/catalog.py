@@ -264,16 +264,51 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
 )
 
 
+def _text_data(value: object) -> str | None:
+    """The value's own character data as an exact built-in ``str``, or ``None``.
+
+    Only the *data* is read. ``str.encode`` is the unbound C function, so it
+    copies the buffer without calling ``__str__``, ``__iter__``, ``__len__``,
+    ``__getitem__``, ``__eq__``, ``__hash__``, or any subclass ``encode``: a
+    ``str`` subclass may render, compare and iterate anything it likes, and the
+    text this module validates is always the same exact built-in string it then
+    formats into user-visible copy. ``isinstance`` alone is not proof of a real
+    string, because a class can advertise a spoofed ``__class__``, so a failed
+    copy is not text at all.
+
+    The codec pair round-trips lone surrogates, so the data is preserved
+    exactly rather than repaired or replaced.
+    """
+    if type(value) is str:
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        copied = str.encode(value, "utf-8", "surrogatepass")
+        text = copied.decode("utf-8", "surrogatepass")
+    except (TypeError, ValueError, UnicodeError):
+        # A spoofed ``__class__`` reaches here; it is not a string's data.
+        return None
+    return text if type(text) is str else None
+
+
 def _validated_command(command: str | None) -> str | None:
-    """Accept only an allowlisted executable name; never echo the argument."""
+    """Accept only an allowlisted executable name; never echo the argument.
+
+    The name is interpolated into user-visible copy, so a ``str`` subclass may
+    not decide what is checked and what is rendered. Its character data is
+    copied to an exact built-in string first, membership is decided on that
+    primitive, and that same primitive is what the caller formats.
+    """
     if command is None:
         return None
-    if not isinstance(command, str) or command not in ALLOWED_COMMANDS:
+    text = _text_data(command)
+    if text is None or text not in ALLOWED_COMMANDS:
         raise ValueError(
             "command must be one of the allowlisted executable names; "
             "arbitrary backend text is not a diagnostic",
         )
-    return command
+    return text
 
 
 def diagnostic(

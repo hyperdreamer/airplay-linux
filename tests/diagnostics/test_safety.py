@@ -221,6 +221,23 @@ def test_no_catalog_message_interpolates_a_caller_supplied_value():
     with pytest.raises(ValueError, match="command"):
         diagnostic(ErrorCode.dependency_missing, command=CANARY_TEXT)
 
+    # F-1: a plain string proves nothing about the boundary. The module's own
+    # subclass probes are the axis. ``SpoofText`` carries the canary as its data
+    # while it compares and hashes as 'doubletake'; ``RenderSpoof`` carries
+    # 'doubletake' while every hook renders the canary. Either outcome is a pass
+    # -- rejection without an echo, or normalization to the allowlisted name --
+    # but no canary may reach the message or the repr.
+    for probe in (SpoofText("doubletake"), RenderSpoof("doubletake")):
+        try:
+            result = diagnostic(ErrorCode.dependency_missing, command=probe)
+        except ValueError as error:
+            assert SMUGGLED not in str(error)
+            assert SMUGGLED not in repr(error)
+            continue
+        assert type(result.message) is str
+        assert SMUGGLED not in result.message
+        assert SMUGGLED not in repr(result)
+
 
 def test_diagnostic_keeps_the_receiver_identity():
     assert diagnostic(ErrorCode.transport_failed, RECEIVER).receiver_id == RECEIVER
@@ -239,6 +256,36 @@ def test_diagnostic_rejects_a_command_outside_the_allowlist():
         diagnostic(ErrorCode.dependency_missing, command=CANARY)
 
     assert CANARY not in str(caught.value)
+    assert CANARY not in repr(caught.value)
+
+
+def test_a_str_subclass_command_cannot_smuggle_text_into_the_diagnostic():
+    # F-1: ``diagnostic`` interpolates the command name into user-visible copy,
+    # so it holds the boundary ``activity`` already holds: the value's character
+    # *data* is the only text that may be validated, and the exact built-in
+    # string whose data was validated is the string that is formatted. Each
+    # probe is either rejected without echoing itself, or accepted only as its
+    # own data; none may put the canary in the message or the repr.
+    probes = (
+        # Data is the payload; membership and rendering both claim the name.
+        SpoofText("doubletake"),
+        # Data is the allowlisted name; every hook renders the payload instead.
+        RenderSpoof("doubletake"),
+        # Claims the allowlisted name by rendering; the data is the payload.
+        RenderSpoof(SMUGGLED, "doubletake"),
+    )
+
+    for probe in probes:
+        try:
+            result = diagnostic(ErrorCode.dependency_missing, command=probe)
+        except ValueError as error:
+            assert SMUGGLED not in str(error)
+            assert SMUGGLED not in repr(error)
+            continue
+        assert type(result.message) is str
+        assert "'doubletake'" in result.message
+        assert SMUGGLED not in result.message
+        assert SMUGGLED not in repr(result)
 
 
 @pytest.mark.parametrize("command", ["doubletake", "doubletake-ctl", "kscreen-doctor", "krfb-virtualmonitor"])
