@@ -11,7 +11,7 @@ import json
 import re
 import string
 from collections.abc import Callable, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Final
@@ -30,6 +30,7 @@ from airplay_linux.diagnostics.activity import (
     ALLOWED_FIELDS,
     FIELD_SHAPES,
     MAX_FIELD_TEXT,
+    _Subscription,
     _VOCABULARIES,
     _bounded,
     _escape,
@@ -2738,3 +2739,830 @@ def test_a_genuine_rejection_lends_only_the_text_the_boundary_recorded(rewrite):
     assert HOOK_CANARY not in repr(caught.value.args)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+# ============================================= adversarial boundary matrix
+#
+# One shared boundary is only worth its indirection if it holds for *every*
+# parameter a caller can fill, so this section is a matrix rather than a list of
+# cases: every public parameter of ``safe_activity`` and ``diagnostic``, every
+# ``CapabilityReport`` leaf, and every item of its diagnostics collection is
+# crossed with every hostile shape the boundary is supposed to refuse.
+#
+# Two properties are asserted per cell, and neither restates the other:
+#
+# * zero caller-hook invocations, proven by a counter the *test* owns, and
+# * either a fixed rejection whose every readable field is canary-free, or an
+#   accepted value that retains no probe and renders no canary.
+#
+# The second property is what stops the matrix from passing by rejecting
+# everything, and a separate positive test drives each slot with the legitimate
+# value that slot exists to accept.
+#
+# Placement is deliberately *outside* the measured window. Putting a hostile
+# value into a ``dict`` as a key hashes it, and that hash is the harness's own
+# work; measuring it would report a leak for code the boundary never runs. So a
+# slot builds its whole input eagerly and returns a zero-argument invoker, and
+# the counter is cleared between the two.
+
+#: The canary every matrix family member carries or raises. It is deliberately
+#: distinct from ``HOOK_CANARY``, so a cell that leaked through the older
+#: suite's fixtures cannot look clean here.
+MATRIX_CANARY: Final[str] = "matrix-canary-5517"
+
+
+class MatrixCounter:
+    """The instrument every hostile hook below reports through.
+
+    It is owned by the test rather than by any value it inspects, so a nonzero
+    count proves the diagnostics package ran caller code inside the boundary it
+    claims not to cross. Labels are per-hook, so a failing cell names the
+    mechanism instead of only the slot it appeared in.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def hit(self, label: str) -> None:
+        self.calls.append(label)
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+
+class _MatrixMeta(type):
+    """A metaclass whose type-level descriptors raise and count.
+
+    ``__mro__``, ``__bases__``, ``__subclasses__`` and ``__dict__`` are all
+    reachable from ``type(value)``, so a boundary that walks a class hierarchy
+    instead of comparing ``type(value)`` is observably leaky.
+    """
+
+    @property
+    def __mro__(cls) -> tuple[type, ...]:  # type: ignore[override]
+        _MATRIX.hit("metaclass.__mro__")
+        raise BaseException(MATRIX_CANARY)
+
+    @property
+    def __bases__(cls) -> tuple[type, ...]:  # type: ignore[override]
+        _MATRIX.hit("metaclass.__bases__")
+        raise BaseException(MATRIX_CANARY)
+
+    @property
+    def __subclasses__(cls) -> list[type]:
+        _MATRIX.hit("metaclass.__subclasses__")
+        raise BaseException(MATRIX_CANARY)
+
+    @property
+    def __dict__(cls) -> dict[str, object]:  # type: ignore[override]
+        _MATRIX.hit("metaclass.__dict__")
+        raise BaseException(MATRIX_CANARY)
+
+
+class MatrixMetaclassStr(str, metaclass=_MatrixMeta):
+    """A ``str`` subclass whose own type cannot be described without a hook."""
+
+
+class MatrixRaisingDict(dict):
+    """A mapping subclass whose every container protocol raises and counts."""
+
+    def items(self):  # type: ignore[override]
+        _MATRIX.hit("dict.items")
+        raise BaseException(MATRIX_CANARY)
+
+    def keys(self):  # type: ignore[override]
+        _MATRIX.hit("dict.keys")
+        raise BaseException(MATRIX_CANARY)
+
+    def values(self):  # type: ignore[override]
+        _MATRIX.hit("dict.values")
+        raise BaseException(MATRIX_CANARY)
+
+    def __iter__(self):  # type: ignore[override]
+        _MATRIX.hit("dict.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __getitem__(self, key: object) -> object:  # type: ignore[override]
+        _MATRIX.hit("dict.__getitem__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("dict.__contains__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __len__(self) -> int:  # type: ignore[override]
+        _MATRIX.hit("dict.__len__")
+        raise BaseException(MATRIX_CANARY)
+
+    def copy(self):  # type: ignore[override]
+        _MATRIX.hit("dict.copy")
+        raise BaseException(MATRIX_CANARY)
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("dict.__eq__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        _MATRIX.hit("dict.__hash__")
+        return 0
+
+    def __repr__(self) -> str:
+        _MATRIX.hit("dict.__repr__")
+        return repr(MATRIX_CANARY)
+
+
+class MatrixHostileMapping:
+    """A non-``dict`` mapping whose every protocol raises: a proxy over a trap."""
+
+    def keys(self) -> object:
+        _MATRIX.hit("mapping.keys")
+        raise BaseException(MATRIX_CANARY)
+
+    def values(self) -> object:
+        _MATRIX.hit("mapping.values")
+        raise BaseException(MATRIX_CANARY)
+
+    def items(self) -> object:
+        _MATRIX.hit("mapping.items")
+        raise BaseException(MATRIX_CANARY)
+
+    def __getitem__(self, key: object) -> object:
+        _MATRIX.hit("mapping.__getitem__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        _MATRIX.hit("mapping.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __contains__(self, key: object) -> bool:
+        _MATRIX.hit("mapping.__contains__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __len__(self) -> int:
+        _MATRIX.hit("mapping.__len__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __eq__(self, other: object) -> bool:
+        _MATRIX.hit("mapping.__eq__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __hash__(self) -> int:
+        _MATRIX.hit("mapping.__hash__")
+        return 0
+
+    def __repr__(self) -> str:
+        _MATRIX.hit("mapping.__repr__")
+        return repr(MATRIX_CANARY)
+
+
+class MatrixHostileIterator:
+    """An iterable that answers only by raising, offered where a collection goes."""
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        _MATRIX.hit("iterator.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __next__(self) -> object:
+        _MATRIX.hit("iterator.__next__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __eq__(self, other: object) -> bool:
+        _MATRIX.hit("iterator.__eq__")
+        return False
+
+    def __hash__(self) -> int:
+        return 0
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixSelfStr(str):
+    """A ``str`` subclass whose ``__str__`` returns ``self`` and whose data lies."""
+
+    def __str__(self) -> str:
+        _MATRIX.hit("self-str.__str__")
+        return self
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("self-str.__eq__")
+        return True
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        _MATRIX.hit("self-str.__hash__")
+        return 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        _MATRIX.hit("self-str.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __len__(self) -> int:
+        _MATRIX.hit("self-str.__len__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __getitem__(self, index: object) -> str:
+        _MATRIX.hit("self-str.__getitem__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __contains__(self, item: object) -> bool:
+        _MATRIX.hit("self-str.__contains__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __lt__(self, other: object) -> bool:
+        _MATRIX.hit("self-str.__lt__")
+        raise BaseException(MATRIX_CANARY)
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        _MATRIX.hit("self-str.encode")
+        return MATRIX_CANARY.encode()
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixSpoofedEqualityStr(str):
+    """A ``str`` subclass whose equality and hash both claim to be a member."""
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("spoof.__eq__")
+        return True
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        _MATRIX.hit("spoof.__hash__")
+        return hash(MATRIX_CANARY)
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixRaisingClassStr(str):
+    """A ``str`` subclass whose advertised ``__class__`` raises and counts."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        _MATRIX.hit("raising-class.__class__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __str__(self) -> str:
+        _MATRIX.hit("raising-class.__str__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixRaisingIterStr(str):
+    """A ``str`` subclass whose iteration raises while its character data is sane."""
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        _MATRIX.hit("raising-iter.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __len__(self) -> int:
+        _MATRIX.hit("raising-iter.__len__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __getitem__(self, index: object) -> str:
+        _MATRIX.hit("raising-iter.__getitem__")
+        raise BaseException(MATRIX_CANARY)
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        _MATRIX.hit("raising-iter.encode")
+        return MATRIX_CANARY.encode()
+
+
+class MatrixPayload:
+    """A bare object that raises ``BaseException`` from every entry it offers."""
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        _MATRIX.hit("payload.__class__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __eq__(self, other: object) -> bool:
+        _MATRIX.hit("payload.__eq__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __hash__(self) -> int:
+        return 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        _MATRIX.hit("payload.__iter__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __len__(self) -> int:
+        _MATRIX.hit("payload.__len__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __str__(self) -> str:
+        _MATRIX.hit("payload.__str__")
+        return MATRIX_CANARY
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixIntSubclass(int):
+    """An ``int`` subclass whose comparison and rendering protocols raise."""
+
+    def __lt__(self, other: object) -> bool:
+        _MATRIX.hit("int.__lt__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __le__(self, other: object) -> bool:
+        _MATRIX.hit("int.__le__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __gt__(self, other: object) -> bool:
+        _MATRIX.hit("int.__gt__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __ge__(self, other: object) -> bool:
+        _MATRIX.hit("int.__ge__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("int.__eq__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return 0
+
+    def __str__(self) -> str:
+        _MATRIX.hit("int.__str__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+class MatrixCallable:
+    """A subscriber that is callable but whose equality and hash are caller code.
+
+    ``subscribe`` must accept it -- a presenter is caller code by definition --
+    but nothing in the diagnostics package may ask it who it equals.
+    """
+
+    def __call__(self, event: ActivityEvent) -> None:
+        _MATRIX.hit("callable.__call__")
+
+    def __eq__(self, other: object) -> bool:  # type: ignore[override]
+        _MATRIX.hit("callable.__eq__")
+        raise BaseException(MATRIX_CANARY)
+
+    def __hash__(self) -> int:  # type: ignore[override]
+        return 0
+
+    def __repr__(self) -> str:
+        return repr(MATRIX_CANARY)
+
+
+#: The one counter. A cell rebinds it just before use, so a stale binding cannot
+#: hide a leak that happened while a previous cell's probe was being built.
+_MATRIX: MatrixCounter = MatrixCounter()
+
+
+def matrix_counter() -> MatrixCounter:
+    """A fresh counter, rebound for the metaclass trap and the shared helpers."""
+    global _MATRIX
+    _MATRIX = MatrixCounter()
+    return _MATRIX
+
+
+def matrix_forged_enum_member() -> object:
+    """An exact-type ``ErrorCode`` nonmember: equal, hash-equal, never registered."""
+    forged = str.__new__(ErrorCode, ErrorCode.transport_failed.value)
+    assert type(forged) is ErrorCode, "the probe must carry the exact enum type"
+    assert forged == ErrorCode.transport_failed, "the probe must compare equal"
+    assert hash(forged) == hash(ErrorCode.transport_failed), "the probe must hash equal"
+    assert forged is not ErrorCode.transport_failed, "the probe must not be the member"
+    return forged
+
+
+def matrix_family() -> tuple[tuple[str, Callable[[], object]], ...]:
+    """One builder per hostile shape, in the order the brief names them.
+
+    Each entry is a *builder* rather than a value, because placement of a probe
+    (into a ``dict`` as a key, say) legitimately runs its hooks; building after
+    the counter is reset keeps the measurement about the boundary alone.
+    """
+    return (
+        ("exact-type-enum-nonmember", matrix_forged_enum_member),
+        ("mapping-subclass", lambda: MatrixRaisingDict({"phase": "Mirroring"})),
+        ("proxy-over-hostile-mapping", lambda: MappingProxyType(MatrixHostileMapping())),
+        ("proxy-over-mapping-subclass", lambda: MappingProxyType(MatrixRaisingDict())),
+        ("hostile-iterator", lambda: MatrixHostileIterator()),
+        ("metaclass-descriptor", lambda: MatrixMetaclassStr("Mirroring")),
+        ("self-returning-str", lambda: MatrixSelfStr(MATRIX_CANARY)),
+        ("spoofed-equality-hash", lambda: MatrixSpoofedEqualityStr(MATRIX_CANARY)),
+        ("raising-class", lambda: MatrixRaisingClassStr("Mirroring")),
+        ("raising-iter", lambda: MatrixRaisingIterStr("Mirroring")),
+        ("baseexception-payload", lambda: MatrixPayload()),
+        ("int-subclass", lambda: MatrixIntSubclass(4)),
+    )
+
+
+#: Built once: re-slugging thousands of cells per session is pure overhead.
+MATRIX_FAMILY: Final[tuple[tuple[str, Callable[[], object]], ...]] = matrix_family()
+
+MATRIX_UTC: Final[str] = "2026-10-17T00:00:00Z"
+
+
+def matrix_event(**leaves: object) -> ActivityEvent:
+    """A hand-built event whose leaves really are ``leaves``.
+
+    ``ActivityEvent.__post_init__`` copies ``fields``, and that copy is domain
+    code this lane may not change, so the value is installed afterwards. The
+    emission path is what is measured, and it receives exactly what a caller
+    could hand it.
+    """
+    event = ActivityEvent(
+        utc=MATRIX_UTC, code="session", receiver_id=None, message="fixed copy", fields={},
+    )
+    for leaf, value in leaves.items():
+        object.__setattr__(event, leaf, value)
+    return event
+
+
+def matrix_report(**leaves: object) -> CapabilityReport:
+    """A complete capability report with ``leaves`` replaced."""
+    report = CapabilityReport(
+        environment="KDE Plasma 6 Wayland",
+        discovery=True,
+        mirror=True,
+        virtual_display=False,
+        audio=True,
+        remembered_pairing=False,
+        additional_virtual_outputs=False,
+        diagnostics=(),
+    )
+    return replace(report, **leaves)
+
+
+def matrix_activity(fields: object) -> ActivityEvent:
+    """One ordinary event whose ``fields`` mapping is ``fields``."""
+    return safe_activity("session", None, fields, MATRIX_UTC)  # type: ignore[arg-type]
+
+
+def _emit_invoker(event: object) -> Callable[[], object]:
+    """Emit ``event`` and hand back the log, so its records can be inspected."""
+
+    def invoke() -> object:
+        log = ActivityLog()
+        log.emit(event)  # type: ignore[arg-type]
+        return log
+
+    return invoke
+
+
+def _export_invoker(report: CapabilityReport) -> Callable[[], object]:
+    """Export ``report``; the document itself is the value under test."""
+
+    def invoke() -> object:
+        return ActivityLog(capabilities=report).export()
+
+    return invoke
+
+
+@dataclass(frozen=True)
+class MatrixSlot:
+    """One public parameter, with its placement already performed."""
+
+    name: str
+    prepare: Callable[[object], Callable[[], object]]
+    legitimate: Callable[[], object]
+
+
+def matrix_slots() -> tuple[MatrixSlot, ...]:
+    """Every public parameter reachable from the diagnostics surface.
+
+    The field-name and field-value slots are generated from ``FIELD_SAMPLES``
+    rather than listed, so a field allowlisted later is covered without anyone
+    remembering to add a cell for it.
+    """
+    slots: list[MatrixSlot] = [
+        MatrixSlot(
+            "safe_activity.code",
+            lambda probe: (lambda: safe_activity(probe, None, {}, MATRIX_UTC)),  # type: ignore[arg-type]
+            lambda: "session",
+        ),
+        MatrixSlot(
+            "safe_activity.receiver_id",
+            lambda probe: (lambda: safe_activity("session", probe, {}, MATRIX_UTC)),  # type: ignore[arg-type]
+            lambda: RECEIVER,
+        ),
+        MatrixSlot(
+            "safe_activity.fields",
+            lambda probe: (lambda: safe_activity("session", None, probe, MATRIX_UTC)),  # type: ignore[arg-type]
+            lambda: MappingProxyType({"phase": "Mirroring"}),
+        ),
+        MatrixSlot(
+            "safe_activity.utc",
+            lambda probe: (lambda: safe_activity("session", None, {}, probe)),  # type: ignore[arg-type]
+            lambda: MATRIX_UTC,
+        ),
+        MatrixSlot(
+            "diagnostic.code",
+            lambda probe: (lambda: diagnostic(probe)),  # type: ignore[arg-type]
+            lambda: ErrorCode.transport_failed,
+        ),
+        MatrixSlot(
+            "diagnostic.receiver_id",
+            lambda probe: (lambda: diagnostic(ErrorCode.transport_failed, probe)),  # type: ignore[arg-type]
+            lambda: RECEIVER,
+        ),
+        MatrixSlot(
+            "diagnostic.command",
+            lambda probe: (
+                lambda: diagnostic(ErrorCode.dependency_missing, command=probe)  # type: ignore[arg-type]
+            ),
+            lambda: "doubletake",
+        ),
+        MatrixSlot(
+            "ActivityLog.max_entries",
+            lambda probe: (lambda: ActivityLog(max_entries=probe)),  # type: ignore[arg-type]
+            lambda: 8,
+        ),
+        MatrixSlot(
+            "ActivityLog.emit.event",
+            lambda probe: _emit_invoker(probe),
+            lambda: matrix_event(),
+        ),
+        MatrixSlot(
+            "ActivityLog.emit.fields",
+            lambda probe: _emit_invoker(matrix_event(fields=probe)),
+            lambda: {"phase": "Mirroring"},
+        ),
+        MatrixSlot(
+            "CapabilityReport.environment",
+            lambda probe: _export_invoker(matrix_report(environment=probe)),
+            lambda: "KDE Plasma 6 Wayland",
+        ),
+        MatrixSlot(
+            "CapabilityReport.diagnostics",
+            lambda probe: _export_invoker(matrix_report(diagnostics=probe)),
+            lambda: (),
+        ),
+        MatrixSlot(
+            "CapabilityReport.diagnostics.item",
+            lambda probe: _export_invoker(matrix_report(diagnostics=(probe,))),
+            lambda: Diagnostic(
+                code=ErrorCode.dependency_missing,
+                message="fixed copy",
+                recovery=(RecoveryAction.retry,),
+            ),
+        ),        MatrixSlot(
+            "CapabilityReport.diagnostics.item.code",
+            lambda probe: _export_invoker(
+                matrix_report(
+                    diagnostics=(
+                        Diagnostic(code=probe, message="fixed copy", recovery=()),  # type: ignore[arg-type]
+                    ),
+                ),
+            ),
+            lambda: ErrorCode.audio_unavailable,
+        ),
+    ]
+    for flag in (
+        "discovery",
+        "mirror",
+        "virtual_display",
+        "audio",
+        "remembered_pairing",
+        "additional_virtual_outputs",
+    ):
+        slots.append(
+            MatrixSlot(
+                f"CapabilityReport.{flag}",
+                (lambda name: lambda probe: _export_invoker(matrix_report(**{name: probe})))(flag),
+                (lambda: True),
+            ),
+        )
+    for field, sample in sorted(FIELD_SAMPLES.items()):
+        slots.append(
+            MatrixSlot(
+                f"safe_activity.fields.name[{field}]",
+                (lambda value: lambda probe: (lambda fields={probe: value}: (lambda: safe_activity(
+                    "session", None, fields, MATRIX_UTC,
+                )))())(sample),
+                (lambda name: lambda: name)(field),
+            ),
+        )
+        slots.append(
+            MatrixSlot(
+                f"safe_activity.fields.value[{field}]",
+                (lambda name: lambda probe: (lambda: matrix_activity({name: probe})))(field),
+                (lambda value: lambda: value)(sample),
+            ),
+        )
+    return tuple(slots)
+
+
+MATRIX_SLOTS: Final[tuple[MatrixSlot, ...]] = matrix_slots()
+
+MATRIX_CELLS: Final[tuple[tuple[str, object, str, object], ...]] = tuple(
+    (slot.name, slot.prepare, probe_name, build)
+    for slot in MATRIX_SLOTS
+    for probe_name, build in MATRIX_FAMILY
+)
+
+
+def assert_matrix_rejection(failure: BaseException) -> None:
+    """A rejection is fixed: no canary in any field a reader can reach."""
+    assert type(failure) is ValueError or type(failure) is TypeError, (
+        f"a rejection must be a builtin ValueError or TypeError, not {type(failure)!r}"
+    )
+    views = (
+        str(failure),
+        repr(failure),
+        repr(failure.args),
+        repr(getattr(failure, "__dict__", None)),
+        repr(getattr(failure, "__notes__", None)),
+    )
+    for view in views:
+        assert MATRIX_CANARY not in view, f"a rejection retained the probe: {view!r}"
+    assert failure.__cause__ is None, "a rejection must not chain the probe as a cause"
+    assert failure.__context__ is None, "a rejection must not chain the probe as context"
+
+
+def assert_matrix_accepted(result: object) -> None:
+    """An accepted value retains no probe object and renders no canary.
+
+    Checking only the rendering would miss the worse outcome: a subclass that
+    carries legitimate-looking data, or an exact-type enum nonmember, kept as
+    itself. So every leaf that survives is required to be an exact builtin.
+    """
+    assert MATRIX_CANARY not in repr(result)
+    if type(result) is ActivityEvent:
+        assert type(result.code) is str, "a retained code must be an exact string"
+        assert type(result.utc) is str, "a retained timestamp must be an exact string"
+        assert type(result.message) is str, "a retained message must be an exact string"
+        assert result.receiver_id is None or type(result.receiver_id) is str, (
+            "a retained identity must be an exact string"
+        )
+        assert type(result.fields) is MappingProxyType, "retained fields must be immutable"
+        retained = result.fields.items()
+        for name, value in retained:
+            assert type(name) is str, "a retained field name must be an exact string"
+            assert type(value) in (str, int, bool), (
+                f"a retained field value must be an exact builtin, not {type(value)!r}"
+            )
+        assert MATRIX_CANARY not in repr(dict(retained))
+        return
+    if type(result) is Diagnostic:
+        assert type(result.code) is ErrorCode, "a retained code must be the enum type"
+        assert MATRIX_CANARY not in result.message
+        return
+    if type(result) is ActivityLog:
+        assert type(result._max_entries) is int, "a retained capacity must be an exact int"
+        for entry in result.entries():
+            assert type(entry) is ActivityEvent, "a retained record must be the domain type"
+            assert MATRIX_CANARY not in repr(entry)
+        assert MATRIX_CANARY not in result.export()
+        return
+    assert type(result) is str, f"an accepted value must be a builtin string, not {type(result)!r}"
+
+
+@pytest.mark.parametrize(
+    ("slot_name", "prepare", "probe_name", "build"),
+    MATRIX_CELLS,
+    ids=[f"{slot}::{probe}" for slot, _, probe, _ in MATRIX_CELLS],
+)
+def test_the_adversarial_matrix_never_runs_a_caller_hook(slot_name, prepare, probe_name, build):
+    # The point of one shared boundary: a class of defect is closed for every
+    # parameter at once. The counter proves no caller hook ran inside the
+    # boundary; either outcome is a pass -- a fixed rejection, or an accepted
+    # value carrying nothing from the probe -- but neither may render or chain it.
+    counter = matrix_counter()
+    probe = build()
+    invoke = prepare(probe)
+    counter.calls.clear()
+
+    try:
+        result = invoke()
+    except (ValueError, TypeError) as failure:
+        assert len(counter) == 0, (
+            f"caller hooks ran at {slot_name} with {probe_name}: {counter.calls}"
+        )
+        assert_matrix_rejection(failure)
+        return
+    assert len(counter) == 0, (
+        f"caller hooks ran at {slot_name} with {probe_name}: {counter.calls}"
+    )
+    assert_matrix_accepted(result)
+
+
+@pytest.mark.parametrize("slot", MATRIX_SLOTS, ids=[slot.name for slot in MATRIX_SLOTS])
+def test_the_positive_matrix_still_accepts_every_legitimate_value(slot):
+    # The matrix would pass trivially if the boundary rejected everything, so
+    # every slot is also driven with the value it exists to accept. This is the
+    # half that keeps the tightening honest.
+    counter = matrix_counter()
+    result = slot.prepare(slot.legitimate())()
+
+    assert len(counter) == 0
+    assert result is not None
+    assert_matrix_accepted(result)
+
+
+def test_the_positive_matrix_covers_every_public_parameter():
+    # A generated matrix is only as complete as its generator, so the coverage
+    # itself is pinned: each parameter the brief names has a slot, and each
+    # allowlisted field has both a name slot and a value slot.
+    names = {slot.name for slot in MATRIX_SLOTS}
+
+    for required in (
+        "safe_activity.code",
+        "safe_activity.receiver_id",
+        "safe_activity.fields",
+        "safe_activity.utc",
+        "diagnostic.code",
+        "diagnostic.receiver_id",
+        "diagnostic.command",
+        "ActivityLog.max_entries",
+        "ActivityLog.emit.event",
+        "ActivityLog.emit.fields",
+        "CapabilityReport.environment",
+        "CapabilityReport.discovery",
+        "CapabilityReport.mirror",
+        "CapabilityReport.virtual_display",
+        "CapabilityReport.audio",
+        "CapabilityReport.remembered_pairing",
+        "CapabilityReport.additional_virtual_outputs",
+        "CapabilityReport.diagnostics",
+        "CapabilityReport.diagnostics.item",
+        "CapabilityReport.diagnostics.item.code",
+    ):
+        assert required in names, f"the matrix does not cover {required}"
+    for field in ALLOWED_FIELDS:
+        assert f"safe_activity.fields.name[{field}]" in names
+        assert f"safe_activity.fields.value[{field}]" in names
+    assert len(names) == len(MATRIX_SLOTS), "slot names must be unique"
+
+
+def test_a_subscription_removal_never_asks_a_callback_who_it_equals():
+    # ``close`` is a public entry point, so the same rule applies to it: a
+    # presenter is caller code, and removing one must not run its ``__eq__``.
+    # Two callables are registered because a single-entry list would answer the
+    # membership question without comparing anything, hiding the defect.
+    counter = matrix_counter()
+    log = ActivityLog()
+    other = MatrixCallable()
+    log.subscribe(other)
+    handle = log.subscribe(len)
+    counter.calls.clear()
+
+    handle.close()
+    handle.close()
+
+    assert len(counter) == 0, f"caller hooks ran while detaching: {counter.calls}"
+    assert len(log) == 0
+    log.emit(matrix_event())
+    assert len(log.entries()) == 1
+    assert log.entries()[0].fields == {}
+
+
+def test_a_hostile_callback_cannot_escape_through_subscription_removal():
+    # With two caller callables registered, ``close`` reaches into the subscriber
+    # list. This one raises ``BaseException`` from ``__eq__``, so a boundary that
+    # compares by equality runs caller code and lets the payload escape as
+    # itself. Removal is therefore by identity, and no hook runs.
+    counter = matrix_counter()
+    log = ActivityLog()
+    hostile = MatrixCallable()
+    log.subscribe(hostile)
+    handle = log.subscribe(len)
+    counter.calls.clear()
+
+    handle.close()
+
+    assert len(counter) == 0, f"caller hooks ran while detaching: {counter.calls}"
+    assert len(log._subscribers) == 1
+    assert log._subscribers[0] is hostile, "the wrong subscriber was removed"
+    assert MATRIX_CANARY not in repr(log.entries())
+
+
+def test_subscription_close_is_a_wrapped_public_entry_point():
+    # ``ActivityLog.subscribe`` returns a removal handle, and ``close`` on it is
+    # reachable from application code, so the architectural rule applies to it:
+    # any raised object -- ``BaseException`` included -- becomes a fixed
+    # rejection rather than escaping as itself. The handle is built directly
+    # because the identity-based removal above cannot raise on its own, and an
+    # unwrapped entry point is exactly the defect this pins.
+    counter = matrix_counter()
+
+    def hostile_action() -> None:
+        counter.hit("action")
+        raise BaseException(MATRIX_CANARY)
+
+    handle = _Subscription(hostile_action)
+
+    with pytest.raises(ValueError) as caught:
+        handle.close()
+
+    assert counter.calls == ["action"]
+    assert_matrix_rejection(caught.value)
+    # Idempotent and inert afterwards: a rejection does not leave the handle able
+    # to run the action a second time.
+    handle.close()
+    assert counter.calls == ["action"]

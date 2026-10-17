@@ -463,7 +463,15 @@ class _Subscription:
         self._action: Callable[[], None] | None = action
         self._closed = False
 
+    @boundary.rejecting
     def close(self) -> None:
+        """Detach exactly the callback this handle was created for.
+
+        Wrapped like every other public entry point: removal runs inside the
+        diagnostics boundary, so a failure raised from there -- including
+        ``BaseException`` -- becomes a fixed rejection instead of escaping as
+        itself.
+        """
         if self._closed:
             return
         self._closed = True
@@ -527,8 +535,15 @@ class ActivityLog:
         self._subscribers.append(callback)
 
         def unsubscribe() -> None:
-            if callback in self._subscribers:
-                self._subscribers.remove(callback)
+            # Identity, not equality. A presenter is caller code by definition,
+            # so asking it who it equals would run its ``__eq__`` inside this
+            # boundary -- and the handle already holds the object that was
+            # registered, so identity is the exact answer to "remove this one".
+            # ``len`` and indexing on an exact builtin list run no caller hook.
+            for index in range(len(self._subscribers)):
+                if self._subscribers[index] is callback:
+                    del self._subscribers[index]
+                    return
 
         return _Subscription(unsubscribe)
 
