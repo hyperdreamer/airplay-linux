@@ -2,9 +2,14 @@
 
 The activity log is a real output channel: it is rendered, copied, and attached
 to bug reports. Only allowlisted field names with primitive values may enter it,
-every text value is escaped and bounded, and each code has fixed message copy.
-Hand-built events are re-validated on emission, so a caller cannot route backend
-text or a private value around :func:`safe_activity`.
+and a field *value* is untrusted input rather than a trusted label: every value
+must satisfy that field's declared shape exactly. Vocabulary fields accept only
+the values the frozen domain enumerates, identifier fields accept only a strict
+token shape, and numeric fields accept only bounded integers. Anything else is
+rejected instead of being escaped, truncated, or echoed back, so backend text
+and secret bytes have no shape they can wear. Each code is drawn from a closed
+vocabulary with fixed message copy, and hand-built events are re-validated on
+emission, so a caller cannot route backend text around :func:`safe_activity`.
 """
 
 from __future__ import annotations
@@ -15,6 +20,7 @@ import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
+from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
@@ -26,17 +32,28 @@ from airplay_linux.domain.operations import (
     SensitiveText,
 )
 from airplay_linux.domain.records import ActivityEvent
-from airplay_linux.domain.resources import CapabilityReport
+from airplay_linux.domain.resources import (
+    AudioState,
+    CapabilityReport,
+    DisplayState,
+    ErrorCode,
+    SessionPhase,
+    TransportState,
+    TrustState,
+)
 
-from .catalog import diagnostic
+from .catalog import ALLOWED_COMMANDS, diagnostic
 
 if TYPE_CHECKING:
     from airplay_linux.domain.ports import Subscription
 
 #: Field names an activity event may carry, and no others.
+#:
+#: A receiver *display name* is deliberately absent: it is free-form text a
+#: receiver advertises, so no value shape can keep a secret out of it. The
+#: recorded identity is ``receiver_id``, which is escaped and bounded below.
 ALLOWED_FIELDS: Final[frozenset[str]] = frozenset(
     {
-        "receiver_name",
         "phase",
         "transport",
         "display",
@@ -62,6 +79,69 @@ _ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 
 #: Upper bound on the code token itself.
 MAX_CODE_LENGTH: Final[int] = 64
+
+
+def _enum_values(enum: type[StrEnum]) -> frozenset[str]:
+    """The frozen domain's own vocabulary for one resource-shaped field."""
+    return frozenset(member.value for member in enum)
+
+
+#: Fields that accept only a closed vocabulary; the domain owns every value.
+_VOCABULARIES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+    {
+        "phase": _enum_values(SessionPhase),
+        "transport": _enum_values(TransportState),
+        "display": _enum_values(DisplayState),
+        "audio": _enum_values(AudioState),
+        "trust": _enum_values(TrustState),
+        "error_code": _enum_values(ErrorCode),
+        "command_name": ALLOWED_COMMANDS,
+        # The reservation stages the design's atomic ownership protocol defines.
+        "reservation_stage": frozenset(
+            {"reserved", "helper_started", "output_observed", "published", "removing"},
+        ),
+    }
+)
+
+#: A KDE connector identity, such as ``DP-1``, ``HDMI-A-1``, ``Virtual-v1``.
+_CONNECTOR: Final[re.Pattern[str]] = re.compile(
+    r"[A-Za-z]{2,12}(?:-(?:[A-Z]|[a-z][0-9]{1,3}|[0-9]{1,3})){1,3}",
+)
+
+#: A KScreen output identity: a small index, a virtual index, or a UUID.
+_OUTPUT_ID: Final[re.Pattern[str]] = re.compile(
+    r"[0-9]{1,12}|v[0-9]{1,12}|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+)
+
+#: ``WIDTHxHEIGHT``, with the same 1..16384 bound the domain's ``Size`` holds.
+_RESOLUTION: Final[re.Pattern[str]] = re.compile(r"([0-9]{1,5})x([0-9]{1,5})")
+
+MAX_RESOLUTION_EDGE: Final[int] = 16384
+
+#: Fields that accept only a whole number inside an inclusive bound.
+_INTEGER_BOUNDS: Final[Mapping[str, tuple[int, int]]] = MappingProxyType(
+    {
+        "retry_seconds": (0, 86400),
+        "endpoint_generation": (0, 2**31 - 1),
+    }
+)
+
+#: Fields that accept only a boolean, and never the integer ``0`` or ``1``.
+_BOOLEAN_FIELDS: Final[frozenset[str]] = frozenset({"explicit_video_only"})
+
+#: The declared value shape of every allowlisted field, derived from the same
+#: registries the enforcement reads, so the two cannot drift apart.
+FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        **{name: "vocabulary" for name in _VOCABULARIES},
+        "connector": "connector",
+        "output_id": "output_id",
+        "resolution": "resolution",
+        **{name: "integer" for name in _INTEGER_BOUNDS},
+        **{name: "boolean" for name in _BOOLEAN_FIELDS},
+    }
+)
 
 PRIVATE_VALUE_TYPES: Final[tuple[type, ...]] = (
     SensitiveText,
@@ -121,11 +201,12 @@ _MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
-_FALLBACK_MESSAGE: Final[str] = "Activity recorded."
+#: Every code the channel can record; anything else is rejected, not echoed.
+ACTIVITY_CODES: Final[frozenset[str]] = frozenset(_MESSAGES)
 
 
 def _reject_code(code: object) -> str:
-    """Validate the code token without ever echoing it back."""
+    """Validate the code token, then require it to be a known code."""
     if not isinstance(code, str) or not code:
         raise ValueError(
             "code must be a non-empty lowercase token such as 'pairing.completed'",
@@ -138,7 +219,11 @@ def _reject_code(code: object) -> str:
         raise ValueError(
             "code may contain only lowercase letters, digits, '.', '_' and '-'",
         )
-    return code
+    if code not in ACTIVITY_CODES:
+        # A token-shaped string can still be backend text, so membership, not
+        # shape, decides what a code is; the rejected value is never echoed.
+        raise ValueError("code must be one of the registered activity codes")
+    return str(code)
 
 
 def _reject_utc(utc: object) -> str:
@@ -196,20 +281,76 @@ def _bounded(text: str) -> str:
 
 
 def _reject_value(name: str, value: object) -> str | int | bool:
-    """Keep primitive, sanitized values and reject anything that could be raw."""
+    """Accept only a value of the shape this field declares, or reject it.
+
+    Shape is the boundary, not an allowlist of names: a field that accepts text
+    accepts one closed vocabulary or one strict token form, so a secret or a
+    backend message has no shape it can wear. Nothing is echoed on rejection.
+    """
     if isinstance(value, PRIVATE_VALUE_TYPES):
         raise ValueError(
             f"value for field {name!r} is a transient private value and cannot be recorded",
         )
-    if isinstance(value, bool):
+    vocabulary = _VOCABULARIES.get(name)
+    if vocabulary is not None:
+        # Normalize once: a ``str`` subclass may render differently on each call.
+        text = str(value) if isinstance(value, str) else None
+        if text is None or text not in vocabulary:
+            raise ValueError(
+                f"value for field {name!r} must be one of the values this field enumerates",
+            )
+        return text
+    if name == "connector":
+        return _identifier(name, value, _CONNECTOR)
+    if name == "output_id":
+        return _identifier(name, value, _OUTPUT_ID)
+    if name == "resolution":
+        return _resolution(value)
+    bounds = _INTEGER_BOUNDS.get(name)
+    if bounds is not None:
+        low, high = bounds
+        if type(value) is not int:
+            raise ValueError(
+                f"value for field {name!r} must be a whole number between {low} and {high}",
+            )
+        if not low <= value <= high:
+            raise ValueError(
+                f"value for field {name!r} must be a whole number between {low} and {high}",
+            )
         return value
-    if isinstance(value, int):
+    if name in _BOOLEAN_FIELDS:
+        if type(value) is not bool:
+            raise ValueError(f"value for field {name!r} must be a boolean")
         return value
-    if isinstance(value, str):
-        return _bounded(_escape(value))
-    raise ValueError(
-        f"value for field {name!r} must be sanitized text, an integer, or a boolean",
-    )
+    # Unreachable while ``FIELD_SHAPES`` covers every allowlisted field name;
+    # the guard exists so a newly allowlisted field cannot inherit a passthrough.
+    raise ValueError(f"field {name!r} declares no value shape and cannot be recorded")
+
+
+def _identifier(name: str, value: object, pattern: re.Pattern[str]) -> str:
+    """Accept only text matching the field's token shape, then escape and bound."""
+    text = str(value) if isinstance(value, str) else None
+    if text is None or pattern.fullmatch(text) is None:
+        raise ValueError(
+            f"value for field {name!r} must be a {FIELD_SHAPES[name]} identifier",
+        )
+    return _bounded(_escape(text))
+
+
+def _resolution(value: object) -> str:
+    """Accept only ``WIDTHxHEIGHT`` inside the domain ``Size`` bounds."""
+    match = _RESOLUTION.fullmatch(str(value)) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError("value for field 'resolution' must be written as WIDTHxHEIGHT")
+    width, height = (int(edge) for edge in match.groups())
+    for edge in (width, height):
+        if not 1 <= edge <= MAX_RESOLUTION_EDGE:
+            raise ValueError(
+                "value for field 'resolution' must be between 1 and "
+                f"{MAX_RESOLUTION_EDGE} on each edge",
+            )
+    # Canonical form, so the recorded text is re-rendered, never echoed.
+    return f"{width}x{height}"
 
 
 def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
@@ -226,7 +367,8 @@ def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
 
 
 def _message_for(code: str) -> str:
-    return _MESSAGES.get(code, _FALLBACK_MESSAGE)
+    """Fixed copy for a code; :func:`_reject_code` has already proven membership."""
+    return _MESSAGES[code]
 
 
 def safe_activity(

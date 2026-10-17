@@ -12,8 +12,14 @@ import re
 
 import pytest
 
-from airplay_linux.diagnostics import ActivityLog, diagnostic, safe_activity
-from airplay_linux.diagnostics.activity import ALLOWED_FIELDS, MAX_FIELD_TEXT
+from airplay_linux.diagnostics import (
+    ACTIVITY_CODES,
+    ALLOWED_COMMANDS,
+    ActivityLog,
+    diagnostic,
+    safe_activity,
+)
+from airplay_linux.diagnostics.activity import ALLOWED_FIELDS, FIELD_SHAPES, MAX_FIELD_TEXT
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import (
     OpaqueBackendToken,
@@ -23,10 +29,15 @@ from airplay_linux.domain.operations import (
 )
 from airplay_linux.domain.records import ActivityEvent
 from airplay_linux.domain.resources import (
+    AudioState,
     CapabilityReport,
     Diagnostic,
+    DisplayState,
     ErrorCode,
     RecoveryAction,
+    SessionPhase,
+    TransportState,
+    TrustState,
 )
 from airplay_linux.testing import MemoryActivity, SequenceIds
 
@@ -34,9 +45,14 @@ RECEIVER = ReceiverId("airplay-device:001122334455")
 UTC = "2026-10-17T00:00:00Z"
 CANARY = "canary-8496"
 
-#: The frozen permit list from the task: nothing else may carry backend text.
+#: A secret that hides inside ordinary-looking text and identifier shapes.
+CANARY_TEXT = "raw-backend-canary-8496"
+
+#: Every field the channel can still record, with one legitimate value each.
+#: ``receiver_name`` is deliberately absent: it is free-form network text, so no
+#: value shape can keep a secret out of it. See
+#: ``test_receiver_name_is_no_longer_an_activity_field``.
 FIELD_SAMPLES: dict[str, str | int | bool] = {
-    "receiver_name": "Office TV",
     "phase": "Mirroring",
     "transport": "Streaming",
     "display": "Owned",
@@ -52,6 +68,27 @@ FIELD_SAMPLES: dict[str, str | int | bool] = {
     "error_code": "cleanup_timeout",
     "explicit_video_only": True,
 }
+
+#: Every value the frozen domain enumerates for one vocabulary-shaped field.
+ENUMERATED_VALUES: tuple[tuple[str, str], ...] = (
+    tuple(
+        (name, member.value)
+        for name, enum in (
+            ("phase", SessionPhase),
+            ("transport", TransportState),
+            ("display", DisplayState),
+            ("audio", AudioState),
+            ("trust", TrustState),
+            ("error_code", ErrorCode),
+        )
+        for member in enum
+    )
+    + tuple(("command_name", command) for command in sorted(ALLOWED_COMMANDS))
+    + tuple(
+        ("reservation_stage", stage)
+        for stage in ("reserved", "helper_started", "output_observed", "published", "removing")
+    )
+)
 
 SECRET_FIELD_NAMES = (
     "pin",
@@ -314,6 +351,140 @@ def test_allowlist_matches_the_frozen_field_permit():
     assert MAX_FIELD_TEXT <= 200
 
 
+def test_every_allowlisted_field_declares_a_value_shape():
+    assert set(FIELD_SHAPES) == ALLOWED_FIELDS
+
+
+def test_receiver_name_is_no_longer_an_activity_field():
+    # A receiver display name is free-form network text, so no value shape can
+    # keep a secret out of it. The receiver identity itself is ``receiver_id``.
+    assert "receiver_name" not in ALLOWED_FIELDS
+
+    with pytest.raises(ValueError, match="field") as caught:
+        safe_activity("session", None, {"receiver_name": "Office TV"}, UTC)
+
+    assert "Office TV" not in str(caught.value)
+
+
+@pytest.mark.parametrize("name", sorted(ALLOWED_FIELDS))
+def test_canary_cannot_survive_in_any_allowlisted_field(name):
+    try:
+        event = safe_activity("session", RECEIVER, {name: CANARY_TEXT}, UTC)
+    except ValueError as error:
+        assert CANARY_TEXT not in str(error)
+        assert CANARY_TEXT not in repr(error)
+        return
+
+    log = ActivityLog()
+    log.emit(event)
+    for rendering in (
+        repr(event),
+        repr(dict(event.fields)),
+        repr(log.entries()),
+        log.export(),
+    ):
+        assert CANARY_TEXT not in rendering
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("connector", f"DP-1 {CANARY_TEXT}"),
+        ("output_id", f"v1{CANARY_TEXT}"),
+        ("resolution", f"1920x1080 {CANARY_TEXT}"),
+        ("phase", f"Mirroring {CANARY_TEXT}"),
+        ("command_name", f"kscreen-doctor {CANARY_TEXT}"),
+        ("reservation_stage", f"published {CANARY_TEXT}"),
+        ("transport", f"Streaming{CANARY_TEXT}"),
+    ],
+)
+def test_a_canary_appended_to_a_legitimate_value_is_rejected(name, value):
+    with pytest.raises(ValueError, match="value") as caught:
+        safe_activity("session", None, {name: value}, UTC)
+
+    assert CANARY_TEXT not in str(caught.value)
+    assert CANARY_TEXT not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("phase", "Mirroring "),
+        ("phase", "mirroring"),
+        ("transport", "Streaming; rm -rf /"),
+        ("display", "Owned\n"),
+        ("audio", "Enabled\x00"),
+        ("trust", "RevocationPending "),
+        ("error_code", "cleanup-timeout"),
+        ("command_name", "/usr/bin/kscreen-doctor"),
+        ("command_name", "rm -rf /"),
+        ("connector", "DP-9;rm"),
+        ("connector", "DP"),
+        ("output_id", "v1\n"),
+        ("output_id", "-1"),
+        ("resolution", "1920X1080"),
+        ("resolution", "1920x"),
+        ("reservation_stage", "Published"),
+    ],
+)
+def test_text_outside_a_fields_shape_is_rejected(name, value):
+    with pytest.raises(ValueError, match="value"):
+        safe_activity("session", None, {name: value}, UTC)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("retry_seconds", -1),
+        ("retry_seconds", 10**6),
+        ("retry_seconds", True),
+        ("retry_seconds", "4"),
+        ("retry_seconds", 4.0),
+        ("endpoint_generation", -1),
+        ("endpoint_generation", 2**31),
+        ("endpoint_generation", True),
+        ("endpoint_generation", "3"),
+        ("explicit_video_only", "true"),
+        ("explicit_video_only", 1),
+        ("explicit_video_only", None),
+    ],
+)
+def test_numeric_fields_accept_only_bounded_numbers_of_their_own_type(name, value):
+    with pytest.raises(ValueError, match="value") as caught:
+        safe_activity("session", None, {name: value}, UTC)
+
+    assert CANARY_TEXT not in str(caught.value)
+
+
+@pytest.mark.parametrize(("name", "value"), ENUMERATED_VALUES)
+def test_legitimate_enumerated_values_are_accepted_unchanged(name, value):
+    event = safe_activity("session", RECEIVER, {name: value}, UTC)
+
+    assert event.fields == {name: value}
+    assert type(event.fields[name]) is str
+
+
+def test_domain_enum_members_are_normalized_to_plain_text():
+    event = safe_activity("session", None, {"phase": SessionPhase.Mirroring}, UTC)
+
+    assert event.fields == {"phase": "Mirroring"}
+    assert type(event.fields["phase"]) is str
+
+
+def test_a_str_subclass_cannot_render_one_value_and_carry_another():
+    class Liar(str):
+        def __str__(self) -> str:
+            return "Mirroring"
+
+    event = safe_activity("session", None, {"phase": Liar(CANARY_TEXT)}, UTC)
+
+    # The stored value is the rendering that was validated, never the source.
+    assert event.fields == {"phase": "Mirroring"}
+    assert type(event.fields["phase"]) is str
+    assert CANARY_TEXT not in repr(event)
+    assert CANARY_TEXT not in repr(dict(event.fields))
+
+
 @pytest.mark.parametrize(("name", "value"), FIELD_SAMPLES.items())
 def test_allowlisted_fields_reach_the_event(name, value):
     event = safe_activity("session", RECEIVER, {name: value}, UTC)
@@ -341,7 +512,7 @@ def test_every_secret_field_name_is_rejected(name):
 @pytest.mark.parametrize("value", SECRET_VALUES)
 def test_transient_private_values_cannot_enter_activity(value):
     with pytest.raises(ValueError, match="private value") as caught:
-        safe_activity("pairing", None, {"receiver_name": value}, UTC)
+        safe_activity("pairing", None, {"phase": value}, UTC)
 
     assert CANARY not in str(caught.value)
     assert CANARY not in repr(caught.value)
@@ -350,19 +521,20 @@ def test_transient_private_values_cannot_enter_activity(value):
 @pytest.mark.parametrize("value", [None, 1.5, b"canary-8496", ["canary-8496"], {"canary-8496": 1}])
 def test_raw_backend_payloads_cannot_enter_activity(value):
     with pytest.raises(ValueError, match="value") as caught:
-        safe_activity("process", None, {"command_name": value}, UTC)
+        safe_activity("process.failed", None, {"command_name": value}, UTC)
 
     assert CANARY not in str(caught.value)
 
 
 def test_fields_must_be_a_mapping():
     with pytest.raises(TypeError, match="mapping"):
-        safe_activity("session", None, [("receiver_name", "Office TV")], UTC)  # type: ignore[arg-type]
+        safe_activity("session", None, [("phase", "Mirroring")], UTC)  # type: ignore[arg-type]
 
 
 def test_control_characters_are_escaped():
-    event = safe_activity("display", None, {"receiver_name": "AirPlay\nTV\x00\x1b[31m"}, UTC)
-    rendered = event.fields["receiver_name"]
+    hostile = ReceiverId("airplay-device:AirPlay\nTV\x00\x1b[31m")
+    event = safe_activity("display.published", hostile, {}, UTC)
+    rendered = event.receiver_id
 
     assert isinstance(rendered, str)
     assert "\n" not in rendered
@@ -373,9 +545,9 @@ def test_control_characters_are_escaped():
     assert "AirPlay" in rendered
 
 
-def test_long_field_text_is_bounded():
-    event = safe_activity("display", None, {"receiver_name": "x" * 5000}, UTC)
-    rendered = event.fields["receiver_name"]
+def test_long_identity_text_is_bounded():
+    event = safe_activity("display.published", ReceiverId("x" * 5000), {}, UTC)
+    rendered = event.receiver_id
 
     assert isinstance(rendered, str)
     assert len(rendered) <= MAX_FIELD_TEXT
@@ -388,11 +560,9 @@ COMPLETE_ESCAPE = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 
 @pytest.mark.parametrize("padding", [MAX_FIELD_TEXT - 6, MAX_FIELD_TEXT - 5, MAX_FIELD_TEXT - 4, MAX_FIELD_TEXT - 3])
 def test_bounding_never_splits_an_escape_sequence(padding):
-    value = "A" * padding + "\n" * 6
+    value = ReceiverId("A" * padding + "\n" * 6)
 
-    rendered = safe_activity("display", None, {"receiver_name": value}, UTC).fields[
-        "receiver_name"
-    ]
+    rendered = safe_activity("display.published", value, {}, UTC).receiver_id
 
     assert isinstance(rendered, str)
     assert len(rendered) <= MAX_FIELD_TEXT
@@ -403,11 +573,9 @@ def test_bounding_never_splits_an_escape_sequence(padding):
 
 
 def test_bounding_keeps_a_whole_escape_at_the_boundary():
-    value = "A" * (MAX_FIELD_TEXT - 7) + "\n\n"
+    value = ReceiverId("A" * (MAX_FIELD_TEXT - 7) + "\n\n")
 
-    rendered = safe_activity("display", None, {"receiver_name": value}, UTC).fields[
-        "receiver_name"
-    ]
+    rendered = safe_activity("display.published", value, {}, UTC).receiver_id
 
     assert isinstance(rendered, str)
     assert len(rendered) == MAX_FIELD_TEXT
@@ -470,12 +638,44 @@ def test_receiver_identity_cannot_carry_controls_or_unbounded_text():
 def test_activity_messages_are_fixed_per_code():
     first = safe_activity("pairing.completed", None, {}, UTC)
     second = safe_activity("pairing.completed", None, {}, UTC)
-    unknown = safe_activity("future.event", None, {}, UTC)
 
     assert first.message == second.message
     assert first.message.strip()
-    assert unknown.message.strip()
     assert CANARY not in first.message
+
+
+@pytest.mark.parametrize("code", ["future.event", CANARY_TEXT])
+def test_unregistered_code_is_rejected_without_echoing_it(code):
+    with pytest.raises(ValueError, match="code") as caught:
+        safe_activity(code, None, {}, UTC)
+
+    assert code not in str(caught.value)
+    assert code not in repr(caught.value)
+
+
+def test_unregistered_code_cannot_reach_the_log_or_export():
+    log = ActivityLog()
+    smuggled = ActivityEvent(
+        utc=UTC, code=CANARY_TEXT, receiver_id=None, message="fixed copy", fields={},
+    )
+
+    with pytest.raises(ValueError, match="code") as caught:
+        log.emit(smuggled)
+
+    assert CANARY_TEXT not in str(caught.value)
+    assert CANARY_TEXT not in repr(caught.value)
+    assert log.entries() == ()
+    assert CANARY_TEXT not in log.export()
+
+
+@pytest.mark.parametrize("code", sorted(ACTIVITY_CODES))
+def test_every_registered_code_has_fixed_rendered_copy(code):
+    message = safe_activity(code, None, {}, UTC).message
+
+    assert message.strip()
+    assert message == safe_activity(code, None, {}, UTC).message
+    assert "{" not in message and "}" not in message
+    assert CANARY not in message
 
 
 def test_event_fields_are_immutable():
@@ -633,7 +833,7 @@ def test_export_emits_no_runtime_records():
 def test_export_is_deterministic_json():
     log = ActivityLog(max_entries=4)
     log.emit(safe_activity("session", None, {"phase": "Mirroring"}, UTC))
-    log.emit(safe_activity("display", None, {"display": "Owned"}, UTC))
+    log.emit(safe_activity("display.removed", None, {"display": "Owned"}, UTC))
 
     first = log.export()
 
@@ -648,7 +848,7 @@ def test_activity_log_feeds_the_frozen_sink():
     identifiers = SequenceIds(seed=1)
     receiver = ReceiverId(f"airplay-device:{identifiers.new()}")
 
-    event = safe_activity("session.started", receiver, {"phase": "Connecting"}, UTC)
+    event = safe_activity("session.starting", receiver, {"phase": "Connecting"}, UTC)
     log.emit(event)
     sink.emit(event)
 
