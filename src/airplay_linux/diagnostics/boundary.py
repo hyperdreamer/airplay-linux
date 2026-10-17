@@ -316,6 +316,32 @@ def vocabulary_text(
     raise _rejection_of(kind, message)
 
 
+def vocabulary_label(
+    value: object,
+    vocabulary: Vocabulary,
+    *,
+    fallback: str,
+    message: str,
+) -> str:
+    """The vocabulary's own label for ``value``, or the fixed ``fallback``.
+
+    The accepting twin of :func:`vocabulary_text`: a value the vocabulary does not
+    list is not a refusal here, it is reported as ``fallback``. Both answers are
+    safe text -- the accepted characters, which the vocabulary's own listing has
+    just proven, or the caller-written ``fallback`` otherwise -- so an
+    unrecognized value leaves no trace in what is retained. Deciding this where
+    the value is accepted, rather than where it is rendered, is what keeps
+    arbitrary backend text out of a private snapshot and out of its ``repr``.
+
+    Only an exact ``str`` is considered at all; anything else is rejected with
+    ``kind=TypeError`` and ``message``, exactly as :func:`exact_text` would.
+    """
+    text = exact_text(value, kind=TypeError, message=message)
+    if text in vocabulary.permitted:
+        return text
+    return fallback
+
+
 def genuine_error_code(value: object) -> ErrorCode:
     """The captured :class:`ErrorCode` member ``value`` is identical to.
 
@@ -370,29 +396,63 @@ COMMAND_VOCABULARY: Final[Vocabulary] = captured_texts(
 )
 
 
-def _fixed_failure(error: BaseException) -> Exception:
-    """A fresh, scrubbed rejection standing in for ``error``.
+def refusal_record(failure: BaseException) -> tuple[type[Exception], str]:
+    """The kind and recorded text to re-issue in place of ``failure``.
 
-    Only a failure *identical to* one this module recorded lends its text, so a
-    caller ``BaseException``, a hand-built ``ValueError`` dressed up with a
-    plausible attribute, and a library error whose message quotes a caller value
-    are all the same answer: the fixed :data:`UNEXPECTED_FAILURE` literal. The
-    text comes from the record, never from the failure, so rewriting ``args`` or
-    ``__dict__`` on a caught rejection cannot change what propagates.
+    Provenance is identity against the private registry, so only a failure this
+    module built lends its own kind and text: a caller-constructed ``ValueError``
+    -- however plausible its message -- is not recognized, and neither is a
+    library failure whose message quotes a caller value. The text returned is the
+    one recorded when the rejection was built, never the failure's current
+    ``args``, so a caller that caught a rejection and rewrote it lends nothing
+    either.
+
+    The pair is exactly what re-issuing needs, so a site that has to defer a
+    refusal -- report it later, at the point the caller observes the value -- can
+    record these two source-written values instead of holding the failure, and
+    later build a fresh rejection from them without asking anything what type it
+    is. The answer is total: a failure this module did not issue degrades to
+    :data:`UNEXPECTED_FAILURE`, which is why the caller needs no branch of its own
+    and cannot accidentally carry the unrecorded failure's text.
 
     The snapshot is taken before scanning because a ``deque`` cannot be iterated
-    while another thread mutates it; a snapshot failure degrades to a literal,
+    while another thread mutates it; a snapshot failure degrades the same way,
     which is the safe direction. Nothing else here can raise — the scan compares
     object identity, which consults no hook of the failure being examined.
     """
     try:
         issued = tuple(_ISSUED)
     except BaseException:
-        issued = ()
+        return ValueError, UNEXPECTED_FAILURE
     for candidate, text, kind in issued:
-        if candidate is error:
-            return _rejection_of(kind, text)
-    return rejection(UNEXPECTED_FAILURE)
+        if candidate is failure:
+            return kind, text
+    return ValueError, UNEXPECTED_FAILURE
+
+
+def rejection_of(kind: type[Exception], message: str) -> Exception:
+    """A fresh rejection of ``kind`` carrying ``message``, recorded here.
+
+    A deferred refusal is re-issued through this function, so the site holding it
+    needs neither to know which of the two built-in kinds it was nor to ask a
+    failure what type it is. Only those two kinds exist: ``kind`` is always the
+    source-written constant recorded beside the text, and anything else is a
+    :class:`ValueError` because no other rejection is ever built here.
+    """
+    return _rejection_of(kind, message)
+
+
+def _fixed_failure(error: BaseException) -> Exception:
+    """A fresh, scrubbed rejection standing in for ``error``.
+
+    Only a failure *identical to* one this module recorded lends its kind and
+    text, so a caller ``BaseException``, a hand-built ``ValueError`` dressed up
+    with a plausible attribute, and a library error whose message quotes a caller
+    value are all the same answer: the fixed :data:`UNEXPECTED_FAILURE` literal.
+    The text comes from the record, never from the failure, so rewriting ``args``
+    or ``__dict__`` on a caught rejection cannot change what propagates.
+    """
+    return _rejection_of(*refusal_record(error))
 
 
 def rejecting(function: _Wrapped) -> _Wrapped:

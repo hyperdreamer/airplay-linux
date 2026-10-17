@@ -13,17 +13,26 @@ emission, so a caller cannot route backend text around :func:`safe_activity`.
 
 Nothing here inspects the type of a caller value: every value crosses
 :mod:`airplay_linux.diagnostics.boundary` once, which accepts exact built-in
-types only and never runs a hook of a caller-supplied object.
+types only and never runs a hook of a caller-supplied object. That module is also
+the only place a rejection is built, and the only place a value is dispatched on,
+so no site here asks an object what type it is.
 
 Accepting a value is also not the same as owning it. A :class:`CapabilityReport`
 is frozen, but the caller keeps its own alias, and ``object.__setattr__`` can
 retype that alias to a subclass, or rewrite one of its leaves, at any time after
 the log has accepted it. So the report's *evidence* -- the environment label,
 the six capability flags and the validated diagnostic codes -- is normalized
-once, at acceptance, into :class:`_CapabilitySnapshot` and only exact built-in
-leaves are retained. The export reads that private snapshot and never the
-caller's object, so a hook installed later cannot run and a mutation made later
-cannot change the document.
+once, at acceptance, into :class:`_CapabilitySnapshot` and only safe built-in
+leaves are retained. Normalizing includes sanitizing: the environment allowlist
+and its fixed ``Unknown`` fallback are applied *before* the snapshot is built, so
+the text a caller supplied never becomes retained state and cannot be reached
+through the snapshot's ``repr``. The export reads that private snapshot and never
+the caller's object, so a hook installed later cannot run and a mutation made
+later cannot change the document.
+
+The two outcomes of reading evidence -- a snapshot, or a refusal deferred to the
+export -- are kept in separate slots, so the export selects by which slot is
+filled rather than by inspecting what it holds.
 """
 
 from __future__ import annotations
@@ -160,6 +169,13 @@ FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
 EXPORT_SCHEMA: Final[str] = "airplay-linux-diagnostics/1"
 _SAFE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"KDE Plasma 6 Wayland"})
 _UNKNOWN_ENVIRONMENT: Final[str] = "Unknown"
+
+#: The environment labels a report may carry, captured once so membership is
+#: decided on character data and the accepted label is this module's own text.
+#: The allowlist is applied when the report is accepted, not when the document is
+#: built: an unrecognized label is replaced by :data:`_UNKNOWN_ENVIRONMENT` before
+#: anything is retained, so the private snapshot never holds caller text.
+_ENVIRONMENTS: Final[Vocabulary] = boundary.captured_texts(_SAFE_ENVIRONMENTS)
 
 #: Fixed text of each capability-evidence refusal, written once here and passed
 #: to the boundary call that enforces it. A report's leaves are normalized when
@@ -492,15 +508,20 @@ class _CapabilitySnapshot:
     """Accepted capability evidence, as exact built-in leaves only.
 
     Every field is an exact built-in the boundary produced: the environment label
-    is the caller's own string data, each flag is a real ``bool``, and the codes
-    are the frozen vocabulary's own text. Nothing here holds a reference to the
-    caller's report, to its diagnostics collection, or to any diagnostic record,
-    so no later mutation or retype of those objects can change what the export
-    says. ``slots=True`` also leaves the instance without a ``__dict__``, so there
-    is no attribute map to rewrite from outside.
+    is one the design allows -- or the fixed ``Unknown`` standing in for one it
+    does not -- each flag is a real ``bool``, and the codes are the frozen
+    vocabulary's own text. Nothing here holds a reference to the caller's report,
+    to its diagnostics collection, or to any diagnostic record, so no later
+    mutation or retype of those objects can change what the export says.
+    ``slots=True`` also leaves the instance without a ``__dict__``, so there is no
+    attribute map to rewrite from outside.
 
-    The generated ``__eq__`` and ``__repr__`` compare these built-in leaves only,
-    so neither can consult a caller object.
+    The subtree that is deliberately *absent* is the diagnostic ``message`` -- the
+    field that holds receiver and backend text -- so a report's prose cannot be
+    reached through this record at all. Since the environment allowlist is applied
+    before construction, the text a caller supplied is not retained here either;
+    the generated ``__repr__`` and ``__eq__`` therefore render and compare safe
+    leaves only, and neither can consult a caller object.
     """
 
     environment: str
@@ -510,15 +531,19 @@ class _CapabilitySnapshot:
 
 @dataclass(frozen=True, slots=True)
 class _CapabilityRefusal:
-    """A refusal this module issued while reading accepted evidence.
+    """A refusal the boundary issued while reading accepted evidence.
 
     A report that cannot be normalized still has to be refused at the export,
     because that is the point at which a caller observes capability evidence, and
     refusing at construction instead would change the observable contract. So the
     refusal is *recorded*: ``kind`` is one of the two built-in kinds and ``text``
     is the fixed copy :mod:`airplay_linux.diagnostics.boundary` already wrote for
-    it, taken from that module's own scrub rather than from the caller's failure.
-    Nothing the caller supplied is reachable from here.
+    it, both taken from that module's own record rather than from the caller's
+    failure. Nothing the caller supplied is reachable from here.
+
+    This is a state, not a variant of the evidence: the log keeps it in its own
+    slot (see :class:`ActivityLog`), so the export selects it by which slot is
+    filled instead of asking an object what type it is.
 
     Recording it also makes the refusal stable: the second export re-issues the
     same kind and the same text without touching the report again, which is what
@@ -529,25 +554,32 @@ class _CapabilityRefusal:
     text: str
 
     def issue(self) -> Exception:
-        """A fresh rejection carrying this recorded kind and fixed text."""
-        if self.kind is TypeError:
-            return boundary.type_rejection(self.text)
-        return boundary.rejection(self.text)
+        """A fresh rejection carrying this recorded kind and fixed text.
+
+        The kind is handed back to the boundary, which is the only module that
+        builds rejections; nothing here inspects a value to decide what to raise.
+        """
+        return boundary.rejection_of(self.kind, self.text)
 
 
 @boundary.rejecting
 def _normalized_capabilities(report: object) -> _CapabilitySnapshot:
-    """Read one accepted report's evidence exactly once into a snapshot.
+    """Read one accepted report's evidence exactly once into a sanitized snapshot.
 
     Each leaf is read here, through :mod:`airplay_linux.diagnostics.boundary`,
-    and only what the boundary returned is retained. The wrapper turns every
-    failure -- a caller ``BaseException`` included -- into one of this module's
-    own fixed rejections, so the caller of this function never has to inspect
-    whatever raised.
+    and only what the boundary returned is retained. That includes the
+    environment, whose allowlist and ``Unknown`` fallback are applied at this
+    point rather than at export: the text a caller supplied never becomes part of
+    this module's retained state, so no rendering of that state can carry it.
+
+    The wrapper turns every failure -- a caller ``BaseException`` included --
+    into one of this module's own fixed rejections, so the caller of this function
+    never has to inspect whatever raised.
     """
-    environment = boundary.exact_text(
+    environment = boundary.vocabulary_label(
         getattr(report, "environment"),
-        kind=TypeError,
+        _ENVIRONMENTS,
+        fallback=_UNKNOWN_ENVIRONMENT,
         message=_ENVIRONMENT_MESSAGE,
     )
     flags: list[tuple[str, bool]] = []
@@ -567,7 +599,7 @@ def _normalized_capabilities(report: object) -> _CapabilitySnapshot:
 
 def _accepted_capabilities(
     capabilities: object,
-) -> _CapabilitySnapshot | _CapabilityRefusal | None:
+) -> tuple[_CapabilitySnapshot | None, _CapabilityRefusal | None]:
     """Take the private snapshot of an accepted report, or record its refusal.
 
     This is the only moment the caller's report is read. Afterwards the log holds
@@ -575,22 +607,27 @@ def _accepted_capabilities(
     ``__getattribute__``, rewriting one of its leaves, or replacing its
     diagnostics tuple cannot reach the export.
 
+    The two outcomes are returned as two slots rather than as one value the export
+    has to identify, so selection is a question of which slot is filled and never
+    a question about an object's type.
+
     A refusal is deferred rather than raised here: the export document is where a
     caller observes capability evidence, so an unacceptable leaf keeps refusing
     at export with the same built-in kind and the same fixed text it always did.
     """
     if capabilities is None:
-        return None
+        return None, None
     try:
-        return cast(_CapabilitySnapshot, _normalized_capabilities(capabilities))
+        return cast(_CapabilitySnapshot, _normalized_capabilities(capabilities)), None
     except (ValueError, TypeError) as refusal:
-        # ``_normalized_capabilities`` is wrapped, so this is one of the two
-        # built-in kinds carrying fixed text this module wrote. Its own ``args``
-        # are not read: the kind and the text are, and both are source-written.
-        return _CapabilityRefusal(
-            kind=type(refusal),
-            text=str(refusal),
-        )
+        # The boundary keeps the text it wrote beside every rejection it built, so
+        # this site records those two source-written values. Reading that record
+        # is what keeps the caller's own failure from lending anything, and what
+        # keeps this site free of a "which type is this" question: the pair is
+        # total, and a failure that is not the boundary's degrades to the fixed
+        # literal inside the boundary itself.
+        kind, text = boundary.refusal_record(refusal)
+        return None, _CapabilityRefusal(kind=kind, text=text)
 
 
 def _sanitize_event(event: ActivityEvent) -> ActivityEvent:
@@ -649,9 +686,10 @@ class ActivityLog:
                 message="capabilities must be a CapabilityReport or None",
             )
         self._max_entries = max_entries
-        # The caller's report is read here and only here; what is retained is a
-        # private snapshot of exact built-in leaves (or the refusal to record).
-        self._capabilities = _accepted_capabilities(capabilities)
+        # The caller's report is read here and only here. What is retained is a
+        # private snapshot of sanitized built-in leaves, or -- in its own slot --
+        # the refusal to record; the export selects by which slot is filled.
+        self._capabilities, self._capability_refusal = _accepted_capabilities(capabilities)
         self._entries: deque[ActivityEvent] = deque(maxlen=max_entries)
         self._subscribers: list[Callable[[ActivityEvent], None]] = []
 
@@ -734,19 +772,32 @@ class ActivityLog:
         return json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True)
 
     def _capabilities_document(self) -> dict[str, object] | None:
-        """The capability section, built from the snapshot only.
+        """The capability section, selected by retained state and nothing else.
 
-        No caller object is read here. The snapshot was taken when the log
-        accepted the report, so a caller that retyped its alias to instrument
-        ``__getattribute__``, rewrote a leaf, or replaced the diagnostics tuple
-        afterwards changes nothing about this document and runs no code of its
-        own while it is built.
+        No caller object is read here, and no retained value is asked what type
+        it is. The log holds two separate states -- accepted evidence and a
+        deferred refusal -- so this method branches on which slot is filled, and
+        a caller that rewrote a slot simply finds it rejected by the boundary.
+
+        The snapshot was taken when the log accepted the report, so a caller that
+        retyped its alias to instrument ``__getattribute__``, rewrote a leaf, or
+        replaced the diagnostics tuple afterwards changes nothing about this
+        document and runs no code of its own while it is built.
         """
+        refusal = self._capability_refusal
+        if refusal is not None:
+            raise cast(
+                _CapabilityRefusal,
+                boundary.exact_only(
+                    refusal,
+                    _CapabilityRefusal,
+                    kind=ValueError,
+                    message=boundary.UNEXPECTED_FAILURE,
+                ),
+            ).issue()
         evidence = self._capabilities
         if evidence is None:
             return None
-        if type(evidence) is _CapabilityRefusal:
-            raise evidence.issue()
         # Anything else is not the state this log accepted: retained evidence
         # was replaced from outside, so there is nothing to normalize and the
         # fixed literal is the only honest answer.
@@ -760,11 +811,9 @@ class ActivityLog:
             ),
         )
         capabilities: dict[str, object] = {
-            "environment": (
-                snapshot.environment
-                if snapshot.environment in _SAFE_ENVIRONMENTS
-                else _UNKNOWN_ENVIRONMENT
-            ),
+            # Already the safe label: the allowlist ran when the report was
+            # accepted, so nothing has to be re-decided from caller text here.
+            "environment": snapshot.environment,
             **dict(snapshot.flags),
             "diagnostic_codes": list(snapshot.diagnostic_codes),
         }

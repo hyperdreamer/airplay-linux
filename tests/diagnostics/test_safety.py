@@ -7,6 +7,7 @@ strings a secret would leave behind.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 import string
@@ -4119,3 +4120,233 @@ def test_a_caller_mutating_its_report_cannot_change_retained_evidence(attribute,
 
     assert log.export() == expected
     assert ALIAS_CANARY not in log.export()
+
+
+
+# ------------------- F-1: an unrecognized environment is sanitized at acceptance
+#
+# Taking a snapshot is only half of owning a value. The snapshot above retained
+# the caller's environment *text* and substituted ``Unknown`` afterwards, at
+# export. The document was clean, but the retained record was not: the ``repr`` of
+# the private snapshot -- and therefore of everything the log keeps -- rendered
+# arbitrary backend text long after the caller had handed the report over. So the
+# allowlist is applied where the value is accepted, and the snapshot retains only
+# the label the export prints.
+
+#: An environment string no allowlist knows, in the shape backend text arrives.
+RETENTION_CANARY: Final[str] = "review-environment-canary-471903"
+
+
+def unrecognized_environment_report() -> CapabilityReport:
+    """An accepted report whose environment is unrecognized but well-shaped."""
+    return replace(capability_report(), environment=RETENTION_CANARY)
+
+
+def retained_evidence(log: ActivityLog) -> str:
+    """Everything the log retains, rendered.
+
+    The whole private state is rendered rather than one named attribute: F-1 is
+    about what the log keeps, so a leak in any retained slot is the same defect,
+    and a slot added later is covered without this test being told its name.
+    """
+    return repr(vars(log))
+
+
+def test_an_unrecognized_environment_is_never_retained():
+    # The reproduction: the export already said ``Unknown``, while the retained
+    # record still rendered the text the caller supplied.
+    log = ActivityLog(capabilities=unrecognized_environment_report())
+
+    exported = log.export()
+
+    assert json.loads(exported)["capabilities"]["environment"] == "Unknown"
+    assert RETENTION_CANARY not in exported
+    assert RETENTION_CANARY not in repr(log)
+    assert RETENTION_CANARY not in retained_evidence(log)
+    assert RETENTION_CANARY not in repr(log.entries())
+
+
+def test_the_retained_environment_leaf_is_the_safe_label():
+    # Not just a renderer: the leaf itself carries the fixed label, so no current
+    # or future rendering of it can reach the text, and no second allowlist check
+    # has to be repeated later.
+    log = ActivityLog(capabilities=unrecognized_environment_report())
+
+    assert log._capabilities.environment == "Unknown"
+    assert RETENTION_CANARY not in repr(log._capabilities)
+
+
+@pytest.mark.parametrize(
+    ("environment", "expected"),
+    [
+        ("KDE Plasma 6 Wayland", "KDE Plasma 6 Wayland"),
+        ("GNOME 47 Wayland", "Unknown"),
+        ("KDE Plasma 6 X11", "Unknown"),
+        ("kde plasma 6 wayland", "Unknown"),
+        ("", "Unknown"),
+    ],
+)
+def test_the_retained_environment_is_the_label_the_export_prints(environment, expected):
+    # The allowlist and its fallback now live at acceptance, so what is retained
+    # and what is printed are the same string by construction.
+    log = ActivityLog(
+        capabilities=replace(capability_report(), environment=environment),
+    )
+
+    assert log._capabilities.environment == expected
+    assert json.loads(log.export())["capabilities"]["environment"] == expected
+
+
+def test_a_non_string_environment_keeps_its_fixed_rejection():
+    # Sanitizing at acceptance must not swallow a wrong type: a non-string is
+    # still refused, at export, with the same fixed kind and text as before.
+    log = ActivityLog(
+        capabilities=replace(capability_report(), environment=RaisingClassObject()),
+    )
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert str(caught.value) == "capabilities environment must be a string"
+    assert CANARY_TEXT not in retained_evidence(log)
+    # Deterministic: the recorded refusal is a fixed value, not a replay of the
+    # caller's failure.
+    with pytest.raises(TypeError) as again:
+        log.export()
+    assert str(again.value) == str(caught.value)
+
+
+def test_an_environment_rewritten_after_acceptance_is_not_retained():
+    # The same acceptance-time rule read through mutation rather than ``repr``: a
+    # caller that rewrites its alias afterwards cannot put its text into the
+    # retained record either.
+    report = alias_report()
+    log = ActivityLog(capabilities=report)
+
+    object.__setattr__(report, "environment", RETENTION_CANARY)
+
+    assert RETENTION_CANARY not in retained_evidence(log)
+    assert json.loads(log.export())["capabilities"]["environment"] == (
+        "KDE Plasma 6 Wayland"
+    )
+
+
+# --------------------------- F-2: the boundary owns selection, not the export site
+#
+# ``boundary.py`` is the single normalization authority, and the constraint behind
+# it is architectural: no per-site type inspection outside that module. So the
+# accepted evidence and a deferred refusal are represented as separate states that
+# the export branches on, and the refusal itself is a value the boundary produces.
+# Nothing below pins an implementation detail; each test observes behaviour the
+# representation has to keep.
+
+DIAGNOSTICS_SOURCE: Final[Path] = (
+    Path(__file__).resolve().parents[2] / "src" / "airplay_linux" / "diagnostics"
+)
+
+#: The calls that ask an object what type it is.
+_TYPE_DISPATCH_CALLS: Final[frozenset[str]] = frozenset(
+    {"type", "isinstance", "issubclass"}
+)
+
+#: Attributes that answer the same question through the advertised class.
+_ADVERTISED_CLASS_ATTRIBUTES: Final[frozenset[str]] = frozenset(
+    {"__class__", "__mro__", "__bases__"}
+)
+
+
+def non_boundary_modules() -> tuple[Path, ...]:
+    """Every diagnostics module except the shared boundary, in stable order."""
+    return tuple(
+        sorted(
+            path
+            for path in DIAGNOSTICS_SOURCE.glob("*.py")
+            if path.name != "boundary.py"
+        )
+    )
+
+
+def parsed_diagnostics_modules() -> tuple[tuple[Path, ast.Module], ...]:
+    """Each non-boundary module with its syntax tree, parsed rather than grepped."""
+    return tuple(
+        (path, ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        for path in non_boundary_modules()
+    )
+
+
+def test_the_boundary_remains_the_only_module_doing_type_dispatch():
+    # Parsed, so a docstring naming ``type`` is not a false hit and a real
+    # dispatch cannot hide inside an expression. A local ``type(x) is ...`` added
+    # to any other diagnostics module fails here, whatever it was meant to select.
+    sites = [
+        f"{path.name}:{node.lineno}:{node.func.id}"
+        for path, tree in parsed_diagnostics_modules()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in _TYPE_DISPATCH_CALLS
+    ]
+
+    assert sites == []
+
+
+def test_no_diagnostics_module_reads_an_advertised_class():
+    # The same rule for the advertised class, which is caller-controlled and is
+    # exactly what dispatch on identity-of-type exists to avoid.
+    sites = [
+        f"{path.name}:{node.lineno}:{node.attr}"
+        for path, tree in parsed_diagnostics_modules()
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute) and node.attr in _ADVERTISED_CLASS_ATTRIBUTES
+    ]
+
+    assert sites == []
+
+
+def test_accepted_evidence_and_a_deferred_refusal_are_distinct_states():
+    # Two logs, two states: one retains accepted evidence and prints it, the other
+    # retains a recorded refusal and issues it. Selecting between them is the
+    # export's only decision, and neither touches the caller's report again.
+    accepted = ActivityLog(capabilities=alias_report())
+    refused = ActivityLog(
+        # ``None`` is not the frozen collection type, which is the point.
+        capabilities=replace(capability_report(), diagnostics=None),  # type: ignore[arg-type]
+    )
+
+    assert json.loads(accepted.export())["capabilities"]["diagnostic_codes"] == [
+        "audio_unavailable",
+        "dependency_missing",
+    ]
+
+    with pytest.raises(TypeError) as caught:
+        refused.export()
+
+    assert str(caught.value) == (
+        "capability diagnostics must be an immutable tuple of diagnostics"
+    )
+    assert json.loads(accepted.export())["capabilities"] != {}
+
+
+@pytest.mark.parametrize(
+    ("slot", "value"),
+    [
+        ("_capabilities", "not a snapshot"),
+        ("_capability_refusal", "not a refusal"),
+    ],
+)
+def test_a_replaced_retained_slot_fails_with_the_fixed_literal(slot, value):
+    # Whatever a caller installs in a retained slot, the export answers with the
+    # boundary's fixed literal instead of reading it. That is what makes a
+    # slot-based representation safe to read: a written slot is never trusted.
+    log = ActivityLog(capabilities=alias_report())
+
+    object.__setattr__(log, slot, value)
+
+    with pytest.raises(ValueError) as caught:
+        log.export()
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == FIXED_LITERAL
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
