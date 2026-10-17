@@ -323,7 +323,8 @@ def diagnostic(
             "code must be an ErrorCode from the diagnostics catalog; "
             "arbitrary error text is not a diagnostic",
         )
-    if receiver_id is not None and not isinstance(receiver_id, str):
+    receiver_text = _text_data(receiver_id)
+    if receiver_id is not None and receiver_text is None:
         raise TypeError("receiver_id must be a ReceiverId or None")
     entry = ENTRIES[code]
     name = _validated_command(command)
@@ -334,6 +335,6 @@ def diagnostic(
         code=code,
         message=message,
         recovery=entry.recovery,
-        receiver_id=receiver_id,
+        receiver_id=ReceiverId(receiver_text) if receiver_text is not None else None,
         detail=None,
     )

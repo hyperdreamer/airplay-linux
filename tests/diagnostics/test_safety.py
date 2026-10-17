@@ -240,7 +240,21 @@ def test_no_catalog_message_interpolates_a_caller_supplied_value():
 
 
 def test_diagnostic_keeps_the_receiver_identity():
-    assert diagnostic(ErrorCode.transport_failed, RECEIVER).receiver_id == RECEIVER
+    result = diagnostic(ErrorCode.transport_failed, RECEIVER)
+
+    assert result.receiver_id == RECEIVER
+    assert type(result.receiver_id) is str
+
+
+def test_diagnostic_normalizes_spoofed_receiver_identity():
+    spoof = ReceiverId(RenderSpoof("airplay-device:001122334455"))
+    result = diagnostic(ErrorCode.transport_failed, spoof)
+
+    assert SMUGGLED not in result.message
+    assert type(result.receiver_id) is str
+    assert SMUGGLED not in result.receiver_id
+    assert SMUGGLED not in repr(result)
+    assert result.receiver_id == "airplay-device:001122334455"
 
 
 def test_diagnostic_rejects_arbitrary_error_text():
