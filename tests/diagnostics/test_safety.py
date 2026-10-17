@@ -2526,3 +2526,215 @@ def test_a_caller_base_exception_never_escapes_the_boundary():
     assert HOOK_CANARY not in str(caught.value)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+
+
+# -------------------------------------- rejection provenance (F-1 regressions)
+
+#: The boundary's own text for a failure it did not issue itself. A failure the
+#: boundary did issue keeps its own literal instead; what may never happen is a
+#: failure *claiming* to be the boundary's and lending its caller's text.
+FIXED_LITERAL: Final[str] = (
+    "the value could not be normalized at the diagnostics boundary"
+)
+
+#: Attribute names a caller could dress its own exception up with, including the
+#: private marker the boundary itself used to write. Provenance is not an
+#: attribute: an exact built-in ``ValueError`` is something any caller can build
+#: and fill in, so trusting one would make the caller's text the "fixed" text.
+FORGED_MARKERS: Final[tuple[str, ...]] = (
+    "_diagnostics_fixed_rejection",
+    "_diagnostics_fixed_text",
+    "_fixed_text",
+    "message",
+)
+
+
+class HookedExceptionDict(dict):
+    """A replacement instance dict whose every read raises and counts.
+
+    ``object.__dict__`` of an exception can be replaced wholesale, so a probe
+    that installs one of these on a caller-built exception reaches the boundary
+    through a decorated public entry point carrying hook-instrumented metadata.
+    """
+
+    def __init__(self, counter: HookCounter) -> None:
+        super().__init__()
+        self._counter = counter
+
+    def get(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+        self._counter.hit("exception.__dict__.get")
+        raise BaseException(HOOK_CANARY)
+
+    def __getitem__(self, key: object) -> object:  # type: ignore[override]
+        self._counter.hit("exception.__dict__[key]")
+        raise BaseException(HOOK_CANARY)
+
+    def __contains__(self, key: object) -> bool:  # type: ignore[override]
+        self._counter.hit("exception.__dict__.__contains__")
+        raise BaseException(HOOK_CANARY)
+
+    def items(self):  # type: ignore[override]
+        self._counter.hit("exception.__dict__.items")
+        raise BaseException(HOOK_CANARY)
+
+    def keys(self):  # type: ignore[override]
+        self._counter.hit("exception.__dict__.keys")
+        raise BaseException(HOOK_CANARY)
+
+    def values(self):  # type: ignore[override]
+        self._counter.hit("exception.__dict__.values")
+        raise BaseException(HOOK_CANARY)
+
+    def copy(self):  # type: ignore[override]
+        self._counter.hit("exception.__dict__.copy")
+        raise BaseException(HOOK_CANARY)
+
+    def __iter__(self):  # type: ignore[override]
+        self._counter.hit("exception.__dict__.__iter__")
+        raise BaseException(HOOK_CANARY)
+
+    def __len__(self) -> int:  # type: ignore[override]
+        self._counter.hit("exception.__dict__.__len__")
+        raise BaseException(HOOK_CANARY)
+
+
+def assert_literal_rejection(failure: Exception) -> None:
+    """The replacement is the boundary's own literal and carries nothing else."""
+    assert type(failure) is ValueError, (
+        "a failure the boundary did not issue becomes a plain rejection"
+    )
+    assert str(failure) == FIXED_LITERAL
+    assert failure.args == (FIXED_LITERAL,)
+    assert HOOK_CANARY not in repr(failure)
+    assert HOOK_CANARY not in repr(failure.args)
+    assert HOOK_CANARY not in repr(failure.__dict__)
+    assert failure.__cause__ is None, "the replacement must not chain its cause"
+    assert failure.__context__ is None, "the replacement must not chain its context"
+
+
+def forging_log(
+    kind: type[Exception],
+    *,
+    marker: str | None = None,
+    counter: HookCounter | None = None,
+) -> ActivityLog:
+    """An ``ActivityLog`` subclass whose trusted hook raises a caller failure.
+
+    This is the reachable attack: ``export`` is a decorated public entry point
+    that calls back into subclass-supplied code, so the failure is the caller's
+    object exactly as a backend adapter could hand one over.
+    """
+
+    class ForgingLog(ActivityLog):
+        def _capabilities_document(self) -> dict[str, object] | None:
+            failure = kind(HOOK_CANARY)
+            if marker is None:
+                assert counter is not None, "a hostile dict probe needs a counter"
+                failure.__dict__ = HookedExceptionDict(counter)
+            else:
+                failure.__dict__[marker] = HOOK_CANARY
+            raise failure
+
+    return ForgingLog(capabilities=capability_report())
+
+
+@pytest.mark.parametrize("kind", [ValueError, TypeError])
+@pytest.mark.parametrize("marker", FORGED_MARKERS)
+def test_a_forged_rejection_marker_never_lends_caller_text(kind, marker):
+    # Only the boundary can say a failure is the boundary's. A copied marker is
+    # a string, and a string is not provenance, so the caller's canary must not
+    # become the replacement's message.
+    log = forging_log(kind, marker=marker)
+
+    with pytest.raises(ValueError) as caught:
+        log.export()
+
+    assert_literal_rejection(caught.value)
+
+
+@pytest.mark.parametrize("kind", [ValueError, TypeError])
+def test_a_hostile_exception_instance_dict_is_never_read(kind):
+    # The same attack with metadata that answers every read by running caller
+    # code: provenancing on anything but identity would execute it.
+    counter = hook_counter()
+    log = forging_log(kind, marker=None, counter=counter)
+
+    with pytest.raises(ValueError) as caught:
+        log.export()
+
+    assert_literal_rejection(caught.value)
+    assert len(counter) == 0, f"caller exception hooks ran: {counter.calls}"
+
+
+def test_a_source_written_rejection_is_recognized_without_touching_its_dict():
+    # The positive half: the boundary's own rejection keeps its own text, and
+    # needs no mutable marker on the exception to be recognized.
+    with pytest.raises(ValueError) as caught:
+        safe_activity("not-a-code", None, {}, UTC)
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == "code must be one of the registered activity codes"
+    assert dict(caught.value.__dict__) == {}, (
+        "provenance must not be recorded in state the caller can edit"
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_source_written_rejection_survives_a_nested_entry_point():
+    # ``emit`` re-validates through ``safe_activity``, so a genuine rejection is
+    # translated by two entry points. Provenance by identity has to survive the
+    # nesting: degrading it to the generic literal would lose the only text that
+    # tells the user what to fix.
+    log = ActivityLog()
+    smuggled = ActivityEvent(
+        utc=UTC, code="pairing", receiver_id=None, message="fixed copy", fields={},
+    )
+    object.__setattr__(smuggled, "fields", MappingProxyType({"password": CANARY}))
+
+    with pytest.raises(ValueError) as caught:
+        log.emit(smuggled)
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == (
+        "field is not allowlisted; secrets and backend payloads cannot enter activity"
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize(
+    "rewrite",
+    [
+        lambda failure: setattr(failure, "args", (HOOK_CANARY,)),
+        lambda failure: setattr(failure, "args", ()),
+        lambda failure: failure.__dict__.update({"message": HOOK_CANARY}),
+        lambda failure: setattr(failure, "__notes__", [HOOK_CANARY]),
+    ],
+    ids=["args-canary", "args-emptied", "dict-canary", "notes-canary"],
+)
+def test_a_genuine_rejection_lends_only_the_text_the_boundary_recorded(rewrite):
+    # Provenance by identity says *which* failure is the boundary's, not what it
+    # currently says. The text that propagates is the recorded one, so a caller
+    # that caught a rejection and rewrote its message cannot lend its own text to
+    # an enclosing entry point -- and cannot blank the message either.
+    try:
+        safe_activity("not-a-code", None, {}, UTC)
+    except ValueError as failure:
+        borrowed = failure
+        rewrite(borrowed)
+
+    class ReraisingLog(ActivityLog):
+        def _capabilities_document(self) -> dict[str, object] | None:
+            raise borrowed
+
+    with pytest.raises(ValueError) as caught:
+        ReraisingLog(capabilities=capability_report()).export()
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == "code must be one of the registered activity codes"
+    assert HOOK_CANARY not in str(caught.value)
+    assert HOOK_CANARY not in repr(caught.value)
+    assert HOOK_CANARY not in repr(caught.value.args)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

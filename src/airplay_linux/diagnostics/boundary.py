@@ -20,12 +20,22 @@ each one closes a whole class of defect rather than one instance of it:
   ``BaseException`` — becomes a fresh rejection built from source-written text.
   Nothing the caller supplied survives in ``args``, ``__cause__`` or
   ``__context__``, and the original failure is never chained.
+* Provenance is object identity, not a marker on the failure. Every rejection
+  this module builds is recorded in a private, bounded registry that keeps the
+  text this module wrote; a wrapped entry point recognizes its own failure with
+  ``is`` and re-issues *that recorded text*. An exact built-in ``ValueError`` is
+  something any caller can construct, fill in and raise, so a mutable attribute
+  — or any other caller-visible field — could never prove that text was ours.
+  The registry keeps no weak references, because built-in exceptions are not
+  weakly referenceable; it is bounded instead, and a miss degrades to the fixed
+  :data:`UNEXPECTED_FAILURE` literal rather than to caller text.
 """
 
 from __future__ import annotations
 
 import gc
 import re
+from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import wraps
@@ -65,9 +75,23 @@ NOT_CANONICAL: Final[str] = (
     "receiver_id must be a canonical public receiver identity"
 )
 
-#: Attribute carrying a rejection's own fixed text, so only text written in this
-#: module survives :func:`rejecting`.
-_FIXED_TEXT: Final[str] = "_diagnostics_fixed_rejection"
+#: How many of this module's own failures stay recognizable.
+#:
+#: Only the failures still in flight need to be: a wrapped entry point re-issues
+#: its replacement immediately as it propagates, so nesting consumes a handful of
+#: entries and the window never has to reach across a call boundary. Keeping the
+#: window bounded is what makes the registry worth its memory — a rejected value
+#: is otherwise retained for as long as the failure it produced is.
+_REGISTRY_CAPACITY: Final[int] = 64
+
+#: ``(failure, text, kind)`` for every rejection this module built, newest last.
+#:
+#: The text is stored *here* rather than read back from the failure, so a caller
+#: that catches a rejection and rewrites its ``args`` or ``__dict__`` still cannot
+#: change what an enclosing entry point propagates. The entries are exact tuples
+#: this module created, and recognition compares them with ``is``, so no method,
+#: attribute or container protocol of a caller-supplied object is ever consulted.
+_ISSUED: Final[deque[tuple[Exception, str, type]]] = deque(maxlen=_REGISTRY_CAPACITY)
 
 #: Types whose instances are transient secrets; none of them has a recorded
 #: shape, and each is rejected before any shape check inspects it.
@@ -112,34 +136,34 @@ def rejection(message: str) -> ValueError:
     ``message`` is always a literal, or text derived from a closed vocabulary, at
     the call site. The value carries exactly one argument — that message — and no
     chaining of its own; :func:`rejecting` raises it outside its ``except`` suite
-    so a caught failure is never attached as ``__context__``.
+    so a caught failure is never attached as ``__context__``. Nothing is written
+    onto the value's ``__dict__``: the text that proves provenance is kept in this
+    module, not in state the caller can read or edit.
     """
-    failure = ValueError(message)
-    _fixed(failure, message)
-    return failure
+    return cast(ValueError, _rejection_of(ValueError, message))
 
 
 def type_rejection(message: str) -> TypeError:
     """A fixed :class:`TypeError`; a wrong type stays a type error, not a value one."""
-    failure = TypeError(message)
-    _fixed(failure, message)
-    return failure
-
-
-def _fixed(failure: Exception, message: str) -> None:
-    """Scrub a rejection and record that its text is this module's own."""
-    failure.__cause__ = None
-    failure.__context__ = None
-    failure.__suppress_context__ = True
-    # The mark is an attribute rather than an encoding of the message, so the
-    # text that propagates is looked up in this module rather than parsed out of
-    # a caller-visible field. A hostile *object* cannot reach an exception the
-    # boundary raises, so it cannot set this mark on one.
-    failure.__dict__[_FIXED_TEXT] = message
+    return cast(TypeError, _rejection_of(TypeError, message))
 
 
 def _rejection_of(kind: type[Exception], message: str) -> Exception:
-    return type_rejection(message) if kind is TypeError else rejection(message)
+    """Build, scrub and record one rejection of ``kind``.
+
+    Only the two built-in kinds exist here, so the type of a rejection this module
+    raised is itself source-written; nothing about the failure is inferred later.
+    Recording the failure object is what lets an enclosing entry point recognize
+    it, and recording the text beside it is what keeps that text out of the
+    exception's own caller-visible fields.
+    """
+    rejection_type: type[Exception] = TypeError if kind is TypeError else ValueError
+    failure = rejection_type(message)
+    failure.__cause__ = None
+    failure.__context__ = None
+    failure.__suppress_context__ = True
+    _ISSUED.append((failure, message, rejection_type))
+    return failure
 
 
 def exact_text(
@@ -345,18 +369,25 @@ COMMAND_VOCABULARY: Final[Vocabulary] = captured_texts(
 def _fixed_failure(error: BaseException) -> Exception:
     """A fresh, scrubbed rejection standing in for ``error``.
 
-    Only a rejection built by this module lends its text, and only through its
-    exact built-in type, so a caller ``BaseException``, an exception subclass,
-    or a library error whose message quotes a caller value is never repeated.
-    The replacement is built here rather than reused, so it carries no ``args``,
-    ``__cause__`` or ``__context__`` from the failure it replaces, and it is
-    marked again so an enclosing entry point recognizes it too.
+    Only a failure *identical to* one this module recorded lends its text, so a
+    caller ``BaseException``, a hand-built ``ValueError`` dressed up with a
+    plausible attribute, and a library error whose message quotes a caller value
+    are all the same answer: the fixed :data:`UNEXPECTED_FAILURE` literal. The
+    text comes from the record, never from the failure, so rewriting ``args`` or
+    ``__dict__`` on a caught rejection cannot change what propagates.
+
+    The snapshot is taken before scanning because a ``deque`` cannot be iterated
+    while another thread mutates it; a snapshot failure degrades to a literal,
+    which is the safe direction. Nothing else here can raise — the scan compares
+    object identity, which consults no hook of the failure being examined.
     """
-    kind = type(error)
-    if kind is ValueError or kind is TypeError:
-        marked = error.__dict__.get(_FIXED_TEXT)
-        if type(marked) is str:
-            return _rejection_of(kind, marked)
+    try:
+        issued = tuple(_ISSUED)
+    except BaseException:
+        issued = ()
+    for candidate, text, kind in issued:
+        if candidate is error:
+            return _rejection_of(kind, text)
     return rejection(UNEXPECTED_FAILURE)
 
 
