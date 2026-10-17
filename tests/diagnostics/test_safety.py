@@ -452,6 +452,114 @@ def test_ownership_mismatch_never_offers_automatic_removal():
     assert RecoveryAction.keep in recovery
 
 
+# ------------------------------------------------- design receiver identity
+
+#: The `sha256` payload the three hash-derived design forms carry: 64 lowercase
+#: hex characters, which is the whole of their declared shape.
+FALLBACK_DIGEST: Final[str] = "0123456789abcdef" * 4
+
+assert len(FALLBACK_DIGEST) == 64
+
+#: One legitimate value of every identity form the approved design defines.
+#: ``airplay-ambiguous:`` is ephemeral by design, but it is still an identity a
+#: diagnostics boundary must be able to record without inventing a fifth form.
+DESIGN_RECEIVER_IDS: Final[tuple[str, ...]] = (
+    "airplay-device:001122334455",
+    "airplay-device:abcdef0123456789",
+    f"airplay-fingerprint:{FALLBACK_DIGEST}",
+    f"airplay-endpoint:{FALLBACK_DIGEST}",
+    f"airplay-ambiguous:{FALLBACK_DIGEST}",
+)
+
+#: Values no design form describes: a wrong or missing prefix, a payload of the
+#: wrong length, case, or alphabet, embedded control or space characters, free
+#: backend text, and secret-bearing suffixes after an otherwise valid prefix.
+REJECTED_RECEIVER_IDS: Final[tuple[str, ...]] = (
+    "device:001122334455",
+    "airplay-devices:001122334455",
+    "airplay_device:001122334455",
+    "airplay-device:",
+    f"airplay-fingerprint:{FALLBACK_DIGEST.upper()}",
+    f"airplay-endpoint:{FALLBACK_DIGEST[:-1]}",
+    f"airplay-ambiguous:{FALLBACK_DIGEST}a",
+    f"airplay-fingerprint:{FALLBACK_DIGEST[:-1]}g",
+    f"airplay-endpoint:{FALLBACK_DIGEST}\n",
+    f"airplay-ambiguous: {FALLBACK_DIGEST}",
+    f"airplay-fingerprint:{FALLBACK_DIGEST}{CANARY_TEXT}",
+    f"airplay-endpoint:{FALLBACK_DIGEST};password={CANARY_TEXT}",
+    "airplay-device:AirPlay TV",
+    f"airplay-device:001122334455 ({CANARY_TEXT})",
+    f"airplay-device:{CANARY_TEXT}",
+    f"{CANARY_TEXT}:{FALLBACK_DIGEST}",
+)
+
+
+@pytest.mark.parametrize("identity", DESIGN_RECEIVER_IDS)
+def test_diagnostic_accepts_every_design_receiver_identity(identity):
+    result = diagnostic(ErrorCode.transport_failed, ReceiverId(identity))
+
+    # Byte-for-byte: the accepted value is the exact built-in string that was
+    # checked, not a re-rendering, a truncation, or a subclass instance.
+    assert result.receiver_id == identity
+    assert type(result.receiver_id) is str
+    assert result.receiver_id.encode("utf-8") == identity.encode("utf-8")
+    assert result.message == diagnostic(ErrorCode.transport_failed).message
+    assert CANARY_TEXT not in repr(result)
+
+
+@pytest.mark.parametrize("identity", DESIGN_RECEIVER_IDS)
+def test_safe_activity_accepts_every_design_receiver_identity(identity):
+    event = safe_activity("session", ReceiverId(identity), {}, UTC)
+    log = ActivityLog()
+    log.emit(event)
+
+    assert event.receiver_id == identity
+    assert type(event.receiver_id) is str
+    assert event.receiver_id.encode("utf-8") == identity.encode("utf-8")
+    assert log.entries()[0].receiver_id == identity
+    assert json.loads(log.export())["activity"][0]["receiver_id"] == identity
+    assert CANARY_TEXT not in repr(event)
+    assert CANARY_TEXT not in log.export()
+
+
+@pytest.mark.parametrize("identity", DESIGN_RECEIVER_IDS)
+def test_both_identity_boundaries_normalize_a_spoofed_value_of_every_form(identity):
+    # The grammar must be applied to the copied character data of every form, so
+    # a self-rendering subclass cannot approve itself by rendering a valid value.
+    spoof = ReceiverId(RenderSpoof(identity))
+
+    result = diagnostic(ErrorCode.transport_failed, spoof)
+    event = safe_activity("session", spoof, {}, UTC)
+
+    for accepted in (result.receiver_id, event.receiver_id):
+        assert accepted == identity
+        assert type(accepted) is str
+        assert SMUGGLED not in accepted
+    assert SMUGGLED not in repr(result)
+    assert SMUGGLED not in repr(event)
+
+
+@pytest.mark.parametrize("constructor", ["diagnostic", "safe_activity"])
+@pytest.mark.parametrize("identity", REJECTED_RECEIVER_IDS)
+def test_neither_identity_boundary_accepts_a_non_design_identity(constructor, identity):
+    if constructor == "diagnostic":
+        invoke = lambda: diagnostic(ErrorCode.transport_failed, ReceiverId(identity))
+    else:
+        invoke = lambda: safe_activity("session", ReceiverId(identity), {}, UTC)
+
+    with pytest.raises(ValueError) as caught:
+        invoke()
+
+    assert_clean_boundary_error(caught.value, ValueError)
+    # Fixed text: nothing from the rejected value, not even a valid prefix or a
+    # secret-bearing suffix, is rendered back to the caller.
+    assert str(caught.value) == "receiver_id must be a canonical public receiver identity"
+    assert identity not in repr(caught.value)
+    payload = identity.split(":", 1)[-1].strip()
+    if payload:
+        assert payload not in str(caught.value)
+
+
 # ------------------------------------------------- design action matrix
 
 #: The approved design that owns the normative action table. This lane reads it

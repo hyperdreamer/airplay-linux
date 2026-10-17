@@ -275,7 +275,11 @@ def _reject_utc(utc: object) -> str:
 
 
 def _reject_receiver(receiver_id: object) -> ReceiverId | None:
-    """Validate a canonical public receiver identity without retaining payloads."""
+    """Validate a design-defined receiver identity without retaining payloads.
+
+    The catalog's validator is the only identity grammar in the package, so the
+    activity channel and the diagnostic catalog accept exactly the same forms.
+    """
     return _validated_receiver_id(receiver_id)
 
 

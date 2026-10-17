@@ -29,10 +29,32 @@ ALLOWED_COMMANDS: Final[frozenset[str]] = frozenset(
 )
 
 MAX_MESSAGE_LENGTH: Final[int] = 240
+
+#: A lowercase ``sha256`` digest, which is the whole payload of every
+#: hash-derived receiver identity the approved design defines.
+_SHA256_DIGEST: Final[str] = r"[0-9a-f]{64}"
+
+#: One grammar per design-defined receiver identity prefix, and no others.
+#:
+#: The design derives an identity from either a normalized device identifier or
+#: a ``sha256`` digest of the discovery evidence, so a diagnostics boundary has
+#: to accept exactly those four forms to be able to record what discovery emits.
+_RECEIVER_ID_BODY: Final[Mapping[str, str]] = MappingProxyType(
+    {
+        "airplay-device": (
+            r"(?:[0-9a-f]{1,64}|"
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+        ),
+        "airplay-fingerprint": _SHA256_DIGEST,
+        "airplay-endpoint": _SHA256_DIGEST,
+        "airplay-ambiguous": _SHA256_DIGEST,
+    }
+)
+
+#: The four forms as one expression; each alternative is whole-string anchored
+#: by :func:`re.fullmatch`, so no prefix can borrow another's payload.
 _RECEIVER_ID: Final[re.Pattern[str]] = re.compile(
-    r"airplay-device:(?:"
-    r"[0-9a-f]{1,64}|"
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    "|".join(f"{prefix}:{body}" for prefix, body in _RECEIVER_ID_BODY.items()),
 )
 
 
@@ -283,7 +305,13 @@ def _text_data(value: object) -> str | None:
 
 
 def _validated_receiver_id(receiver_id: object) -> ReceiverId | None:
-    """Accept only the canonical public identity shape used for correlation."""
+    """Accept exactly the design-defined identity forms used for correlation.
+
+    This is the single grammar both constructors share, so the catalog and the
+    activity channel cannot drift apart on what a receiver identity is. The
+    value's character data is copied first and matched as a whole string, so a
+    ``str`` subclass cannot approve itself by rendering a valid form.
+    """
     if receiver_id is None:
         return None
     text = _text_data(receiver_id)
