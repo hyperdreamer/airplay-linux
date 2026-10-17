@@ -35,6 +35,7 @@ from airplay_linux.domain.records import ActivityEvent
 from airplay_linux.domain.resources import (
     AudioState,
     CapabilityReport,
+    Diagnostic,
     DisplayState,
     ErrorCode,
     SessionPhase,
@@ -42,7 +43,7 @@ from airplay_linux.domain.resources import (
     TrustState,
 )
 
-from .catalog import ALLOWED_COMMANDS, _validated_receiver_id, diagnostic
+from .catalog import ALLOWED_COMMANDS, _validated_code, _validated_receiver_id
 
 if TYPE_CHECKING:
     from airplay_linux.domain.ports import Subscription
@@ -148,6 +149,12 @@ _INTEGER_BOUNDS: Final[Mapping[str, tuple[int, int]]] = MappingProxyType(
 
 #: Fields that accept only a boolean, and never the integer ``0`` or ``1``.
 _BOOLEAN_FIELDS: Final[frozenset[str]] = frozenset({"explicit_video_only"})
+
+#: The fixed text of every code, captured from the frozen enum once, so an
+#: exported capability token is never re-read from a caller-supplied object.
+_ERROR_CODE_TEXT: Final[Mapping[ErrorCode, str]] = MappingProxyType(
+    {member: member.value for member in ErrorCode}
+)
 
 #: The declared value shape of every allowlisted field, derived from the same
 #: registries the enforcement reads, so the two cannot drift apart.
@@ -458,6 +465,38 @@ def safe_activity(
     )
 
 
+def _capability_codes(diagnostics: object) -> list[str]:
+    """Validate the capability-diagnostic collection before reading any item.
+
+    This is a record boundary, not a renderer: only the exact frozen tuple type
+    holding exact :class:`Diagnostic` records with genuine :class:`ErrorCode`
+    members may contribute a code. The collection and each item's type are
+    decided *before* any attribute is read, so a caller object whose ``code``
+    hook raises, advertises a borrowed ``__class__``, or carries backend text is
+    never consulted, and the exported strings are the frozen vocabulary's own.
+    """
+    if type(diagnostics) is not tuple:
+        raise TypeError(
+            "capability diagnostics must be an immutable tuple of diagnostics",
+        )
+    codes: set[str] = set()
+    for item in diagnostics:
+        if type(item) is not Diagnostic:
+            raise TypeError(
+                "capability diagnostics must be domain Diagnostic records; "
+                "arbitrary objects are not capability evidence",
+            )
+        text = _ERROR_CODE_TEXT.get(_validated_code(item.code))
+        if text is None:
+            # Unreachable while every member has a registered code; the guard
+            # keeps an unrecognized member from inventing its own text.
+            raise TypeError(
+                "capability diagnostics must carry a registered error code",
+            )
+        codes.add(text)
+    return sorted(codes)
+
+
 def _sanitize_event(event: ActivityEvent) -> ActivityEvent:
     """Re-derive copy and fields, so a hand-built event cannot smuggle content."""
     token = _reject_code(event.code)
@@ -588,8 +627,6 @@ class ActivityLog:
                 environment if environment in _SAFE_ENVIRONMENTS else _UNKNOWN_ENVIRONMENT
             ),
             **flags,
-            "diagnostic_codes": sorted(
-                {diagnostic(item.code).code.value for item in report.diagnostics},
-            ),
+            "diagnostic_codes": _capability_codes(report.diagnostics),
         }
         return capabilities

@@ -1689,6 +1689,49 @@ def test_subscribe_requires_a_callable():
 # --------------------------------------------------------------------- export
 
 
+class RaisingCapabilityItem:
+    """A capability-diagnostic item whose ``code`` hook raises the canary.
+
+    It is not a :class:`Diagnostic`, so no part of it may be inspected. The
+    counter proves the export decides on the item's actual type before it reads
+    any attribute, rather than trusting what the object offers to answer.
+    """
+
+    def __init__(self) -> None:
+        self.code_reads = 0
+
+    @property
+    def code(self) -> ErrorCode:
+        self.code_reads += 1
+        raise RuntimeError(CANARY_TEXT)
+
+    def __repr__(self) -> str:
+        return repr(CANARY_TEXT)
+
+
+class RaisingCodeDiagnostic(Diagnostic):
+    """A ``Diagnostic`` subclass whose ``code`` access raises the canary.
+
+    Only the exact domain type may pass the collection check, so a subclass
+    cannot get its ``code`` read at all, however it behaves when asked.
+    """
+
+    def __getattribute__(self, name: str) -> object:
+        if name == "code":
+            raise RuntimeError(CANARY_TEXT)
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        return "<raising-code diagnostic>"
+
+
+class IteratingDiagnostics(tuple):
+    """A ``tuple`` whose iteration is caller-controlled, so it is not a tuple."""
+
+    def __iter__(self) -> Iterator[object]:
+        yield RaisingCapabilityItem()
+
+
 def capability_report() -> CapabilityReport:
     return CapabilityReport(
         environment="KDE Plasma 6 Wayland",
@@ -1761,6 +1804,158 @@ def test_capability_export_rejects_unvalidated_flag_values(field, value):
 
     assert_clean_boundary_error(caught.value, TypeError)
     assert log.entries() == ()
+
+
+def test_capability_export_rejects_an_item_whose_code_hook_raises():
+    hostile = RaisingCapabilityItem()
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=(hostile,)))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert hostile.code_reads == 0, "the item's type is decided before any attribute"
+    assert log.entries() == ()
+
+
+def test_capability_export_rejects_a_diagnostic_subclass_before_reading_it():
+    # The item is shaped like a domain record, but its actual type is not the
+    # frozen one, so even a well-formed construction may not reach the export.
+    item = RaisingCodeDiagnostic(
+        code=ErrorCode.dependency_missing,
+        message=f"backend said {CANARY_TEXT}",
+        recovery=(RecoveryAction.retry,),
+    )
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=(item,)))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [CANARY_TEXT, "dependency_missing", None, 42, ErrorCode.dependency_missing.value],
+)
+def test_capability_export_rejects_a_code_that_is_not_an_error_code(code):
+    item = Diagnostic(code=code, message="fixed copy", recovery=())  # type: ignore[arg-type]
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=(item,)))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
+
+
+def test_a_code_impostor_cannot_reach_the_capability_export():
+    # ``isinstance`` honours the advertised class, so the impostor claims to be
+    # an ``ErrorCode`` while holding a catalog-looking key as its own data.
+    impostor = CodeImpostor("dependency_missing")
+    assert isinstance(impostor, ErrorCode), "the probe must still fool isinstance"
+    item = Diagnostic(code=impostor, message="fixed copy", recovery=())  # type: ignore[arg-type]
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=(item,)))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert IMPOSTOR_CANARY not in repr(caught.value)
+
+
+def test_capability_export_rejects_a_mutable_diagnostic_collection():
+    genuine = Diagnostic(
+        code=ErrorCode.audio_denied,
+        message="fixed copy",
+        recovery=(RecoveryAction.video_only,),
+    )
+    log = ActivityLog(
+        capabilities=replace(capability_report(), diagnostics=[genuine]),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    # Deterministic: a second export fails the same way and renders no codes.
+    with pytest.raises(TypeError) as again:
+        log.export()
+    assert str(again.value) == str(caught.value)
+
+
+def test_capability_export_rejects_a_collection_that_controls_its_own_iteration():
+    # The collection is not consulted at all: only the exact frozen tuple type
+    # is a capability collection, so its ``__iter__`` cannot decide what runs.
+    hostile = IteratingDiagnostics()
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=hostile))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
+
+
+@pytest.mark.parametrize(
+    "collection",
+    [None, "diagnostics", frozenset(), {"diagnostics": ()}, 7],
+)
+def test_capability_export_rejects_a_non_tuple_diagnostic_collection(collection):
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=collection))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+
+
+def test_genuine_diagnostics_still_export_their_fixed_codes():
+    report = CapabilityReport(
+        environment="KDE Plasma 6 Wayland",
+        discovery=True,
+        mirror=True,
+        virtual_display=True,
+        audio=True,
+        remembered_pairing=True,
+        additional_virtual_outputs=True,
+        diagnostics=(
+            Diagnostic(
+                code=ErrorCode.dependency_missing,
+                message=f"backend said {CANARY_TEXT}",
+                recovery=(RecoveryAction.retry,),
+            ),
+            Diagnostic(
+                code=ErrorCode.audio_unavailable,
+                message=CANARY_TEXT,
+                recovery=(RecoveryAction.video_only,),
+            ),
+            Diagnostic(
+                code=ErrorCode.dependency_missing,
+                message="a duplicate leaf",
+                recovery=(),
+            ),
+        ),
+    )
+
+    exported = ActivityLog(capabilities=report).export()
+
+    capabilities = json.loads(exported)["capabilities"]
+    # The seven leaves are unchanged, and codes come from the frozen vocabulary.
+    assert capabilities == {
+        "environment": "KDE Plasma 6 Wayland",
+        "discovery": True,
+        "mirror": True,
+        "virtual_display": True,
+        "audio": True,
+        "remembered_pairing": True,
+        "additional_virtual_outputs": True,
+        "diagnostic_codes": ["audio_unavailable", "dependency_missing"],
+    }
+    vocabulary = {member.value for member in ErrorCode}
+    assert all(code in vocabulary for code in capabilities["diagnostic_codes"])
+    assert CANARY_TEXT not in exported
 
 
 def test_export_includes_counts_and_capabilities_only():
