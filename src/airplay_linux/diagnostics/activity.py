@@ -42,10 +42,10 @@ import re
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, NamedTuple, cast
 
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.records import ActivityEvent
@@ -503,8 +503,7 @@ def _capability_codes(diagnostics: object) -> tuple[str, ...]:
     return tuple(sorted(codes))
 
 
-@dataclass(frozen=True, slots=True)
-class _CapabilitySnapshot:
+class _CapabilitySnapshot(NamedTuple):
     """Accepted capability evidence, as exact built-in leaves only.
 
     Every field is an exact built-in the boundary produced: the environment label
@@ -513,8 +512,8 @@ class _CapabilitySnapshot:
     vocabulary's own text. Nothing here holds a reference to the caller's report,
     to its diagnostics collection, or to any diagnostic record, so no later
     mutation or retype of those objects can change what the export says.
-    ``slots=True`` also leaves the instance without a ``__dict__``, so there is no
-    attribute map to rewrite from outside.
+    ``NamedTuple`` makes the retained record a tuple of immutable built-in
+    leaves, so ``object.__setattr__`` cannot rewrite an accepted value.
 
     The subtree that is deliberately *absent* is the diagnostic ``message`` -- the
     field that holds receiver and backend text -- so a report's prose cannot be
@@ -529,8 +528,7 @@ class _CapabilitySnapshot:
     diagnostic_codes: tuple[str, ...]
 
 
-@dataclass(frozen=True, slots=True)
-class _CapabilityRefusal:
+class _CapabilityRefusal(NamedTuple):
     """A refusal the boundary issued while reading accepted evidence.
 
     A report that cannot be normalized still has to be refused at the export,

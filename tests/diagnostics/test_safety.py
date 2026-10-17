@@ -3869,6 +3869,46 @@ def test_a_scrubbed_rejection_keeps_its_own_fixed_message(entry_point):
     assert caught.value.__context__ is None
 
 
+def module_owned_traceback_locals(
+    failure: BaseException,
+) -> tuple[tuple[str, dict[str, object]], ...]:
+    """Return locals from diagnostics-owned frames, excluding caller frames."""
+    owned: list[tuple[str, dict[str, object]]] = []
+    traceback_node = failure.__traceback__
+    while traceback_node is not None:
+        module_name = traceback_node.tb_frame.f_globals.get("__name__")
+        if module_name in {
+            "airplay_linux.diagnostics.activity",
+            "airplay_linux.diagnostics.boundary",
+        }:
+            owned.append((module_name, dict(traceback_node.tb_frame.f_locals)))
+        traceback_node = traceback_node.tb_next
+    return tuple(owned)
+
+
+@pytest.mark.parametrize("entry_point", ["safe_activity", "diagnostic"])
+def test_rejection_traceback_frames_do_not_retain_caller_arguments(entry_point):
+    # The replacement exception is clean, but its traceback must not retain the
+    # rejected argument in a diagnostics-owned frame either. Caller frames are
+    # intentionally excluded: the module cannot control its caller's locals.
+    canary = "TRACEBACK-CANARY-final-review"
+    if entry_point == "safe_activity":
+        invoke = lambda: safe_activity(canary, None, {}, UTC)
+    else:
+        invoke = lambda: diagnostic(canary)  # type: ignore[arg-type]
+
+    with pytest.raises((ValueError, TypeError)) as caught:
+        invoke()
+
+    owned_frames = module_owned_traceback_locals(caught.value)
+    assert owned_frames, "the rejection traceback should include a diagnostics frame"
+    for module_name, locals_ in owned_frames:
+        for local_name, value in locals_.items():
+            assert canary not in repr(value), (
+                f"{module_name}.{local_name} retained the rejected argument"
+            )
+
+
 def test_an_ordinary_call_under_a_handler_still_succeeds():
     # The scrub lives in the raising path, so the accepting path must be
     # untouched: a value the boundary accepts under an active handler is still
@@ -4121,6 +4161,69 @@ def test_a_caller_mutating_its_report_cannot_change_retained_evidence(attribute,
     assert log.export() == expected
     assert ALIAS_CANARY not in log.export()
 
+
+
+@pytest.mark.parametrize(
+    ("attribute", "payload"),
+    [
+        ("environment", ALIAS_CANARY),
+        ("flags", ((ALIAS_CANARY, True),)),
+        ("diagnostic_codes", (ALIAS_CANARY,)),
+    ],
+)
+def test_every_capability_snapshot_leaf_resists_object_setattr(
+    attribute,
+    payload,
+):
+    # A frozen dataclass slot can still be rewritten with object.__setattr__. The
+    # accepted evidence must be a genuinely immutable retained value, so the
+    # attempted rewrite cannot alter its repr or the legitimate export.
+    expected = pristine_alias_document()
+    log = ActivityLog(capabilities=alias_report())
+    snapshot = log._capabilities
+    assert snapshot is not None
+
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(snapshot, attribute, payload)
+
+    assert ALIAS_CANARY not in repr(snapshot)
+    assert log.export() == expected
+
+
+RETAINED_REFUSAL_CANARY: Final[str] = "RETAINED-REFUSAL-CANARY-final-review"
+
+
+@pytest.mark.parametrize(
+    ("attribute", "payload"),
+    [("kind", ValueError), ("text", RETAINED_REFUSAL_CANARY)],
+)
+def test_every_capability_refusal_leaf_resists_object_setattr(attribute, payload):
+    # Refusal provenance is retained until export. Its kind and fixed text must
+    # be just as non-rewritable as accepted evidence, or a caller can change the
+    # kind or inject text into the next raised exception.
+    log = ActivityLog(
+        capabilities=replace(capability_report(), diagnostics=None),  # type: ignore[arg-type]
+    )
+    refusal = log._capability_refusal
+    assert refusal is not None
+
+    with pytest.raises((AttributeError, TypeError)):
+        object.__setattr__(refusal, attribute, payload)
+
+    assert RETAINED_REFUSAL_CANARY not in repr(refusal)
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert type(caught.value) is TypeError
+    assert caught.value.args == (
+        "capability diagnostics must be an immutable tuple of diagnostics",
+    )
+    assert RETAINED_REFUSAL_CANARY not in str(caught.value)
+    assert RETAINED_REFUSAL_CANARY not in repr(caught.value)
+    assert all(RETAINED_REFUSAL_CANARY not in repr(arg) for arg in caught.value.args)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert getattr(caught.value, "__notes__", None) is None
 
 
 # ------------------- F-1: an unrecognized environment is sanitized at acceptance

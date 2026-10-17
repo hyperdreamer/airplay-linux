@@ -485,6 +485,10 @@ def rejecting(function: _Wrapped) -> _Wrapped:
             return function(*args, **kwargs)
         except BaseException as error:
             failure = _fixed_failure(error)
+        # The wrapper frame is part of the replacement traceback. Release the
+        # caller's argument tuple and mapping before the raise captures it.
+        args = ()
+        kwargs = {}
         try:
             raise failure
         finally:
