@@ -398,13 +398,18 @@ def _resolution(value: object) -> str:
 
 
 def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
-    if not any(
-        _has_type_in_mro(fields, expected)
-        for expected in (Mapping, dict, MappingProxyType)
-    ):
+    # Do not dispatch through a caller-supplied ``items`` attribute.  Exact
+    # built-in containers are the only sources whose descriptors can be trusted
+    # at this boundary; subclasses and arbitrary Mapping implementations may
+    # execute caller code before validation even begins.
+    if type(fields) is dict:
+        raw_items = dict.items(fields)
+    elif type(fields) is MappingProxyType:
+        raw_items = MappingProxyType.items(fields)
+    else:
         raise TypeError("fields must be a mapping of allowlisted names to values")
     try:
-        items = iter(fields.items())  # type: ignore[union-attr]
+        items = iter(raw_items)
     except Exception:
         items = None
     if items is None:

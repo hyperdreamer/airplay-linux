@@ -1384,6 +1384,72 @@ def test_raw_backend_payloads_cannot_enter_activity(value):
     assert CANARY not in str(caught.value)
 
 
+class BaseExceptionItems(dict):
+    """A mapping subclass whose overridden ``items`` leaks a BaseException."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items_calls = 0
+
+    def items(self):
+        self.items_calls += 1
+        raise BaseException(CANARY_TEXT)
+
+
+class HostileItemsIterator:
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        raise BaseException(CANARY_TEXT)
+
+
+class HostileIteratorItems(dict):
+    """A mapping subclass returning an iterator controlled by the caller."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items_calls = 0
+
+    def items(self):
+        self.items_calls += 1
+        return HostileItemsIterator()
+
+
+class MalformedFieldItem:
+    """An item whose unpacking hook raises caller-controlled payload text."""
+
+    def __iter__(self):
+        raise BaseException(CANARY_TEXT)
+
+
+class MalformedItems(dict):
+    """A mapping subclass returning a malformed item object."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.items_calls = 0
+
+    def items(self):
+        self.items_calls += 1
+        return [MalformedFieldItem()]
+
+
+@pytest.mark.parametrize(
+    "fields_type",
+    [BaseExceptionItems, HostileIteratorItems, MalformedItems],
+    ids=["overridden-items", "hostile-items-iterator", "malformed-item"],
+)
+def test_mapping_subclasses_are_rejected_before_caller_hooks_run(fields_type):
+    fields = fields_type()
+
+    with pytest.raises(TypeError) as caught:
+        safe_activity("session", None, fields, UTC)  # type: ignore[arg-type]
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert fields.items_calls == 0
+
+
 def test_fields_must_be_a_mapping():
     with pytest.raises(TypeError, match="mapping"):
         safe_activity("session", None, [("phase", "Mirroring")], UTC)  # type: ignore[arg-type]
