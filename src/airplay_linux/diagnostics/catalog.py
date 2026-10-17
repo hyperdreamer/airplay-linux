@@ -311,6 +311,24 @@ def _validated_command(command: str | None) -> str | None:
     return text
 
 
+def _validated_code(code: object) -> ErrorCode:
+    """The genuine enum member for ``code``, or a fixed rejection.
+
+    ``isinstance`` is not proof of an enum member: a class can advertise
+    ``__class__`` as :class:`ErrorCode`, so a look-alike ``str`` passes the type
+    test while it really renders, compares, and hashes whatever it likes. Only
+    the exact enum type may reach the catalog lookup and the returned
+    :class:`Diagnostic`; anything else is rejected with fixed text, so no
+    catalog ``KeyError`` ever renders the argument.
+    """
+    if type(code) is not ErrorCode:
+        raise TypeError(
+            "code must be an ErrorCode from the diagnostics catalog; "
+            "arbitrary error text is not a diagnostic",
+        )
+    return code
+
+
 def diagnostic(
     code: ErrorCode,
     receiver_id: ReceiverId | None = None,
@@ -318,21 +336,17 @@ def diagnostic(
     command: str | None = None,
 ) -> Diagnostic:
     """Build the catalog diagnostic for ``code``; no backend text is accepted."""
-    if not isinstance(code, ErrorCode):
-        raise TypeError(
-            "code must be an ErrorCode from the diagnostics catalog; "
-            "arbitrary error text is not a diagnostic",
-        )
+    validated = _validated_code(code)
     receiver_text = _text_data(receiver_id)
     if receiver_id is not None and receiver_text is None:
         raise TypeError("receiver_id must be a ReceiverId or None")
-    entry = ENTRIES[code]
+    entry = ENTRIES[validated]
     name = _validated_command(command)
     message = entry.message
     if name is not None and entry.command_message is not None:
         message = entry.command_message.format(command=name)
     return Diagnostic(
-        code=code,
+        code=validated,
         message=message,
         recovery=entry.recovery,
         receiver_id=ReceiverId(receiver_text) if receiver_text is not None else None,

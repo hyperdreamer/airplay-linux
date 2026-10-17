@@ -265,6 +265,60 @@ def test_diagnostic_rejects_arbitrary_error_text():
     assert CANARY not in repr(caught.value)
 
 
+def test_every_genuine_error_code_still_builds_its_catalog_diagnostic():
+    # The impostor check below tightens the boundary, so the positive case is
+    # pinned too: every frozen member must still resolve to its own entry, with
+    # a real ``ErrorCode`` and the fixed copy it always had.
+    assert len(list(ErrorCode)) > 1, "the probe must iterate the real enumeration"
+
+    for member in ErrorCode:
+        result = diagnostic(member)
+
+        assert isinstance(result, Diagnostic)
+        assert type(result.code) is ErrorCode
+        assert result.code is member
+        assert result.message == ENTRIES[member].message
+        assert result.recovery == ENTRIES[member].recovery
+        assert result.receiver_id is None
+        assert result.detail is None
+
+
+def test_an_error_code_impostor_is_rejected_without_rendering_it():
+    # A ``str`` subclass can advertise ``__class__`` as ``ErrorCode``, so
+    # ``isinstance`` approves it. Data that happens to match a catalog key would
+    # then index the catalog and be returned *as* the code; data that matches
+    # nothing reached ``KeyError`` with the raw text in the exception message.
+    # Both are rejected with the module's existing fixed type and no echo.
+    for data in (ErrorCode.transport_failed.value, "not-a-registered-error-code"):
+        impostor = CodeImpostor(data)
+        assert isinstance(impostor, ErrorCode), "the probe must pass isinstance"
+        assert type(impostor) is not ErrorCode, "the probe must not be the enum"
+
+        with pytest.raises(TypeError) as caught:
+            diagnostic(impostor)  # type: ignore[arg-type]
+
+        assert IMPOSTOR_CANARY not in str(caught.value)
+        assert IMPOSTOR_CANARY not in repr(caught.value)
+        # A ``KeyError`` would have tried to render the unvalidated object.
+        assert not isinstance(caught.value, KeyError)
+
+
+def test_an_error_code_impostor_never_reaches_a_diagnostic():
+    # Nothing may be produced that carries the impostor, not even when its data
+    # is a genuine enumerated value with a real catalog entry behind it.
+    impostor = CodeImpostor(ErrorCode.cleanup_timeout.value)
+
+    with pytest.raises(TypeError) as caught:
+        diagnostic(impostor)  # type: ignore[arg-type]
+
+    assert IMPOSTOR_CANARY not in str(caught.value)
+    assert IMPOSTOR_CANARY not in repr(caught.value)
+    # Every argument the exception carries is checked, so a fixed message plus a
+    # stray payload argument cannot slip through behind a clean ``str``.
+    for argument in caught.value.args:
+        assert IMPOSTOR_CANARY not in repr(argument)
+
+
 def test_diagnostic_rejects_a_command_outside_the_allowlist():
     with pytest.raises(ValueError, match="command") as caught:
         diagnostic(ErrorCode.dependency_missing, command=CANARY)
@@ -876,6 +930,29 @@ class RenderSpoof(str):
 
     def __getitem__(self, index: int) -> str:
         return self._rendering[index]
+
+
+#: The canary an ``ErrorCode`` impostor renders; it must never be echoed.
+IMPOSTOR_CANARY: Final[str] = CANARY_TEXT
+
+
+class CodeImpostor(str):
+    """A ``str`` that claims to be an :class:`ErrorCode` and renders a canary.
+
+    Its own data is a catalog key (or nothing at all), so a check that trusts
+    the advertised class approves it while every rendering hook reports the
+    payload. Only the enum type itself is the code.
+    """
+
+    @property
+    def __class__(self) -> type[ErrorCode]:  # type: ignore[override]
+        return ErrorCode
+
+    def __str__(self) -> str:
+        return IMPOSTOR_CANARY
+
+    def __repr__(self) -> str:
+        return repr(IMPOSTOR_CANARY)
 
 
 #: One value-taking field per shape, with the legitimate text it accepts.
