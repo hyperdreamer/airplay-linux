@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airplay-linux"
+version = "0.1.0"
+description = "A desktop controller for AirPlay receiver sessions on Linux"
+requires-python = ">=3.12"
+dependencies = [
+    "PySide6>=6.6,<7",
+    "qasync>=0.27,<1",
+    "zeroconf>=0.140,<1",
+    "dbus-next>=0.2.3,<1",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=0.24,<2",
+    "pytest-qt>=4.4,<5",
+]
+
+[project.scripts]
+airplay-linux = "airplay_linux.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+airplay_linux = ["resources/*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["src"]
+testpaths = ["tests"]
+markers = [
+    "live_backend: requires an explicitly selected live backend test environment",
+    "live_kde: requires an explicitly selected KDE display test environment",
+    "live_hardware: requires explicitly selected receiver hardware",
+]
