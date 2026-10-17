@@ -1379,6 +1379,7 @@ class FakeDisplay(_Scripted, _EventSource):
         self.crashes: list[tuple[OwnerId, str]] = []
         self.fenced_operations: set[OperationId] = set()
         self._creations: list[_Creation] = []
+        self._teardown_gates: dict[ReceiverId, int] = {}
         self._creation_lock = asyncio.Lock()
         self._in_flight = 0
         self._crash_at: str | None = None
@@ -1593,6 +1594,10 @@ class FakeDisplay(_Scripted, _EventSource):
             "create", receiver_id=receiver_id, endpoint_fingerprint=endpoint_fingerprint,
             size=size, context=context,
         )
+        # Admission and gate entry are synchronous: no same-receiver acquisition
+        # can slip past a teardown suspended in scripting or a durable write.
+        if receiver_id in self._teardown_gates:
+            return _failure(ErrorCode.stale_event, "Creation was rejected while teardown is in progress")
         creation = _Creation(receiver_id=receiver_id, operation_id=context.operation_id)
         self._creations.append(creation)
         scripted = await self._take(
@@ -1748,25 +1753,31 @@ class FakeDisplay(_Scripted, _EventSource):
             "prepare_teardown", receiver_id=receiver_id,
             superseded_operation_id=superseded_operation_id, context=context,
         )
-        scripted = await self._take("prepare_teardown")
-        if scripted is not _UNSET:
-            return scripted
-        # Fence first: a create that has no owner UUID yet must not be able to
-        # reserve or publish an active output once this gate has acknowledged.
+        # Close admission before the first suspension, not just over the current
+        # pending-create snapshot. Count overlapping gates for this receiver.
+        self._teardown_gates[receiver_id] = self._teardown_gates.get(receiver_id, 0) + 1
         if superseded_operation_id is not None:
             self.fenced_operations.add(superseded_operation_id)
         self._fence_pending(receiver_id)
-        admitted: list[OwnerId] = []
-        for record in list(self.ownership.records.values()):
-            if record.receiver_id != receiver_id or record.desired_state != "active":
-                continue
-            removing = self._next_record(record, "removing", "removing")
-            written = await self.ownership.write(removing)
-            if isinstance(written, Err):
-                return written
-            self._note_stage(removing, "removing")
-            admitted.append(record.owner_uuid)
-        return Ok(value=tuple(admitted))
+        try:
+            scripted = await self._take("prepare_teardown")
+            if scripted is not _UNSET:
+                return scripted
+            admitted: list[OwnerId] = []
+            for record in list(self.ownership.records.values()):
+                if record.receiver_id != receiver_id or record.desired_state != "active":
+                    continue
+                removing = self._next_record(record, "removing", "removing")
+                written = await self.ownership.write(removing)
+                if isinstance(written, Err):
+                    return written
+                self._note_stage(removing, "removing")
+                admitted.append(record.owner_uuid)
+            return Ok(value=tuple(admitted))
+        finally:
+            self._teardown_gates[receiver_id] -= 1
+            if self._teardown_gates[receiver_id] == 0:
+                del self._teardown_gates[receiver_id]
 
     async def mark_removing(self, owner_uuid: OwnerId) -> Result[None]:
         self._record("mark_removing", owner_uuid=owner_uuid)

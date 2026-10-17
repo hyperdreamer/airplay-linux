@@ -1149,6 +1149,136 @@ def test_prepare_teardown_fences_a_create_suspended_during_a_stage_write():
     run(scenario())
 
 
+@pytest.mark.parametrize("scripted_create", [False, True])
+def test_prepare_teardown_rejects_new_create_while_removal_write_is_suspended(scripted_create):
+    async def scenario():
+        display = FakeDisplay()
+        receiver = target()
+        original = context(generation=1)
+        owner = (await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, original,
+        )).value
+        suspended = Deferred()
+        display.ownership.queue_result("write", suspended)
+        teardown = asyncio.ensure_future(display.prepare_teardown(
+            receiver.receiver_id, original.operation_id, context(generation=2),
+        ))
+        await asyncio.sleep(0)
+        assert not teardown.done()
+        assert display.ownership.pending("write") == 0
+        assert display.ownership.journal.calls("ownership_store.write")[-1]["record"]["stage"] == "removing"
+
+        if scripted_create:
+            display.queue_result("create", Ok(value=virtual_handle(owner=7, output="v7")))
+        replacement = await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=3),
+        )
+        # Finish the gate before asserting so failure also shows any escaped owner.
+        suspended.resolve(Ok(value=None))
+        admitted = await teardown
+        records = (await display.ownership.all()).value
+        assert isinstance(replacement, Err), (replacement, records)
+        assert replacement.error.code is ErrorCode.stale_event
+        assert admitted == Ok(value=(owner.owner_uuid,))
+        assert [(record.owner_uuid, record.desired_state, record.stage) for record in records] == [
+            (owner.owner_uuid, "removing", "removing"),
+        ]
+        assert display.created == [owner]
+        assert display.outputs == {owner.source.kscreen_output_id: owner.source.connector}
+        assert display.process.terminated == []
+        if scripted_create:
+            # Reject admission before consuming a scripted acquisition.
+            assert display.pending("create") == 1
+        assert await display.remove(owner.owner_uuid, context(generation=4)) == Ok(value=None)
+        # A fresh start is allowed after the confirmed cleanup.
+        assert isinstance(await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=5),
+        ), Ok)
+
+    run(scenario())
+
+
+def test_prepare_teardown_keeps_admission_closed_until_all_receiver_gates_finish():
+    async def scenario():
+        display = FakeDisplay()
+        receiver = target()
+        owner = (await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=1),
+        )).value
+        first_write, second_write = Deferred(), Deferred()
+        display.ownership.queue_result("write", first_write)
+        display.ownership.queue_result("write", second_write)
+        first = asyncio.ensure_future(display.prepare_teardown(
+            receiver.receiver_id, None, context(generation=2),
+        ))
+        await asyncio.sleep(0)
+        second = asyncio.ensure_future(display.prepare_teardown(
+            receiver.receiver_id, None, context(generation=3),
+        ))
+        await asyncio.sleep(0)
+        assert not first.done() and not second.done()
+        assert display.ownership.pending("write") == 0
+        first_write.resolve(Ok(value=None))
+        assert await first == Ok(value=(owner.owner_uuid,))
+        assert not second.done()
+        replacement = await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=4),
+        )
+        second_write.resolve(Ok(value=None))
+        assert await second == Ok(value=(owner.owner_uuid,))
+        assert isinstance(replacement, Err)
+        assert replacement.error.code is ErrorCode.stale_event
+        assert [(record.owner_uuid, record.desired_state)
+                for record in (await display.ownership.all()).value] == [
+            (owner.owner_uuid, "removing"),
+        ]
+        assert await display.remove(owner.owner_uuid, context(generation=5)) == Ok(value=None)
+        assert isinstance(await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=6),
+        ), Ok)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+def test_prepare_teardown_admission_gate_is_receiver_local_and_released_on_exit(outcome):
+    async def scenario():
+        display = FakeDisplay()
+        receiver, other = target("a"), target("b")
+        suspended = Deferred()
+        display.queue_result("prepare_teardown", suspended)
+        gate = asyncio.ensure_future(display.prepare_teardown(
+            receiver.receiver_id, None, context(generation=1),
+        ))
+        await asyncio.sleep(0)
+        assert not gate.done()
+        assert display.pending("prepare_teardown") == 0
+        other_result = await display.create(
+            other.receiver_id, other.endpoint_fingerprint, MONITOR, context(generation=2),
+        )
+        blocked = await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=3),
+        )
+        if outcome == "cancelled":
+            gate.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await gate
+            suspended.resolve(Ok(value=()))
+        else:
+            expected = Ok(value=()) if outcome == "success" else failure(ErrorCode.persistence_failed)
+            suspended.resolve(expected)
+            assert await gate == expected
+        assert isinstance(other_result, Ok)
+        assert isinstance(blocked, Err)
+        assert blocked.error.code is ErrorCode.stale_event
+        assert display.created == [other_result.value]
+        assert isinstance(await display.create(
+            receiver.receiver_id, receiver.endpoint_fingerprint, MONITOR, context(generation=4),
+        ), Ok)
+
+    run(scenario())
+
+
 def test_display_never_emits_an_undeclared_display_event_kind():
     from airplay_linux.testing.adapters import DISPLAY_EVENT_KINDS
 
