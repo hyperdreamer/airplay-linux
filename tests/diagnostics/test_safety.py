@@ -10,9 +10,10 @@ from __future__ import annotations
 import json
 import re
 import string
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
+from types import MappingProxyType
 from typing import Final
 
 import pytest
@@ -249,15 +250,17 @@ def test_diagnostic_keeps_the_receiver_identity():
     assert type(result.receiver_id) is str
 
 
-def test_diagnostic_normalizes_spoofed_receiver_identity():
+def test_diagnostic_rejects_a_spoofed_receiver_identity_without_reading_it():
+    # Only an exact ``str`` is an identity. A subclass is rejected rather than
+    # copied, so neither its data nor its rendering can become the retained
+    # correlation value.
     spoof = ReceiverId(RenderSpoof("airplay-device:001122334455"))
-    result = diagnostic(ErrorCode.transport_failed, spoof)
 
-    assert SMUGGLED not in result.message
-    assert type(result.receiver_id) is str
-    assert SMUGGLED not in result.receiver_id
-    assert SMUGGLED not in repr(result)
-    assert result.receiver_id == "airplay-device:001122334455"
+    with pytest.raises(TypeError) as caught:
+        diagnostic(ErrorCode.transport_failed, spoof)
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert str(caught.value) == "receiver_id must be a ReceiverId or None"
 
 
 def test_diagnostic_rejects_noncanonical_receiver_ids_without_retaining_them():
@@ -278,17 +281,28 @@ def test_a_diagnostic_receiver_id_is_preserved_exactly_when_canonical():
     assert CANARY_TEXT not in repr(result)
 
 
-def test_raising_class_string_subclasses_are_normalized_by_the_catalog():
-    result = diagnostic(
-        ErrorCode.dependency_missing,
-        ReceiverId(RaisingClassStr("airplay-device:abcdef0123456789")),
-        command=RaisingClassStr("doubletake"),
-    )
-
-    assert result.receiver_id == "airplay-device:abcdef0123456789"
-    assert "'doubletake'" in result.message
-    assert CANARY_TEXT not in result.message
-    assert CANARY_TEXT not in repr(result)
+def test_raising_class_string_subclasses_are_rejected_by_the_catalog():
+    # The advertised class is never consulted, so a raising ``__class__`` cannot
+    # decide anything here: the value is not an exact ``str`` and is rejected
+    # with fixed text that carries none of its own.
+    for invoke, expected_type in (
+        (
+            lambda: diagnostic(
+                ErrorCode.dependency_missing,
+                ReceiverId(RaisingClassStr("airplay-device:abcdef0123456789")),
+            ),
+            TypeError,
+        ),
+        (
+            lambda: diagnostic(
+                ErrorCode.dependency_missing, command=RaisingClassStr("doubletake")
+            ),
+            ValueError,
+        ),
+    ):
+        with pytest.raises(expected_type) as caught:
+            invoke()
+        assert_clean_boundary_error(caught.value, expected_type)
 
 
 def test_diagnostic_rejects_arbitrary_error_text():
@@ -523,20 +537,19 @@ def test_safe_activity_accepts_every_design_receiver_identity(identity):
 
 
 @pytest.mark.parametrize("identity", DESIGN_RECEIVER_IDS)
-def test_both_identity_boundaries_normalize_a_spoofed_value_of_every_form(identity):
-    # The grammar must be applied to the copied character data of every form, so
-    # a self-rendering subclass cannot approve itself by rendering a valid value.
+def test_both_identity_boundaries_reject_a_spoofed_value_of_every_form(identity):
+    # A subclass cannot approve itself by rendering a valid identity: the
+    # boundary accepts the exact ``str`` type only, for every design form.
     spoof = ReceiverId(RenderSpoof(identity))
 
-    result = diagnostic(ErrorCode.transport_failed, spoof)
-    event = safe_activity("session", spoof, {}, UTC)
-
-    for accepted in (result.receiver_id, event.receiver_id):
-        assert accepted == identity
-        assert type(accepted) is str
-        assert SMUGGLED not in accepted
-    assert SMUGGLED not in repr(result)
-    assert SMUGGLED not in repr(event)
+    for invoke in (
+        lambda: diagnostic(ErrorCode.transport_failed, spoof),
+        lambda: safe_activity("session", spoof, {}, UTC),
+    ):
+        with pytest.raises(TypeError) as caught:
+            invoke()
+        assert_clean_boundary_error(caught.value, TypeError)
+        assert str(caught.value) == "receiver_id must be a ReceiverId or None"
 
 
 @pytest.mark.parametrize("constructor", ["diagnostic", "safe_activity"])
@@ -979,18 +992,19 @@ def test_a_str_subclass_cannot_render_one_value_and_carry_another():
     assert CANARY_TEXT not in repr(caught.value)
 
 
-def test_a_str_subclass_with_legitimate_data_is_stored_as_plain_text():
+def test_a_str_subclass_with_legitimate_data_is_rejected_not_copied():
     class Quiet(str):
         def __str__(self) -> str:
             return SMUGGLED
 
-    event = safe_activity("session", None, {"phase": Quiet("Mirroring")}, UTC)
+    # Exact types only: carrying legitimate data does not make a subclass a
+    # diagnostics value, so nothing is copied, rendered, or stored from it.
+    with pytest.raises(ValueError) as caught:
+        safe_activity("session", None, {"phase": Quiet("Mirroring")}, UTC)
 
-    # The stored value is the exact built-in string whose data was validated.
-    assert event.fields == {"phase": "Mirroring"}
-    assert type(event.fields["phase"]) is str
-    assert SMUGGLED not in repr(event)
-    assert SMUGGLED not in repr(dict(event.fields))
+    assert_clean_boundary_error(caught.value, ValueError)
+    assert SMUGGLED not in str(caught.value)
+    assert SMUGGLED not in repr(caught.value)
 
 
 #: The canary every subclass below hides; no hook on it may reach any output.
@@ -1150,25 +1164,40 @@ SHAPED_SAMPLES: Final[tuple[tuple[str, str], ...]] = (
 )
 
 
-def test_raising_class_string_subclasses_are_copied_as_data_at_activity_boundaries():
+def test_raising_class_string_subclasses_are_rejected_at_activity_boundaries():
+    # The advertised class is never consulted. Each position an activity value
+    # can occupy therefore rejects a subclass with fixed text, whether the
+    # probe wraps the code, the identity, a field name, a field value or the
+    # timestamp, and none of them is copied into the event.
     receiver = ReceiverId(RaisingClassStr("airplay-device:001122334455"))
-    event = safe_activity(
-        RaisingClassStr("session"),
-        receiver,
-        {RaisingClassStr("phase"): RaisingClassStr("Mirroring")},
-        RaisingClassStr(UTC),
-    )
-
-    assert event.code == "session"
-    assert event.receiver_id == RECEIVER
-    assert event.fields == {"phase": "Mirroring"}
-    assert event.utc == UTC
-    assert all(type(value) is str for value in (event.code, event.receiver_id, event.utc))
-    log = ActivityLog()
-    log.emit(event)
-    assert CANARY_TEXT not in repr(event)
-    assert CANARY_TEXT not in repr(log.entries())
-    assert CANARY_TEXT not in log.export()
+    for invoke, expected_type in (
+        (
+            lambda: safe_activity(
+                RaisingClassStr("session"), None, {"phase": "Mirroring"}, UTC
+            ),
+            ValueError,
+        ),
+        (lambda: safe_activity("session", receiver, {}, UTC), TypeError),
+        (
+            lambda: safe_activity(
+                "session", None, {RaisingClassStr("phase"): "Mirroring"}, UTC
+            ),
+            ValueError,
+        ),
+        (
+            lambda: safe_activity(
+                "session", None, {"phase": RaisingClassStr("Mirroring")}, UTC
+            ),
+            ValueError,
+        ),
+        (
+            lambda: safe_activity("session", None, {}, RaisingClassStr(UTC)),
+            ValueError,
+        ),
+    ):
+        with pytest.raises(expected_type) as caught:
+            invoke()
+        assert_clean_boundary_error(caught.value, expected_type)
 
 
 def test_raising_class_hooks_are_rejected_with_fixed_errors_at_all_boundaries():
@@ -1253,7 +1282,7 @@ def test_a_self_rendering_phase_value_is_rejected_not_stored():
     # The finding's exact probe: the data is the canary, every check claims
     # 'Mirroring', and ``__str__`` returns ``self``.
     value = SpoofText("Mirroring")
-    assert value in _VOCABULARIES["phase"], "the probe must still satisfy membership"
+    assert value in _VOCABULARIES["phase"].permitted, "the probe must still satisfy membership"
 
     with pytest.raises(ValueError, match="value") as caught:
         safe_activity("session", None, {"phase": value}, UTC)
@@ -1314,19 +1343,21 @@ def test_a_spoofed_receiver_identity_cannot_render_the_canary():
 
 
 def test_a_utc_subclass_cannot_be_parsed_through_its_own_hooks():
-    # ``datetime.fromisoformat`` accepts ``str`` subclasses, so the timestamp is
-    # re-read from the value's data before parsing, never through its hooks.
+    # ``datetime.fromisoformat`` accepts ``str`` subclasses and may consult their
+    # hooks, so a subclass is never handed to it: the boundary requires the exact
+    # ``str`` type and rejects the probe before any parsing happens.
     spoof = RenderSpoof("2026-10-17T02:00:00+02:00")
 
-    event = safe_activity("session", None, {}, spoof)
+    with pytest.raises(ValueError) as caught:
+        safe_activity("session", None, {}, spoof)
 
-    assert event.utc == UTC
-    assert type(event.utc) is str
-    assert SMUGGLED not in repr(event)
+    assert_clean_boundary_error(caught.value, ValueError)
+    assert SMUGGLED not in str(caught.value)
 
 
 def test_a_capability_environment_subclass_cannot_render_the_canary():
-    # The export sanitizes this text the same way as an activity value.
+    # The export sanitizes this text the same way as an activity value, so a
+    # subclass is rejected rather than rendered into the document.
     log = ActivityLog(
         capabilities=CapabilityReport(
             environment=RenderSpoof("KDE Plasma 6 Wayland"),
@@ -1340,7 +1371,11 @@ def test_a_capability_environment_subclass_cannot_render_the_canary():
         ),
     )
 
-    assert SMUGGLED not in log.export()
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert SMUGGLED not in str(caught.value)
 
 
 @pytest.mark.parametrize(("name", "value"), FIELD_SAMPLES.items())
@@ -1606,22 +1641,16 @@ def test_unregistered_code_cannot_reach_the_log_or_export():
 
 
 def test_a_registered_code_that_renders_the_canary_cannot_leak_it():
-    # F-2: the code's own text is the registered 'session', so every check on
-    # the original object passes while ``__str__`` renders the canary, and the
-    # old lookup raised KeyError('raw-backend-canary-8496'). The code is now
-    # read as data and stored as that same primitive, so the fixed copy is used
-    # and no failure ever carries the rejected text.
-    event = safe_activity(RenderSpoof("session"), None, {}, UTC)
+    # F-2: the code's own data is the registered 'session', so every check that
+    # re-reads the object from the outside approves it while ``__str__`` renders
+    # the canary. Exact types only: the subclass is rejected before its data,
+    # its rendering, or its hooks are consulted, and no failure carries it.
+    with pytest.raises(ValueError, match="code") as caught:
+        safe_activity(RenderSpoof("session"), None, {}, UTC)
 
-    assert event.code == "session"
-    assert type(event.code) is str
-    assert event.message == safe_activity("session", None, {}, UTC).message
-    assert SMUGGLED not in repr(event)
-
-    log = ActivityLog()
-    log.emit(event)
-    for rendering in (repr(log.entries()), log.export()):
-        assert SMUGGLED not in rendering
+    assert_clean_boundary_error(caught.value, ValueError)
+    assert SMUGGLED not in str(caught.value)
+    assert SMUGGLED not in repr(caught.value)
 
 
 def test_a_code_with_spoofed_membership_cannot_reach_the_log_or_export():
@@ -1820,7 +1849,17 @@ def capability_report() -> CapabilityReport:
 @pytest.mark.parametrize("environment", [CANARY_TEXT, "raising-subclass"])
 def test_capability_environment_uses_a_fixed_unknown_fallback_for_unrecognized_text(environment):
     if environment == "raising-subclass":
-        environment = RaisingClassStr(CANARY_TEXT)
+        # A subclass is not an environment string at all, so the export rejects
+        # it with fixed text rather than reading it through its own hooks.
+        log = ActivityLog(
+            capabilities=replace(
+                capability_report(), environment=RaisingClassStr(CANARY_TEXT)
+            ),
+        )
+        with pytest.raises(TypeError) as caught:
+            log.export()
+        assert_clean_boundary_error(caught.value, TypeError)
+        return
     report = replace(capability_report(), environment=environment)
     log = ActivityLog(capabilities=report)
 
@@ -2082,3 +2121,408 @@ def test_activity_log_feeds_the_frozen_sink():
     sink.emit(event)
 
     assert sink.events == list(log.entries())
+
+
+# ------------------------------------------- hook-free normalization boundary
+
+#: The canary every hostile hook below raises or renders; it must never surface.
+HOOK_CANARY: Final[str] = "hook-canary-3821"
+
+
+class HookCounter:
+    """The shared instrument: every hostile hook below records into one of these.
+
+    The counter is owned by the test, not by any value it inspects, so a nonzero
+    count proves the diagnostics package ran caller code inside its boundary.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def hit(self, name: str) -> None:
+        self.calls.append(name)
+
+    def __len__(self) -> int:
+        return len(self.calls)
+
+
+class HookedMeta(type):
+    """A metaclass whose ``__mro__`` access is itself the leak."""
+
+    @property
+    def __mro__(cls) -> tuple[type, ...]:  # type: ignore[override]
+        _LIVE_COUNTER.hit("metaclass.__mro__")
+        raise BaseException(HOOK_CANARY)
+
+
+class MetaclassTrap(str, metaclass=HookedMeta):
+    """A ``str`` subclass whose own type cannot be described without that hook."""
+
+
+class HookedItemsDict(dict):
+    """A mapping subclass whose every container protocol raises and counts."""
+
+    def __init__(self, counter: HookCounter) -> None:
+        super().__init__({"phase": "Mirroring"})
+        self._counter = counter
+
+    def items(self):  # type: ignore[override]
+        self._counter.hit("dict.items")
+        raise BaseException(HOOK_CANARY)
+
+    def keys(self):  # type: ignore[override]
+        self._counter.hit("dict.keys")
+        raise BaseException(HOOK_CANARY)
+
+    def __iter__(self):  # type: ignore[override]
+        self._counter.hit("dict.__iter__")
+        raise BaseException(HOOK_CANARY)
+
+    def __getitem__(self, key):  # type: ignore[override]
+        self._counter.hit("dict.__getitem__")
+        raise BaseException(HOOK_CANARY)
+
+    def copy(self):  # type: ignore[override]
+        self._counter.hit("dict.copy")
+        raise BaseException(HOOK_CANARY)
+
+    def __len__(self) -> int:
+        self._counter.hit("dict.__len__")
+        raise BaseException(HOOK_CANARY)
+
+
+class HookedSelfStr(str):
+    """A ``str`` subclass that returns itself, spoofs equality, and counts."""
+
+    def __new__(cls, claim: str, counter: HookCounter) -> "HookedSelfStr":
+        instance = super().__new__(cls, HOOK_CANARY)
+        instance._claim = claim
+        instance._counter = counter
+        return instance
+
+    def __str__(self) -> str:
+        self._counter.hit("str.__str__")
+        return self
+
+    def __eq__(self, other: object) -> bool:
+        self._counter.hit("str.__eq__")
+        return True
+
+    def __hash__(self) -> int:
+        self._counter.hit("str.__hash__")
+        return hash(self._claim)
+
+    def __repr__(self) -> str:
+        self._counter.hit("str.__repr__")
+        return repr(HOOK_CANARY)
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        self._counter.hit("str.encode")
+        return HOOK_CANARY.encode()
+
+
+class HookedClassStr(str):
+    """A ``str`` subclass whose advertised class access raises and counts."""
+
+    def __new__(cls, counter: HookCounter) -> "HookedClassStr":
+        instance = super().__new__(cls, "Mirroring")
+        instance._counter = counter
+        return instance
+
+    @property
+    def __class__(self) -> type:  # type: ignore[override]
+        self._counter.hit("__class__")
+        raise BaseException(HOOK_CANARY)
+
+    def __str__(self) -> str:
+        self._counter.hit("str.__str__")
+        raise BaseException(HOOK_CANARY)
+
+    def __repr__(self) -> str:
+        self._counter.hit("str.__repr__")
+        raise BaseException(HOOK_CANARY)
+
+
+#: The counter the metaclass trap and shared helper report into. A probe always
+#: rebinds it just before use, so a stale binding cannot hide a leak.
+_LIVE_COUNTER: HookCounter = HookCounter()
+
+
+def hook_counter() -> HookCounter:
+    global _LIVE_COUNTER
+    _LIVE_COUNTER = HookCounter()
+    return _LIVE_COUNTER
+
+
+def forged_error_code() -> object:
+    """An exact-type ``ErrorCode`` nonmember, which compares like the member.
+
+    ``str.__new__`` builds an instance whose type *is* the enum, so a type check,
+    equality, hashing and dictionary lookup all accept it, while the enumeration
+    never registered it and ``is`` never matches it.
+    """
+    forged = str.__new__(ErrorCode, ErrorCode.transport_failed.value)
+    assert type(forged) is ErrorCode, "the probe must carry the exact enum type"
+    assert forged == ErrorCode.transport_failed, "the probe must compare equal"
+    assert hash(forged) == hash(ErrorCode.transport_failed), "the probe must hash equal"
+    assert forged is not ErrorCode.transport_failed, "the probe must not be the member"
+    return forged
+
+
+def hostile_probes(counter: HookCounter) -> tuple[tuple[str, object], ...]:
+    """One instance of every hostile shape the boundary must not inspect."""
+    return (
+        ("forged-enum", forged_error_code()),
+        ("hooked-dict", HookedItemsDict(counter)),
+        ("proxy-over-hooked-dict", MappingProxyType(HookedItemsDict(counter))),
+        ("metaclass-mro", MetaclassTrap("Mirroring")),
+        ("self-rendering-str", HookedSelfStr("Mirroring", counter)),
+        ("raising-class-str", HookedClassStr(counter)),
+    )
+
+
+#: Every public entry point a hostile value can cross, with the argument slot it
+#: occupies. The positive matrix below proves the same slots still accept the
+#: legitimate values the design allows.
+BOUNDARY_ENTRY_POINTS: Final[tuple[tuple[str, Callable[[object], object]], ...]] = (
+    ("safe_activity.code", lambda probe: safe_activity(probe, None, {}, UTC)),
+    ("safe_activity.receiver_id", lambda probe: safe_activity("session", probe, {}, UTC)),
+    ("safe_activity.fields", lambda probe: safe_activity("session", None, probe, UTC)),
+    ("safe_activity.utc", lambda probe: safe_activity("session", None, {}, probe)),
+    ("diagnostic.code", lambda probe: diagnostic(probe)),
+    ("diagnostic.receiver_id", lambda probe: diagnostic(ErrorCode.transport_failed, probe)),
+    (
+        "diagnostic.command",
+        lambda probe: diagnostic(ErrorCode.dependency_missing, command=probe),
+    ),
+    ("ActivityLog.emit", lambda probe: ActivityLog().emit(probe)),
+    ("ActivityLog.capabilities", lambda probe: ActivityLog(capabilities=probe)),
+    (
+        "ActivityLog.emit.fields",
+        lambda probe: ActivityLog().emit(event_with_fields(probe)),
+    ),
+)
+
+
+def event_with_fields(fields: object) -> ActivityEvent:
+    """A hand-built event whose ``fields`` really holds ``fields``.
+
+    ``ActivityEvent.__post_init__`` copies its mapping, and that copy is domain
+    code this lane cannot change, so the probe is installed afterwards. The
+    emission path is what is under test: it receives the hostile mapping exactly
+    as a caller could hand it one.
+    """
+    event = ActivityEvent(
+        utc=UTC, code="session", receiver_id=None, message="fixed copy", fields={},
+    )
+    object.__setattr__(event, "fields", fields)
+    return event
+
+
+def assert_scrubbed(failure: Exception, counter: HookCounter) -> None:
+    """The rejection is fixed, unhooked, and carries nothing the probe supplied."""
+    assert len(counter) == 0, f"caller hooks ran at the boundary: {counter.calls}"
+    assert type(failure) is ValueError or type(failure) is TypeError
+    assert HOOK_CANARY not in str(failure)
+    assert HOOK_CANARY not in repr(failure)
+    assert all(HOOK_CANARY not in repr(argument) for argument in failure.args)
+    assert failure.__cause__ is None, "the rejection must not chain its cause"
+    assert failure.__context__ is None, "the rejection must not chain its context"
+
+
+@pytest.mark.parametrize(
+    ("entry_point", "invoke"),
+    BOUNDARY_ENTRY_POINTS,
+    ids=[name for name, _ in BOUNDARY_ENTRY_POINTS],
+)
+@pytest.mark.parametrize(
+    "probe_name",
+    [name for name, _ in hostile_probes(HookCounter())],
+)
+def test_no_public_entry_point_runs_a_caller_hook(entry_point, invoke, probe_name):
+    # The point of one shared boundary: a class of defect is closed for every
+    # entry point at once instead of one instance at a time. The counter proves
+    # no caller hook ran. Either outcome is a pass -- a fixed rejection, or
+    # acceptance of a value the entry point never had to inspect -- but a
+    # rejection may not render the probe and an accepted value may not carry it.
+    counter = hook_counter()
+    probes = dict(hostile_probes(counter))
+    probe = probes[probe_name]
+
+    try:
+        result = invoke(probe)
+    except (ValueError, TypeError) as failure:
+        assert_scrubbed(failure, counter)
+        return
+
+    assert len(counter) == 0, f"caller hooks ran at {entry_point}: {counter.calls}"
+    assert HOOK_CANARY not in repr(result)
+
+
+def test_a_forged_exact_type_enum_nonmember_is_rejected_by_identity():
+    # Type and equality both accept the forgery, so only ``is`` against a
+    # captured member can reject it.
+    forged = forged_error_code()
+
+    with pytest.raises(TypeError) as caught:
+        diagnostic(forged)  # type: ignore[arg-type]
+
+    assert type(caught.value) is TypeError
+    assert str(caught.value) == (
+        "code must be an ErrorCode from the diagnostics catalog; "
+        "arbitrary error text is not a diagnostic"
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_forged_exact_type_enum_nonmember_cannot_reach_the_capability_export():
+    # The same forgery on the export path: the enum's captured text is what is
+    # exported, so a nonmember contributes no code at all.
+    forged = forged_error_code()
+    item = Diagnostic(code=forged, message="fixed copy", recovery=())  # type: ignore[arg-type]
+    log = ActivityLog(capabilities=replace(capability_report(), diagnostics=(item,)))
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
+
+
+def test_a_mapping_proxy_over_an_exact_dict_is_accepted():
+    # The positive half of the proxy rule: a proxy over an *exact* dict is a
+    # legitimate immutable mapping and must keep working.
+    fields = MappingProxyType({"phase": "Mirroring", "retry_seconds": 4})
+
+    event = safe_activity("session", None, fields, UTC)
+
+    assert event.fields == {"phase": "Mirroring", "retry_seconds": 4}
+    assert type(event.fields["phase"]) is str
+    assert type(event.fields["retry_seconds"]) is int
+
+
+def test_a_mapping_proxy_over_a_dict_subclass_is_rejected_before_its_hooks_run():
+    # A proxy hides the subclass from a plain type check, so the wrapped
+    # object's exact type is decided before anything is read from it. The counter
+    # proves the wrapped subclass's hooks never ran.
+    counter = hook_counter()
+    fields = MappingProxyType(HookedItemsDict(counter))
+
+    with pytest.raises(TypeError) as caught:
+        safe_activity("session", None, fields, UTC)  # type: ignore[arg-type]
+
+    assert_scrubbed(caught.value, counter)
+    assert str(caught.value) == "fields must be a mapping of allowlisted names to values"
+
+
+def test_a_metaclass_mro_hook_is_never_consulted():
+    # Reading ``__mro__`` through the type would run this metaclass property, so
+    # the boundary must decide on ``type(value)`` alone.
+    counter = hook_counter()
+    probe = MetaclassTrap("Mirroring")
+
+    for invoke in (
+        lambda: safe_activity("session", None, {"phase": probe}, UTC),
+        lambda: safe_activity(probe, None, {}, UTC),
+        lambda: diagnostic(ErrorCode.dependency_missing, command=probe),
+    ):
+        with pytest.raises((TypeError, ValueError)) as caught:
+            invoke()
+        assert_scrubbed(caught.value, counter)
+
+
+def test_ordinary_values_still_work_through_every_entry_point():
+    # The positive matrix: the boundary tightens what is rejected without
+    # narrowing what the design already allows.
+    assert safe_activity("session", RECEIVER, {}, UTC).receiver_id == RECEIVER
+    assert safe_activity("session", None, {"phase": "Mirroring"}, UTC).fields == {
+        "phase": "Mirroring"
+    }
+    assert safe_activity("session", None, {}, "2026-10-17T02:00:00+02:00").utc == UTC
+    assert diagnostic(ErrorCode.transport_failed, RECEIVER).receiver_id == RECEIVER
+    rendered = diagnostic(ErrorCode.dependency_missing, command="doubletake").message
+    assert "'doubletake'" in rendered
+
+    log = ActivityLog()
+    log.emit(safe_activity("session", None, {"retry_seconds": 4}, UTC))
+    assert len(log.entries()) == 1
+    assert json.loads(log.export())["counts"]["entries"] == 1
+
+
+@pytest.mark.parametrize("member", list(ErrorCode))
+def test_every_genuine_error_code_member_is_still_accepted_by_identity(member):
+    result = diagnostic(member)
+
+    assert result.code is member
+    assert result.message == ENTRIES[member].message
+
+
+def test_every_genuine_error_code_member_still_export_its_captured_text():
+    report = replace(
+        capability_report(),
+        diagnostics=tuple(
+            Diagnostic(code=member, message="fixed copy", recovery=()) for member in ErrorCode
+        ),
+    )
+
+    exported = json.loads(ActivityLog(capabilities=report).export())
+
+    assert exported["capabilities"]["diagnostic_codes"] == sorted(
+        member.value for member in ErrorCode
+    )
+
+
+def test_a_base_exception_from_trusted_state_becomes_a_fixed_rejection():
+    # The wrapper's own rule, on a path where the boundary does read a trusted
+    # domain record: a hostile subclass of that record raises ``BaseException``
+    # while its attributes are read, and the caller still receives a fresh
+    # rejection with no chaining and no caller text.
+    class ExplodingReport(CapabilityReport):
+        def __getattribute__(self, name: str) -> object:
+            if name == "diagnostics":
+                raise BaseException(HOOK_CANARY)
+            return object.__getattribute__(self, name)
+
+    report = ExplodingReport(
+        environment="KDE Plasma 6 Wayland",
+        discovery=True,
+        mirror=True,
+        virtual_display=False,
+        audio=True,
+        remembered_pairing=False,
+        additional_virtual_outputs=False,
+        diagnostics=(),
+    )
+    log = ActivityLog(capabilities=capability_report())
+    # A subclass is refused at construction, so the probe is installed afterwards
+    # to reach the export path with the hostile record a caller would supply.
+    object.__setattr__(log, "_capabilities", report)
+
+    with pytest.raises(ValueError) as caught:
+        log.export()
+
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == (
+        "the value could not be normalized at the diagnostics boundary"
+    )
+    assert HOOK_CANARY not in str(caught.value)
+    assert HOOK_CANARY not in repr(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_a_caller_base_exception_never_escapes_the_boundary():
+    # ``BaseException`` is not ``Exception``: an entry point that caught only
+    # ``Exception`` would let this probe's payload escape as itself.
+    class ExplodingFields(dict):
+        def items(self):
+            raise KeyboardInterrupt(HOOK_CANARY)
+
+    with pytest.raises(TypeError) as caught:
+        safe_activity("session", None, ExplodingFields(), UTC)  # type: ignore[arg-type]
+
+    assert type(caught.value) is TypeError
+    assert HOOK_CANARY not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None

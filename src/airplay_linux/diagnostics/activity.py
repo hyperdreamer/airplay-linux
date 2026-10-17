@@ -10,6 +10,10 @@ rejected instead of being escaped, truncated, or echoed back, so backend text
 and secret bytes have no shape they can wear. Each code is drawn from a closed
 vocabulary with fixed message copy, and hand-built events are re-validated on
 emission, so a caller cannot route backend text around :func:`safe_activity`.
+
+Nothing here inspects the type of a caller value: every value crosses
+:mod:`airplay_linux.diagnostics.boundary` once, which accepts exact built-in
+types only and never runs a hook of a caller-supplied object.
 """
 
 from __future__ import annotations
@@ -20,17 +24,10 @@ import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
-from enum import StrEnum
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
 
 from airplay_linux.domain.identity import ReceiverId
-from airplay_linux.domain.operations import (
-    OpaqueBackendToken,
-    OpaqueCredentialRef,
-    OpaqueProvisionalCredentialRef,
-    SensitiveText,
-)
 from airplay_linux.domain.records import ActivityEvent
 from airplay_linux.domain.resources import (
     AudioState,
@@ -43,7 +40,9 @@ from airplay_linux.domain.resources import (
     TrustState,
 )
 
-from .catalog import ALLOWED_COMMANDS, _validated_code, _validated_receiver_id
+from . import boundary
+from .boundary import Vocabulary
+from .catalog import ALLOWED_COMMANDS
 
 if TYPE_CHECKING:
     from airplay_linux.domain.ports import Subscription
@@ -81,44 +80,28 @@ _ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 #: Upper bound on the code token itself.
 MAX_CODE_LENGTH: Final[int] = 64
 
-
-def _text_data(value: object) -> str | None:
-    """Copy genuine string character data without consulting ``__class__``."""
-    if type(value) is str:
-        return value
-    try:
-        copied = str.encode(value, "utf-8", "surrogatepass")
-        text = copied.decode("utf-8", "surrogatepass")
-    except Exception:
-        return None
-    return text if type(text) is str else None
-
-
-def _has_type_in_mro(value: object, expected: type) -> bool:
-    """Inspect the actual type hierarchy without reading value.__class__."""
-    actual_type = type(value)
-    actual_mro = type.__getattribute__(actual_type, "__mro__")
-    return any(base is expected for base in actual_mro)
-
-
-def _enum_values(enum: type[StrEnum]) -> frozenset[str]:
-    """The frozen domain's own vocabulary for one resource-shaped field."""
-    return frozenset(member.value for member in enum)
-
+#: Fixed rejection text for a field name outside the allowlist.
+_FIELD_NAME_MESSAGE: Final[str] = (
+    "field is not allowlisted; secrets and backend payloads cannot enter activity"
+)
 
 #: Fields that accept only a closed vocabulary; the domain owns every value.
-_VOCABULARIES: Final[Mapping[str, frozenset[str]]] = MappingProxyType(
+#:
+#: Each vocabulary is captured once at import time, so a genuine enum member is
+#: recognized by identity, and neither equality nor hashing decides what counts
+#: as a member.
+_VOCABULARIES: Final[Mapping[str, Vocabulary]] = MappingProxyType(
     {
-        "phase": _enum_values(SessionPhase),
-        "transport": _enum_values(TransportState),
-        "display": _enum_values(DisplayState),
-        "audio": _enum_values(AudioState),
-        "trust": _enum_values(TrustState),
-        "error_code": _enum_values(ErrorCode),
-        "command_name": ALLOWED_COMMANDS,
+        "phase": boundary.captured_enum(SessionPhase),
+        "transport": boundary.captured_enum(TransportState),
+        "display": boundary.captured_enum(DisplayState),
+        "audio": boundary.captured_enum(AudioState),
+        "trust": boundary.captured_enum(TrustState),
+        "error_code": boundary.captured_enum(ErrorCode),
+        "command_name": boundary.captured_texts(ALLOWED_COMMANDS),
         # The reservation stages the design's atomic ownership protocol defines.
-        "reservation_stage": frozenset(
-            {"reserved", "helper_started", "output_observed", "published", "removing"},
+        "reservation_stage": boundary.captured_texts(
+            ("reserved", "helper_started", "output_observed", "published", "removing"),
         ),
     }
 )
@@ -150,12 +133,6 @@ _INTEGER_BOUNDS: Final[Mapping[str, tuple[int, int]]] = MappingProxyType(
 #: Fields that accept only a boolean, and never the integer ``0`` or ``1``.
 _BOOLEAN_FIELDS: Final[frozenset[str]] = frozenset({"explicit_video_only"})
 
-#: The fixed text of every code, captured from the frozen enum once, so an
-#: exported capability token is never re-read from a caller-supplied object.
-_ERROR_CODE_TEXT: Final[Mapping[ErrorCode, str]] = MappingProxyType(
-    {member: member.value for member in ErrorCode}
-)
-
 #: The declared value shape of every allowlisted field, derived from the same
 #: registries the enforcement reads, so the two cannot drift apart.
 FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
@@ -167,13 +144,6 @@ FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
         **{name: "integer" for name in _INTEGER_BOUNDS},
         **{name: "boolean" for name in _BOOLEAN_FIELDS},
     }
-)
-
-PRIVATE_VALUE_TYPES: Final[tuple[type, ...]] = (
-    SensitiveText,
-    OpaqueCredentialRef,
-    OpaqueProvisionalCredentialRef,
-    OpaqueBackendToken,
 )
 
 EXPORT_SCHEMA: Final[str] = "airplay-linux-diagnostics/1"
@@ -235,23 +205,26 @@ ACTIVITY_CODES: Final[frozenset[str]] = frozenset(_MESSAGES)
 
 def _reject_code(code: object) -> str:
     """Validate the code token, then require it to be a known code."""
-    text = _text_data(code)
-    if text is None or not text:
-        raise ValueError(
+    text = boundary.exact_text(
+        code,
+        message="code must be a non-empty lowercase token such as 'pairing.completed'",
+    )
+    if not text:
+        raise boundary.rejection(
             "code must be a non-empty lowercase token such as 'pairing.completed'",
         )
     if len(text) > MAX_CODE_LENGTH:
-        raise ValueError("code must be a bounded token of at most 64 characters")
+        raise boundary.rejection("code must be a bounded token of at most 64 characters")
     if not (text[0].isalpha() and text[0].islower()):
-        raise ValueError("code must start with a lowercase letter")
+        raise boundary.rejection("code must start with a lowercase letter")
     if not all(char.islower() or char.isdigit() or char in "._-" for char in text):
-        raise ValueError(
+        raise boundary.rejection(
             "code may contain only lowercase letters, digits, '.', '_' and '-'",
         )
     if text not in ACTIVITY_CODES:
         # A token-shaped string can still be backend text, so membership, not
         # shape, decides what a code is; the rejected value is never echoed.
-        raise ValueError("code must be one of the registered activity codes")
+        raise boundary.rejection("code must be one of the registered activity codes")
     # The exact string that was checked is the string that is stored: the code
     # cannot render, compare or hash as anything else afterwards.
     return text
@@ -259,42 +232,34 @@ def _reject_code(code: object) -> str:
 
 def _reject_utc(utc: object) -> str:
     """Require an absolute timestamp and normalize it to canonical UTC."""
-    text = _text_data(utc)
-    if text is None:
-        raise ValueError("utc must be an absolute ISO-8601 timestamp with an offset")
+    text = boundary.exact_text(
+        utc,
+        message="utc must be an absolute ISO-8601 timestamp with an offset",
+    )
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
         parsed = None
     if parsed is None:
-        raise ValueError(
+        raise boundary.rejection(
             "utc must be an absolute ISO-8601 timestamp with an offset",
         )
     if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError("utc must carry an explicit UTC offset")
+        raise boundary.rejection("utc must carry an explicit UTC offset")
     try:
         normalized = parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         normalized = None
     if normalized is None:
-        raise ValueError("utc could not be normalized to canonical UTC")
+        raise boundary.rejection("utc could not be normalized to canonical UTC")
     return normalized
-
-
-def _reject_receiver(receiver_id: object) -> ReceiverId | None:
-    """Validate a design-defined receiver identity without retaining payloads.
-
-    The catalog's validator is the only identity grammar in the package, so the
-    activity channel and the diagnostic catalog accept exactly the same forms.
-    """
-    return _validated_receiver_id(receiver_id)
 
 
 def _escape(text: str) -> str:
     """Render control and format characters as visible escapes, never raw.
 
-    ``text`` is the exact built-in string :func:`_text_data` returned, so the
-    characters rendered here are the characters that were validated.
+    ``text`` is an exact built-in string :func:`boundary.exact_text` returned,
+    so the characters rendered here are the characters that were validated.
     """
     pieces: list[str] = []
     for char in text:
@@ -331,18 +296,19 @@ def _reject_value(name: str, value: object) -> str | int | bool:
     accepts one closed vocabulary or one strict token form, so a secret or a
     backend message has no shape it can wear. Nothing is echoed on rejection.
     """
-    if any(_has_type_in_mro(value, private_type) for private_type in PRIVATE_VALUE_TYPES):
-        raise ValueError(
+    if boundary.is_private_value(value):
+        raise boundary.rejection(
             f"value for field {name!r} is a transient private value and cannot be recorded",
         )
     vocabulary = _VOCABULARIES.get(name)
     if vocabulary is not None:
-        text = _text_data(value)
-        if text is None or text not in vocabulary:
-            raise ValueError(
-                f"value for field {name!r} must be one of the values this field enumerates",
-            )
-        return text
+        return boundary.vocabulary_text(
+            value,
+            vocabulary,
+            message=(
+                f"value for field {name!r} must be one of the values this field enumerates"
+            ),
+        )
     if name == "connector":
         return _identifier(name, value, _CONNECTOR)
     if name == "output_id":
@@ -352,44 +318,47 @@ def _reject_value(name: str, value: object) -> str | int | bool:
     bounds = _INTEGER_BOUNDS.get(name)
     if bounds is not None:
         low, high = bounds
-        if type(value) is not int:
-            raise ValueError(
-                f"value for field {name!r} must be a whole number between {low} and {high}",
-            )
-        if not low <= value <= high:
-            raise ValueError(
-                f"value for field {name!r} must be a whole number between {low} and {high}",
-            )
-        return value
+        return boundary.exact_bounded_int(
+            value,
+            low=low,
+            high=high,
+            message=(
+                f"value for field {name!r} must be a whole number between {low} and {high}"
+            ),
+        )
     if name in _BOOLEAN_FIELDS:
-        if type(value) is not bool:
-            raise ValueError(f"value for field {name!r} must be a boolean")
-        return value
+        # A boolean field accepts the exact ``bool`` type only, never the
+        # integers ``0`` and ``1``, which are a different type.
+        return boundary.exact_only(
+            value,
+            bool,
+            kind=ValueError,
+            message=f"value for field {name!r} must be a boolean",
+        )  # type: ignore[return-value]
     # Unreachable while ``FIELD_SHAPES`` covers every allowlisted field name;
     # the guard exists so a newly allowlisted field cannot inherit a passthrough.
-    raise ValueError(f"field {name!r} declares no value shape and cannot be recorded")
+    raise boundary.rejection(f"field {name!r} declares no value shape and cannot be recorded")
 
 
 def _identifier(name: str, value: object, pattern: re.Pattern[str]) -> str:
     """Accept only text matching the field's token shape, then escape and bound."""
-    text = _text_data(value)
-    if text is None or pattern.fullmatch(text) is None:
-        raise ValueError(
-            f"value for field {name!r} must be a {FIELD_SHAPES[name]} identifier",
-        )
+    message = f"value for field {name!r} must be a {FIELD_SHAPES[name]} identifier"
+    text = boundary.exact_text(value, message=message)
+    if pattern.fullmatch(text) is None:
+        raise boundary.rejection(message)
     return _bounded(_escape(text))
 
 
 def _resolution(value: object) -> str:
     """Accept only ``WIDTHxHEIGHT`` inside the domain ``Size`` bounds."""
-    text = _text_data(value)
-    match = _RESOLUTION.fullmatch(text) if text is not None else None
+    message = "value for field 'resolution' must be written as WIDTHxHEIGHT"
+    match = _RESOLUTION.fullmatch(boundary.exact_text(value, message=message))
     if match is None:
-        raise ValueError("value for field 'resolution' must be written as WIDTHxHEIGHT")
+        raise boundary.rejection(message)
     width, height = (int(edge) for edge in match.groups())
     for edge in (width, height):
         if not 1 <= edge <= MAX_RESOLUTION_EDGE:
-            raise ValueError(
+            raise boundary.rejection(
                 "value for field 'resolution' must be between 1 and "
                 f"{MAX_RESOLUTION_EDGE} on each edge",
             )
@@ -398,46 +367,15 @@ def _resolution(value: object) -> str:
 
 
 def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
-    # Do not dispatch through a caller-supplied ``items`` attribute.  Exact
-    # built-in containers are the only sources whose descriptors can be trusted
-    # at this boundary; subclasses and arbitrary Mapping implementations may
-    # execute caller code before validation even begins.
-    if type(fields) is dict:
-        raw_items = dict.items(fields)
-    elif type(fields) is MappingProxyType:
-        raw_items = MappingProxyType.items(fields)
-    else:
-        raise TypeError("fields must be a mapping of allowlisted names to values")
-    try:
-        items = iter(raw_items)
-    except Exception:
-        items = None
-    if items is None:
-        raise TypeError("fields must be a mapping of allowlisted names to values")
-
+    # The boundary decides the container's exact type before anything is read
+    # from it, so a mapping subclass cannot run its ``items``, ``keys`` or
+    # iteration hooks inside the diagnostics package.
     clean: dict[str, str | int | bool] = {}
-    iteration_failed = False
-    while True:
-        try:
-            item = next(items)
-        except StopIteration:
-            break
-        except Exception:
-            iteration_failed = True
-            break
-        try:
-            raw_name, value = item
-        except Exception:
-            iteration_failed = True
-            break
-        name = _text_data(raw_name)
-        if name is None or name not in ALLOWED_FIELDS:
-            raise ValueError(
-                "field is not allowlisted; secrets and backend payloads cannot enter activity",
-            )
+    for raw_name, value in boundary.exact_mapping_items(fields):
+        name = boundary.exact_text(raw_name, message=_FIELD_NAME_MESSAGE)
+        if name not in ALLOWED_FIELDS:
+            raise boundary.rejection(_FIELD_NAME_MESSAGE)
         clean[name] = _reject_value(name, value)
-    if iteration_failed:
-        raise ValueError("fields could not be normalized")
     return MappingProxyType(clean)
 
 
@@ -450,6 +388,7 @@ def _message_for(code: str) -> str:
     return _MESSAGES.get(code) or _MESSAGES["session"]
 
 
+@boundary.rejecting
 def safe_activity(
     code: str,
     receiver_id: ReceiverId | None,
@@ -459,7 +398,7 @@ def safe_activity(
     """Build one activity event from sanitized DTO values only."""
     token = _reject_code(code)
     stamp = _reject_utc(utc)
-    receiver = _reject_receiver(receiver_id)
+    receiver = boundary.exact_receiver_id(receiver_id)
     clean = _validate_fields(fields)
     return ActivityEvent(
         utc=stamp,
@@ -480,25 +419,32 @@ def _capability_codes(diagnostics: object) -> list[str]:
     hook raises, advertises a borrowed ``__class__``, or carries backend text is
     never consulted, and the exported strings are the frozen vocabulary's own.
     """
-    if type(diagnostics) is not tuple:
-        raise TypeError(
-            "capability diagnostics must be an immutable tuple of diagnostics",
-        )
+    diagnostics = boundary.exact_only(
+        diagnostics,
+        tuple,
+        message="capability diagnostics must be an immutable tuple of diagnostics",
+    )
     codes: set[str] = set()
-    for item in diagnostics:
-        if type(item) is not Diagnostic:
-            raise TypeError(
+    for item in diagnostics:  # type: ignore[attr-defined]
+        item = boundary.exact_only(
+            item,
+            Diagnostic,
+            message=(
                 "capability diagnostics must be domain Diagnostic records; "
-                "arbitrary objects are not capability evidence",
-            )
-        text = _ERROR_CODE_TEXT.get(_validated_code(item.code))
-        if text is None:
-            # Unreachable while every member has a registered code; the guard
-            # keeps an unrecognized member from inventing its own text.
-            raise TypeError(
-                "capability diagnostics must carry a registered error code",
-            )
-        codes.add(text)
+                "arbitrary objects are not capability evidence"
+            ),
+        )
+        code = boundary.genuine_error_code(item.code)  # type: ignore[attr-defined]
+        # The code is a captured genuine member, so its text comes from the
+        # frozen vocabulary rather than from anything the caller holds.
+        codes.add(
+            boundary.vocabulary_text(
+                code,
+                boundary.ERROR_CODE_VOCABULARY,
+                kind=TypeError,
+                message="capability diagnostics must carry a registered error code",
+            ),
+        )
     return sorted(codes)
 
 
@@ -529,18 +475,26 @@ class _Subscription:
 class ActivityLog:
     """A bounded, ordered activity log plus a stable, secret-free export."""
 
+    @boundary.rejecting
     def __init__(
         self,
         max_entries: int = 1000,
         *,
         capabilities: CapabilityReport | None = None,
     ) -> None:
-        if type(max_entries) is not int:
-            raise TypeError("max_entries must be an integer")
-        if max_entries < 1:
-            raise ValueError("max_entries must be at least 1")
-        if capabilities is not None and type(capabilities) is not CapabilityReport:
-            raise TypeError("capabilities must be a CapabilityReport or None")
+        max_entries = boundary.exact_only(
+            max_entries,
+            int,
+            message="max_entries must be an integer",
+        )
+        if max_entries < 1:  # type: ignore[operator]
+            raise boundary.rejection("max_entries must be at least 1")
+        if capabilities is not None:
+            capabilities = boundary.exact_only(
+                capabilities,
+                CapabilityReport,
+                message="capabilities must be a CapabilityReport or None",
+            )
         self._max_entries = max_entries
         self._capabilities = capabilities
         self._entries: deque[ActivityEvent] = deque(maxlen=max_entries)
@@ -548,11 +502,15 @@ class ActivityLog:
 
     # -- writing ------------------------------------------------------------
 
+    @boundary.rejecting
     def emit(self, event: ActivityEvent) -> None:
         """Record one sanitized event and notify current subscribers."""
-        if type(event) is not ActivityEvent:
-            raise TypeError("only a domain ActivityEvent can be emitted")
-        sanitized = _sanitize_event(event)
+        event = boundary.exact_only(
+            event,
+            ActivityEvent,
+            message="only a domain ActivityEvent can be emitted",
+        )
+        sanitized = _sanitize_event(event)  # type: ignore[arg-type]
         self._entries.append(sanitized)
         for callback in tuple(self._subscribers):
             try:
@@ -561,10 +519,11 @@ class ActivityLog:
                 # A broken presenter must not lose the durable activity record.
                 continue
 
+    @boundary.rejecting
     def subscribe(self, callback: Callable[[ActivityEvent], None]) -> Subscription:
         """Attach a presenter; the returned handle removes exactly this callback."""
         if not callable(callback):
-            raise TypeError("callback must be callable")
+            raise boundary.type_rejection("callback must be callable")
         self._subscribers.append(callback)
 
         def unsubscribe() -> None:
@@ -581,6 +540,7 @@ class ActivityLog:
     def __len__(self) -> int:
         return len(self._entries)
 
+    @boundary.rejecting
     def export(self) -> str:
         """Serialize counts, capabilities, and safe activity, and nothing else."""
         by_code: dict[str, int] = {}
@@ -611,9 +571,11 @@ class ActivityLog:
         report = self._capabilities
         if report is None:
             return None
-        environment = _text_data(report.environment)
-        if environment is None:
-            raise TypeError("capabilities environment must be a string")
+        environment = boundary.exact_text(
+            report.environment,
+            kind=TypeError,
+            message="capabilities environment must be a string",
+        )
         flags: dict[str, bool] = {}
         for name in (
             "discovery",
@@ -623,10 +585,11 @@ class ActivityLog:
             "remembered_pairing",
             "additional_virtual_outputs",
         ):
-            value = getattr(report, name)
-            if type(value) is not bool:
-                raise TypeError("capability flags must be booleans")
-            flags[name] = value
+            flags[name] = boundary.exact_only(  # type: ignore[assignment]
+                getattr(report, name),
+                bool,
+                message="capability flags must be booleans",
+            )
         capabilities: dict[str, object] = {
             "environment": (
                 environment if environment in _SAFE_ENVIRONMENTS else _UNKNOWN_ENVIRONMENT

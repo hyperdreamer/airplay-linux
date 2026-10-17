@@ -9,7 +9,6 @@ that this code has a way forward.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -18,44 +17,15 @@ from typing import Final
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.resources import Diagnostic, ErrorCode, RecoveryAction
 
+from . import boundary
+
 #: Executable names the environment check may report; nothing else is echoed.
-ALLOWED_COMMANDS: Final[frozenset[str]] = frozenset(
-    {
-        "doubletake",
-        "doubletake-ctl",
-        "kscreen-doctor",
-        "krfb-virtualmonitor",
-    }
-)
+#:
+#: The names are the boundary's captured command vocabulary, so the catalog and
+#: the activity channel decide membership against one frozen set.
+ALLOWED_COMMANDS: Final[frozenset[str]] = boundary.COMMAND_VOCABULARY.permitted
 
 MAX_MESSAGE_LENGTH: Final[int] = 240
-
-#: A lowercase ``sha256`` digest, which is the whole payload of every
-#: hash-derived receiver identity the approved design defines.
-_SHA256_DIGEST: Final[str] = r"[0-9a-f]{64}"
-
-#: One grammar per design-defined receiver identity prefix, and no others.
-#:
-#: The design derives an identity from either a normalized device identifier or
-#: a ``sha256`` digest of the discovery evidence, so a diagnostics boundary has
-#: to accept exactly those four forms to be able to record what discovery emits.
-_RECEIVER_ID_BODY: Final[Mapping[str, str]] = MappingProxyType(
-    {
-        "airplay-device": (
-            r"(?:[0-9a-f]{1,64}|"
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
-        ),
-        "airplay-fingerprint": _SHA256_DIGEST,
-        "airplay-endpoint": _SHA256_DIGEST,
-        "airplay-ambiguous": _SHA256_DIGEST,
-    }
-)
-
-#: The four forms as one expression; each alternative is whole-string anchored
-#: by :func:`re.fullmatch`, so no prefix can borrow another's payload.
-_RECEIVER_ID: Final[re.Pattern[str]] = re.compile(
-    "|".join(f"{prefix}:{body}" for prefix, body in _RECEIVER_ID_BODY.items()),
-)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -292,73 +262,22 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
 )
 
 
-def _text_data(value: object) -> str | None:
-    """Copy genuine string character data without consulting ``__class__``."""
-    if type(value) is str:
-        return value
-    try:
-        copied = str.encode(value, "utf-8", "surrogatepass")
-        text = copied.decode("utf-8", "surrogatepass")
-    except Exception:
-        return None
-    return text if type(text) is str else None
-
-
 def _validated_receiver_id(receiver_id: object) -> ReceiverId | None:
-    """Accept exactly the design-defined identity forms used for correlation.
-
-    This is the single grammar both constructors share, so the catalog and the
-    activity channel cannot drift apart on what a receiver identity is. The
-    value's character data is copied first and matched as a whole string, so a
-    ``str`` subclass cannot approve itself by rendering a valid form.
-    """
-    if receiver_id is None:
-        return None
-    text = _text_data(receiver_id)
-    if text is None:
-        raise TypeError("receiver_id must be a ReceiverId or None")
-    if _RECEIVER_ID.fullmatch(text) is None:
-        raise ValueError("receiver_id must be a canonical public receiver identity")
-    return ReceiverId(text)
+    """The boundary's single identity grammar, shared with the activity channel."""
+    return boundary.exact_receiver_id(receiver_id)
 
 
-def _validated_command(command: str | None) -> str | None:
-    """Accept only an allowlisted executable name; never echo the argument.
-
-    The name is interpolated into user-visible copy, so a ``str`` subclass may
-    not decide what is checked and what is rendered. Its character data is
-    copied to an exact built-in string first, membership is decided on that
-    primitive, and that same primitive is what the caller formats.
-    """
-    if command is None:
-        return None
-    text = _text_data(command)
-    if text is None or text not in ALLOWED_COMMANDS:
-        raise ValueError(
-            "command must be one of the allowlisted executable names; "
-            "arbitrary backend text is not a diagnostic",
-        )
-    return text
+def _validated_command(command: object) -> str | None:
+    """An allowlisted executable name, or ``None``; the argument is never echoed."""
+    return boundary.exact_command(command)
 
 
 def _validated_code(code: object) -> ErrorCode:
-    """The genuine enum member for ``code``, or a fixed rejection.
-
-    ``isinstance`` is not proof of an enum member: a class can advertise
-    ``__class__`` as :class:`ErrorCode`, so a look-alike ``str`` passes the type
-    test while it really renders, compares, and hashes whatever it likes. Only
-    the exact enum type may reach the catalog lookup and the returned
-    :class:`Diagnostic`; anything else is rejected with fixed text, so no
-    catalog ``KeyError`` ever renders the argument.
-    """
-    if type(code) is not ErrorCode:
-        raise TypeError(
-            "code must be an ErrorCode from the diagnostics catalog; "
-            "arbitrary error text is not a diagnostic",
-        )
-    return code
+    """The genuine enum member for ``code``, or a fixed rejection."""
+    return boundary.genuine_error_code(code)
 
 
+@boundary.rejecting
 def diagnostic(
     code: ErrorCode,
     receiver_id: ReceiverId | None = None,
