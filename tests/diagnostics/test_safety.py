@@ -1777,6 +1777,76 @@ def test_failing_subscriber_does_not_block_the_log():
     assert CANARY not in log.export()
 
 
+@pytest.mark.parametrize(
+    "exposure",
+    ["subscriber-during-emit", "subscriber-after-emit", "entries"],
+)
+@pytest.mark.parametrize(
+    ("attribute", "payload"),
+    [
+        ("message", CANARY_TEXT),
+        ("receiver_id", ReceiverId(CANARY_TEXT)),
+        ("fields", {"phase": CANARY_TEXT}),
+    ],
+)
+def test_external_event_mutation_cannot_poison_retained_activity(exposure, attribute, payload):
+    # F-18: frozen records still allow object.__setattr__. Neither delivery nor
+    # reading may give caller code the record the log owns, and each subscriber
+    # needs its own record so one presenter cannot poison another's event.
+    expected = ActivityEvent(
+        utc=UTC,
+        code="session.active",
+        receiver_id=RECEIVER,
+        message="Session is active.",
+        fields={"phase": "Mirroring"},
+    )
+    log = ActivityLog(max_entries=2)
+    delivered: list[ActivityEvent] = []
+    observed: list[ActivityEvent] = []
+    counts_at_notification: list[int] = []
+
+    def receive(event: ActivityEvent) -> None:
+        delivered.append(event)
+        counts_at_notification.append(len(log))
+        if exposure == "subscriber-during-emit":
+            object.__setattr__(event, attribute, payload)
+
+    log.subscribe(receive)
+    log.subscribe(observed.append)
+    original = safe_activity("session.active", RECEIVER, {"phase": "Mirroring"}, UTC)
+    log.emit(original)
+
+    exposed = log.entries()[0] if exposure == "entries" else delivered[0]
+    if exposure != "subscriber-during-emit":
+        object.__setattr__(exposed, attribute, payload)
+    assert getattr(exposed, attribute) == payload, "the mutation must actually occur"
+
+    # Inspect retained state first: normalizing only on reads cannot pass this.
+    assert tuple(log._entries) == (expected,)
+    assert log.entries() == (expected,)
+    assert original == expected
+    assert observed == [expected]
+    assert counts_at_notification == [1], "retain before notifying subscribers"
+    assert len(log) == 1
+    exported = log.export()
+    assert json.loads(exported) == {
+        "schema": "airplay-linux-diagnostics/1",
+        "counts": {"entries": 1, "capacity": 2, "by_code": {"session.active": 1}},
+        "capabilities": None,
+        "activity": [
+            {
+                "utc": UTC,
+                "code": "session.active",
+                "receiver_id": RECEIVER,
+                "message": "Session is active.",
+                "fields": {"phase": "Mirroring"},
+            },
+        ],
+    }
+    for view in (repr(log._entries), repr(log.entries()), repr(observed), exported):
+        assert CANARY_TEXT not in view
+
+
 def test_subscribe_requires_a_callable():
     with pytest.raises(TypeError, match="callback"):
         ActivityLog().subscribe("not-callable")  # type: ignore[arg-type]

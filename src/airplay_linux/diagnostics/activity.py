@@ -23,6 +23,7 @@ import re
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Final
@@ -512,7 +513,7 @@ class ActivityLog:
 
     @boundary.rejecting
     def emit(self, event: ActivityEvent) -> None:
-        """Record one sanitized event and notify current subscribers."""
+        """Retain a private event and notify subscribers with independent copies."""
         event = boundary.exact_only(
             event,
             ActivityEvent,
@@ -522,7 +523,10 @@ class ActivityLog:
         self._entries.append(sanitized)
         for callback in tuple(self._subscribers):
             try:
-                callback(sanitized)
+                # The domain constructor also copies the immutable field map.
+                # A presenter can mutate its record without reaching ours or
+                # another presenter's copy, even through object.__setattr__.
+                callback(replace(sanitized))
             except Exception:
                 # A broken presenter must not lose the durable activity record.
                 continue
@@ -550,7 +554,8 @@ class ActivityLog:
     # -- reading ------------------------------------------------------------
 
     def entries(self) -> tuple[ActivityEvent, ...]:
-        return tuple(self._entries)
+        """Return independent event snapshots in arrival order."""
+        return tuple(replace(event) for event in self._entries)
 
     def __len__(self) -> int:
         return len(self._entries)
