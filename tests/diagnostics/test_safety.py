@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import re
+import string
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Final
 
 import pytest
@@ -17,6 +19,7 @@ import pytest
 from airplay_linux.diagnostics import (
     ACTIVITY_CODES,
     ALLOWED_COMMANDS,
+    ENTRIES,
     ActivityLog,
     diagnostic,
     safe_activity,
@@ -138,13 +141,85 @@ def test_every_error_code_has_a_helpful_catalog_diagnostic(code):
     assert all(isinstance(action, RecoveryAction) for action in result.recovery)
 
 
+#: Non-``str.format`` placeholder syntax a fixed message must never carry: printf
+#: verbs, ``<name>`` slots and ``${...}`` interpolation. Braces are checked
+#: structurally below, with :mod:`string`'s own parser.
+_FOREIGN_PLACEHOLDER: Final[re.Pattern[str]] = re.compile(
+    r"%[-+ #0]*[0-9]*(?:\.[0-9]+)?[sdrifXxeEgG]|<[A-Za-z_][A-Za-z0-9_ .-]{0,40}>|\$\{[^{}]*\}",
+)
+
+
+def replacement_fields(template: str) -> tuple[str, ...]:
+    """The named or positioned fields ``str.format`` would substitute."""
+    return tuple(
+        field for _, field, _, _ in string.Formatter().parse(template) if field is not None
+    )
+
+
 def test_catalog_messages_are_distinct_and_fully_rendered():
     messages = [diagnostic(code).message for code in ErrorCode]
 
     assert len(set(messages)) == len(messages), "each code needs its own message"
-    for message in messages:
-        assert "{" not in message and "}" not in message
+    for code, message in zip(ErrorCode, messages, strict=True):
+        assert message.strip(), f"{code} needs non-empty copy"
+        assert message == message.strip(), f"{code} must be rendered, not padded"
+        assert message.isprintable(), f"{code} must carry no control characters"
         assert len(message) <= 240
+        # A rendered message is the entry's own fixed literal: no placeholder
+        # survived rendering, and nothing was substituted into it.
+        assert message == ENTRIES[code].message
+        assert replacement_fields(message) == ()
+        assert _FOREIGN_PLACEHOLDER.search(message) is None, (
+            f"{code} still contains placeholder syntax: {message!r}"
+        )
+
+
+def test_every_catalog_template_declares_only_its_own_fields():
+    # ``diagnostic`` substitutes exactly one value, the allowlisted command name,
+    # and only where an entry declares that field. Any other field name would be
+    # a template slot with no provider, and any unnamed slot a silent echo.
+    for code, entry in ENTRIES.items():
+        fields = replacement_fields(entry.message)
+        assert fields == (), f"{code} interpolates into its fixed message copy: {fields}"
+        if entry.command_message is not None:
+            assert replacement_fields(entry.command_message) == ("command",), (
+                f"{code} must interpolate the command name and nothing else"
+            )
+
+
+def test_no_catalog_message_interpolates_a_caller_supplied_value():
+    # ``diagnostic`` accepts exactly two optional values, a receiver identity and
+    # a command name; the catalog has no other input. Fixed copy therefore means
+    # the message is byte-identical whichever legal argument is supplied, which is
+    # the whole of "no interpolated input value". Only ``dependency_missing``
+    # renders a command, and only after the allowlist check.
+    commanded = {code for code, entry in ENTRIES.items() if entry.command_message is not None}
+
+    for code in ErrorCode:
+        base = diagnostic(code).message
+        for receiver in (None, RECEIVER, ReceiverId(CANARY_TEXT), ReceiverId("x" * 500)):
+            assert diagnostic(code, receiver).message == base, (
+                f"{code} must not interpolate the receiver identity"
+            )
+        if code in commanded:
+            continue
+        for command in sorted(ALLOWED_COMMANDS):
+            assert diagnostic(code, command=command).message == base, (
+                f"{code} must not interpolate a command name it does not name"
+            )
+
+    entry = ENTRIES[ErrorCode.dependency_missing]
+    assert entry.command_message is not None, "the command entry must keep its message"
+    for command in sorted(ALLOWED_COMMANDS):
+        rendered = diagnostic(ErrorCode.dependency_missing, command=command).message
+        assert rendered == entry.command_message.format(command=command)
+        assert f"'{command}'" in rendered
+        assert replacement_fields(rendered) == ()
+        assert _FOREIGN_PLACEHOLDER.search(rendered) is None
+        assert CANARY_TEXT not in rendered
+
+    with pytest.raises(ValueError, match="command"):
+        diagnostic(ErrorCode.dependency_missing, command=CANARY_TEXT)
 
 
 def test_diagnostic_keeps_the_receiver_identity():
@@ -230,54 +305,107 @@ def test_ownership_mismatch_never_offers_automatic_removal():
 
 # ------------------------------------------------- design action matrix
 
-#: The design's normative "Allowed primary actions" text, quoted from the UI state
-#: matrix rows that name an :class:`ErrorCode` (design:110-128). Rows that no code
-#: represents (Available, Offline, Pairing, Resolution required, Creating output,
-#: Connecting, Mirroring, Virtual display, Reconfiguring) are absent on purpose.
-#: ``unsupported_source`` is absent too: design:64/534 require surfacing the
-#: unsupported descriptor so the user picks another source, which is the ``back``
-#: action of its own catalog entry, not a matrix row.
-DESIGN_ROWS: tuple[tuple[str, tuple[ErrorCode, ...], tuple[str, ...]], ...] = (
+#: The approved design that owns the normative action table. This lane reads it
+#: and never edits it. The expected labels are *read from the document* rather
+#: than quoted into the test, so a hand-copied row cannot drift from the design
+#: and still agree with itself.
+DESIGN_PATH: Final[Path] = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-10-17-airplay-mirroring-design.md"
+)
+
+#: The design's UI state matrix header; the table ends at the first non-row line.
+DESIGN_TABLE_HEADER: Final[str] = "| Domain/resource state |"
+
+
+def design_action_cells() -> dict[str, str]:
+    """The design's "Allowed primary actions" cell, keyed by its state cell.
+
+    Read at test time, so a missing or reshaped design fails that row as a test
+    failure instead of breaking collection.
+    """
+    cells: dict[str, str] = {}
+    in_table = False
+    for line in DESIGN_PATH.read_text(encoding="utf-8").splitlines():
+        if line.startswith(DESIGN_TABLE_HEADER):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if not line.startswith("|"):
+            break
+        row = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(row) != 3:
+            continue
+        if all(cell and set(cell) <= set("-: ") for cell in row):
+            continue  # the header separator rule
+        cells[row[0]] = row[2]
+    assert cells, "the design's UI state matrix must be present and parseable"
+    return cells
+
+
+def design_action_labels(cell: str) -> tuple[str, ...]:
+    """The actions one design cell enumerates, without its reading "or"."""
+    labels: list[str] = []
+    for part in cell.split(","):
+        label = part.strip()
+        if label.lower().startswith("or "):
+            label = label[3:].strip()
+        labels.append(label)
+    return tuple(labels)
+
+
+#: The design's state rows that name typed failure recovery, and the codes each
+#: governs (design:111, :119, :121-128). A code the design reports in more than
+#: one row carries the union of those rows, so an entry names every state it
+#: answers for and the test checks each state's own contribution separately.
+DESIGN_ROWS: tuple[tuple[tuple[str, ...], tuple[ErrorCode, ...]], ...] = (
     (
-        "design:121 resolution mismatch",
+        ("Resolution mismatch",),
         (ErrorCode.resolution_mismatch,),
-        ("Recreate at accepted mode", "Stop"),
     ),
     (
-        "design:124 dependency or capability failure",
+        ("Dependency or capability failure",),
         (
             ErrorCode.unsupported_operation,
             ErrorCode.dependency_missing,
             ErrorCode.dependency_incompatible,
         ),
-        ("Retry after fix", "Back"),
     ),
     (
-        "design:125 orphan candidate",
+        ("Orphan candidate",),
         (ErrorCode.ownership_mismatch,),
-        ("Remove after confirmation", "Keep"),
     ),
     (
-        "design:126 cleanup required",
+        ("Cleanup required",),
         (ErrorCode.cleanup_timeout,),
-        ("Retry cleanup", "Keep for manual cleanup", "Stop"),
     ),
     (
-        "design:127 trust cleanup required",
+        ("Trust cleanup required",),
         (ErrorCode.trust_cleanup_required,),
-        ("Retry revocation", "Keep blocked", "Remove saved metadata"),
     ),
     (
-        # One code reports the audio failure in both phases, so its action set is
-        # the union of the two rows: retry before video readiness and after it.
-        "design:122-123 audio decision required or audio unavailable",
+        # One code reports a pre-video audio decision and a runtime audio failure,
+        # which are two design rows with different action sets: the union is
+        # pinned, and each row must still contribute its own actions exactly.
+        (
+            "Audio decision required",
+            "Audio unavailable (video active)",
+        ),
         (ErrorCode.audio_denied, ErrorCode.audio_unavailable),
-        ("Retry audio", "explicit video-only start", "Cancel", "Stop"),
     ),
     (
-        # design:111 (Recovering), design:119 (Reconnecting) and design:128
-        # (Failed) share one action set, so a retryable failure pins the same tuple.
-        "design:111-128 recovering, reconnecting, or failed",
+        # Recovering (design:111), Reconnecting (design:119) and Failed
+        # (design:128) share one action set; that these rows really agree is
+        # asserted below rather than assumed in a comment.
+        (
+            "Recovering (`Output owned`, transport reconnecting)",
+            "Reconnecting (`Output owned` or no output)",
+            "Failed",
+        ),
         (
             ErrorCode.transport_failed,
             ErrorCode.daemon_failed,
@@ -288,9 +416,63 @@ DESIGN_ROWS: tuple[tuple[str, tuple[ErrorCode, ...], tuple[str, ...]], ...] = (
             ErrorCode.stale_socket,
             ErrorCode.persistence_failed,
         ),
-        ("Retry", "Stop"),
     ),
 )
+
+DESIGN_ROW_IDS: Final[tuple[str, ...]] = tuple(
+    " + ".join(states) for states, _ in DESIGN_ROWS
+)
+
+#: The design rows this audit deliberately does not pin, and why. A row is either
+#: covered by :data:`DESIGN_ROWS` or excused here, so a new row in the design's
+#: matrix fails the completeness test until it is deliberately classified.
+DESIGN_UNPINNED_ROWS: Final[dict[str, str]] = {
+    "Available (`Idle`, no output)": "no failure: the pane offers Start, Pair, Scan",
+    "Offline (`Idle`, no output)": "no failure: a saved receiver with no record",
+    "Pairing (`No output`)": "a healthy prompt, not an error recovery",
+    "Pairing (`Output owned`)": "a healthy prompt over a retained output",
+    "Resolution required": "a required decision, not an error",
+    "Creating output": "progress; only Cancel, which is the Stopping path",
+    "Connecting": "progress; only Stop",
+    "Mirroring": "a healthy session: mute and stop, not recovery",
+    "Virtual display": "a healthy session: mute, stop and change resolution",
+    "Reconfiguring": "progress; only Cancel, which is the Stopping path",
+}
+
+#: Codes the design gives no row in the action matrix, with the prose that governs
+#: them. Their recovery tuples stay exactly as they are: this audit repairs a row
+#: that contradicts a designed action, and it never invents one.
+UNPINNED_CODES: Final[frozenset[ErrorCode]] = frozenset(
+    {
+        # design:451 lists these as distinct actionable errors. design:328 makes
+        # portal denial and cancellation recoverable capture events, whose pane
+        # offers another physical source (``back``) or stop; the matrix names no
+        # row for them.
+        ErrorCode.portal_cancelled,
+        ErrorCode.portal_denied,
+        # design:466 requires a usable keyring for remembered pairing, and
+        # design:451 keeps a keyring failure actionable. The matrix names no row.
+        ErrorCode.keyring_unavailable,
+        # design:64/534 surface an unverifiable physical monitor as unsupported so
+        # the user chooses another source rather than retrying the descriptor.
+        ErrorCode.unsupported_source,
+        # design:114 is the "Resolution required" row, which offers Choose and
+        # Cancel for a value the user has not supplied yet; it names no recovery
+        # for a mode the receiver does not advertise.
+        ErrorCode.unsupported_mode,
+        # design:365 keeps the prior known audio state on a mute failure and reports
+        # the backend error; the matrix enumerates no primary action for that case.
+        ErrorCode.audio_mute_failed,
+        # Target-local, retryable events the design describes in prose only:
+        # design:439 (discovery), design:402 (a stale event changes nothing),
+        # design:355 (bounded invalid-input budget and challenge expiry).
+        ErrorCode.discovery_failed,
+        ErrorCode.stale_event,
+        ErrorCode.invalid_input,
+        ErrorCode.pairing_expired,
+    }
+)
+
 
 #: The design's words to the catalog's typed action. The catalog has no separate
 #: cancel token, so the design's ``Cancel`` for an abandoned attempt is ``stop``.
@@ -313,26 +495,74 @@ DESIGN_ACTIONS: dict[str, RecoveryAction] = {
 }
 
 
-def test_design_matrix_names_only_known_actions():
-    for row, _, actions in DESIGN_ROWS:
-        for label in actions:
-            assert label in DESIGN_ACTIONS, f"{row} names an unmapped action {label!r}"
+def test_every_design_action_label_maps_to_a_typed_action():
+    table = design_action_cells()
+
+    for states, _ in DESIGN_ROWS:
+        for state in states:
+            assert state in table, f"the design no longer has a {state!r} row"
+            labels = design_action_labels(table[state])
+            assert labels, f"the design's {state!r} row must name an action"
+            for label in labels:
+                assert label in DESIGN_ACTIONS, (
+                    f"design row {state!r} names an action with no typed token: {label!r}"
+                )
+
+
+def test_every_design_matrix_row_is_pinned_or_deliberately_excused():
+    # Both directions, so neither a new design row nor a renamed one can slip past
+    # the audit: each row is either governed by a pinned code or excused by name.
+    table = design_action_cells()
+    pinned = {state for states, _ in DESIGN_ROWS for state in states}
+    excused = set(DESIGN_UNPINNED_ROWS)
+
+    assert not pinned & excused, "a design row cannot be both pinned and excused"
+    assert pinned | excused == set(table), (
+        "every design row must be pinned or excused; unclassified: "
+        f"{sorted(set(table) - pinned - excused)}, stale: {sorted(pinned | excused - set(table))}"
+    )
 
 
 def test_design_matrix_rows_do_not_contradict_each_other():
-    pinned = [code for _, codes, _ in DESIGN_ROWS for code in codes]
+    pinned = [code for _, codes in DESIGN_ROWS for code in codes]
 
     assert len(pinned) == len(set(pinned)), "a code may be pinned to one row only"
 
 
-@pytest.mark.parametrize(("row", "codes", "actions"), DESIGN_ROWS, ids=[row for row, _, _ in DESIGN_ROWS])
-def test_catalog_recovery_matches_the_design_action_matrix(row, codes, actions):
-    expected = frozenset(DESIGN_ACTIONS[label] for label in actions)
+def test_every_error_code_is_pinned_or_deliberately_unpinned():
+    pinned = {code for _, codes in DESIGN_ROWS for code in codes}
+
+    assert not pinned & UNPINNED_CODES, "a code cannot be both pinned and excused"
+    assert pinned | UNPINNED_CODES == set(ErrorCode), (
+        "every code must answer a design row or be deliberately excused, so a new "
+        "member cannot escape the audit"
+    )
+
+
+@pytest.mark.parametrize(("states", "codes"), DESIGN_ROWS, ids=DESIGN_ROW_IDS)
+def test_catalog_recovery_matches_the_design_action_matrix(states, codes):
+    table = design_action_cells()
+    expected = frozenset(
+        DESIGN_ACTIONS[label]
+        for state in states
+        for label in design_action_labels(table[state])
+    )
 
     for code in codes:
         recovery = diagnostic(code).recovery
         assert len(set(recovery)) == len(recovery), f"{code} repeats a recovery action"
-        assert set(recovery) == expected, f"{code} must match {row}: {sorted(expected)}"
+        # Each design row must contribute its own actions exactly: a merged entry
+        # may not drop one row's action or invent an action neither row allows.
+        for state in states:
+            row = frozenset(DESIGN_ACTIONS[label] for label in design_action_labels(table[state]))
+            assert row <= set(recovery), (
+                f"{code} must offer every action of design row {state!r}: "
+                f"missing {sorted(row - set(recovery))}"
+            )
+        assert set(recovery) == expected, (
+            f"{code} must offer exactly {sorted(expected)} for {list(states)}; "
+            f"it offers {sorted(set(recovery))}"
+        )
 
 
 def test_resolution_mismatch_offers_the_only_design_recovery():
