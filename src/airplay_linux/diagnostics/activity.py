@@ -81,6 +81,33 @@ _ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 MAX_CODE_LENGTH: Final[int] = 64
 
 
+def _text_data(value: object) -> str | None:
+    """The value's own character data as an exact built-in ``str``, or ``None``.
+
+    Only the *data* is read. ``str.encode`` is the unbound C function, so it
+    copies the buffer without calling ``__str__``, ``__iter__``, ``__len__``,
+    ``__getitem__``, ``__eq__``, ``__hash__``, or any subclass ``encode``: a
+    ``str`` subclass may render, compare and iterate anything it likes, and the
+    text this module validates is always the same exact built-in string it then
+    stores. ``isinstance`` alone is not proof of a real string, because a class
+    can advertise a spoofed ``__class__``, so a failed copy is not text at all.
+
+    The codec pair round-trips lone surrogates, so the data is preserved
+    exactly rather than repaired or replaced.
+    """
+    if type(value) is str:
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        copied = str.encode(value, "utf-8", "surrogatepass")
+        text = copied.decode("utf-8", "surrogatepass")
+    except (TypeError, ValueError, UnicodeError):
+        # A spoofed ``__class__`` reaches here; it is not a string's data.
+        return None
+    return text if type(text) is str else None
+
+
 def _enum_values(enum: type[StrEnum]) -> frozenset[str]:
     """The frozen domain's own vocabulary for one resource-shaped field."""
     return frozenset(member.value for member in enum)
@@ -207,31 +234,35 @@ ACTIVITY_CODES: Final[frozenset[str]] = frozenset(_MESSAGES)
 
 def _reject_code(code: object) -> str:
     """Validate the code token, then require it to be a known code."""
-    if not isinstance(code, str) or not code:
+    text = _text_data(code)
+    if text is None or not text:
         raise ValueError(
             "code must be a non-empty lowercase token such as 'pairing.completed'",
         )
-    if len(code) > MAX_CODE_LENGTH:
+    if len(text) > MAX_CODE_LENGTH:
         raise ValueError("code must be a bounded token of at most 64 characters")
-    if not (code[0].isalpha() and code[0].islower()):
+    if not (text[0].isalpha() and text[0].islower()):
         raise ValueError("code must start with a lowercase letter")
-    if not all(char.islower() or char.isdigit() or char in "._-" for char in code):
+    if not all(char.islower() or char.isdigit() or char in "._-" for char in text):
         raise ValueError(
             "code may contain only lowercase letters, digits, '.', '_' and '-'",
         )
-    if code not in ACTIVITY_CODES:
+    if text not in ACTIVITY_CODES:
         # A token-shaped string can still be backend text, so membership, not
         # shape, decides what a code is; the rejected value is never echoed.
         raise ValueError("code must be one of the registered activity codes")
-    return str(code)
+    # The exact string that was checked is the string that is stored: the code
+    # cannot render, compare or hash as anything else afterwards.
+    return text
 
 
 def _reject_utc(utc: object) -> str:
     """Require an absolute timestamp and normalize it to canonical UTC."""
-    if not isinstance(utc, str):
+    text = _text_data(utc)
+    if text is None:
         raise ValueError("utc must be an absolute ISO-8601 timestamp with an offset")
     try:
-        parsed = datetime.fromisoformat(utc)
+        parsed = datetime.fromisoformat(text)
     except ValueError:
         raise ValueError(
             "utc must be an absolute ISO-8601 timestamp with an offset",
@@ -245,13 +276,18 @@ def _reject_receiver(receiver_id: object) -> ReceiverId | None:
     """Sanitize the identity token the same way as an allowlisted field value."""
     if receiver_id is None:
         return None
-    if not isinstance(receiver_id, str):
+    text = _text_data(receiver_id)
+    if text is None:
         raise TypeError("receiver_id must be a ReceiverId string or None")
-    return ReceiverId(_bounded(_escape(receiver_id)))
+    return ReceiverId(_bounded(_escape(text)))
 
 
 def _escape(text: str) -> str:
-    """Render control and format characters as visible escapes, never raw."""
+    """Render control and format characters as visible escapes, never raw.
+
+    ``text`` is the exact built-in string :func:`_text_data` returned, so the
+    characters rendered here are the characters that were validated.
+    """
     pieces: list[str] = []
     for char in text:
         if char.isprintable():
@@ -293,8 +329,7 @@ def _reject_value(name: str, value: object) -> str | int | bool:
         )
     vocabulary = _VOCABULARIES.get(name)
     if vocabulary is not None:
-        # Normalize once: a ``str`` subclass may render differently on each call.
-        text = str(value) if isinstance(value, str) else None
+        text = _text_data(value)
         if text is None or text not in vocabulary:
             raise ValueError(
                 f"value for field {name!r} must be one of the values this field enumerates",
@@ -329,7 +364,7 @@ def _reject_value(name: str, value: object) -> str | int | bool:
 
 def _identifier(name: str, value: object, pattern: re.Pattern[str]) -> str:
     """Accept only text matching the field's token shape, then escape and bound."""
-    text = str(value) if isinstance(value, str) else None
+    text = _text_data(value)
     if text is None or pattern.fullmatch(text) is None:
         raise ValueError(
             f"value for field {name!r} must be a {FIELD_SHAPES[name]} identifier",
@@ -339,7 +374,8 @@ def _identifier(name: str, value: object, pattern: re.Pattern[str]) -> str:
 
 def _resolution(value: object) -> str:
     """Accept only ``WIDTHxHEIGHT`` inside the domain ``Size`` bounds."""
-    match = _RESOLUTION.fullmatch(str(value)) if isinstance(value, str) else None
+    text = _text_data(value)
+    match = _RESOLUTION.fullmatch(text) if text is not None else None
     if match is None:
         raise ValueError("value for field 'resolution' must be written as WIDTHxHEIGHT")
     width, height = (int(edge) for edge in match.groups())
@@ -357,8 +393,12 @@ def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
     if not isinstance(fields, Mapping):
         raise TypeError("fields must be a mapping of allowlisted names to values")
     clean: dict[str, str | int | bool] = {}
-    for name, value in fields.items():
-        if not isinstance(name, str) or name not in ALLOWED_FIELDS:
+    for raw_name, value in fields.items():
+        # A name is untrusted text too: read its data, so a ``str`` key cannot
+        # claim an allowlisted name while its stored/repr text is something
+        # else. The allowlist is then searched with an exact built-in string.
+        name = _text_data(raw_name)
+        if name is None or name not in ALLOWED_FIELDS:
             raise ValueError(
                 "field is not allowlisted; secrets and backend payloads cannot enter activity",
             )
@@ -367,8 +407,12 @@ def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
 
 
 def _message_for(code: str) -> str:
-    """Fixed copy for a code; :func:`_reject_code` has already proven membership."""
-    return _MESSAGES[code]
+    """Fixed copy for a code; :func:`_reject_code` has already proven membership.
+
+    The lookup is total and its fallback is a fixed literal, so an impossible
+    miss can never surface as an exception whose text carries the token.
+    """
+    return _MESSAGES.get(code) or _MESSAGES["session"]
 
 
 def safe_activity(
@@ -500,8 +544,11 @@ class ActivityLog:
         report = self._capabilities
         if report is None:
             return None
+        environment = _text_data(report.environment)
+        if environment is None:
+            raise TypeError("capabilities environment must be a string")
         capabilities: dict[str, object] = {
-            "environment": _bounded(_escape(report.environment)),
+            "environment": _bounded(_escape(environment)),
             "discovery": report.discovery,
             "mirror": report.mirror,
             "virtual_display": report.virtual_display,

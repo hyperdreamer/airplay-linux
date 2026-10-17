@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
+from typing import Final
 
 import pytest
 
@@ -19,7 +21,12 @@ from airplay_linux.diagnostics import (
     diagnostic,
     safe_activity,
 )
-from airplay_linux.diagnostics.activity import ALLOWED_FIELDS, FIELD_SHAPES, MAX_FIELD_TEXT
+from airplay_linux.diagnostics.activity import (
+    ALLOWED_FIELDS,
+    FIELD_SHAPES,
+    MAX_FIELD_TEXT,
+    _VOCABULARIES,
+)
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import (
     OpaqueBackendToken,
@@ -476,13 +483,248 @@ def test_a_str_subclass_cannot_render_one_value_and_carry_another():
         def __str__(self) -> str:
             return "Mirroring"
 
-    event = safe_activity("session", None, {"phase": Liar(CANARY_TEXT)}, UTC)
+    # The object's own data is backend text; only its (spoofed) rendering looks
+    # legitimate. Data is the value, so this is rejected rather than stored.
+    with pytest.raises(ValueError, match="value") as caught:
+        safe_activity("session", None, {"phase": Liar(CANARY_TEXT)}, UTC)
 
-    # The stored value is the rendering that was validated, never the source.
+    assert CANARY_TEXT not in str(caught.value)
+    assert CANARY_TEXT not in repr(caught.value)
+
+
+def test_a_str_subclass_with_legitimate_data_is_stored_as_plain_text():
+    class Quiet(str):
+        def __str__(self) -> str:
+            return SMUGGLED
+
+    event = safe_activity("session", None, {"phase": Quiet("Mirroring")}, UTC)
+
+    # The stored value is the exact built-in string whose data was validated.
     assert event.fields == {"phase": "Mirroring"}
     assert type(event.fields["phase"]) is str
-    assert CANARY_TEXT not in repr(event)
-    assert CANARY_TEXT not in repr(dict(event.fields))
+    assert SMUGGLED not in repr(event)
+    assert SMUGGLED not in repr(dict(event.fields))
+
+
+#: The canary every subclass below hides; no hook on it may reach any output.
+SMUGGLED: Final[str] = CANARY_TEXT
+
+
+class SpoofText(str):
+    """A ``str`` subclass that lies through *every* protocol it is asked for.
+
+    ``__str__`` returns ``self`` (F-1's mechanism), so a caller that stores the
+    rendering stores the source. Equality and hashing claim ``claim``, so
+    container membership looks satisfied while the object carries the canary.
+    Iteration, length, indexing and ``encode`` render the canary too, so a
+    sanitizer that re-reads the value's characters learns the wrong text.
+    """
+
+    _claim: str
+
+    def __new__(cls, claim: str, payload: str = SMUGGLED) -> SpoofText:
+        instance = super().__new__(cls, payload)
+        instance._claim = claim
+        return instance
+
+    def __str__(self) -> str:
+        return self
+
+    def __hash__(self) -> int:
+        return hash(self._claim)
+
+    def __eq__(self, other: object) -> bool:
+        return str(other) == self._claim
+
+    def __repr__(self) -> str:
+        return repr(SMUGGLED)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(SMUGGLED)
+
+    def __len__(self) -> int:
+        return len(SMUGGLED)
+
+    def __getitem__(self, index: int) -> str:
+        return SMUGGLED[index]
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        return SMUGGLED.encode()
+
+
+class RenderSpoof(str):
+    """Carries legitimate text as its data, but renders the canary instead.
+
+    This is the axis F-2 names: the wrapped text is a legitimate value, so any
+    check against the object itself approves it, while every hook a sanitizer
+    might call afterwards reports something else. Only the character *data* is
+    the value; nothing here may be read as text.
+    """
+
+    _rendering: str
+
+    def __new__(cls, value: str, rendering: str = SMUGGLED) -> RenderSpoof:
+        instance = super().__new__(cls, value)
+        instance._rendering = rendering
+        return instance
+
+    def __str__(self) -> str:
+        return self._rendering
+
+    def __repr__(self) -> str:
+        return repr(self._rendering)
+
+    def encode(self, *args: object, **kwargs: object) -> bytes:
+        return self._rendering.encode()
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._rendering)
+
+    def __len__(self) -> int:
+        return len(self._rendering)
+
+    def __getitem__(self, index: int) -> str:
+        return self._rendering[index]
+
+
+#: One value-taking field per shape, with the legitimate text it accepts.
+SHAPED_SAMPLES: Final[tuple[tuple[str, str], ...]] = (
+    ("phase", "Mirroring"),
+    ("transport", "Streaming"),
+    ("display", "Owned"),
+    ("audio", "Enabled"),
+    ("trust", "Trusted"),
+    ("command_name", "kscreen-doctor"),
+    ("reservation_stage", "published"),
+    ("error_code", "cleanup_timeout"),
+    ("connector", "DP-1"),
+    ("output_id", "v1"),
+    ("resolution", "1920x1080"),
+)
+
+
+@pytest.mark.parametrize(("name", "claim"), SHAPED_SAMPLES)
+def test_a_fully_spoofed_value_cannot_reach_the_event_entries_or_export(name, claim):
+    # F-1: the reproduction from the finding. A self-rendering subclass with
+    # spoofed equality and hashing satisfies vocabulary membership while it
+    # carries unrelated text. It must be rejected, or normalized to a plain
+    # built-in string that cannot contain the canary -- never stored as itself.
+    value = SpoofText(claim)
+
+    try:
+        event = safe_activity("session", RECEIVER, {name: value}, UTC)
+    except ValueError as error:
+        assert SMUGGLED not in str(error)
+        assert SMUGGLED not in repr(error)
+        return
+
+    # A field's own character data is the only text that may be kept, and only
+    # as an exact built-in string.
+    assert type(event.fields[name]) is str
+    assert event.fields[name] == claim
+    log = ActivityLog()
+    log.emit(event)
+    for rendering in (
+        repr(event),
+        repr(dict(event.fields)),
+        repr(log.entries()),
+        log.export(),
+    ):
+        assert SMUGGLED not in rendering
+
+
+def test_a_self_rendering_phase_value_is_rejected_not_stored():
+    # The finding's exact probe: the data is the canary, every check claims
+    # 'Mirroring', and ``__str__`` returns ``self``.
+    value = SpoofText("Mirroring")
+    assert value in _VOCABULARIES["phase"], "the probe must still satisfy membership"
+
+    with pytest.raises(ValueError, match="value") as caught:
+        safe_activity("session", None, {"phase": value}, UTC)
+
+    assert SMUGGLED not in str(caught.value)
+    assert SMUGGLED not in repr(caught.value)
+
+
+def test_a_spoofed_field_name_cannot_dress_as_an_allowlisted_name():
+    # The same hook class on the name axis: a ``str`` key whose equality and
+    # hash claim 'phase' while it carries and renders the canary.
+    spoof = SpoofText("phase")
+    assert spoof in ALLOWED_FIELDS, "the probe must still satisfy membership"
+
+    with pytest.raises(ValueError, match="field") as caught:
+        safe_activity("session", None, {spoof: "Mirroring"}, UTC)  # type: ignore[dict-item]
+
+    assert SMUGGLED not in str(caught.value)
+    assert SMUGGLED not in repr(caught.value)
+
+
+@pytest.mark.parametrize(("name", "claim"), SHAPED_SAMPLES)
+def test_a_differently_rendering_value_cannot_change_after_validation(name, claim):
+    # The wrapped text is legitimate but the object renders something else, so
+    # nothing may be re-read from the source after the check has run.
+    try:
+        event = safe_activity("session", RECEIVER, {name: RenderSpoof(claim)}, UTC)
+    except ValueError as error:
+        assert SMUGGLED not in str(error)
+        assert SMUGGLED not in repr(error)
+        return
+
+    assert type(event.fields[name]) is str
+    assert SMUGGLED not in repr(event)
+    log = ActivityLog()
+    log.emit(event)
+    for rendering in (repr(log.entries()), log.export()):
+        assert SMUGGLED not in rendering
+
+
+def test_a_spoofed_receiver_identity_cannot_render_the_canary():
+    # ``receiver_id`` is escaped and bounded by reading its characters, so a
+    # subclass whose iteration protocol yields other text must not survive.
+    spoof = ReceiverId(RenderSpoof("airplay-device:001122334455"))
+
+    try:
+        event = safe_activity("session", spoof, {}, UTC)
+    except (TypeError, ValueError) as error:
+        assert SMUGGLED not in str(error)
+        assert SMUGGLED not in repr(error)
+        return
+
+    assert type(event.receiver_id) is str
+    log = ActivityLog()
+    log.emit(event)
+    for rendering in (repr(event), repr(log.entries()), log.export()):
+        assert SMUGGLED not in rendering
+
+
+def test_a_utc_subclass_cannot_be_parsed_through_its_own_hooks():
+    # ``datetime.fromisoformat`` accepts ``str`` subclasses, so the timestamp is
+    # re-read from the value's data before parsing, never through its hooks.
+    spoof = RenderSpoof("2026-10-17T02:00:00+02:00")
+
+    event = safe_activity("session", None, {}, spoof)
+
+    assert event.utc == UTC
+    assert type(event.utc) is str
+    assert SMUGGLED not in repr(event)
+
+
+def test_a_capability_environment_subclass_cannot_render_the_canary():
+    # The export sanitizes this text the same way as an activity value.
+    log = ActivityLog(
+        capabilities=CapabilityReport(
+            environment=RenderSpoof("KDE Plasma 6 Wayland"),
+            discovery=True,
+            mirror=True,
+            virtual_display=False,
+            audio=True,
+            remembered_pairing=False,
+            additional_virtual_outputs=False,
+            diagnostics=(),
+        ),
+    )
+
+    assert SMUGGLED not in log.export()
 
 
 @pytest.mark.parametrize(("name", "value"), FIELD_SAMPLES.items())
@@ -666,6 +908,48 @@ def test_unregistered_code_cannot_reach_the_log_or_export():
     assert CANARY_TEXT not in repr(caught.value)
     assert log.entries() == ()
     assert CANARY_TEXT not in log.export()
+
+
+def test_a_registered_code_that_renders_the_canary_cannot_leak_it():
+    # F-2: the code's own text is the registered 'session', so every check on
+    # the original object passes while ``__str__`` renders the canary, and the
+    # old lookup raised KeyError('raw-backend-canary-8496'). The code is now
+    # read as data and stored as that same primitive, so the fixed copy is used
+    # and no failure ever carries the rejected text.
+    event = safe_activity(RenderSpoof("session"), None, {}, UTC)
+
+    assert event.code == "session"
+    assert type(event.code) is str
+    assert event.message == safe_activity("session", None, {}, UTC).message
+    assert SMUGGLED not in repr(event)
+
+    log = ActivityLog()
+    log.emit(event)
+    for rendering in (repr(log.entries()), log.export()):
+        assert SMUGGLED not in rendering
+
+
+def test_a_code_with_spoofed_membership_cannot_reach_the_log_or_export():
+    code = SpoofText("session")
+    assert code in ACTIVITY_CODES, "the probe must still satisfy membership"
+
+    with pytest.raises(ValueError, match="code") as caught:
+        safe_activity(code, None, {}, UTC)
+
+    assert SMUGGLED not in str(caught.value)
+    assert SMUGGLED not in repr(caught.value)
+
+    log = ActivityLog()
+    smuggled = ActivityEvent(
+        utc=UTC, code=code, receiver_id=None, message="fixed copy", fields={},
+    )
+    with pytest.raises(ValueError, match="code") as revalidated:
+        log.emit(smuggled)
+
+    assert SMUGGLED not in str(revalidated.value)
+    assert SMUGGLED not in repr(revalidated.value)
+    assert log.entries() == ()
+    assert SMUGGLED not in log.export()
 
 
 @pytest.mark.parametrize("code", sorted(ACTIVITY_CODES))
