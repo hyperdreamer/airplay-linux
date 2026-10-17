@@ -42,7 +42,7 @@ from airplay_linux.domain.resources import (
     TrustState,
 )
 
-from .catalog import ALLOWED_COMMANDS, diagnostic
+from .catalog import ALLOWED_COMMANDS, _validated_receiver_id, diagnostic
 
 if TYPE_CHECKING:
     from airplay_linux.domain.ports import Subscription
@@ -82,30 +82,22 @@ MAX_CODE_LENGTH: Final[int] = 64
 
 
 def _text_data(value: object) -> str | None:
-    """The value's own character data as an exact built-in ``str``, or ``None``.
-
-    Only the *data* is read. ``str.encode`` is the unbound C function, so it
-    copies the buffer without calling ``__str__``, ``__iter__``, ``__len__``,
-    ``__getitem__``, ``__eq__``, ``__hash__``, or any subclass ``encode``: a
-    ``str`` subclass may render, compare and iterate anything it likes, and the
-    text this module validates is always the same exact built-in string it then
-    stores. ``isinstance`` alone is not proof of a real string, because a class
-    can advertise a spoofed ``__class__``, so a failed copy is not text at all.
-
-    The codec pair round-trips lone surrogates, so the data is preserved
-    exactly rather than repaired or replaced.
-    """
+    """Copy genuine string character data without consulting ``__class__``."""
     if type(value) is str:
         return value
-    if not isinstance(value, str):
-        return None
     try:
         copied = str.encode(value, "utf-8", "surrogatepass")
         text = copied.decode("utf-8", "surrogatepass")
-    except (TypeError, ValueError, UnicodeError):
-        # A spoofed ``__class__`` reaches here; it is not a string's data.
+    except Exception:
         return None
     return text if type(text) is str else None
+
+
+def _has_type_in_mro(value: object, expected: type) -> bool:
+    """Inspect the actual type hierarchy without reading value.__class__."""
+    actual_type = type(value)
+    actual_mro = type.__getattribute__(actual_type, "__mro__")
+    return any(base is expected for base in actual_mro)
 
 
 def _enum_values(enum: type[StrEnum]) -> frozenset[str]:
@@ -178,6 +170,8 @@ PRIVATE_VALUE_TYPES: Final[tuple[type, ...]] = (
 )
 
 EXPORT_SCHEMA: Final[str] = "airplay-linux-diagnostics/1"
+_SAFE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"KDE Plasma 6 Wayland"})
+_UNKNOWN_ENVIRONMENT: Final[str] = "Unknown"
 
 #: Fixed message copy per code; a new code needs a line here, not a raw string.
 _MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
@@ -264,22 +258,25 @@ def _reject_utc(utc: object) -> str:
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError:
+        parsed = None
+    if parsed is None:
         raise ValueError(
             "utc must be an absolute ISO-8601 timestamp with an offset",
-        ) from None
+        )
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError("utc must carry an explicit UTC offset")
-    return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        normalized = parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        normalized = None
+    if normalized is None:
+        raise ValueError("utc could not be normalized to canonical UTC")
+    return normalized
 
 
 def _reject_receiver(receiver_id: object) -> ReceiverId | None:
-    """Sanitize the identity token the same way as an allowlisted field value."""
-    if receiver_id is None:
-        return None
-    text = _text_data(receiver_id)
-    if text is None:
-        raise TypeError("receiver_id must be a ReceiverId string or None")
-    return ReceiverId(_bounded(_escape(text)))
+    """Validate a canonical public receiver identity without retaining payloads."""
+    return _validated_receiver_id(receiver_id)
 
 
 def _escape(text: str) -> str:
@@ -323,7 +320,7 @@ def _reject_value(name: str, value: object) -> str | int | bool:
     accepts one closed vocabulary or one strict token form, so a secret or a
     backend message has no shape it can wear. Nothing is echoed on rejection.
     """
-    if isinstance(value, PRIVATE_VALUE_TYPES):
+    if any(_has_type_in_mro(value, private_type) for private_type in PRIVATE_VALUE_TYPES):
         raise ValueError(
             f"value for field {name!r} is a transient private value and cannot be recorded",
         )
@@ -390,19 +387,41 @@ def _resolution(value: object) -> str:
 
 
 def _validate_fields(fields: object) -> Mapping[str, str | int | bool]:
-    if not isinstance(fields, Mapping):
+    if not any(
+        _has_type_in_mro(fields, expected)
+        for expected in (Mapping, dict, MappingProxyType)
+    ):
         raise TypeError("fields must be a mapping of allowlisted names to values")
+    try:
+        items = iter(fields.items())  # type: ignore[union-attr]
+    except Exception:
+        items = None
+    if items is None:
+        raise TypeError("fields must be a mapping of allowlisted names to values")
+
     clean: dict[str, str | int | bool] = {}
-    for raw_name, value in fields.items():
-        # A name is untrusted text too: read its data, so a ``str`` key cannot
-        # claim an allowlisted name while its stored/repr text is something
-        # else. The allowlist is then searched with an exact built-in string.
+    iteration_failed = False
+    while True:
+        try:
+            item = next(items)
+        except StopIteration:
+            break
+        except Exception:
+            iteration_failed = True
+            break
+        try:
+            raw_name, value = item
+        except Exception:
+            iteration_failed = True
+            break
         name = _text_data(raw_name)
         if name is None or name not in ALLOWED_FIELDS:
             raise ValueError(
                 "field is not allowlisted; secrets and backend payloads cannot enter activity",
             )
         clean[name] = _reject_value(name, value)
+    if iteration_failed:
+        raise ValueError("fields could not be normalized")
     return MappingProxyType(clean)
 
 
@@ -472,7 +491,7 @@ class ActivityLog:
             raise TypeError("max_entries must be an integer")
         if max_entries < 1:
             raise ValueError("max_entries must be at least 1")
-        if capabilities is not None and not isinstance(capabilities, CapabilityReport):
+        if capabilities is not None and type(capabilities) is not CapabilityReport:
             raise TypeError("capabilities must be a CapabilityReport or None")
         self._max_entries = max_entries
         self._capabilities = capabilities
@@ -483,7 +502,7 @@ class ActivityLog:
 
     def emit(self, event: ActivityEvent) -> None:
         """Record one sanitized event and notify current subscribers."""
-        if not isinstance(event, ActivityEvent):
+        if type(event) is not ActivityEvent:
             raise TypeError("only a domain ActivityEvent can be emitted")
         sanitized = _sanitize_event(event)
         self._entries.append(sanitized)
@@ -547,14 +566,24 @@ class ActivityLog:
         environment = _text_data(report.environment)
         if environment is None:
             raise TypeError("capabilities environment must be a string")
+        flags: dict[str, bool] = {}
+        for name in (
+            "discovery",
+            "mirror",
+            "virtual_display",
+            "audio",
+            "remembered_pairing",
+            "additional_virtual_outputs",
+        ):
+            value = getattr(report, name)
+            if type(value) is not bool:
+                raise TypeError("capability flags must be booleans")
+            flags[name] = value
         capabilities: dict[str, object] = {
-            "environment": _bounded(_escape(environment)),
-            "discovery": report.discovery,
-            "mirror": report.mirror,
-            "virtual_display": report.virtual_display,
-            "audio": report.audio,
-            "remembered_pairing": report.remembered_pairing,
-            "additional_virtual_outputs": report.additional_virtual_outputs,
+            "environment": (
+                environment if environment in _SAFE_ENVIRONMENTS else _UNKNOWN_ENVIRONMENT
+            ),
+            **flags,
             "diagnostic_codes": sorted(
                 {diagnostic(item.code).code.value for item in report.diagnostics},
             ),

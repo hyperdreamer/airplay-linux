@@ -11,6 +11,7 @@ import json
 import re
 import string
 from collections.abc import Iterator
+from dataclasses import replace
 from pathlib import Path
 from typing import Final
 
@@ -29,6 +30,8 @@ from airplay_linux.diagnostics.activity import (
     FIELD_SHAPES,
     MAX_FIELD_TEXT,
     _VOCABULARIES,
+    _bounded,
+    _escape,
 )
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import (
@@ -197,7 +200,7 @@ def test_no_catalog_message_interpolates_a_caller_supplied_value():
 
     for code in ErrorCode:
         base = diagnostic(code).message
-        for receiver in (None, RECEIVER, ReceiverId(CANARY_TEXT), ReceiverId("x" * 500)):
+        for receiver in (None, RECEIVER, ReceiverId("airplay-device:abcdef")):
             assert diagnostic(code, receiver).message == base, (
                 f"{code} must not interpolate the receiver identity"
             )
@@ -255,6 +258,37 @@ def test_diagnostic_normalizes_spoofed_receiver_identity():
     assert SMUGGLED not in result.receiver_id
     assert SMUGGLED not in repr(result)
     assert result.receiver_id == "airplay-device:001122334455"
+
+
+def test_diagnostic_rejects_noncanonical_receiver_ids_without_retaining_them():
+    with pytest.raises(ValueError) as caught:
+        diagnostic(ErrorCode.transport_failed, ReceiverId("airplay-device:" + CANARY_TEXT))
+
+    assert_clean_boundary_error(caught.value, ValueError)
+
+
+def test_a_diagnostic_receiver_id_is_preserved_exactly_when_canonical():
+    canonical = ReceiverId("airplay-device:abcdef0123456789")
+    result = diagnostic(ErrorCode.transport_failed, canonical)
+
+    assert result.receiver_id == canonical
+    assert type(result.receiver_id) is str
+    assert result.receiver_id == "airplay-device:abcdef0123456789"
+    assert CANARY_TEXT not in result.message
+    assert CANARY_TEXT not in repr(result)
+
+
+def test_raising_class_string_subclasses_are_normalized_by_the_catalog():
+    result = diagnostic(
+        ErrorCode.dependency_missing,
+        ReceiverId(RaisingClassStr("airplay-device:abcdef0123456789")),
+        command=RaisingClassStr("doubletake"),
+    )
+
+    assert result.receiver_id == "airplay-device:abcdef0123456789"
+    assert "'doubletake'" in result.message
+    assert CANARY_TEXT not in result.message
+    assert CANARY_TEXT not in repr(result)
 
 
 def test_diagnostic_rejects_arbitrary_error_text():
@@ -955,6 +989,43 @@ class CodeImpostor(str):
         return repr(IMPOSTOR_CANARY)
 
 
+class RaisingClassStr(str):
+    """A string whose advertised class access raises with a secret-bearing error."""
+
+    @property
+    def __class__(self) -> type:
+        raise RuntimeError(CANARY_TEXT)
+
+    def __str__(self) -> str:
+        return CANARY_TEXT
+
+    def __repr__(self) -> str:
+        return repr(CANARY_TEXT)
+
+
+class RaisingClassObject:
+    """A non-string whose advertised class access raises with a canary."""
+
+    @property
+    def __class__(self) -> type:
+        raise RuntimeError(CANARY_TEXT)
+
+    def __str__(self) -> str:
+        return CANARY_TEXT
+
+    def __repr__(self) -> str:
+        return repr(CANARY_TEXT)
+
+
+def assert_clean_boundary_error(error: Exception, expected_type: type[Exception]) -> None:
+    assert type(error) is expected_type
+    assert CANARY_TEXT not in str(error)
+    assert CANARY_TEXT not in repr(error)
+    assert all(CANARY_TEXT not in repr(argument) for argument in error.args)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
 #: One value-taking field per shape, with the legitimate text it accepts.
 SHAPED_SAMPLES: Final[tuple[tuple[str, str], ...]] = (
     ("phase", "Mirroring"),
@@ -969,6 +1040,75 @@ SHAPED_SAMPLES: Final[tuple[tuple[str, str], ...]] = (
     ("output_id", "v1"),
     ("resolution", "1920x1080"),
 )
+
+
+def test_raising_class_string_subclasses_are_copied_as_data_at_activity_boundaries():
+    receiver = ReceiverId(RaisingClassStr("airplay-device:001122334455"))
+    event = safe_activity(
+        RaisingClassStr("session"),
+        receiver,
+        {RaisingClassStr("phase"): RaisingClassStr("Mirroring")},
+        RaisingClassStr(UTC),
+    )
+
+    assert event.code == "session"
+    assert event.receiver_id == RECEIVER
+    assert event.fields == {"phase": "Mirroring"}
+    assert event.utc == UTC
+    assert all(type(value) is str for value in (event.code, event.receiver_id, event.utc))
+    log = ActivityLog()
+    log.emit(event)
+    assert CANARY_TEXT not in repr(event)
+    assert CANARY_TEXT not in repr(log.entries())
+    assert CANARY_TEXT not in log.export()
+
+
+def test_raising_class_hooks_are_rejected_with_fixed_errors_at_all_boundaries():
+    bad = RaisingClassObject()
+
+    class RaisingItems(dict):
+        def items(self):
+            raise RuntimeError(CANARY_TEXT)
+
+    cases = (
+        (lambda: safe_activity(bad, None, {}, UTC), ValueError),
+        (lambda: safe_activity("session", bad, {}, UTC), TypeError),
+        (lambda: safe_activity("session", None, {bad: "Mirroring"}, UTC), ValueError),
+        (lambda: safe_activity("session", None, {"phase": bad}, UTC), ValueError),
+        (lambda: safe_activity("session", None, RaisingItems(), UTC), TypeError),
+        (lambda: safe_activity("session", None, {}, bad), ValueError),
+        (lambda: safe_activity("session", None, bad, UTC), TypeError),
+        (lambda: diagnostic(ErrorCode.transport_failed, bad), TypeError),
+        (lambda: diagnostic(bad), TypeError),
+        (lambda: diagnostic(ErrorCode.dependency_missing, command=bad), ValueError),
+    )
+    for invoke, expected_type in cases:
+        with pytest.raises(expected_type) as caught:
+            invoke()
+        assert_clean_boundary_error(caught.value, expected_type)
+
+
+def test_raising_class_hooks_cannot_bypass_numeric_or_boolean_field_shapes():
+    for name, value in (
+        ("retry_seconds", RaisingClassStr("4")),
+        ("retry_seconds", RaisingClassObject()),
+        ("explicit_video_only", RaisingClassStr("True")),
+        ("explicit_video_only", RaisingClassObject()),
+    ):
+        with pytest.raises(ValueError) as caught:
+            safe_activity("session", None, {name: value}, UTC)
+        assert_clean_boundary_error(caught.value, ValueError)
+
+
+def test_raising_class_hooks_on_outer_activity_types_are_rejected_cleanly():
+    bad = RaisingClassObject()
+    for invoke, expected_type in (
+        (lambda: ActivityLog(capabilities=bad), TypeError),
+        (lambda: ActivityLog().emit(bad), TypeError),
+    ):
+        with pytest.raises(expected_type) as caught:
+            invoke()
+        assert_clean_boundary_error(caught.value, expected_type)
 
 
 @pytest.mark.parametrize(("name", "claim"), SHAPED_SAMPLES)
@@ -1047,8 +1187,8 @@ def test_a_differently_rendering_value_cannot_change_after_validation(name, clai
 
 
 def test_a_spoofed_receiver_identity_cannot_render_the_canary():
-    # ``receiver_id`` is escaped and bounded by reading its characters, so a
-    # subclass whose iteration protocol yields other text must not survive.
+    # A canonical identity subclass is copied from its actual string data; its
+    # rendering hooks cannot alter the retained receiver correlation value.
     spoof = ReceiverId(RenderSpoof("airplay-device:001122334455"))
 
     try:
@@ -1141,27 +1281,17 @@ def test_fields_must_be_a_mapping():
         safe_activity("session", None, [("phase", "Mirroring")], UTC)  # type: ignore[arg-type]
 
 
-def test_control_characters_are_escaped():
+def test_control_characters_in_receiver_identity_are_rejected():
     hostile = ReceiverId("airplay-device:AirPlay\nTV\x00\x1b[31m")
-    event = safe_activity("display.published", hostile, {}, UTC)
-    rendered = event.receiver_id
-
-    assert isinstance(rendered, str)
-    assert "\n" not in rendered
-    assert "\x00" not in rendered
-    assert "\x1b" not in rendered
-    assert "\\u000a" in rendered
-    assert "\\u001b" in rendered
-    assert "AirPlay" in rendered
+    with pytest.raises(ValueError) as caught:
+        safe_activity("display.published", hostile, {}, UTC)
+    assert_clean_boundary_error(caught.value, ValueError)
 
 
-def test_long_identity_text_is_bounded():
-    event = safe_activity("display.published", ReceiverId("x" * 5000), {}, UTC)
-    rendered = event.receiver_id
-
-    assert isinstance(rendered, str)
-    assert len(rendered) <= MAX_FIELD_TEXT
-    assert rendered.endswith("\N{HORIZONTAL ELLIPSIS}")
+def test_long_receiver_identity_is_rejected_instead_of_truncated():
+    with pytest.raises(ValueError) as caught:
+        safe_activity("display.published", ReceiverId("airplay-device:" + "a" * 5000), {}, UTC)
+    assert_clean_boundary_error(caught.value, ValueError)
 
 
 #: A complete escape this module can emit, so a leftover backslash is a fragment.
@@ -1170,9 +1300,9 @@ COMPLETE_ESCAPE = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 
 @pytest.mark.parametrize("padding", [MAX_FIELD_TEXT - 6, MAX_FIELD_TEXT - 5, MAX_FIELD_TEXT - 4, MAX_FIELD_TEXT - 3])
 def test_bounding_never_splits_an_escape_sequence(padding):
-    value = ReceiverId("A" * padding + "\n" * 6)
+    value = "A" * padding + "\n" * 6
 
-    rendered = safe_activity("display.published", value, {}, UTC).receiver_id
+    rendered = _bounded(_escape(value))
 
     assert isinstance(rendered, str)
     assert len(rendered) <= MAX_FIELD_TEXT
@@ -1183,9 +1313,9 @@ def test_bounding_never_splits_an_escape_sequence(padding):
 
 
 def test_bounding_keeps_a_whole_escape_at_the_boundary():
-    value = ReceiverId("A" * (MAX_FIELD_TEXT - 7) + "\n\n")
+    value = "A" * (MAX_FIELD_TEXT - 7) + "\n\n"
 
-    rendered = safe_activity("display.published", value, {}, UTC).receiver_id
+    rendered = _bounded(_escape(value))
 
     assert isinstance(rendered, str)
     assert len(rendered) == MAX_FIELD_TEXT
@@ -1204,6 +1334,18 @@ def test_utc_must_be_an_absolute_timestamp(utc):
         safe_activity("session", None, {}, utc)  # type: ignore[arg-type]
 
 
+def test_invalid_utc_rejection_does_not_retain_the_original_text():
+    with pytest.raises(ValueError) as caught:
+        safe_activity("session", None, {}, CANARY_TEXT)
+    assert_clean_boundary_error(caught.value, ValueError)
+
+
+def test_utc_normalization_overflow_uses_a_fixed_boundary_error():
+    with pytest.raises(ValueError) as caught:
+        safe_activity("session", None, {}, "0001-01-01T00:00:00+23:59")
+    assert_clean_boundary_error(caught.value, ValueError)
+
+
 def test_utc_is_normalized_to_canonical_utc():
     event = safe_activity("session", None, {}, "2026-10-17T02:00:00+02:00")
 
@@ -1215,6 +1357,33 @@ def test_receiver_identity_is_preserved(receiver):
     assert safe_activity("session", receiver, {}, UTC).receiver_id == receiver
 
 
+def test_receiver_identity_must_be_canonical():
+    bad = ReceiverId("airplay-device:" + CANARY_TEXT)
+    log = ActivityLog()
+    with pytest.raises(ValueError) as caught:
+        log.emit(safe_activity("session", bad, {}, UTC))
+    assert_clean_boundary_error(caught.value, ValueError)
+    assert log.entries() == ()
+    assert CANARY_TEXT not in repr(log.entries())
+    assert CANARY_TEXT not in log.export()
+
+
+def test_activity_receiver_id_is_preserved_exactly_when_canonical():
+    canonical = ReceiverId("airplay-device:abcdef0123456789")
+    event = safe_activity("session", canonical, {}, UTC)
+    log = ActivityLog()
+    log.emit(event)
+
+    assert event.receiver_id == canonical
+    assert type(event.receiver_id) is str
+    assert event.receiver_id == "airplay-device:abcdef0123456789"
+    assert CANARY_TEXT not in repr(event)
+    assert log.entries()[0].receiver_id == canonical
+    assert json.loads(log.export())["activity"][0]["receiver_id"] == canonical
+    assert CANARY_TEXT not in repr(log.entries())
+    assert CANARY_TEXT not in log.export()
+
+
 def test_receiver_identity_must_be_a_identifier():
     with pytest.raises(TypeError, match="receiver"):
         safe_activity("session", 12345, {}, UTC)  # type: ignore[arg-type]
@@ -1223,26 +1392,10 @@ def test_receiver_identity_must_be_a_identifier():
 def test_receiver_identity_cannot_carry_controls_or_unbounded_text():
     hostile = ReceiverId("airplay-device:" + "\n\x1b[31m\x00" + "A" * 430)
 
-    event = safe_activity("session", hostile, {}, UTC)
-    rendered = event.receiver_id
+    with pytest.raises(ValueError) as caught:
+        safe_activity("session", hostile, {}, UTC)
 
-    assert rendered is not None
-    assert len(rendered) <= MAX_FIELD_TEXT
-    assert "airplay-device:" in rendered
-    assert "\\u000a" in rendered
-    for control in ("\n", "\x1b", "\x00"):
-        assert control not in rendered
-
-    log = ActivityLog()
-    log.emit(event)
-    entry = log.entries()[0]
-    assert entry.receiver_id is not None
-    for control in ("\n", "\x1b", "\x00"):
-        assert control not in repr(entry)
-        assert control not in entry.receiver_id
-    exported = json.loads(log.export())["activity"][0]["receiver_id"]
-    assert exported == rendered
-    assert "\x1b" not in log.export() and "\x00" not in log.export()
+    assert_clean_boundary_error(caught.value, ValueError)
 
 
 def test_activity_messages_are_fixed_per_code():
@@ -1445,6 +1598,61 @@ def capability_report() -> CapabilityReport:
             ),
         ),
     )
+
+
+@pytest.mark.parametrize("environment", [CANARY_TEXT, "raising-subclass"])
+def test_capability_environment_uses_a_fixed_unknown_fallback_for_unrecognized_text(environment):
+    if environment == "raising-subclass":
+        environment = RaisingClassStr(CANARY_TEXT)
+    report = replace(capability_report(), environment=environment)
+    log = ActivityLog(capabilities=report)
+
+    exported = log.export()
+
+    assert json.loads(exported)["capabilities"]["environment"] == "Unknown"
+    assert CANARY_TEXT not in exported
+    assert CANARY_TEXT not in repr(log.entries())
+
+
+def test_capability_environment_rejects_non_string_data_cleanly():
+    report = replace(capability_report(), environment=RaisingClassObject())
+    log = ActivityLog(capabilities=report)
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "discovery",
+        "mirror",
+        "virtual_display",
+        "audio",
+        "remembered_pairing",
+        "additional_virtual_outputs",
+    ],
+)
+@pytest.mark.parametrize(
+    "value",
+    [CANARY_TEXT, 1, "raising-subclass", "raising-object"],
+)
+def test_capability_export_rejects_unvalidated_flag_values(field, value):
+    if value == "raising-subclass":
+        value = RaisingClassStr(CANARY_TEXT)
+    elif value == "raising-object":
+        value = RaisingClassObject()
+    report = replace(capability_report(), **{field: value})
+    log = ActivityLog(capabilities=report)
+
+    with pytest.raises(TypeError) as caught:
+        log.export()
+
+    assert_clean_boundary_error(caught.value, TypeError)
+    assert log.entries() == ()
 
 
 def test_export_includes_counts_and_capabilities_only():

@@ -9,6 +9,7 @@ that this code has a way forward.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -28,6 +29,11 @@ ALLOWED_COMMANDS: Final[frozenset[str]] = frozenset(
 )
 
 MAX_MESSAGE_LENGTH: Final[int] = 240
+_RECEIVER_ID: Final[re.Pattern[str]] = re.compile(
+    r"airplay-device:(?:"
+    r"[0-9a-f]{1,64}|"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -265,31 +271,27 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
 
 
 def _text_data(value: object) -> str | None:
-    """The value's own character data as an exact built-in ``str``, or ``None``.
-
-    Only the *data* is read. ``str.encode`` is the unbound C function, so it
-    copies the buffer without calling ``__str__``, ``__iter__``, ``__len__``,
-    ``__getitem__``, ``__eq__``, ``__hash__``, or any subclass ``encode``: a
-    ``str`` subclass may render, compare and iterate anything it likes, and the
-    text this module validates is always the same exact built-in string it then
-    formats into user-visible copy. ``isinstance`` alone is not proof of a real
-    string, because a class can advertise a spoofed ``__class__``, so a failed
-    copy is not text at all.
-
-    The codec pair round-trips lone surrogates, so the data is preserved
-    exactly rather than repaired or replaced.
-    """
+    """Copy genuine string character data without consulting ``__class__``."""
     if type(value) is str:
         return value
-    if not isinstance(value, str):
-        return None
     try:
         copied = str.encode(value, "utf-8", "surrogatepass")
         text = copied.decode("utf-8", "surrogatepass")
-    except (TypeError, ValueError, UnicodeError):
-        # A spoofed ``__class__`` reaches here; it is not a string's data.
+    except Exception:
         return None
     return text if type(text) is str else None
+
+
+def _validated_receiver_id(receiver_id: object) -> ReceiverId | None:
+    """Accept only the canonical public identity shape used for correlation."""
+    if receiver_id is None:
+        return None
+    text = _text_data(receiver_id)
+    if text is None:
+        raise TypeError("receiver_id must be a ReceiverId or None")
+    if _RECEIVER_ID.fullmatch(text) is None:
+        raise ValueError("receiver_id must be a canonical public receiver identity")
+    return ReceiverId(text)
 
 
 def _validated_command(command: str | None) -> str | None:
@@ -337,9 +339,7 @@ def diagnostic(
 ) -> Diagnostic:
     """Build the catalog diagnostic for ``code``; no backend text is accepted."""
     validated = _validated_code(code)
-    receiver_text = _text_data(receiver_id)
-    if receiver_id is not None and receiver_text is None:
-        raise TypeError("receiver_id must be a ReceiverId or None")
+    receiver = _validated_receiver_id(receiver_id)
     entry = ENTRIES[validated]
     name = _validated_command(command)
     message = entry.message
@@ -349,6 +349,6 @@ def diagnostic(
         code=validated,
         message=message,
         recovery=entry.recovery,
-        receiver_id=ReceiverId(receiver_text) if receiver_text is not None else None,
+        receiver_id=receiver,
         detail=None,
     )
