@@ -1,0 +1,1126 @@
+source_plan:
+  path: docs/superpowers/plans/2026-10-17-airplay-mirroring.md
+  sha256: 4d1d90be2502063827e8287e312a97f51b4baf236c4275442857a78c1522b22d
+  commit_oid: 9d329b583b7a7d0041f4f472dd6abbadd347bb79
+schema_version: 1
+lanes:
+  - id: foundation
+    task_ids: [T-001, T-002]
+    owns: ["pyproject.toml", ".gitignore", "src/airplay_linux/__init__.py", "src/airplay_linux/domain/__init__.py", "src/airplay_linux/domain/identity.py", "src/airplay_linux/domain/resources.py", "src/airplay_linux/domain/operations.py", "src/airplay_linux/domain/records.py", "src/airplay_linux/domain/messages.py", "src/airplay_linux/domain/ports.py", "tests/domain/test_contracts.py", "src/airplay_linux/testing/__init__.py", "src/airplay_linux/testing/time.py", "src/airplay_linux/testing/adapters.py", "src/airplay_linux/testing/builders.py", "tests/testing/test_fakes.py"]
+    resources: ["domain-contracts", "foundation-test-seams"]
+  - id: diagnostics
+    task_ids: [T-003]
+    owns: ["src/airplay_linux/diagnostics/__init__.py", "src/airplay_linux/diagnostics/catalog.py", "src/airplay_linux/diagnostics/activity.py", "tests/diagnostics/test_safety.py"]
+    resources: ["diagnostics-catalog"]
+  - id: storage
+    task_ids: [T-004]
+    owns: ["src/airplay_linux/storage/__init__.py", "src/airplay_linux/storage/atomic.py", "src/airplay_linux/storage/codecs.py", "src/airplay_linux/storage/repositories.py", "tests/storage/test_atomic_records.py", "tests/storage/test_secret_boundaries.py"]
+    resources: ["metadata-store"]
+  - id: discovery
+    task_ids: [T-005, T-006]
+    owns: ["src/airplay_linux/discovery/__init__.py", "src/airplay_linux/discovery/identity.py", "tests/discovery/test_identity.py", "src/airplay_linux/discovery/zeroconf_adapter.py", "tests/fixtures/discovery/services.json", "tests/discovery/test_zeroconf_adapter.py"]
+    resources: ["identity-index", "mdns-browser"]
+  - id: process
+    task_ids: [T-007, T-008, T-009]
+    owns: ["src/airplay_linux/process/__init__.py", "src/airplay_linux/process/linux.py", "src/airplay_linux/process/procfs.py", "tests/process/test_linux_runner.py", "tests/process/test_procfs.py", "src/airplay_linux/backend/__init__.py", "src/airplay_linux/backend/contract.py", "src/airplay_linux/backend/control.py", "tests/fixtures/backend/doubletake-0.5-help.txt", "tests/fixtures/backend/doubletake-ctl-0.5-help.txt", "tests/fixtures/backend/status-0.5.json", "tests/fixtures/backend/contract-v1.json", "docs/backend-compatibility.md", "tests/backend/test_contract.py", "tests/backend/test_control.py", "src/airplay_linux/process/supervisor.py", "src/airplay_linux/process/daemon_registry.py", "tests/process/test_supervisor.py", "tests/process/test_daemon_registry.py"]
+    resources: ["process-runtime", "backend-contract", "daemon-registry"]
+  - id: trust
+    task_ids: [T-010]
+    owns: ["src/airplay_linux/trust/__init__.py", "src/airplay_linux/trust/fences.py", "src/airplay_linux/trust/keyring.py", "src/airplay_linux/trust/coordinator.py", "tests/trust/test_pairing_transactions.py", "tests/trust/test_keyring_boundary.py"]
+    resources: ["trust-coordinator"]
+  - id: transport
+    task_ids: [T-011]
+    owns: ["src/airplay_linux/transport/__init__.py", "src/airplay_linux/transport/targets.py", "src/airplay_linux/transport/doubletake.py", "tests/transport/test_doubletake.py"]
+    resources: ["transport-daemon"]
+  - id: capture
+    task_ids: [T-012]
+    owns: ["src/airplay_linux/capture/__init__.py", "src/airplay_linux/capture/portal.py", "src/airplay_linux/capture/physical.py", "tests/capture/test_physical_sources.py", "tests/capture/test_portal.py"]
+    resources: ["portal-capture"]
+  - id: display
+    task_ids: [T-013, T-014, T-015]
+    owns: ["src/airplay_linux/display/__init__.py", "src/airplay_linux/display/kscreen.py", "src/airplay_linux/display/helper.py", "tests/fixtures/display/kscreen-baseline.json", "tests/fixtures/display/kscreen-two-virtual.json", "tests/display/test_kscreen.py", "tests/display/test_helper.py", "src/airplay_linux/display/creation.py", "src/airplay_linux/display/locking.py", "tests/display/test_creation_transaction.py", "src/airplay_linux/display/recovery.py", "src/airplay_linux/display/removal.py", "src/airplay_linux/display/kde.py", "tests/display/test_recovery_matrix.py", "tests/display/test_removal_and_layout.py"]
+    resources: ["kde-observer", "kde-creation-lock", "kde-output-cleanup"]
+  - id: policy
+    task_ids: [T-016, T-017]
+    owns: ["src/airplay_linux/policy/__init__.py", "src/airplay_linux/policy/resolution.py", "tests/policy/test_resolution.py", "src/airplay_linux/policy/capabilities.py", "src/airplay_linux/policy/audio.py", "tests/policy/test_capabilities.py", "tests/policy/test_audio_probe.py"]
+    resources: ["resolution-policy", "capability-probes"]
+  - id: session
+    task_ids: [T-018, T-019, T-020, T-021, T-022, T-023]
+    owns: ["src/airplay_linux/session/__init__.py", "src/airplay_linux/session/engine.py", "src/airplay_linux/session/fencing.py", "src/airplay_linux/session/phase.py", "src/airplay_linux/session/testing.py", "tests/session/test_engine.py", "tests/session/test_fencing.py", "src/airplay_linux/session/mirror.py", "src/airplay_linux/session/pairing.py", "src/airplay_linux/session/cleanup.py", "tests/session/test_mirror_and_trust.py", "tests/session/test_stop_matrix.py", "src/airplay_linux/session/virtual.py", "tests/session/virtual_scenarios.py", "tests/session/test_virtual_and_resolution.py", "src/airplay_linux/session/reconnect.py", "tests/session/test_reconnect.py", "tests/session/test_daemon_recovery.py", "src/airplay_linux/session/audio.py", "tests/session/test_audio_lifecycle.py", "src/airplay_linux/session/recovery.py", "src/airplay_linux/session/persistence.py", "src/airplay_linux/session/shutdown.py", "tests/session/test_startup_recovery.py", "tests/session/test_shutdown.py"]
+    resources: ["session-manager", "receiver-lifecycle"]
+  - id: ui
+    task_ids: [T-024, T-025, T-026]
+    owns: ["src/airplay_linux/ui/__init__.py", "src/airplay_linux/ui/state.py", "tests/ui/test_state_projection.py", "src/airplay_linux/ui/models.py", "src/airplay_linux/ui/window.py", "src/airplay_linux/ui/dialogs.py", "tests/ui/test_dashboard_widgets.py", "src/airplay_linux/ui/presenter.py", "tests/ui/test_presenter.py"]
+    resources: ["ui-projection", "qt-ui", "ui-presenter"]
+  - id: assembly
+    task_ids: [T-027]
+    owns: ["src/airplay_linux/app.py", "src/airplay_linux/runtime.py", "src/airplay_linux/process/instance.py", "src/airplay_linux/resources/airplay-linux.desktop", "README.md", "docs/operations.md", "tests/app/test_composition.py", "tests/app/test_instance_guard.py"]
+    resources: ["application-runtime"]
+  - id: adapter-acceptance
+    task_ids: [T-028]
+    owns: ["tests/adapter_contracts/test_transport_contract.py", "tests/adapter_contracts/test_keyring_contract.py", "tests/adapter_contracts/test_capture_contract.py", "tests/adapter_contracts/test_kde_contract.py", "tests/adapter_contracts/test_private_processes.py", "tests/fixtures/processes/fake_doubletake.py", "tests/fixtures/processes/fake_virtualmonitor.py", "tests/fixtures/processes/fake_kscreen.py", "tests/environment/test_installed_contracts.py", "tests/environment/test_live_kde.py", "tests/environment/test_live_receivers.py"]
+    resources: []
+  - id: lifecycle-acceptance
+    task_ids: [T-029]
+    owns: ["tests/integration/test_lifecycle_matrix.py", "tests/integration/test_concurrent_sessions.py", "tests/integration/test_crash_recovery.py", "tests/integration/test_trust_and_audio.py"]
+    resources: []
+  - id: ui-acceptance
+    task_ids: [T-030]
+    owns: ["tests/ui_acceptance/test_matrix.py", "tests/ui_acceptance/test_multireceiver_flow.py", "tests/ui_acceptance/test_diagnostics.py"]
+    resources: []
+produces:
+  - id: I-001
+    name: TypedDomainContracts
+    signature: "Typed domain contracts expose immutable receiver, resource, operation, record, message, and adapter-port DTOs for the AirPlay session."
+    sha256: ffb1bc5c0aaca7b08a60a4c2cff77965953fce1a5f042d53d66cce7d2e15b6b5
+    producer: T-001
+  - id: I-002
+    name: DeterministicTestAdapters
+    signature: "Deterministic test adapters expose fake clocks, schedulers, IDs, ports, stores, event sources, and journaled secret-free effects."
+    sha256: b62b3bdb441e34b04f65c81207b46526b39a3994c2adcd1eb06d319143dc1a12
+    producer: T-002
+  - id: I-003
+    name: SafeDiagnostics
+    signature: "Safe diagnostics expose allowlisted catalog messages, bounded activity records, and secret-rejecting exports."
+    sha256: 6f191807bb897dcb561b1963d918514a4a1de82db2ec2949a279abb5ff922cd7
+    producer: T-003
+  - id: I-004
+    name: AtomicMetadataStorage
+    signature: "Atomic metadata storage exposes versioned non-secret JSON codecs, repositories, and continuity-filtered preferences."
+    sha256: 74f1558127f4a47dcf9ccc0cd8fb9f3205e441fb89736bf42ddec75e5d1c0a86
+    producer: T-004
+  - id: I-005
+    name: ConservativeIdentityResolution
+    signature: "Conservative discovery identity resolution exposes stable receiver sets, endpoint generations, targets, and ambiguity barriers."
+    sha256: 4ebe457b820b9b43c7560edef0c263605d98e03c5d47dddab376ed92932afccc
+    producer: T-005
+  - id: I-006
+    name: ZeroconfDiscovery
+    signature: "Zeroconf discovery exposes bounded mDNS browsing, normalized service records, offline retention, and typed discovery events."
+    sha256: 44c5e925a911a9df7c0dabb11ca8149ed73ea2f8fc913e3d09896fd5fdd0bd9f
+    producer: T-006
+  - id: I-007
+    name: LinuxProcessExecution
+    signature: "Linux process execution exposes bounded commands, exact PID start identities, ownership checks, termination, and exit events."
+    sha256: cc8dfc187712330901aa1662aff3d75a0319b10fc26473d4f98f3c7bef4a8f26
+    producer: T-007
+  - id: I-008
+    name: BackendContract
+    signature: "Backend contract negotiation exposes conservative feature profiles and typed target-bound control operations with provenance."
+    sha256: ec3e98a37abb5889e72bf3fcb9c42694645b9a5cdde6205e9db5ba07c0ac41ab
+    producer: T-008
+  - id: I-009
+    name: DaemonOwnership
+    signature: "Daemon ownership exposes a foreground supervisor, authenticated handshake, durable lifecycle records, reconciliation, and restart notices."
+    sha256: 1abddb31bf6626aaccba47f951935cc200ec6df745c798157e62d94020c6da7c
+    producer: T-009
+  - id: I-010
+    name: TrustTransactions
+    signature: "Trust coordination exposes generation-fenced keyring transactions, challenge lifecycle, cancellation compensation, revocation, and blocked cleanup."
+    sha256: 1c06f7ec0dd22794175202386ff6b13ec733004b69d0bd5715d4e1bba21989b8
+    producer: T-010
+  - id: I-011
+    name: TargetBoundTransport
+    signature: "DoubleTake transport exposes current-target validation, exact stream leases, physical-source verification, independent audio, and sole pairing authority."
+    sha256: 0266920ab427340c425d021e81920365c02cee1e7695306603bfcf270bf5073f
+    producer: T-011
+  - id: I-012
+    name: PhysicalCapture
+    signature: "Physical capture exposes monitor-only portal selection, connector verification, unique capture leases, and stale-source release."
+    sha256: 4e181e0c219088651e4b1c2ccce1cc18a5c9029c36cc02de267d9cd090d3daac
+    producer: T-012
+  - id: I-013
+    name: KdeDisplayObservation
+    signature: "KDE display observation exposes parsed KScreen outputs, version-checked virtual helpers, exact ownership evidence, and bounded polling."
+    sha256: 06d1740d2459b025af5afc5816cabb3cf3548c8701d26d40fdf84f472054f864
+    producer: T-013
+  - id: I-014
+    name: VirtualDisplayCreation
+    signature: "Virtual display creation exposes provider-locked staged reservations, cancellation fences, verified publication, and progress events."
+    sha256: 5300a9c146d4fce80cdb7de168ceb04f1c6349771f73ce6f6063de3d330f3ed7
+    producer: T-014
+  - id: I-015
+    name: DisplayRecovery
+    signature: "Display recovery exposes stage-aware reconciliation, exact removal, orphan confirmation, cleanup uncertainty, and guarded layout restoration."
+    sha256: c7d8382594efc85f0860fbb40ff6c0e91b968ddec83e01fa6452146a6b07445d
+    producer: T-015
+  - id: I-016
+    name: ResolutionPolicy
+    signature: "Resolution policy exposes continuity-filtered stored choices, reliable evidence precedence, explicit picker decisions, and mismatch detection."
+    sha256: 4550bdcb376dd3ae636dd6fa07fb09dbae7bcbdeed2a129e58816b3e67c5d719
+    producer: T-016
+  - id: I-017
+    name: CapabilityAudioPolicy
+    signature: "Capability and audio policy exposes environment-gated modes, repeatable audio probes, and explicit pre-ready audio decisions."
+    sha256: f400646d86ea7e2a169262eaac511ef3938009ec48685e159d22b98a144552a9
+    producer: T-017
+  - id: I-018
+    name: SessionEngine
+    signature: "Session engine exposes serialized receiver actors, resource-specific event fences, effect ledgers, independent resource snapshots, and deterministic test rigs."
+    sha256: 1a5a9244f5fb3bae79dc5821bc859348318a2c6e998c9377cbc82e2f9f48f969
+    producer: T-018
+  - id: I-019
+    name: MirrorLifecycle
+    signature: "Mirror lifecycle handlers expose physical-only start, pairing, mode confirmation, and ordered idempotent cleanup."
+    sha256: b020dfba75e287c7c2163535bb0bffa02711942fad2d57327748841b3885f1bc
+    producer: T-019
+  - id: I-020
+    name: VirtualLifecycle
+    signature: "Virtual lifecycle handlers expose resolution-gated creation, retained-output pairing, helper-failure cleanup, and destroy-recreate changes."
+    sha256: b99068c67aa207cb8edab5fb4f9d3bb2d851afab821c2c2fa09103f87c143f6c
+    producer: T-020
+  - id: I-021
+    name: ReconnectRecovery
+    signature: "Reconnect handlers expose current-target refresh, capped indefinite network backoff, shared daemon recovery, and independent receiver retry."
+    sha256: 03e3bc8a194c6ca2e187945271ee9a2fd19479f1ceef525fad2c4cd871b246a6
+    producer: T-021
+  - id: I-022
+    name: AudioLifecycle
+    signature: "Audio lifecycle handlers expose explicit startup choices, independent retry IDs, runtime video retention, and exact mute state fencing."
+    sha256: fdbbc5ae99a39a8a72989337a8c00e6aca41e746f462a736b66ea28724aba3ff
+    producer: T-022
+  - id: I-023
+    name: StartupShutdownRecovery
+    signature: "Startup and shutdown handlers expose durable intent restoration, output reconciliation, bounded ordered teardown, and unresolved-resource evidence."
+    sha256: b1012dad193c43e2d147d91427b142f4386268778db10be9cd3ca62a0d44eccb
+    producer: T-023
+  - id: I-024
+    name: UiStateProjection
+    signature: "UI state projection exposes authoritative resource badges, safe action sets, mode exclusivity, and receiver-row summaries."
+    sha256: d2a774f7b2b12b9b388b5e3813ece35309558736f735addaf0d82fdc97c0a2af
+    producer: T-024
+  - id: I-025
+    name: QtDashboard
+    signature: "Qt dashboard widgets expose receiver table rendering, selected-pane controls, accessible prompts, and signal-only user intent."
+    sha256: 772d09bb8ea3eced08917323a2e45edc38d4f27d936ee006cb6fafd12c11bf80
+    producer: T-025
+  - id: I-026
+    name: GuiPresenter
+    signature: "GUI presenter exposes receiver-scoped asynchronous command binding, stale-prompt fencing, dialog continuations, and bounded close."
+    sha256: 888de30a0ad7df87d8bc0c3d3c4d742e67f5cc88ed18314d7641614f1fdeef21
+    producer: T-026
+  - id: I-027
+    name: ApplicationAssembly
+    signature: "Application assembly exposes composed handlers, runtime construction, single-instance ownership, read-only diagnostics, and bounded shutdown."
+    sha256: fbcb2d58018d0b4c8432a0aa70011841c3ef333e55488d89a248d80d2ce21cbc
+    producer: T-027
+consumes:
+  - id: I-001
+    name: TypedDomainContracts
+    signature: "Typed domain contracts expose immutable receiver, resource, operation, record, message, and adapter-port DTOs for the AirPlay session."
+    sha256: ffb1bc5c0aaca7b08a60a4c2cff77965953fce1a5f042d53d66cce7d2e15b6b5
+    producer: T-001
+  - id: I-002
+    name: DeterministicTestAdapters
+    signature: "Deterministic test adapters expose fake clocks, schedulers, IDs, ports, stores, event sources, and journaled secret-free effects."
+    sha256: b62b3bdb441e34b04f65c81207b46526b39a3994c2adcd1eb06d319143dc1a12
+    producer: T-002
+  - id: I-003
+    name: SafeDiagnostics
+    signature: "Safe diagnostics expose allowlisted catalog messages, bounded activity records, and secret-rejecting exports."
+    sha256: 6f191807bb897dcb561b1963d918514a4a1de82db2ec2949a279abb5ff922cd7
+    producer: T-003
+  - id: I-004
+    name: AtomicMetadataStorage
+    signature: "Atomic metadata storage exposes versioned non-secret JSON codecs, repositories, and continuity-filtered preferences."
+    sha256: 74f1558127f4a47dcf9ccc0cd8fb9f3205e441fb89736bf42ddec75e5d1c0a86
+    producer: T-004
+  - id: I-005
+    name: ConservativeIdentityResolution
+    signature: "Conservative discovery identity resolution exposes stable receiver sets, endpoint generations, targets, and ambiguity barriers."
+    sha256: 4ebe457b820b9b43c7560edef0c263605d98e03c5d47dddab376ed92932afccc
+    producer: T-005
+  - id: I-006
+    name: ZeroconfDiscovery
+    signature: "Zeroconf discovery exposes bounded mDNS browsing, normalized service records, offline retention, and typed discovery events."
+    sha256: 44c5e925a911a9df7c0dabb11ca8149ed73ea2f8fc913e3d09896fd5fdd0bd9f
+    producer: T-006
+  - id: I-007
+    name: LinuxProcessExecution
+    signature: "Linux process execution exposes bounded commands, exact PID start identities, ownership checks, termination, and exit events."
+    sha256: cc8dfc187712330901aa1662aff3d75a0319b10fc26473d4f98f3c7bef4a8f26
+    producer: T-007
+  - id: I-008
+    name: BackendContract
+    signature: "Backend contract negotiation exposes conservative feature profiles and typed target-bound control operations with provenance."
+    sha256: ec3e98a37abb5889e72bf3fcb9c42694645b9a5cdde6205e9db5ba07c0ac41ab
+    producer: T-008
+  - id: I-009
+    name: DaemonOwnership
+    signature: "Daemon ownership exposes a foreground supervisor, authenticated handshake, durable lifecycle records, reconciliation, and restart notices."
+    sha256: 1abddb31bf6626aaccba47f951935cc200ec6df745c798157e62d94020c6da7c
+    producer: T-009
+  - id: I-010
+    name: TrustTransactions
+    signature: "Trust coordination exposes generation-fenced keyring transactions, challenge lifecycle, cancellation compensation, revocation, and blocked cleanup."
+    sha256: 1c06f7ec0dd22794175202386ff6b13ec733004b69d0bd5715d4e1bba21989b8
+    producer: T-010
+  - id: I-011
+    name: TargetBoundTransport
+    signature: "DoubleTake transport exposes current-target validation, exact stream leases, physical-source verification, independent audio, and sole pairing authority."
+    sha256: 0266920ab427340c425d021e81920365c02cee1e7695306603bfcf270bf5073f
+    producer: T-011
+  - id: I-012
+    name: PhysicalCapture
+    signature: "Physical capture exposes monitor-only portal selection, connector verification, unique capture leases, and stale-source release."
+    sha256: 4e181e0c219088651e4b1c2ccce1cc18a5c9029c36cc02de267d9cd090d3daac
+    producer: T-012
+  - id: I-013
+    name: KdeDisplayObservation
+    signature: "KDE display observation exposes parsed KScreen outputs, version-checked virtual helpers, exact ownership evidence, and bounded polling."
+    sha256: 06d1740d2459b025af5afc5816cabb3cf3548c8701d26d40fdf84f472054f864
+    producer: T-013
+  - id: I-014
+    name: VirtualDisplayCreation
+    signature: "Virtual display creation exposes provider-locked staged reservations, cancellation fences, verified publication, and progress events."
+    sha256: 5300a9c146d4fce80cdb7de168ceb04f1c6349771f73ce6f6063de3d330f3ed7
+    producer: T-014
+  - id: I-015
+    name: DisplayRecovery
+    signature: "Display recovery exposes stage-aware reconciliation, exact removal, orphan confirmation, cleanup uncertainty, and guarded layout restoration."
+    sha256: c7d8382594efc85f0860fbb40ff6c0e91b968ddec83e01fa6452146a6b07445d
+    producer: T-015
+  - id: I-016
+    name: ResolutionPolicy
+    signature: "Resolution policy exposes continuity-filtered stored choices, reliable evidence precedence, explicit picker decisions, and mismatch detection."
+    sha256: 4550bdcb376dd3ae636dd6fa07fb09dbae7bcbdeed2a129e58816b3e67c5d719
+    producer: T-016
+  - id: I-017
+    name: CapabilityAudioPolicy
+    signature: "Capability and audio policy exposes environment-gated modes, repeatable audio probes, and explicit pre-ready audio decisions."
+    sha256: f400646d86ea7e2a169262eaac511ef3938009ec48685e159d22b98a144552a9
+    producer: T-017
+  - id: I-018
+    name: SessionEngine
+    signature: "Session engine exposes serialized receiver actors, resource-specific event fences, effect ledgers, independent resource snapshots, and deterministic test rigs."
+    sha256: 1a5a9244f5fb3bae79dc5821bc859348318a2c6e998c9377cbc82e2f9f48f969
+    producer: T-018
+  - id: I-019
+    name: MirrorLifecycle
+    signature: "Mirror lifecycle handlers expose physical-only start, pairing, mode confirmation, and ordered idempotent cleanup."
+    sha256: b020dfba75e287c7c2163535bb0bffa02711942fad2d57327748841b3885f1bc
+    producer: T-019
+  - id: I-020
+    name: VirtualLifecycle
+    signature: "Virtual lifecycle handlers expose resolution-gated creation, retained-output pairing, helper-failure cleanup, and destroy-recreate changes."
+    sha256: b99068c67aa207cb8edab5fb4f9d3bb2d851afab821c2c2fa09103f87c143f6c
+    producer: T-020
+  - id: I-021
+    name: ReconnectRecovery
+    signature: "Reconnect handlers expose current-target refresh, capped indefinite network backoff, shared daemon recovery, and independent receiver retry."
+    sha256: 03e3bc8a194c6ca2e187945271ee9a2fd19479f1ceef525fad2c4cd871b246a6
+    producer: T-021
+  - id: I-022
+    name: AudioLifecycle
+    signature: "Audio lifecycle handlers expose explicit startup choices, independent retry IDs, runtime video retention, and exact mute state fencing."
+    sha256: fdbbc5ae99a39a8a72989337a8c00e6aca41e746f462a736b66ea28724aba3ff
+    producer: T-022
+  - id: I-023
+    name: StartupShutdownRecovery
+    signature: "Startup and shutdown handlers expose durable intent restoration, output reconciliation, bounded ordered teardown, and unresolved-resource evidence."
+    sha256: b1012dad193c43e2d147d91427b142f4386268778db10be9cd3ca62a0d44eccb
+    producer: T-023
+  - id: I-024
+    name: UiStateProjection
+    signature: "UI state projection exposes authoritative resource badges, safe action sets, mode exclusivity, and receiver-row summaries."
+    sha256: d2a774f7b2b12b9b388b5e3813ece35309558736f735addaf0d82fdc97c0a2af
+    producer: T-024
+  - id: I-025
+    name: QtDashboard
+    signature: "Qt dashboard widgets expose receiver table rendering, selected-pane controls, accessible prompts, and signal-only user intent."
+    sha256: 772d09bb8ea3eced08917323a2e45edc38d4f27d936ee006cb6fafd12c11bf80
+    producer: T-025
+  - id: I-026
+    name: GuiPresenter
+    signature: "GUI presenter exposes receiver-scoped asynchronous command binding, stale-prompt fencing, dialog continuations, and bounded close."
+    sha256: 888de30a0ad7df87d8bc0c3d3c4d742e67f5cc88ed18314d7641614f1fdeef21
+    producer: T-026
+  - id: I-027
+    name: ApplicationAssembly
+    signature: "Application assembly exposes composed handlers, runtime construction, single-instance ownership, read-only diagnostics, and bounded shutdown."
+    sha256: fbcb2d58018d0b4c8432a0aa70011841c3ef333e55488d89a248d80d2ce21cbc
+    producer: T-027
+interfaces:
+  produces:
+    - id: I-001
+      name: TypedDomainContracts
+      signature: "Typed domain contracts expose immutable receiver, resource, operation, record, message, and adapter-port DTOs for the AirPlay session."
+      sha256: ffb1bc5c0aaca7b08a60a4c2cff77965953fce1a5f042d53d66cce7d2e15b6b5
+      producer: T-001
+    - id: I-002
+      name: DeterministicTestAdapters
+      signature: "Deterministic test adapters expose fake clocks, schedulers, IDs, ports, stores, event sources, and journaled secret-free effects."
+      sha256: b62b3bdb441e34b04f65c81207b46526b39a3994c2adcd1eb06d319143dc1a12
+      producer: T-002
+    - id: I-003
+      name: SafeDiagnostics
+      signature: "Safe diagnostics expose allowlisted catalog messages, bounded activity records, and secret-rejecting exports."
+      sha256: 6f191807bb897dcb561b1963d918514a4a1de82db2ec2949a279abb5ff922cd7
+      producer: T-003
+    - id: I-004
+      name: AtomicMetadataStorage
+      signature: "Atomic metadata storage exposes versioned non-secret JSON codecs, repositories, and continuity-filtered preferences."
+      sha256: 74f1558127f4a47dcf9ccc0cd8fb9f3205e441fb89736bf42ddec75e5d1c0a86
+      producer: T-004
+    - id: I-005
+      name: ConservativeIdentityResolution
+      signature: "Conservative discovery identity resolution exposes stable receiver sets, endpoint generations, targets, and ambiguity barriers."
+      sha256: 4ebe457b820b9b43c7560edef0c263605d98e03c5d47dddab376ed92932afccc
+      producer: T-005
+    - id: I-006
+      name: ZeroconfDiscovery
+      signature: "Zeroconf discovery exposes bounded mDNS browsing, normalized service records, offline retention, and typed discovery events."
+      sha256: 44c5e925a911a9df7c0dabb11ca8149ed73ea2f8fc913e3d09896fd5fdd0bd9f
+      producer: T-006
+    - id: I-007
+      name: LinuxProcessExecution
+      signature: "Linux process execution exposes bounded commands, exact PID start identities, ownership checks, termination, and exit events."
+      sha256: cc8dfc187712330901aa1662aff3d75a0319b10fc26473d4f98f3c7bef4a8f26
+      producer: T-007
+    - id: I-008
+      name: BackendContract
+      signature: "Backend contract negotiation exposes conservative feature profiles and typed target-bound control operations with provenance."
+      sha256: ec3e98a37abb5889e72bf3fcb9c42694645b9a5cdde6205e9db5ba07c0ac41ab
+      producer: T-008
+    - id: I-009
+      name: DaemonOwnership
+      signature: "Daemon ownership exposes a foreground supervisor, authenticated handshake, durable lifecycle records, reconciliation, and restart notices."
+      sha256: 1abddb31bf6626aaccba47f951935cc200ec6df745c798157e62d94020c6da7c
+      producer: T-009
+    - id: I-010
+      name: TrustTransactions
+      signature: "Trust coordination exposes generation-fenced keyring transactions, challenge lifecycle, cancellation compensation, revocation, and blocked cleanup."
+      sha256: 1c06f7ec0dd22794175202386ff6b13ec733004b69d0bd5715d4e1bba21989b8
+      producer: T-010
+    - id: I-011
+      name: TargetBoundTransport
+      signature: "DoubleTake transport exposes current-target validation, exact stream leases, physical-source verification, independent audio, and sole pairing authority."
+      sha256: 0266920ab427340c425d021e81920365c02cee1e7695306603bfcf270bf5073f
+      producer: T-011
+    - id: I-012
+      name: PhysicalCapture
+      signature: "Physical capture exposes monitor-only portal selection, connector verification, unique capture leases, and stale-source release."
+      sha256: 4e181e0c219088651e4b1c2ccce1cc18a5c9029c36cc02de267d9cd090d3daac
+      producer: T-012
+    - id: I-013
+      name: KdeDisplayObservation
+      signature: "KDE display observation exposes parsed KScreen outputs, version-checked virtual helpers, exact ownership evidence, and bounded polling."
+      sha256: 06d1740d2459b025af5afc5816cabb3cf3548c8701d26d40fdf84f472054f864
+      producer: T-013
+    - id: I-014
+      name: VirtualDisplayCreation
+      signature: "Virtual display creation exposes provider-locked staged reservations, cancellation fences, verified publication, and progress events."
+      sha256: 5300a9c146d4fce80cdb7de168ceb04f1c6349771f73ce6f6063de3d330f3ed7
+      producer: T-014
+    - id: I-015
+      name: DisplayRecovery
+      signature: "Display recovery exposes stage-aware reconciliation, exact removal, orphan confirmation, cleanup uncertainty, and guarded layout restoration."
+      sha256: c7d8382594efc85f0860fbb40ff6c0e91b968ddec83e01fa6452146a6b07445d
+      producer: T-015
+    - id: I-016
+      name: ResolutionPolicy
+      signature: "Resolution policy exposes continuity-filtered stored choices, reliable evidence precedence, explicit picker decisions, and mismatch detection."
+      sha256: 4550bdcb376dd3ae636dd6fa07fb09dbae7bcbdeed2a129e58816b3e67c5d719
+      producer: T-016
+    - id: I-017
+      name: CapabilityAudioPolicy
+      signature: "Capability and audio policy exposes environment-gated modes, repeatable audio probes, and explicit pre-ready audio decisions."
+      sha256: f400646d86ea7e2a169262eaac511ef3938009ec48685e159d22b98a144552a9
+      producer: T-017
+    - id: I-018
+      name: SessionEngine
+      signature: "Session engine exposes serialized receiver actors, resource-specific event fences, effect ledgers, independent resource snapshots, and deterministic test rigs."
+      sha256: 1a5a9244f5fb3bae79dc5821bc859348318a2c6e998c9377cbc82e2f9f48f969
+      producer: T-018
+    - id: I-019
+      name: MirrorLifecycle
+      signature: "Mirror lifecycle handlers expose physical-only start, pairing, mode confirmation, and ordered idempotent cleanup."
+      sha256: b020dfba75e287c7c2163535bb0bffa02711942fad2d57327748841b3885f1bc
+      producer: T-019
+    - id: I-020
+      name: VirtualLifecycle
+      signature: "Virtual lifecycle handlers expose resolution-gated creation, retained-output pairing, helper-failure cleanup, and destroy-recreate changes."
+      sha256: b99068c67aa207cb8edab5fb4f9d3bb2d851afab821c2c2fa09103f87c143f6c
+      producer: T-020
+    - id: I-021
+      name: ReconnectRecovery
+      signature: "Reconnect handlers expose current-target refresh, capped indefinite network backoff, shared daemon recovery, and independent receiver retry."
+      sha256: 03e3bc8a194c6ca2e187945271ee9a2fd19479f1ceef525fad2c4cd871b246a6
+      producer: T-021
+    - id: I-022
+      name: AudioLifecycle
+      signature: "Audio lifecycle handlers expose explicit startup choices, independent retry IDs, runtime video retention, and exact mute state fencing."
+      sha256: fdbbc5ae99a39a8a72989337a8c00e6aca41e746f462a736b66ea28724aba3ff
+      producer: T-022
+    - id: I-023
+      name: StartupShutdownRecovery
+      signature: "Startup and shutdown handlers expose durable intent restoration, output reconciliation, bounded ordered teardown, and unresolved-resource evidence."
+      sha256: b1012dad193c43e2d147d91427b142f4386268778db10be9cd3ca62a0d44eccb
+      producer: T-023
+    - id: I-024
+      name: UiStateProjection
+      signature: "UI state projection exposes authoritative resource badges, safe action sets, mode exclusivity, and receiver-row summaries."
+      sha256: d2a774f7b2b12b9b388b5e3813ece35309558736f735addaf0d82fdc97c0a2af
+      producer: T-024
+    - id: I-025
+      name: QtDashboard
+      signature: "Qt dashboard widgets expose receiver table rendering, selected-pane controls, accessible prompts, and signal-only user intent."
+      sha256: 772d09bb8ea3eced08917323a2e45edc38d4f27d936ee006cb6fafd12c11bf80
+      producer: T-025
+    - id: I-026
+      name: GuiPresenter
+      signature: "GUI presenter exposes receiver-scoped asynchronous command binding, stale-prompt fencing, dialog continuations, and bounded close."
+      sha256: 888de30a0ad7df87d8bc0c3d3c4d742e67f5cc88ed18314d7641614f1fdeef21
+      producer: T-026
+    - id: I-027
+      name: ApplicationAssembly
+      signature: "Application assembly exposes composed handlers, runtime construction, single-instance ownership, read-only diagnostics, and bounded shutdown."
+      sha256: fbcb2d58018d0b4c8432a0aa70011841c3ef333e55488d89a248d80d2ce21cbc
+      producer: T-027
+  consumes:
+    - id: I-001
+      name: TypedDomainContracts
+      signature: "Typed domain contracts expose immutable receiver, resource, operation, record, message, and adapter-port DTOs for the AirPlay session."
+      sha256: ffb1bc5c0aaca7b08a60a4c2cff77965953fce1a5f042d53d66cce7d2e15b6b5
+      producer: T-001
+    - id: I-002
+      name: DeterministicTestAdapters
+      signature: "Deterministic test adapters expose fake clocks, schedulers, IDs, ports, stores, event sources, and journaled secret-free effects."
+      sha256: b62b3bdb441e34b04f65c81207b46526b39a3994c2adcd1eb06d319143dc1a12
+      producer: T-002
+    - id: I-003
+      name: SafeDiagnostics
+      signature: "Safe diagnostics expose allowlisted catalog messages, bounded activity records, and secret-rejecting exports."
+      sha256: 6f191807bb897dcb561b1963d918514a4a1de82db2ec2949a279abb5ff922cd7
+      producer: T-003
+    - id: I-004
+      name: AtomicMetadataStorage
+      signature: "Atomic metadata storage exposes versioned non-secret JSON codecs, repositories, and continuity-filtered preferences."
+      sha256: 74f1558127f4a47dcf9ccc0cd8fb9f3205e441fb89736bf42ddec75e5d1c0a86
+      producer: T-004
+    - id: I-005
+      name: ConservativeIdentityResolution
+      signature: "Conservative discovery identity resolution exposes stable receiver sets, endpoint generations, targets, and ambiguity barriers."
+      sha256: 4ebe457b820b9b43c7560edef0c263605d98e03c5d47dddab376ed92932afccc
+      producer: T-005
+    - id: I-006
+      name: ZeroconfDiscovery
+      signature: "Zeroconf discovery exposes bounded mDNS browsing, normalized service records, offline retention, and typed discovery events."
+      sha256: 44c5e925a911a9df7c0dabb11ca8149ed73ea2f8fc913e3d09896fd5fdd0bd9f
+      producer: T-006
+    - id: I-007
+      name: LinuxProcessExecution
+      signature: "Linux process execution exposes bounded commands, exact PID start identities, ownership checks, termination, and exit events."
+      sha256: cc8dfc187712330901aa1662aff3d75a0319b10fc26473d4f98f3c7bef4a8f26
+      producer: T-007
+    - id: I-008
+      name: BackendContract
+      signature: "Backend contract negotiation exposes conservative feature profiles and typed target-bound control operations with provenance."
+      sha256: ec3e98a37abb5889e72bf3fcb9c42694645b9a5cdde6205e9db5ba07c0ac41ab
+      producer: T-008
+    - id: I-009
+      name: DaemonOwnership
+      signature: "Daemon ownership exposes a foreground supervisor, authenticated handshake, durable lifecycle records, reconciliation, and restart notices."
+      sha256: 1abddb31bf6626aaccba47f951935cc200ec6df745c798157e62d94020c6da7c
+      producer: T-009
+    - id: I-010
+      name: TrustTransactions
+      signature: "Trust coordination exposes generation-fenced keyring transactions, challenge lifecycle, cancellation compensation, revocation, and blocked cleanup."
+      sha256: 1c06f7ec0dd22794175202386ff6b13ec733004b69d0bd5715d4e1bba21989b8
+      producer: T-010
+    - id: I-011
+      name: TargetBoundTransport
+      signature: "DoubleTake transport exposes current-target validation, exact stream leases, physical-source verification, independent audio, and sole pairing authority."
+      sha256: 0266920ab427340c425d021e81920365c02cee1e7695306603bfcf270bf5073f
+      producer: T-011
+    - id: I-012
+      name: PhysicalCapture
+      signature: "Physical capture exposes monitor-only portal selection, connector verification, unique capture leases, and stale-source release."
+      sha256: 4e181e0c219088651e4b1c2ccce1cc18a5c9029c36cc02de267d9cd090d3daac
+      producer: T-012
+    - id: I-013
+      name: KdeDisplayObservation
+      signature: "KDE display observation exposes parsed KScreen outputs, version-checked virtual helpers, exact ownership evidence, and bounded polling."
+      sha256: 06d1740d2459b025af5afc5816cabb3cf3548c8701d26d40fdf84f472054f864
+      producer: T-013
+    - id: I-014
+      name: VirtualDisplayCreation
+      signature: "Virtual display creation exposes provider-locked staged reservations, cancellation fences, verified publication, and progress events."
+      sha256: 5300a9c146d4fce80cdb7de168ceb04f1c6349771f73ce6f6063de3d330f3ed7
+      producer: T-014
+    - id: I-015
+      name: DisplayRecovery
+      signature: "Display recovery exposes stage-aware reconciliation, exact removal, orphan confirmation, cleanup uncertainty, and guarded layout restoration."
+      sha256: c7d8382594efc85f0860fbb40ff6c0e91b968ddec83e01fa6452146a6b07445d
+      producer: T-015
+    - id: I-016
+      name: ResolutionPolicy
+      signature: "Resolution policy exposes continuity-filtered stored choices, reliable evidence precedence, explicit picker decisions, and mismatch detection."
+      sha256: 4550bdcb376dd3ae636dd6fa07fb09dbae7bcbdeed2a129e58816b3e67c5d719
+      producer: T-016
+    - id: I-017
+      name: CapabilityAudioPolicy
+      signature: "Capability and audio policy exposes environment-gated modes, repeatable audio probes, and explicit pre-ready audio decisions."
+      sha256: f400646d86ea7e2a169262eaac511ef3938009ec48685e159d22b98a144552a9
+      producer: T-017
+    - id: I-018
+      name: SessionEngine
+      signature: "Session engine exposes serialized receiver actors, resource-specific event fences, effect ledgers, independent resource snapshots, and deterministic test rigs."
+      sha256: 1a5a9244f5fb3bae79dc5821bc859348318a2c6e998c9377cbc82e2f9f48f969
+      producer: T-018
+    - id: I-019
+      name: MirrorLifecycle
+      signature: "Mirror lifecycle handlers expose physical-only start, pairing, mode confirmation, and ordered idempotent cleanup."
+      sha256: b020dfba75e287c7c2163535bb0bffa02711942fad2d57327748841b3885f1bc
+      producer: T-019
+    - id: I-020
+      name: VirtualLifecycle
+      signature: "Virtual lifecycle handlers expose resolution-gated creation, retained-output pairing, helper-failure cleanup, and destroy-recreate changes."
+      sha256: b99068c67aa207cb8edab5fb4f9d3bb2d851afab821c2c2fa09103f87c143f6c
+      producer: T-020
+    - id: I-021
+      name: ReconnectRecovery
+      signature: "Reconnect handlers expose current-target refresh, capped indefinite network backoff, shared daemon recovery, and independent receiver retry."
+      sha256: 03e3bc8a194c6ca2e187945271ee9a2fd19479f1ceef525fad2c4cd871b246a6
+      producer: T-021
+    - id: I-022
+      name: AudioLifecycle
+      signature: "Audio lifecycle handlers expose explicit startup choices, independent retry IDs, runtime video retention, and exact mute state fencing."
+      sha256: fdbbc5ae99a39a8a72989337a8c00e6aca41e746f462a736b66ea28724aba3ff
+      producer: T-022
+    - id: I-023
+      name: StartupShutdownRecovery
+      signature: "Startup and shutdown handlers expose durable intent restoration, output reconciliation, bounded ordered teardown, and unresolved-resource evidence."
+      sha256: b1012dad193c43e2d147d91427b142f4386268778db10be9cd3ca62a0d44eccb
+      producer: T-023
+    - id: I-024
+      name: UiStateProjection
+      signature: "UI state projection exposes authoritative resource badges, safe action sets, mode exclusivity, and receiver-row summaries."
+      sha256: d2a774f7b2b12b9b388b5e3813ece35309558736f735addaf0d82fdc97c0a2af
+      producer: T-024
+    - id: I-025
+      name: QtDashboard
+      signature: "Qt dashboard widgets expose receiver table rendering, selected-pane controls, accessible prompts, and signal-only user intent."
+      sha256: 772d09bb8ea3eced08917323a2e45edc38d4f27d936ee006cb6fafd12c11bf80
+      producer: T-025
+    - id: I-026
+      name: GuiPresenter
+      signature: "GUI presenter exposes receiver-scoped asynchronous command binding, stale-prompt fencing, dialog continuations, and bounded close."
+      sha256: 888de30a0ad7df87d8bc0c3d3c4d742e67f5cc88ed18314d7641614f1fdeef21
+      producer: T-026
+    - id: I-027
+      name: ApplicationAssembly
+      signature: "Application assembly exposes composed handlers, runtime construction, single-instance ownership, read-only diagnostics, and bounded shutdown."
+      sha256: fbcb2d58018d0b4c8432a0aa70011841c3ef333e55488d89a248d80d2ce21cbc
+      producer: T-027
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: "Establish packaging and freeze typed domain interfaces"
+    lane: foundation
+    sequence: 1
+    tier: capable
+    category: shared-contract
+    owns: ["pyproject.toml", ".gitignore", "src/airplay_linux/__init__.py", "src/airplay_linux/domain/__init__.py", "src/airplay_linux/domain/identity.py", "src/airplay_linux/domain/resources.py", "src/airplay_linux/domain/operations.py", "src/airplay_linux/domain/records.py", "src/airplay_linux/domain/messages.py", "src/airplay_linux/domain/ports.py", "tests/domain/test_contracts.py"]
+    resources: ["domain-contracts"]
+    depends_on: []
+    interfaces:
+      produces: [I-001]
+      consumes: []
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/domain"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-002
+    plan_task: 2
+    title: "Supply deterministic adapters and a controllable event laboratory"
+    lane: foundation
+    sequence: 2
+    tier: advanced
+    category: test-seams
+    owns: ["src/airplay_linux/testing/__init__.py", "src/airplay_linux/testing/time.py", "src/airplay_linux/testing/adapters.py", "src/airplay_linux/testing/builders.py", "tests/testing/test_fakes.py"]
+    resources: ["foundation-test-seams"]
+    depends_on: [T-001]
+    interfaces:
+      produces: [I-002]
+      consumes: [I-001]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/testing"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-003
+    plan_task: 3
+    title: "Define safe diagnostics and user recovery messages"
+    lane: diagnostics
+    sequence: 1
+    tier: standard
+    category: observable-errors
+    owns: ["src/airplay_linux/diagnostics/__init__.py", "src/airplay_linux/diagnostics/catalog.py", "src/airplay_linux/diagnostics/activity.py", "tests/diagnostics/test_safety.py"]
+    resources: ["diagnostics-catalog"]
+    depends_on: [T-001, T-002]
+    interfaces:
+      produces: [I-003]
+      consumes: [I-001, I-002]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/diagnostics"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-004
+    plan_task: 4
+    title: "Implement durable non-secret records and continuity-aware preferences"
+    lane: storage
+    sequence: 1
+    tier: advanced
+    category: durable-metadata
+    owns: ["src/airplay_linux/storage/__init__.py", "src/airplay_linux/storage/atomic.py", "src/airplay_linux/storage/codecs.py", "src/airplay_linux/storage/repositories.py", "tests/storage/test_atomic_records.py", "tests/storage/test_secret_boundaries.py"]
+    resources: ["metadata-store"]
+    depends_on: [T-001, T-002, T-003]
+    interfaces:
+      produces: [I-004]
+      consumes: [I-001, I-002, I-003]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/storage"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-005
+    plan_task: 5
+    title: "Derive conservative receiver identities after cross-service aggregation"
+    lane: discovery
+    sequence: 1
+    tier: capable
+    category: identity
+    owns: ["src/airplay_linux/discovery/__init__.py", "src/airplay_linux/discovery/identity.py", "tests/discovery/test_identity.py"]
+    resources: ["identity-index"]
+    depends_on: [T-001, T-002]
+    interfaces:
+      produces: [I-005]
+      consumes: [I-001, I-002]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/discovery/test_identity.py"]
+        cwd: "."
+        timeout_seconds: 600
+  - id: T-006
+    plan_task: 6
+    title: "Watch mDNS and expose domain discovery events"
+    lane: discovery
+    sequence: 2
+    tier: advanced
+    category: zeroconf-adapter
+    owns: ["src/airplay_linux/discovery/zeroconf_adapter.py", "tests/fixtures/discovery/services.json", "tests/discovery/test_zeroconf_adapter.py"]
+    resources: ["mdns-browser"]
+    depends_on: [T-001, T-002, T-003, T-005]
+    interfaces:
+      produces: [I-006]
+      consumes: [I-001, I-002, I-003, I-005]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/discovery/test_zeroconf_adapter.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-007
+    plan_task: 7
+    title: "Implement bounded Linux process operations and exact ownership evidence"
+    lane: process
+    sequence: 1
+    tier: advanced
+    category: process-runtime
+    owns: ["src/airplay_linux/process/__init__.py", "src/airplay_linux/process/linux.py", "src/airplay_linux/process/procfs.py", "tests/process/test_linux_runner.py", "tests/process/test_procfs.py"]
+    resources: ["process-runtime"]
+    depends_on: [T-001, T-002, T-003]
+    interfaces:
+      produces: [I-007]
+      consumes: [I-001, I-002, I-003]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/process/test_linux_runner.py", "tests/process/test_procfs.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-008
+    plan_task: 8
+    title: "Pin the published backend contract and capability negotiation"
+    lane: process
+    sequence: 2
+    tier: capable
+    category: backend-contract
+    owns: ["src/airplay_linux/backend/__init__.py", "src/airplay_linux/backend/contract.py", "src/airplay_linux/backend/control.py", "tests/fixtures/backend/doubletake-0.5-help.txt", "tests/fixtures/backend/doubletake-ctl-0.5-help.txt", "tests/fixtures/backend/status-0.5.json", "tests/fixtures/backend/contract-v1.json", "docs/backend-compatibility.md", "tests/backend/test_contract.py", "tests/backend/test_control.py"]
+    resources: ["backend-contract"]
+    depends_on: [T-001, T-002, T-003, T-007]
+    interfaces:
+      produces: [I-008]
+      consumes: [I-001, I-002, I-003, I-007]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/backend"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-009
+    plan_task: 9
+    title: "Own a foreground daemon through supervisor and runtime reconciliation"
+    lane: process
+    sequence: 3
+    tier: capable
+    category: daemon-ownership
+    owns: ["src/airplay_linux/process/supervisor.py", "src/airplay_linux/process/daemon_registry.py", "tests/process/test_supervisor.py", "tests/process/test_daemon_registry.py"]
+    resources: ["daemon-registry"]
+    depends_on: [T-001, T-002, T-003, T-004, T-007, T-008]
+    interfaces:
+      produces: [I-009]
+      consumes: [I-001, I-002, I-003, I-004, I-007, I-008]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/process"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-010
+    plan_task: 10
+    title: "Fence keyring trust transactions and compensate late pairing completion"
+    lane: trust
+    sequence: 1
+    tier: capable
+    category: pairing-transaction
+    owns: ["src/airplay_linux/trust/__init__.py", "src/airplay_linux/trust/fences.py", "src/airplay_linux/trust/keyring.py", "src/airplay_linux/trust/coordinator.py", "tests/trust/test_pairing_transactions.py", "tests/trust/test_keyring_boundary.py"]
+    resources: ["trust-coordinator"]
+    depends_on: [T-001, T-002, T-003, T-004, T-008]
+    interfaces:
+      produces: [I-010]
+      consumes: [I-001, I-002, I-003, I-004, I-008]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/trust"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-011
+    plan_task: 11
+    title: "Coordinate target-bound concurrent transport and sole-authority pairing"
+    lane: transport
+    sequence: 1
+    tier: capable
+    category: doubletake-adapter
+    owns: ["src/airplay_linux/transport/__init__.py", "src/airplay_linux/transport/targets.py", "src/airplay_linux/transport/doubletake.py", "tests/transport/test_doubletake.py"]
+    resources: ["transport-daemon"]
+    depends_on: [T-001, T-002, T-003, T-008, T-009, T-010]
+    interfaces:
+      produces: [I-011]
+      consumes: [I-001, I-002, I-003, I-008, I-009, I-010]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/transport"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-012
+    plan_task: 12
+    title: "Enforce physical-monitor capture through portal and backend verification"
+    lane: capture
+    sequence: 1
+    tier: advanced
+    category: physical-monitor-selection
+    owns: ["src/airplay_linux/capture/__init__.py", "src/airplay_linux/capture/portal.py", "src/airplay_linux/capture/physical.py", "tests/capture/test_physical_sources.py", "tests/capture/test_portal.py"]
+    resources: ["portal-capture"]
+    depends_on: [T-001, T-002, T-003, T-007, T-008]
+    interfaces:
+      produces: [I-012]
+      consumes: [I-001, I-002, I-003, I-007, I-008]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/capture"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-013
+    plan_task: 13
+    title: "Observe KScreen and launch version-checked owned virtual-monitor helpers"
+    lane: display
+    sequence: 1
+    tier: advanced
+    category: helper-and-kscreen
+    owns: ["src/airplay_linux/display/__init__.py", "src/airplay_linux/display/kscreen.py", "src/airplay_linux/display/helper.py", "tests/fixtures/display/kscreen-baseline.json", "tests/fixtures/display/kscreen-two-virtual.json", "tests/display/test_kscreen.py", "tests/display/test_helper.py"]
+    resources: ["kde-observer"]
+    depends_on: [T-001, T-002, T-003, T-007]
+    interfaces:
+      produces: [I-013]
+      consumes: [I-001, I-002, I-003, I-007]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/display/test_kscreen.py", "tests/display/test_helper.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-014
+    plan_task: 14
+    title: "Reserve and publish serialized KDE virtual-output creation"
+    lane: display
+    sequence: 2
+    tier: capable
+    category: creation-transaction
+    owns: ["src/airplay_linux/display/creation.py", "src/airplay_linux/display/locking.py", "tests/display/test_creation_transaction.py"]
+    resources: ["kde-creation-lock"]
+    depends_on: [T-001, T-002, T-003, T-004, T-013]
+    interfaces:
+      produces: [I-014]
+      consumes: [I-001, I-002, I-003, I-004, I-013]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/display/test_creation_transaction.py"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-015
+    plan_task: 15
+    title: "Reconcile every ownership stage and remove outputs conservatively"
+    lane: display
+    sequence: 3
+    tier: capable
+    category: recovery-and-removal
+    owns: ["src/airplay_linux/display/recovery.py", "src/airplay_linux/display/removal.py", "src/airplay_linux/display/kde.py", "tests/display/test_recovery_matrix.py", "tests/display/test_removal_and_layout.py"]
+    resources: ["kde-output-cleanup"]
+    depends_on: [T-001, T-002, T-003, T-004, T-007, T-013, T-014]
+    interfaces:
+      produces: [I-015]
+      consumes: [I-001, I-002, I-003, I-004, I-007, I-013, I-014]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/display"]
+        cwd: "."
+        timeout_seconds: 1500
+  - id: T-016
+    plan_task: 16
+    title: "Resolve receiver modes with reliable evidence and identity continuity"
+    lane: policy
+    sequence: 1
+    tier: standard
+    category: resolution
+    owns: ["src/airplay_linux/policy/__init__.py", "src/airplay_linux/policy/resolution.py", "tests/policy/test_resolution.py"]
+    resources: ["resolution-policy"]
+    depends_on: [T-001, T-002, T-004, T-005]
+    interfaces:
+      produces: [I-016]
+      consumes: [I-001, I-002, I-004, I-005]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/policy/test_resolution.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-017
+    plan_task: 17
+    title: "Probe environment, audio, and per-mode capability gates"
+    lane: policy
+    sequence: 2
+    tier: advanced
+    category: startup-capabilities
+    owns: ["src/airplay_linux/policy/capabilities.py", "src/airplay_linux/policy/audio.py", "tests/policy/test_capabilities.py", "tests/policy/test_audio_probe.py"]
+    resources: ["capability-probes"]
+    depends_on: [T-001, T-002, T-003, T-007, T-008, T-012, T-013, T-016]
+    interfaces:
+      produces: [I-017]
+      consumes: [I-001, I-002, I-003, I-007, I-008, I-012, I-013, I-016]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/policy"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-018
+    plan_task: 18
+    title: "Serialize receiver actors and fence events by their actual resource"
+    lane: session
+    sequence: 1
+    tier: capable
+    category: actor-and-effect-engine
+    owns: ["src/airplay_linux/session/__init__.py", "src/airplay_linux/session/engine.py", "src/airplay_linux/session/fencing.py", "src/airplay_linux/session/phase.py", "src/airplay_linux/session/testing.py", "tests/session/test_engine.py", "tests/session/test_fencing.py"]
+    resources: ["session-manager"]
+    depends_on: [T-001, T-002, T-003, T-010]
+    interfaces:
+      produces: [I-018]
+      consumes: [I-001, I-002, I-003, I-010]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_engine.py", "tests/session/test_fencing.py"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-019
+    plan_task: 19
+    title: "Implement Mirror, pairing, mode confirmation, and universal ordered Stop"
+    lane: session
+    sequence: 2
+    tier: capable
+    category: mirror-trust-cleanup
+    owns: ["src/airplay_linux/session/mirror.py", "src/airplay_linux/session/pairing.py", "src/airplay_linux/session/cleanup.py", "tests/session/test_mirror_and_trust.py", "tests/session/test_stop_matrix.py"]
+    resources: ["receiver-lifecycle"]
+    depends_on: [T-001, T-002, T-003, T-010, T-011, T-012, T-017, T-018]
+    interfaces:
+      produces: [I-019]
+      consumes: [I-001, I-002, I-003, I-010, I-011, I-012, I-017, I-018]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_mirror_and_trust.py", "tests/session/test_stop_matrix.py"]
+        cwd: "."
+        timeout_seconds: 1500
+  - id: T-020
+    plan_task: 20
+    title: "Implement Virtual display, retained-output pairing, and resolution recreation"
+    lane: session
+    sequence: 3
+    tier: capable
+    category: virtual-transaction
+    owns: ["src/airplay_linux/session/virtual.py", "tests/session/virtual_scenarios.py", "tests/session/test_virtual_and_resolution.py"]
+    resources: ["receiver-lifecycle"]
+    depends_on: [T-014, T-015, T-016, T-017, T-018, T-019]
+    interfaces:
+      produces: [I-020]
+      consumes: [I-014, I-015, I-016, I-017, I-018, I-019]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_virtual_and_resolution.py"]
+        cwd: "."
+        timeout_seconds: 1500
+  - id: T-021
+    plan_task: 21
+    title: "Reconnect current targets and coordinate shared daemon recovery"
+    lane: session
+    sequence: 4
+    tier: capable
+    category: reconnect-and-daemon-recovery
+    owns: ["src/airplay_linux/session/reconnect.py", "tests/session/test_reconnect.py", "tests/session/test_daemon_recovery.py"]
+    resources: ["receiver-lifecycle"]
+    depends_on: [T-009, T-011, T-018, T-019, T-020]
+    interfaces:
+      produces: [I-021]
+      consumes: [I-009, I-011, I-018, I-019, I-020]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_reconnect.py", "tests/session/test_daemon_recovery.py"]
+        cwd: "."
+        timeout_seconds: 1500
+  - id: T-022
+    plan_task: 22
+    title: "Preserve video through runtime audio loss and implement local mute"
+    lane: session
+    sequence: 5
+    tier: advanced
+    category: audio-lifecycle
+    owns: ["src/airplay_linux/session/audio.py", "tests/session/test_audio_lifecycle.py"]
+    resources: ["receiver-lifecycle"]
+    depends_on: [T-011, T-017, T-018, T-019, T-020, T-021]
+    interfaces:
+      produces: [I-022]
+      consumes: [I-011, I-017, I-018, I-019, I-020, I-021]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_audio_lifecycle.py"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-023
+    plan_task: 23
+    title: "Restore persisted intent, reconcile outputs, and bound shutdown"
+    lane: session
+    sequence: 6
+    tier: capable
+    category: persistence-recovery-shutdown
+    owns: ["src/airplay_linux/session/recovery.py", "src/airplay_linux/session/persistence.py", "src/airplay_linux/session/shutdown.py", "tests/session/test_startup_recovery.py", "tests/session/test_shutdown.py"]
+    resources: ["receiver-lifecycle"]
+    depends_on: [T-004, T-009, T-010, T-011, T-015, T-018, T-019, T-020, T-021, T-022]
+    interfaces:
+      produces: [I-023]
+      consumes: [I-004, I-009, I-010, I-011, I-015, I-018, I-019, I-020, I-021, I-022]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/session/test_startup_recovery.py", "tests/session/test_shutdown.py", "tests/session"]
+        cwd: "."
+        timeout_seconds: 1800
+  - id: T-024
+    plan_task: 24
+    title: "Project every resource combination into safe UI actions"
+    lane: ui
+    sequence: 1
+    tier: advanced
+    category: pure-state-projection
+    owns: ["src/airplay_linux/ui/__init__.py", "src/airplay_linux/ui/state.py", "tests/ui/test_state_projection.py"]
+    resources: ["ui-projection"]
+    depends_on: [T-001, T-002, T-003]
+    interfaces:
+      produces: [I-024]
+      consumes: [I-001, I-003]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/ui/test_state_projection.py"]
+        cwd: "."
+        timeout_seconds: 900
+  - id: T-025
+    plan_task: 25
+    title: "Build the dense PySide6 dashboard and accessible prompts"
+    lane: ui
+    sequence: 2
+    tier: advanced
+    category: widgets-and-models
+    owns: ["src/airplay_linux/ui/models.py", "src/airplay_linux/ui/window.py", "src/airplay_linux/ui/dialogs.py", "tests/ui/test_dashboard_widgets.py"]
+    resources: ["qt-ui"]
+    depends_on: [T-001, T-002, T-003, T-024]
+    interfaces:
+      produces: [I-025]
+      consumes: [I-001, I-024]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/ui/test_dashboard_widgets.py"]
+        cwd: "."
+        timeout_seconds: 1200
+  - id: T-026
+    plan_task: 26
+    title: "Bind GUI intent to domain commands and safe asynchronous updates"
+    lane: ui
+    sequence: 3
+    tier: advanced
+    category: presenter
+    owns: ["src/airplay_linux/ui/presenter.py", "tests/ui/test_presenter.py"]
+    resources: ["ui-presenter"]
+    depends_on: [T-001, T-002, T-003, T-024, T-025]
+    interfaces:
+      produces: [I-026]
+      consumes: [I-001, I-003, I-024, I-025]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/ui/test_presenter.py"]
+        cwd: "."
+        timeout_seconds: 1500
+  - id: T-027
+    plan_task: 27
+    title: "Compose application startup, single-instance guard, and operator diagnostics"
+    lane: assembly
+    sequence: 1
+    tier: capable
+    category: runnable-application
+    owns: ["src/airplay_linux/app.py", "src/airplay_linux/runtime.py", "src/airplay_linux/process/instance.py", "src/airplay_linux/resources/airplay-linux.desktop", "README.md", "docs/operations.md", "tests/app/test_composition.py", "tests/app/test_instance_guard.py"]
+    resources: ["application-runtime"]
+    depends_on: [T-003, T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-012, T-013, T-014, T-015, T-016, T-017, T-018, T-019, T-020, T-021, T-022, T-023, T-024, T-025, T-026]
+    interfaces:
+      produces: [I-027]
+      consumes: [I-003, I-004, I-005, I-006, I-007, I-008, I-009, I-010, I-011, I-012, I-013, I-014, I-015, I-016, I-017, I-018, I-019, I-020, I-021, I-022, I-023, I-024, I-025, I-026]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/app"]
+        cwd: "."
+        timeout_seconds: 1800
+  - id: T-028
+    plan_task: 28
+    title: "Exercise real adapter plumbing with private fake processes and opt-in environment checks"
+    lane: adapter-acceptance
+    sequence: 1
+    tier: advanced
+    category: contract-and-environment-tests
+    owns: ["tests/adapter_contracts/test_transport_contract.py", "tests/adapter_contracts/test_keyring_contract.py", "tests/adapter_contracts/test_capture_contract.py", "tests/adapter_contracts/test_kde_contract.py", "tests/adapter_contracts/test_private_processes.py", "tests/fixtures/processes/fake_doubletake.py", "tests/fixtures/processes/fake_virtualmonitor.py", "tests/fixtures/processes/fake_kscreen.py", "tests/environment/test_installed_contracts.py", "tests/environment/test_live_kde.py", "tests/environment/test_live_receivers.py"]
+    resources: []
+    depends_on: [T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-012, T-013, T-014, T-015, T-016, T-017, T-027]
+    interfaces:
+      produces: []
+      consumes: [I-004, I-005, I-006, I-007, I-008, I-009, I-010, I-011, I-012, I-013, I-014, I-015, I-016, I-017, I-027]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/adapter_contracts", "-m", "not live_backend and not live_kde and not live_hardware"]
+        cwd: "."
+        timeout_seconds: 1800
+  - id: T-029
+    plan_task: 29
+    title: "Verify every lifecycle transition and crash boundary through assembled sessions"
+    lane: lifecycle-acceptance
+    sequence: 1
+    tier: capable
+    category: end-to-end-domain-tests
+    owns: ["tests/integration/test_lifecycle_matrix.py", "tests/integration/test_concurrent_sessions.py", "tests/integration/test_crash_recovery.py", "tests/integration/test_trust_and_audio.py"]
+    resources: []
+    depends_on: [T-001, T-002, T-003, T-004, T-005, T-006, T-007, T-008, T-009, T-010, T-011, T-012, T-013, T-014, T-015, T-016, T-017, T-018, T-019, T-020, T-021, T-022, T-023, T-027]
+    interfaces:
+      produces: []
+      consumes: [I-001, I-002, I-003, I-004, I-005, I-006, I-007, I-008, I-009, I-010, I-011, I-012, I-013, I-014, I-015, I-016, I-017, I-018, I-019, I-020, I-021, I-022, I-023, I-027]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/integration", "tests/session", "tests/display", "tests/trust"]
+        cwd: "."
+        timeout_seconds: 2400
+  - id: T-030
+    plan_task: 30
+    title: "Verify the full Qt state matrix and final runnable acceptance"
+    lane: ui-acceptance
+    sequence: 1
+    tier: advanced
+    category: final-behavior-tests
+    owns: ["tests/ui_acceptance/test_matrix.py", "tests/ui_acceptance/test_multireceiver_flow.py", "tests/ui_acceptance/test_diagnostics.py"]
+    resources: []
+    depends_on: [T-024, T-025, T-026, T-027, T-028, T-029]
+    interfaces:
+      produces: []
+      consumes: [I-024, I-025, I-026, I-027]
+    validation:
+      - argv: ["python", "-m", "pytest", "-q", "tests/ui_acceptance", "-m", "not live_backend and not live_kde and not live_hardware"]
+        cwd: "."
+        timeout_seconds: 2400

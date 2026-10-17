@@ -1,0 +1,271 @@
+digraph airplay_linux {
+  rankdir=LR;
+  node [shape=box];
+  subgraph cluster_foundation {
+    label="foundation";
+    "T-001" [label="Task 1: Establish packaging and freeze typed domain interfaces\nCapable"];
+    "T-002" [label="Task 2: Supply deterministic adapters and a controllable event laboratory\nAdvanced"];
+  }
+  subgraph cluster_diagnostics {
+    label="diagnostics";
+    "T-003" [label="Task 3: Define safe diagnostics and user recovery messages\nStandard"];
+  }
+  subgraph cluster_storage {
+    label="storage";
+    "T-004" [label="Task 4: Implement durable non-secret records and continuity-aware preferences\nAdvanced"];
+  }
+  subgraph cluster_discovery {
+    label="discovery";
+    "T-005" [label="Task 5: Derive conservative receiver identities after cross-service aggregation\nCapable"];
+    "T-006" [label="Task 6: Watch mDNS and expose domain discovery events\nAdvanced"];
+  }
+  subgraph cluster_process {
+    label="process";
+    "T-007" [label="Task 7: Implement bounded Linux process operations and exact ownership evidence\nAdvanced"];
+    "T-008" [label="Task 8: Pin the published backend contract and capability negotiation\nCapable"];
+    "T-009" [label="Task 9: Own a foreground daemon through supervisor and runtime reconciliation\nCapable"];
+  }
+  subgraph cluster_trust {
+    label="trust";
+    "T-010" [label="Task 10: Fence keyring trust transactions and compensate late pairing completion\nCapable"];
+  }
+  subgraph cluster_transport {
+    label="transport";
+    "T-011" [label="Task 11: Coordinate target-bound concurrent transport and sole-authority pairing\nCapable"];
+  }
+  subgraph cluster_capture {
+    label="capture";
+    "T-012" [label="Task 12: Enforce physical-monitor capture through portal and backend verification\nAdvanced"];
+  }
+  subgraph cluster_display {
+    label="display";
+    "T-013" [label="Task 13: Observe KScreen and launch version-checked owned virtual-monitor helpers\nAdvanced"];
+    "T-014" [label="Task 14: Reserve and publish serialized KDE virtual-output creation\nCapable"];
+    "T-015" [label="Task 15: Reconcile every ownership stage and remove outputs conservatively\nCapable"];
+  }
+  subgraph cluster_policy {
+    label="policy";
+    "T-016" [label="Task 16: Resolve receiver modes with reliable evidence and identity continuity\nStandard"];
+    "T-017" [label="Task 17: Probe environment, audio, and per-mode capability gates\nAdvanced"];
+  }
+  subgraph cluster_session {
+    label="session";
+    "T-018" [label="Task 18: Serialize receiver actors and fence events by their actual resource\nCapable"];
+    "T-019" [label="Task 19: Implement Mirror, pairing, mode confirmation, and universal ordered Stop\nCapable"];
+    "T-020" [label="Task 20: Implement Virtual display, retained-output pairing, and resolution recreation\nCapable"];
+    "T-021" [label="Task 21: Reconnect current targets and coordinate shared daemon recovery\nCapable"];
+    "T-022" [label="Task 22: Preserve video through runtime audio loss and implement local mute\nAdvanced"];
+    "T-023" [label="Task 23: Restore persisted intent, reconcile outputs, and bound shutdown\nCapable"];
+  }
+  subgraph cluster_ui {
+    label="ui";
+    "T-024" [label="Task 24: Project every resource combination into safe UI actions\nAdvanced"];
+    "T-025" [label="Task 25: Build the dense PySide6 dashboard and accessible prompts\nAdvanced"];
+    "T-026" [label="Task 26: Bind GUI intent to domain commands and safe asynchronous updates\nAdvanced"];
+  }
+  subgraph cluster_assembly {
+    label="assembly";
+    "T-027" [label="Task 27: Compose application startup, single-instance guard, and operator diagnostics\nCapable"];
+  }
+  subgraph cluster_adapter_acceptance {
+    label="adapter-acceptance";
+    "T-028" [label="Task 28: Exercise real adapter plumbing with private fake processes and opt-in environment checks\nAdvanced"];
+  }
+  subgraph cluster_lifecycle_acceptance {
+    label="lifecycle-acceptance";
+    "T-029" [label="Task 29: Verify every lifecycle transition and crash boundary through assembled sessions\nCapable"];
+  }
+  subgraph cluster_ui_acceptance {
+    label="ui-acceptance";
+    "T-030" [label="Task 30: Verify the full Qt state matrix and final runnable acceptance\nAdvanced"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-002" -> "T-003";
+  "T-001" -> "T-004";
+  "T-002" -> "T-004";
+  "T-003" -> "T-004";
+  "T-001" -> "T-005";
+  "T-002" -> "T-005";
+  "T-001" -> "T-006";
+  "T-002" -> "T-006";
+  "T-003" -> "T-006";
+  "T-005" -> "T-006";
+  "T-001" -> "T-007";
+  "T-002" -> "T-007";
+  "T-003" -> "T-007";
+  "T-001" -> "T-008";
+  "T-002" -> "T-008";
+  "T-003" -> "T-008";
+  "T-007" -> "T-008";
+  "T-001" -> "T-009";
+  "T-002" -> "T-009";
+  "T-003" -> "T-009";
+  "T-004" -> "T-009";
+  "T-007" -> "T-009";
+  "T-008" -> "T-009";
+  "T-001" -> "T-010";
+  "T-002" -> "T-010";
+  "T-003" -> "T-010";
+  "T-004" -> "T-010";
+  "T-008" -> "T-010";
+  "T-001" -> "T-011";
+  "T-002" -> "T-011";
+  "T-003" -> "T-011";
+  "T-008" -> "T-011";
+  "T-009" -> "T-011";
+  "T-010" -> "T-011";
+  "T-001" -> "T-012";
+  "T-002" -> "T-012";
+  "T-003" -> "T-012";
+  "T-007" -> "T-012";
+  "T-008" -> "T-012";
+  "T-001" -> "T-013";
+  "T-002" -> "T-013";
+  "T-003" -> "T-013";
+  "T-007" -> "T-013";
+  "T-001" -> "T-014";
+  "T-002" -> "T-014";
+  "T-003" -> "T-014";
+  "T-004" -> "T-014";
+  "T-013" -> "T-014";
+  "T-001" -> "T-015";
+  "T-002" -> "T-015";
+  "T-003" -> "T-015";
+  "T-004" -> "T-015";
+  "T-007" -> "T-015";
+  "T-013" -> "T-015";
+  "T-014" -> "T-015";
+  "T-001" -> "T-016";
+  "T-002" -> "T-016";
+  "T-004" -> "T-016";
+  "T-005" -> "T-016";
+  "T-001" -> "T-017";
+  "T-002" -> "T-017";
+  "T-003" -> "T-017";
+  "T-007" -> "T-017";
+  "T-008" -> "T-017";
+  "T-012" -> "T-017";
+  "T-013" -> "T-017";
+  "T-016" -> "T-017";
+  "T-001" -> "T-018";
+  "T-002" -> "T-018";
+  "T-003" -> "T-018";
+  "T-010" -> "T-018";
+  "T-001" -> "T-019";
+  "T-002" -> "T-019";
+  "T-003" -> "T-019";
+  "T-010" -> "T-019";
+  "T-011" -> "T-019";
+  "T-012" -> "T-019";
+  "T-017" -> "T-019";
+  "T-018" -> "T-019";
+  "T-014" -> "T-020";
+  "T-015" -> "T-020";
+  "T-016" -> "T-020";
+  "T-017" -> "T-020";
+  "T-018" -> "T-020";
+  "T-019" -> "T-020";
+  "T-009" -> "T-021";
+  "T-011" -> "T-021";
+  "T-018" -> "T-021";
+  "T-019" -> "T-021";
+  "T-020" -> "T-021";
+  "T-011" -> "T-022";
+  "T-017" -> "T-022";
+  "T-018" -> "T-022";
+  "T-019" -> "T-022";
+  "T-020" -> "T-022";
+  "T-021" -> "T-022";
+  "T-004" -> "T-023";
+  "T-009" -> "T-023";
+  "T-010" -> "T-023";
+  "T-011" -> "T-023";
+  "T-015" -> "T-023";
+  "T-018" -> "T-023";
+  "T-019" -> "T-023";
+  "T-020" -> "T-023";
+  "T-021" -> "T-023";
+  "T-022" -> "T-023";
+  "T-001" -> "T-024";
+  "T-002" -> "T-024";
+  "T-003" -> "T-024";
+  "T-001" -> "T-025";
+  "T-002" -> "T-025";
+  "T-003" -> "T-025";
+  "T-024" -> "T-025";
+  "T-001" -> "T-026";
+  "T-002" -> "T-026";
+  "T-003" -> "T-026";
+  "T-024" -> "T-026";
+  "T-025" -> "T-026";
+  "T-003" -> "T-027";
+  "T-004" -> "T-027";
+  "T-005" -> "T-027";
+  "T-006" -> "T-027";
+  "T-007" -> "T-027";
+  "T-008" -> "T-027";
+  "T-009" -> "T-027";
+  "T-010" -> "T-027";
+  "T-011" -> "T-027";
+  "T-012" -> "T-027";
+  "T-013" -> "T-027";
+  "T-014" -> "T-027";
+  "T-015" -> "T-027";
+  "T-016" -> "T-027";
+  "T-017" -> "T-027";
+  "T-018" -> "T-027";
+  "T-019" -> "T-027";
+  "T-020" -> "T-027";
+  "T-021" -> "T-027";
+  "T-022" -> "T-027";
+  "T-023" -> "T-027";
+  "T-024" -> "T-027";
+  "T-025" -> "T-027";
+  "T-026" -> "T-027";
+  "T-004" -> "T-028";
+  "T-005" -> "T-028";
+  "T-006" -> "T-028";
+  "T-007" -> "T-028";
+  "T-008" -> "T-028";
+  "T-009" -> "T-028";
+  "T-010" -> "T-028";
+  "T-011" -> "T-028";
+  "T-012" -> "T-028";
+  "T-013" -> "T-028";
+  "T-014" -> "T-028";
+  "T-015" -> "T-028";
+  "T-016" -> "T-028";
+  "T-017" -> "T-028";
+  "T-027" -> "T-028";
+  "T-001" -> "T-029";
+  "T-002" -> "T-029";
+  "T-003" -> "T-029";
+  "T-004" -> "T-029";
+  "T-005" -> "T-029";
+  "T-006" -> "T-029";
+  "T-007" -> "T-029";
+  "T-008" -> "T-029";
+  "T-009" -> "T-029";
+  "T-010" -> "T-029";
+  "T-011" -> "T-029";
+  "T-012" -> "T-029";
+  "T-013" -> "T-029";
+  "T-014" -> "T-029";
+  "T-015" -> "T-029";
+  "T-016" -> "T-029";
+  "T-017" -> "T-029";
+  "T-018" -> "T-029";
+  "T-019" -> "T-029";
+  "T-020" -> "T-029";
+  "T-021" -> "T-029";
+  "T-022" -> "T-029";
+  "T-023" -> "T-029";
+  "T-027" -> "T-029";
+  "T-024" -> "T-030";
+  "T-025" -> "T-030";
+  "T-026" -> "T-030";
+  "T-027" -> "T-030";
+  "T-028" -> "T-030";
+  "T-029" -> "T-030";
+}
