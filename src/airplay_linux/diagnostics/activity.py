@@ -10,6 +10,7 @@ text or a private value around :func:`safe_activity`.
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
@@ -55,6 +56,9 @@ ALLOWED_FIELDS: Final[frozenset[str]] = frozenset(
 
 #: Upper bound on one rendered text value; longer values are elided.
 MAX_FIELD_TEXT: Final[int] = 120
+
+#: A complete escape as :func:`_escape` emits it; truncation never splits one.
+_ESCAPE: Final[re.Pattern[str]] = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
 
 #: Upper bound on the code token itself.
 MAX_CODE_LENGTH: Final[int] = 64
@@ -153,11 +157,12 @@ def _reject_utc(utc: object) -> str:
 
 
 def _reject_receiver(receiver_id: object) -> ReceiverId | None:
+    """Sanitize the identity token the same way as an allowlisted field value."""
     if receiver_id is None:
         return None
     if not isinstance(receiver_id, str):
         raise TypeError("receiver_id must be a ReceiverId string or None")
-    return ReceiverId(receiver_id)
+    return ReceiverId(_bounded(_escape(receiver_id)))
 
 
 def _escape(text: str) -> str:
@@ -176,9 +181,18 @@ def _escape(text: str) -> str:
 
 
 def _bounded(text: str) -> str:
+    """Elide to the bound without ever cutting an escape sequence in half."""
     if len(text) <= MAX_FIELD_TEXT:
         return text
-    return text[: MAX_FIELD_TEXT - 1] + "\N{HORIZONTAL ELLIPSIS}"
+    cut = MAX_FIELD_TEXT - 1
+    for match in _ESCAPE.finditer(text):
+        if match.start() >= cut:
+            break
+        if match.end() > cut:
+            # The cut falls inside this escape; end the value before it instead.
+            cut = match.start()
+            break
+    return text[:cut] + "\N{HORIZONTAL ELLIPSIS}"
 
 
 def _reject_value(name: str, value: object) -> str | int | bool:

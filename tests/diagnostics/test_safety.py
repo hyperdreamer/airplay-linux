@@ -8,6 +8,7 @@ strings a secret would leave behind.
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -183,6 +184,128 @@ def test_ownership_mismatch_never_offers_automatic_removal():
     assert RecoveryAction.keep in recovery
 
 
+# ------------------------------------------------- design action matrix
+
+#: The design's normative "Allowed primary actions" text, quoted from the UI state
+#: matrix rows that name an :class:`ErrorCode` (design:110-128). Rows that no code
+#: represents (Available, Offline, Pairing, Resolution required, Creating output,
+#: Connecting, Mirroring, Virtual display, Reconfiguring) are absent on purpose.
+#: ``unsupported_source`` is absent too: design:64/534 require surfacing the
+#: unsupported descriptor so the user picks another source, which is the ``back``
+#: action of its own catalog entry, not a matrix row.
+DESIGN_ROWS: tuple[tuple[str, tuple[ErrorCode, ...], tuple[str, ...]], ...] = (
+    (
+        "design:121 resolution mismatch",
+        (ErrorCode.resolution_mismatch,),
+        ("Recreate at accepted mode", "Stop"),
+    ),
+    (
+        "design:124 dependency or capability failure",
+        (
+            ErrorCode.unsupported_operation,
+            ErrorCode.dependency_missing,
+            ErrorCode.dependency_incompatible,
+        ),
+        ("Retry after fix", "Back"),
+    ),
+    (
+        "design:125 orphan candidate",
+        (ErrorCode.ownership_mismatch,),
+        ("Remove after confirmation", "Keep"),
+    ),
+    (
+        "design:126 cleanup required",
+        (ErrorCode.cleanup_timeout,),
+        ("Retry cleanup", "Keep for manual cleanup", "Stop"),
+    ),
+    (
+        "design:127 trust cleanup required",
+        (ErrorCode.trust_cleanup_required,),
+        ("Retry revocation", "Keep blocked", "Remove saved metadata"),
+    ),
+    (
+        # One code reports the audio failure in both phases, so its action set is
+        # the union of the two rows: retry before video readiness and after it.
+        "design:122-123 audio decision required or audio unavailable",
+        (ErrorCode.audio_denied, ErrorCode.audio_unavailable),
+        ("Retry audio", "explicit video-only start", "Cancel", "Stop"),
+    ),
+    (
+        # design:111 (Recovering), design:119 (Reconnecting) and design:128
+        # (Failed) share one action set, so a retryable failure pins the same tuple.
+        "design:111-128 recovering, reconnecting, or failed",
+        (
+            ErrorCode.transport_failed,
+            ErrorCode.daemon_failed,
+            ErrorCode.helper_failed,
+            ErrorCode.configuration_failed,
+            ErrorCode.receiver_rejected,
+            ErrorCode.stale_target,
+            ErrorCode.stale_socket,
+            ErrorCode.persistence_failed,
+        ),
+        ("Retry", "Stop"),
+    ),
+)
+
+#: The design's words to the catalog's typed action. The catalog has no separate
+#: cancel token, so the design's ``Cancel`` for an abandoned attempt is ``stop``.
+DESIGN_ACTIONS: dict[str, RecoveryAction] = {
+    "Recreate at accepted mode": RecoveryAction.recreate,
+    "Retry after fix": RecoveryAction.retry,
+    "Retry": RecoveryAction.retry,
+    "Back": RecoveryAction.back,
+    "Remove after confirmation": RecoveryAction.confirm_remove,
+    "Keep": RecoveryAction.keep,
+    "Keep for manual cleanup": RecoveryAction.keep,
+    "Retry cleanup": RecoveryAction.retry_cleanup,
+    "Retry revocation": RecoveryAction.retry_revocation,
+    "Keep blocked": RecoveryAction.keep_blocked,
+    "Remove saved metadata": RecoveryAction.remove_metadata,
+    "Retry audio": RecoveryAction.retry_audio,
+    "explicit video-only start": RecoveryAction.video_only,
+    "Cancel": RecoveryAction.stop,
+    "Stop": RecoveryAction.stop,
+}
+
+
+def test_design_matrix_names_only_known_actions():
+    for row, _, actions in DESIGN_ROWS:
+        for label in actions:
+            assert label in DESIGN_ACTIONS, f"{row} names an unmapped action {label!r}"
+
+
+def test_design_matrix_rows_do_not_contradict_each_other():
+    pinned = [code for _, codes, _ in DESIGN_ROWS for code in codes]
+
+    assert len(pinned) == len(set(pinned)), "a code may be pinned to one row only"
+
+
+@pytest.mark.parametrize(("row", "codes", "actions"), DESIGN_ROWS, ids=[row for row, _, _ in DESIGN_ROWS])
+def test_catalog_recovery_matches_the_design_action_matrix(row, codes, actions):
+    expected = frozenset(DESIGN_ACTIONS[label] for label in actions)
+
+    for code in codes:
+        recovery = diagnostic(code).recovery
+        assert len(set(recovery)) == len(recovery), f"{code} repeats a recovery action"
+        assert set(recovery) == expected, f"{code} must match {row}: {sorted(expected)}"
+
+
+def test_resolution_mismatch_offers_the_only_design_recovery():
+    result = diagnostic(ErrorCode.resolution_mismatch)
+
+    assert RecoveryAction.recreate in result.recovery
+    assert RecoveryAction.back not in result.recovery
+    assert "accepted mode" in result.message.lower()
+
+
+def test_trust_cleanup_offers_a_way_to_drop_the_saved_metadata():
+    recovery = diagnostic(ErrorCode.trust_cleanup_required).recovery
+
+    assert RecoveryAction.remove_metadata in recovery
+    assert "metadata" in diagnostic(ErrorCode.trust_cleanup_required).message.lower()
+
+
 # ------------------------------------------------------------------ activity
 
 
@@ -259,6 +382,38 @@ def test_long_field_text_is_bounded():
     assert rendered.endswith("\N{HORIZONTAL ELLIPSIS}")
 
 
+#: A complete escape this module can emit, so a leftover backslash is a fragment.
+COMPLETE_ESCAPE = re.compile(r"\\u[0-9a-f]{4}|\\U[0-9a-f]{8}")
+
+
+@pytest.mark.parametrize("padding", [MAX_FIELD_TEXT - 6, MAX_FIELD_TEXT - 5, MAX_FIELD_TEXT - 4, MAX_FIELD_TEXT - 3])
+def test_bounding_never_splits_an_escape_sequence(padding):
+    value = "A" * padding + "\n" * 6
+
+    rendered = safe_activity("display", None, {"receiver_name": value}, UTC).fields[
+        "receiver_name"
+    ]
+
+    assert isinstance(rendered, str)
+    assert len(rendered) <= MAX_FIELD_TEXT
+    assert rendered.endswith("\N{HORIZONTAL ELLIPSIS}")
+    # A truncated ``\u00`` fragment is a dangling backslash once the complete
+    # escapes are removed; the source contains none of its own.
+    assert "\\" not in COMPLETE_ESCAPE.sub("", rendered)
+
+
+def test_bounding_keeps_a_whole_escape_at_the_boundary():
+    value = "A" * (MAX_FIELD_TEXT - 7) + "\n\n"
+
+    rendered = safe_activity("display", None, {"receiver_name": value}, UTC).fields[
+        "receiver_name"
+    ]
+
+    assert isinstance(rendered, str)
+    assert len(rendered) == MAX_FIELD_TEXT
+    assert rendered.endswith("\\u000a\N{HORIZONTAL ELLIPSIS}")
+
+
 @pytest.mark.parametrize("code", ["", "PAIRING", "pairing completed", "pairing\npassword=x", "p" * 80, 7])
 def test_code_must_be_a_bounded_token(code):
     with pytest.raises(ValueError, match="code"):
@@ -285,6 +440,31 @@ def test_receiver_identity_is_preserved(receiver):
 def test_receiver_identity_must_be_a_identifier():
     with pytest.raises(TypeError, match="receiver"):
         safe_activity("session", 12345, {}, UTC)  # type: ignore[arg-type]
+
+
+def test_receiver_identity_cannot_carry_controls_or_unbounded_text():
+    hostile = ReceiverId("airplay-device:" + "\n\x1b[31m\x00" + "A" * 430)
+
+    event = safe_activity("session", hostile, {}, UTC)
+    rendered = event.receiver_id
+
+    assert rendered is not None
+    assert len(rendered) <= MAX_FIELD_TEXT
+    assert "airplay-device:" in rendered
+    assert "\\u000a" in rendered
+    for control in ("\n", "\x1b", "\x00"):
+        assert control not in rendered
+
+    log = ActivityLog()
+    log.emit(event)
+    entry = log.entries()[0]
+    assert entry.receiver_id is not None
+    for control in ("\n", "\x1b", "\x00"):
+        assert control not in repr(entry)
+        assert control not in entry.receiver_id
+    exported = json.loads(log.export())["activity"][0]["receiver_id"]
+    assert exported == rendered
+    assert "\x1b" not in log.export() and "\x00" not in log.export()
 
 
 def test_activity_messages_are_fixed_per_code():

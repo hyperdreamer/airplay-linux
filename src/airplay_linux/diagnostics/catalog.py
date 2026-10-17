@@ -89,27 +89,28 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
         ErrorCode.unsupported_operation: CatalogEntry(
             message=(
                 "The installed backend does not expose this operation. Update doubletake "
-                "or choose an operation it reports as available."
+                "or go back and choose an operation it reports as available."
             ),
-            recovery=(RecoveryAction.stop,),
+            recovery=(RecoveryAction.retry, RecoveryAction.back),
         ),
         ErrorCode.dependency_missing: CatalogEntry(
             message=(
-                "A required command is not installed or not on PATH. Install it, or "
-                "update the environment that provides the missing capability."
+                "A required command is not installed or not on PATH. Install it and retry, "
+                "or go back and choose a capability that is available."
             ),
             command_message=(
                 "The required command '{command}' is not installed or not on PATH. "
-                "Install it, or update the environment that provides it."
+                "Install it and retry, or go back and choose a capability that is available."
             ),
-            recovery=(RecoveryAction.retry, RecoveryAction.stop),
+            recovery=(RecoveryAction.retry, RecoveryAction.back),
         ),
         ErrorCode.dependency_incompatible: CatalogEntry(
             message=(
                 "The installed backend version does not expose the required operations. "
-                "Update doubletake, then retry."
+                "Update doubletake and retry, or go back and choose a capability that is "
+                "available."
             ),
-            recovery=(RecoveryAction.retry, RecoveryAction.stop),
+            recovery=(RecoveryAction.retry, RecoveryAction.back),
         ),
         ErrorCode.audio_denied: CatalogEntry(
             message=(
@@ -192,23 +193,32 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
         ErrorCode.cleanup_timeout: CatalogEntry(
             message=(
                 "Removal could not be confirmed. Retry cleanup or keep this resource for "
-                "manual cleanup."
+                "manual cleanup. Stop also ends the attempt without claiming removal."
             ),
-            recovery=(RecoveryAction.retry_cleanup, RecoveryAction.keep),
+            recovery=(
+                RecoveryAction.retry_cleanup,
+                RecoveryAction.keep,
+                RecoveryAction.stop,
+            ),
         ),
         ErrorCode.trust_cleanup_required: CatalogEntry(
             message=(
                 "Trust revocation is unconfirmed, so new pairing is blocked. Retry "
-                "revocation, or keep pairing blocked."
+                "revocation, keep pairing blocked, or remove the saved metadata."
             ),
-            recovery=(RecoveryAction.retry_revocation, RecoveryAction.keep_blocked),
+            recovery=(
+                RecoveryAction.retry_revocation,
+                RecoveryAction.keep_blocked,
+                RecoveryAction.remove_metadata,
+            ),
         ),
         ErrorCode.resolution_mismatch: CatalogEntry(
             message=(
-                "The receiver did not accept the chosen resolution. Go back and choose a "
-                "resolution the receiver reports as supported."
+                "The receiver did not accept the chosen resolution. Recreate the output at "
+                "the accepted mode, or stop and remove the retained output. The output is "
+                "never changed silently."
             ),
-            recovery=(RecoveryAction.back, RecoveryAction.stop),
+            recovery=(RecoveryAction.recreate, RecoveryAction.stop),
         ),
         ErrorCode.discovery_failed: CatalogEntry(
             message=(
