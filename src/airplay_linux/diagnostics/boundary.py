@@ -18,8 +18,10 @@ each one closes a whole class of defect rather than one instance of it:
   registered it.
 * Every public entry point is wrapped, so any raised object — including
   ``BaseException`` — becomes a fresh rejection built from source-written text.
-  Nothing the caller supplied survives in ``args``, ``__cause__`` or
-  ``__context__``, and the original failure is never chained.
+  Nothing the caller supplied survives in ``args``, ``__cause__``,
+  ``__context__`` or ``__notes__``, and the original failure is never chained —
+  including the exception the *caller* was already handling, which Python would
+  otherwise attach at the ``raise`` itself.
 * Provenance is object identity, not a marker on the failure. Every rejection
   this module builds is recorded in a private, bounded registry that keeps the
   text this module wrote; a wrapped entry point recognizes its own failure with
@@ -136,9 +138,11 @@ def rejection(message: str) -> ValueError:
     ``message`` is always a literal, or text derived from a closed vocabulary, at
     the call site. The value carries exactly one argument — that message — and no
     chaining of its own; :func:`rejecting` raises it outside its ``except`` suite
-    so a caught failure is never attached as ``__context__``. Nothing is written
-    onto the value's ``__dict__``: the text that proves provenance is kept in this
-    module, not in state the caller can read or edit.
+    and clears the interpreter-attached context in the raising ``try``'s
+    ``finally``, so neither a caught failure nor one the caller was already
+    handling is attached as ``__context__``. Nothing is written onto the value's
+    ``__dict__``: the text that proves provenance is kept in this module, not in
+    state the caller can read or edit.
     """
     return cast(ValueError, _rejection_of(ValueError, message))
 
@@ -394,9 +398,24 @@ def _fixed_failure(error: BaseException) -> Exception:
 def rejecting(function: _Wrapped) -> _Wrapped:
     """Wrap one public entry point so no raised object carries caller data.
 
-    The replacement is raised after the ``except`` suite has finished, so the
-    failure that triggered it is neither chained as ``__context__`` nor attached
-    as ``__cause__``.
+    Two things have to be released from the replacement, and only one of them is
+    under this function's control at the moment it builds the failure:
+
+    * the failure that triggered the wrapper, which is why the replacement is
+      built inside the ``except`` suite and raised after it has finished; and
+    * the exception the *caller* was already handling when it entered this
+      wrapper. Python attaches that one as ``__context__`` at the ``raise``
+      itself, after every check the wrapper could make, so an application that
+      records a diagnostic from inside an ``except`` handler would otherwise
+      hand its backend failure to the rejection one step after the value was
+      scrubbed. ``from None`` sets ``__suppress_context__`` — which only hides
+      the link from a rendered traceback — and sets ``__cause__``, so it is not
+      a scrub: the chain survives in the object and in ``repr``.
+
+    The link is therefore removed *after* the interpreter makes it, from the
+    ``finally`` of the raising ``try``: on the way in the replacement is already
+    built and recorded, so nothing about the original failure is inspected
+    here, and on the way out the same object that propagates has been cleared.
     """
 
     @wraps(function)
@@ -406,6 +425,13 @@ def rejecting(function: _Wrapped) -> _Wrapped:
             return function(*args, **kwargs)
         except BaseException as error:
             failure = _fixed_failure(error)
-        raise failure
+        try:
+            raise failure
+        finally:
+            # Only the chaining fields of this module's own replacement are
+            # written, so no caller object is touched and no method of one runs.
+            failure.__cause__ = None
+            failure.__context__ = None
+            failure.__suppress_context__ = True
 
     return cast(_Wrapped, boundary_entry)

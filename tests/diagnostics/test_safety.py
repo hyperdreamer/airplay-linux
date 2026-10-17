@@ -10,7 +10,8 @@ from __future__ import annotations
 import json
 import re
 import string
-from collections.abc import Callable, Iterator
+import traceback
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
@@ -3636,3 +3637,248 @@ def test_subscription_close_is_a_wrapped_public_entry_point():
     # to run the action a second time.
     handle.close()
     assert counter.calls == ["action"]
+
+
+# ============================ rejection context under an active caller handler
+#
+# The boundary builds a fresh, scrubbed rejection and *then* raises it, and the
+# raise is where Python attaches the exception ``currently being handled`` in
+# the raising frame as ``__context__``. So an application that catches a backend
+# failure and records a diagnostic from inside its ``except`` handler hands the
+# rejection the backend's message one step after the value was scrubbed, and the
+# "fixed" text is fixed only in ``args``: ``repr``, the rendered traceback and
+# the retained object all still carry whatever the backend wrote.
+#
+# ``from None`` is not enough. It sets ``__cause__`` and ``__suppress_context__``,
+# which changes what a *printed* traceback shows, not what the object holds. The
+# link has to be removed after the interpreter makes it, which is only possible
+# from the ``finally`` of the raising ``try``.
+
+#: Message of the exception the caller is already handling when it calls in.
+HANDLER_CANARY: Final[str] = "handler-canary-6043"
+
+#: Message of the exception that handler itself replaced. At depth two it
+#: survives only inside the handled exception's own ``__context__``, so a
+#: one-level scrub and a one-level assertion both miss it.
+NESTED_HANDLER_CANARY: Final[str] = "nested-handler-canary-6043"
+
+#: Every public entry point the brief names, each of which is about to reject.
+HANDLER_ENTRY_POINTS: Final[tuple[str, ...]] = (
+    "safe_activity",
+    "diagnostic",
+    "ActivityLog.emit",
+    "ActivityLog.export",
+    "Subscription.close",
+)
+
+#: The kind and exact text each of those entry points rejects with. A rejection
+#: keeps its own useful message through the scrub: falling back to the generic
+#: literal would tell the user nothing about what to fix.
+HANDLER_ENTRY_POINT_REJECTIONS: Final[Mapping[str, tuple[type[Exception], str]]] = (
+    MappingProxyType(
+        {
+            "safe_activity": (
+                ValueError,
+                "code must be one of the registered activity codes",
+            ),
+            "diagnostic": (
+                TypeError,
+                "code must be an ErrorCode from the diagnostics catalog; "
+                "arbitrary error text is not a diagnostic",
+            ),
+            "ActivityLog.emit": (
+                ValueError,
+                "field is not allowlisted; secrets and backend payloads "
+                "cannot enter activity",
+            ),
+            "ActivityLog.export": (
+                TypeError,
+                "capability diagnostics must be an immutable tuple of diagnostics",
+            ),
+            "Subscription.close": (
+                ValueError,
+                "the value could not be normalized at the diagnostics boundary",
+            ),
+        }
+    )
+)
+
+
+def raising_action() -> None:
+    """A removal action that fails, so the handle has something to reject."""
+    raise RuntimeError("the removal action failed")
+
+
+def handler_entry_point(name: str) -> Callable[[], object]:
+    """A fresh invocation of one public entry point, bound to reject.
+
+    Built per test rather than at collection time because two of these entry
+    points are stateful: ``Subscription.close`` is idempotent, so a handle
+    reused after its rejection would return silently and prove nothing.
+    """
+    if name == "safe_activity":
+        return lambda: safe_activity("not-a-code", None, {}, UTC)
+    if name == "diagnostic":
+        return lambda: diagnostic("not-a-code")  # type: ignore[arg-type]
+    if name == "ActivityLog.emit":
+        smuggled = event_with_fields(MappingProxyType({"password": CANARY}))
+        return lambda: ActivityLog().emit(smuggled)
+    if name == "ActivityLog.export":
+        report = replace(capability_report(), diagnostics=None)  # type: ignore[arg-type]
+        return lambda: ActivityLog(capabilities=report).export()
+    assert name == "Subscription.close", name
+    # The handle is built directly: a real one wraps an identity-based removal
+    # that cannot raise on its own, and the wrapped entry point is the thing
+    # under test here, not the removal strategy.
+    return _Subscription(raising_action).close
+
+
+def call_inside_handler(
+    invoke: Callable[[], object],
+    *,
+    handler_kind: type[BaseException],
+    depth: int,
+) -> None:
+    """Run ``invoke`` while ``depth`` caller exceptions are being handled.
+
+    At depth two the innermost handled exception has itself replaced another, so
+    the first canary is reachable only through ``__context__.__context__``. Both
+    ``Exception`` and ``BaseException`` are exercised because the wrapper's rule
+    is about raised objects, not about the ``Exception`` subtree.
+    """
+    if depth == 2:
+        try:
+            raise RuntimeError(NESTED_HANDLER_CANARY)
+        except Exception:
+            # Reraised from inside that handler, so the second handled exception
+            # is itself chained to the first, and the rejection raised further
+            # in would be three links from a clean one.
+            try:
+                raise handler_kind(HANDLER_CANARY)
+            except handler_kind:
+                invoke()
+        return
+    try:
+        raise handler_kind(HANDLER_CANARY)
+    except handler_kind:
+        invoke()
+
+
+def chained_exceptions(failure: BaseException) -> tuple[BaseException, ...]:
+    """``failure`` and everything reachable through its own chaining.
+
+    ``repr`` of a two-deep chain renders only the outermost link, so the walk is
+    what makes the assertion able to say *where* a leak survived.
+    """
+    found: list[BaseException] = []
+    pending: list[BaseException] = [failure]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        found.append(current)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return tuple(found)
+
+
+def assert_no_handler_text(failure: Exception, canaries: tuple[str, ...]) -> None:
+    """A rejection retains no text from an exception its caller was handling."""
+    assert type(failure) is ValueError or type(failure) is TypeError, (
+        f"a rejection must be a builtin ValueError or TypeError, not {type(failure)!r}"
+    )
+    assert failure.__context__ is None, (
+        "a rejection must not chain the exception its caller was handling"
+    )
+    assert failure.__cause__ is None, "a rejection must not chain a cause"
+    assert getattr(failure, "__notes__", None) is None, (
+        "a rejection must carry no notes"
+    )
+
+    for link in chained_exceptions(failure):
+        views = (
+            str(link),
+            repr(link),
+            repr(link.args),
+            repr(getattr(link, "__dict__", None)),
+            repr(getattr(link, "__notes__", None)),
+        )
+        for view in views:
+            for canary in canaries:
+                assert canary not in view, f"the rejection retained handler text: {view!r}"
+
+    # The rendered report is what a user pastes into a bug report, and it walks
+    # the chain itself, so it is the view that would leak even if every
+    # individual field above looked clean.
+    rendered = "".join(
+        traceback.format_exception(type(failure), failure, failure.__traceback__)
+    )
+    for canary in canaries:
+        assert canary not in rendered, (
+            f"the rendered rejection retained handler text: {rendered!r}"
+        )
+
+
+@pytest.mark.parametrize("entry_point", HANDLER_ENTRY_POINTS)
+@pytest.mark.parametrize(
+    "handler_kind",
+    [Exception, BaseException],
+    ids=["catching-exception", "catching-baseexception"],
+)
+@pytest.mark.parametrize("depth", [1, 2], ids=["one-deep", "two-deep"])
+def test_a_rejection_never_chains_the_exception_its_caller_is_handling(
+    entry_point,
+    handler_kind,
+    depth,
+):
+    # One class of defect, every entry point at once: the wrapper is shared, so
+    # a rejection built under an active handler must be released from it on all
+    # of them, not on the one path a fix happened to touch.
+    invoke = handler_entry_point(entry_point)
+
+    with pytest.raises((ValueError, TypeError)) as caught:
+        call_inside_handler(invoke, handler_kind=handler_kind, depth=depth)
+
+    assert_no_handler_text(
+        caught.value,
+        (HANDLER_CANARY, NESTED_HANDLER_CANARY),
+    )
+
+
+@pytest.mark.parametrize("entry_point", HANDLER_ENTRY_POINTS)
+def test_a_scrubbed_rejection_keeps_its_own_fixed_message(entry_point):
+    # The scrub removes chaining, not information: the user still gets exactly
+    # one exception, of the same built-in kind, carrying the same fixed text it
+    # would carry with no handler active. Degrading to the generic literal here
+    # would trade a leak for a message that tells nobody what to fix.
+    expected_kind, expected_text = HANDLER_ENTRY_POINT_REJECTIONS[entry_point]
+    invoke = handler_entry_point(entry_point)
+
+    with pytest.raises(expected_kind) as caught:
+        call_inside_handler(invoke, handler_kind=Exception, depth=1)
+
+    assert type(caught.value) is expected_kind
+    assert caught.value.args == (expected_text,), (
+        "a rejection carries exactly its own fixed text and no inherited argument"
+    )
+    assert str(caught.value) == expected_text
+    assert caught.value.__context__ is None
+
+
+def test_an_ordinary_call_under_a_handler_still_succeeds():
+    # The scrub lives in the raising path, so the accepting path must be
+    # untouched: a value the boundary accepts under an active handler is still
+    # returned, and the handler's exception is not disturbed either.
+    with pytest.raises(RuntimeError) as handled:
+        try:
+            raise RuntimeError(HANDLER_CANARY)
+        except RuntimeError:
+            event = safe_activity("session", None, {}, UTC)
+            assert event.code == "session"
+            assert HANDLER_CANARY not in repr(event)
+            raise
+
+    assert str(handled.value) == HANDLER_CANARY
