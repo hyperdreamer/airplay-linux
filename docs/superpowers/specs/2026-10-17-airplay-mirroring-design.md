@@ -39,14 +39,22 @@ Different receivers may use different modes concurrently. Switching a receiver f
 
 ### Receiver identity
 
-`ReceiverId` is derived in this order:
+The discovery layer first aggregates all records belonging to one receiver into a `ReceiverRecordSet`; it derives `ReceiverId` only after this cross-service merge. Records are matched in this order:
 
-1. Prefer the normalized AirPlay `deviceid` or MAC-like identifier from service TXT records.
-2. If no device identifier exists, use `airplay-fingerprint:<sha256>` over the canonical service type, normalized host name, model, and service port.
+1. Prefer equal normalized AirPlay `deviceid` or MAC-like identifiers across `_airplay._tcp` and `_raop._tcp`.
+2. Otherwise match an AirPlay and RAOP record with the same normalized service-instance label and normalized model within the same discovery window. Service type, port, and current host are not part of this match key, so changing ports or hostnames does not split a receiver.
+3. If the labels or models conflict, keep the records separate as an ambiguous candidate and require explicit user confirmation before merging.
+4. If no cross-service key exists, use a weaker fingerprint over the normalized service-instance label and model. If the label is also absent, use a host/model fingerprint marked as endpoint-sensitive; trust and remembered resolution never transfer automatically after that fingerprint changes.
 
-A service-name change does not change an ID when the device identifier is present. A new device identifier at the same host is a new receiver and cannot silently inherit trust. For a fingerprint-only receiver, a changed canonical fingerprint is shown as a possible receiver replacement and requires explicit re-pairing. Collisions are handled by retaining the full canonical record and requiring user confirmation before merging.
+For a merged record set, `ReceiverId` is derived in this order:
 
-The application stores the receiver ID, display name, last endpoint, pairing/trust metadata, and non-secret preferences. It never stores a PIN or credential in this record.
+1. `airplay-device:<normalized-device-id>` when a device identifier exists.
+2. `airplay-fingerprint:<sha256(normalized-instance-label|normalized-model)>` for a stable service-instance fallback.
+3. `airplay-endpoint:<sha256(normalized-host|normalized-model)>` for the weaker endpoint-sensitive fallback.
+
+A service-name, port, or hostname change does not change an ID when a device identifier or stable service-instance label is present. A new device identifier at the same endpoint is a new receiver and cannot silently inherit trust. For endpoint-sensitive identities, a changed host or model is shown as a possible receiver replacement and requires explicit re-pairing. Collisions retain the complete record sets, do not merge sessions, and never inherit trust. Discovery fixtures cover both service types, port and hostname changes, missing identifiers, collisions, and replacement warnings.
+
+The application stores the receiver ID, merged service metadata, display name, last endpoint, pairing/trust metadata, and non-secret preferences. It never stores a PIN or credential in this record.
 
 ### Mirror mode
 
@@ -60,7 +68,7 @@ Virtual display mode creates a KDE virtual output at the receiver's resolved res
 
 The domain contract uses a typed `VirtualOutputSource` containing the connector identity, KScreen output ID, and configured size. The output is owned by the session that created it.
 
-Stopping the mode stops transport first and then removes the output owned by that session. A transport-only network failure preserves the output. A virtual-display helper failure is different: because the output may no longer exist, the session records a display failure and performs cleanup/reconciliation rather than pretending the display remains usable. A stale output found on a later startup is identified and offered for cleanup rather than being deleted without user consent.
+Stopping the mode stops transport first and then removes the output owned by that session. A transport-only network failure preserves the output. A virtual-display helper failure invalidates the display source and enters display cleanup/reconciliation rather than pretending the display remains usable. A stale output found on a later startup is identified and offered for cleanup rather than being deleted without user consent.
 
 ## UI Direction
 
@@ -93,22 +101,31 @@ Unfamiliar icon-only controls must have tooltips. Text buttons remain for clear 
 
 ### UI state matrix
 
-| Domain state | Selected-pane presentation | Allowed primary actions |
+The primary session label is rendered together with compact transport, display, and audio resource badges. This makes retained resources explicit instead of implying that one coarse label describes every side effect.
+
+| Domain/resource state | Selected-pane presentation | Allowed primary actions |
 |---|---|---|
-| Available | Mode selector, source or resolution controls, Pair if needed | Start, Pair, Scan |
-| Pairing required | PIN/password prompt, receiver identity, Cancel | Submit PIN, Cancel, Retry |
-| Resolution required | Supported-mode list or explicit picker, remembered choice indicator | Choose, Cancel |
-| Creating output | Progress and cancel action; no mode switch | Cancel |
-| Connecting | Progress, selected source, audio policy | Stop |
+| Available (`Idle`, no output) | Mode selector, physical source or resolution controls, Pair if needed | Start, Pair, Scan |
+| Offline (`Idle`, no output) | Last-known receiver identity and offline badge | Scan, Remove saved metadata |
+| Recovering (`Output owned`, transport reconnecting) | Recovered output, receiver identity, reconnect status | Retry, Stop |
+| Pairing (`No output`) | PIN/password prompt, receiver identity, Cancel | Submit PIN, Cancel, Retry |
+| Pairing (`Output owned`) | Pairing prompt plus retained output badge and cleanup-on-cancel notice | Submit PIN, Cancel and remove output |
+| Resolution required | Supported-mode list or explicit picker, remembered-choice indicator | Choose, Cancel |
+| Creating output | Progress, reservation stage, and Cancel; no mode switch | Cancel |
+| Connecting | Progress, selected source, audio policy and current display badge | Stop |
 | Mirroring | Physical source, active audio/mute control, Stop | Mute/Unmute, Stop |
 | Virtual display | Output size, active audio/mute control, Stop | Mute/Unmute, Stop, Change resolution |
-| Reconnecting | `Reconnecting` state, last error, next retry, Retry and Stop | Retry, Stop |
-| Resolution mismatch | Reported accepted mode, window-layout warning | Recreate at accepted mode, Cancel |
+| Reconnecting (`Output owned` or no output) | `Reconnecting`, last error, endpoint status, next retry | Retry, Stop |
+| Reconfiguring | Old output removal/new output creation progress and layout warning | Cancel |
+| Resolution mismatch | Stream stopped, current output details, accepted mode and layout warning | Recreate at accepted mode, Stop |
+| Audio decision required | Audio unavailable before video is ready; show Retry audio, Start video only, and Cancel | Retry audio, explicit video-only start, or Cancel |
+| Audio unavailable (video active) | Video remains active, audio error, disabled mute, Retry audio | Retry audio, Stop |
 | Dependency or capability failure | Exact missing capability and recovery hint | Retry after fix, Back |
-| Orphan candidate | Connector/output details and ownership evidence | Remove after confirmation, Keep |
-| Failed | Error detail, retained session intent, Retry and Stop | Retry, Stop |
+| Orphan candidate | Connector/output details, ownership evidence, and helper status | Remove after confirmation, Keep |
+| Cleanup required | Resource that could not be confirmed removed, timeout detail | Retry cleanup, Keep for manual cleanup, Stop |
+| Failed | Error detail plus transport/display/audio resource badges and retained intent | Retry, Stop |
 
-The mode selector is disabled while a session is active, creating an output, or stopping. A requested mode switch first requires Stop and waits for teardown completion; the application never starts the next mode concurrently with cleanup from the previous one.
+The mode selector is disabled while a session is active, creating an output, reconfiguring, or stopping. A requested mode switch is queued only after the user confirms Stop; the next mode starts after teardown completes. The application never starts the next mode concurrently with cleanup from the previous one. Runtime audio failure leaves video active, disables mute while audio is unavailable, and exposes Retry audio or Stop.
 
 ## Architecture
 
@@ -128,69 +145,116 @@ The session manager is the central deep module. Its interface accepts domain com
 - transport-before-teardown ordering;
 - reconnect preservation for Virtual display mode after transport-only network failure;
 - cleanup ownership for child processes and outputs;
-- serialized commands per receiver.
+- serialized commands per receiver;
+- independent resource state for transport, display, and audio.
 
-Each command allocates an `operation_id` and increments the receiver's `operation_generation`. Adapter events carry the operation ID and receiver ID. Events from older generations are ignored, so a late connect or process-exit event cannot revive a session after Stop or mode switch.
+Each command allocates an `operation_id` and increments the receiver's `operation_generation` before starting side effects. Adapter events carry the operation ID, receiver ID, and target endpoint generation. Events from older generations are ignored, so a late connect or process-exit event cannot revive a session after Stop, cancellation, or mode switch. Invalidating a generation also cancels scheduled retries and prevents new work from being started by the old operation.
 
 The session manager injects a monotonic `Clock` and `Scheduler`, so retry timers and stop timeouts are deterministic in tests. It also receives injected process, transport-event, capture-source, display-observer, and credential interfaces rather than calling OS tools directly.
 
-### Lifecycle transition contract
+#### Resource state model
 
-Commands are serialized per receiver. A Stop command is accepted from every non-idle state and transitions to `Stopping`; repeated Stop commands are idempotent. The following table defines the important transitions:
+The user-visible phase is derived from three independent resources:
 
-| State | Event or command | Transition and side effect |
+- `TransportState`: `Idle`, `Pairing`, `Connecting`, `Streaming`, `Reconnecting`, `Stopping`, or `Failed`.
+- `DisplayState`: `None`, `Resolving`, `Creating`, `Owned`, `Reconfiguring`, `Removing`, `Failed`, or `CleanupRequired`.
+- `AudioState`: `Disabled`, `Starting`, `Enabled`, `Muted`, or `Unavailable`.
+
+A Virtual display session may therefore be `Pairing + DisplayState.Owned`, `Reconnecting + DisplayState.Owned`, or `Failed + DisplayState.CleanupRequired` without contradictory resource claims. `SessionPhase` is one of `Available`, `Offline`, `ResolutionRequired`, `AudioDecisionRequired`, `CreatingDisplay`, `Pairing`, `Connecting`, `Mirroring`, `VirtualDisplay`, `Reconnecting`, `Reconfiguring`, `Recovering`, `Stopping`, `CleanupRequired`, or `Failed`. The phase is a projection for the UI; resource states are authoritative for cleanup.
+
+An operation that owns a display always records whether the display is absent, being created, owned and usable, being removed, or cleanup-uncertain. A provider failure never reports `DisplayState.None` until the provider confirms that no owned output remains. A transport-only failure does not change `DisplayState.Owned`.
+
+#### Lifecycle transition contract
+
+Commands are serialized per receiver. A Stop command is accepted from every non-idle state and transitions to `Stopping`; repeated Stop commands are idempotent. Before any cancellation or superseding command, the manager increments the operation generation, cancels timers, stops accepting events for the old operation, and runs cleanup in this order: stop/release transport, stop audio control, remove the owned display, wait for provider confirmation, then restore only eligible layout changes. A cleanup event belongs to the current stopping operation and is not rejected merely because the superseded start operation is old.
+
+| State and resources | Event or command | Transition and side effect |
 |---|---|---|
-| Available | Start Mirror | Resolve physical source and audio, then Pairing or Connecting |
-| Available | Start Virtual | Resolve `ResolutionDecision`, then Creating output |
-| Pairing | Submit PIN | Pair through transport, then Connecting |
-| Pairing | Cancel or receiver disappears | Available or Offline; no output exists |
-| Resolution required | Choose or Cancel | Creating output, or Available |
-| Creating output | Output ready | Connecting with `VirtualOutputSource` |
-| Creating output | Cancel or provider failure | Stopping/cleanup, or Failed with no owned output |
-| Connecting | Stream ready | Mirroring or Virtual display |
-| Connecting | Pairing required | Pairing; preserve virtual output if already created |
-| Connecting | Network failure | Reconnecting; preserve virtual output |
-| Connecting | Stop | Stopping |
-| Active Mirror | Network failure | Reconnecting; no display cleanup needed |
-| Active Virtual display | Network failure | Reconnecting; keep the output and layout |
-| Active state | Stop or mode switch | Stopping, then Available or next requested mode |
-| Reconnecting | Network recovery | Connecting with a new operation generation |
-| Reconnecting | Stop | Stopping, then Available |
-| Reconnecting | Unrecoverable error | Failed; retain virtual output only if it remains valid |
-| Any transport state | Daemon exit | Restart app-owned daemon within a bounded restart budget, otherwise Failed |
-| Any virtual state | Helper exit | Display failure; reconcile output and move to Failed or cleanup-required |
-| Any state | Shutdown | Stopping with bounded cleanup, then process exit |
-| Stopping | Cleanup complete | Available, Offline, or next mode |
-| Stopping | Timeout | Force cleanup and record Cleanup required |
+| Available (`Idle`, `None`) | Start Mirror | Select a physical source and audio policy, then Pairing or Connecting |
+| Available (`Idle`, `None`) | Start Virtual | Resolve `ResolutionDecision`, then Pairing or Creating display |
+| Offline (`Idle`, `None`) | Receiver reappears | Update target generation, then Available and retry only after user intent permits |
+| Offline (`Idle`, `None`) | Start | Refresh discovery/target; do not send to the stale endpoint |
+| Resolution required | Choose | Begin Creating display for Virtual, or resolve Mirror source |
+| Resolution required | Cancel | Available or Offline |
+| Pairing (`None`) | Submit valid input | Transport pairing, then Connecting or Creating display |
+| Pairing (`None`) | Cancel, expiry, invalid input budget exhausted | Available/Offline, with no output and no trust mutation |
+| Pairing (`Owned`) | Submit valid input | Continue Connecting with the retained output |
+| Pairing (`Owned`) | Cancel or expiry | Stopping; stop transport if any, remove the output, then Available/Offline or CleanupRequired |
+| Creating (`Creating` or partial) | Output published | Display becomes Owned, then Connecting |
+| Creating (`Creating` or partial) | Cancel or provider failure | Stopping/Removing; only after confirmed removal may the phase become Available/Failed |
+| Connecting (`None` or `Owned`) | Stream ready | Mirroring or VirtualDisplay; audio becomes Enabled/Muted or remains Unavailable |
+| Connecting | Pairing required | Pairing with the current display resource preserved |
+| Connecting | Network failure | Reconnecting; Virtual keeps Owned, Mirror keeps None |
+| Connecting | Audio startup failure | AudioDecisionRequired; continue only after Retry audio, explicit video-only choice, or Cancel |
+| Mirroring/VirtualDisplay | Network failure or receiver removal | Reconnecting; increment endpoint wait state, retain Virtual output |
+| Mirroring/VirtualDisplay | Runtime audio failure | Keep video active, set AudioState.Unavailable, disable mute, offer Retry audio or Stop |
+| Active state | Stop or confirmed mode switch | Stopping; no next mode starts before cleanup completes |
+| Reconnecting | Network recovery | New operation generation, refresh target, then Connecting |
+| Reconnecting | Stop | Stopping, then Available/Offline or CleanupRequired |
+| Reconnecting | Retry budget for local recovery exhausted | Failed; preserve a valid Virtual output, or enter CleanupRequired if display ownership is uncertain |
+| Any transport state | Daemon exit | Reconcile daemon instance, restart within the local restart budget, then reconnect each target independently or enter Failed |
+| Any virtual state | Helper exit or KScreen disappearance | Set DisplayState.Failed, stop transport using the invalid source, then Remove or CleanupRequired |
+| VirtualDisplay | Change resolution | Reconfiguring: stop stream, remove old output, create the new output, then reconnect |
+| Reconfiguring | Cancel | Continue ordered removal/cleanup; then Available/Offline or CleanupRequired, never revive the old stream |
+| Resolution mismatch | Recreate at accepted mode | Reconfiguring using the same ordered destroy/recreate transaction |
+| Resolution mismatch | Stop/Cancel | Stopping; remove the retained output |
+| Recovering | Matching helper/output adopted | Reconstruct the Virtual session with DisplayState.Owned and Reconnecting/Connecting transport |
+| Recovering | Receiver unavailable | Offline/Reconnecting with the output retained and an explicit Stop action |
+| Any state | Shutdown | Invalidate operation, stop transport, remove owned outputs with bounded timeouts, then exit |
+| Stopping | All resources confirmed released | Available, Offline, or the queued next mode |
+| Stopping | Timeout or ambiguous ownership | CleanupRequired; never report false Available |
+| CleanupRequired | Retry cleanup succeeds | Available/Offline |
+| CleanupRequired | Keep/manual cleanup | Retain an explicit cleanup badge and do not claim ownership is released |
 
-Network reconnect uses exponential delays capped at a fixed maximum. It does not become terminal merely because a TV is offline; it remains Reconnecting until Stop or an explicit unrecoverable classification. Bounded retry budgets apply to daemon restart and other local recovery attempts. When such a budget is exhausted, the session becomes Failed with its intent retained and an explicit Retry action. A Virtual display output is not removed by a transport-only Failed state; it is removed on Stop, valid helper failure cleanup, session end, or user-approved orphan cleanup.
+Network reconnect uses exponential delays capped at a fixed maximum. It does not become terminal merely because a TV is offline; it remains Reconnecting until Stop or an explicit unrecoverable classification. Bounded retry budgets apply to daemon restart and other local recovery attempts. When such a budget is exhausted, the session becomes Failed with its intent retained and an explicit Retry action. A Virtual display output is not removed by a transport-only Failed state; it is removed on Stop, valid helper-failure cleanup, session end, or user-approved orphan cleanup.
 
 ### Discovery adapter
 
-The discovery adapter watches `_airplay._tcp` and `_raop._tcp` through mDNS, merges records by `ReceiverId`, and emits added/updated/removed events. It normalizes display name, host/address, model, feature bits, service port, pairing hints, and last-seen state.
+The discovery adapter watches `_airplay._tcp` and `_raop._tcp` through mDNS, first aggregates related service records into a `ReceiverRecordSet`, then derives `ReceiverId` and emits added/updated/removed events. It normalizes display name, host/address, model, feature bits, service port, pairing hints, endpoint fingerprint, and last-seen state. Endpoint changes increment the record set's endpoint generation without changing a stable device identity.
 
 Avahi or a Python zeroconf implementation may provide the first adapter. The domain interface must not expose raw Avahi or zeroconf records. Discovery does not claim a panel resolution unless the receiver information is trustworthy. Removal of a discovered record does not immediately stop an active session; active sessions enter Reconnecting, while an idle receiver becomes Offline.
 
 ### Transport adapter
 
-`DoubleTakeTransport` owns one private `doubletake` daemon for the application and all receiver targets. It starts the daemon with a private socket below `$XDG_RUNTIME_DIR/airplay-linux/`, rather than attaching to an unrelated user daemon at the default socket. The app owns daemon startup, health monitoring, restart, and shutdown. The daemon's native multi-target support is used for concurrent streams.
+`DoubleTakeTransport` owns one private `doubletake` daemon for the application and all receiver targets. It starts the daemon with a private socket under `$XDG_RUNTIME_DIR/airplay-linux/instances/<app_instance_uuid>/`, rather than attaching to an unrelated user daemon at the default socket. The app owns daemon startup, health monitoring, restart, and shutdown. The daemon's native multi-target support is used for concurrent streams.
+
+The GUI is single-instance. A `QLockFile` at `$XDG_RUNTIME_DIR/airplay-linux/airplay-linux.lock` contains an application instance UUID. Startup verifies the lock owner using PID liveness and `/proc/<pid>/stat` start time before reporting that another application instance is active. A stale lock is removed only after those checks. Each daemon instance has an owner token, PID/start time, protocol version, private socket path, and runtime directory record. The record is atomically published before the daemon is used. A socket is accepted only after its path, owner record, PID/start time, and control handshake match the current app instance. A stale socket or mismatched handshake is removed only after the recorded process is proven dead; a live mismatch is an ownership error and is never reused.
+
+`ReceiverTarget` binds every command to the current endpoint:
+
+```text
+ReceiverTarget(
+    receiver_id,
+    service_records,
+    canonical_host,
+    service_port,
+    protocol,
+    endpoint_fingerprint,
+    endpoint_generation,
+)
+```
+
+The target is built from the current merged `ReceiverRecordSet`. An endpoint change increments `endpoint_generation`; commands already sent to the old generation may finish only for cleanup, while new start, pair, mute, and reconnect commands require the current target. The adapter rejects a target whose receiver ID, endpoint fingerprint, or generation is stale. A new device ID at the same endpoint is not allowed to receive commands through the old target.
 
 The typed transport interface is conceptually:
 
 ```text
-pair(receiver_id, pairing_input) -> PairingResult
-query_modes(receiver_id) -> ReceiverCapabilities or Unknown
-start_stream(receiver_id, source, audio_policy) -> StreamHandle
-stop_stream(stream_handle) -> Result
-set_muted(stream_handle, muted) -> Result
+pair(target, pairing_input, operation_context) -> PairingResult
+query_modes(target, operation_context) -> ReceiverCapabilities or Unknown
+start_stream(target, source, audio_policy, operation_context) -> StreamHandle
+stop_stream(stream_handle, operation_context) -> Result
+set_muted(stream_handle, muted, operation_context) -> Result
+start_audio(stream_handle, operation_context) -> Result
 subscribe() -> TransportEvent
 ```
 
-`source` is either `PhysicalMonitorSource(connector, portal_restore_token)` or `VirtualOutputSource(connector, kscreen_output_id, size)`. `StreamHandle` contains the receiver ID and backend target/stream ID. Every event contains the receiver ID, stream ID when applicable, operation ID, and a typed classification such as `pairing_required`, `network_failure`, `audio_unavailable`, `unsupported_source`, `daemon_failure`, or `receiver_rejected`.
+`source` is either `PhysicalMonitorSource(connector, portal_restore_token)` or `VirtualOutputSource(connector, kscreen_output_id, size)`. `StreamHandle` contains the receiver ID, target endpoint generation, backend target/stream ID, and daemon instance UUID. `OperationContext` contains the operation ID and generation. Every event contains the receiver ID, stream ID when applicable, target endpoint fingerprint/generation, daemon instance UUID, operation ID, and a typed classification such as `pairing_required`, `network_failure`, `audio_unavailable`, `unsupported_source`, `daemon_failure`, or `receiver_rejected`.
 
 The adapter uses the published `doubletake`/`doubletake-ctl` command and socket contract. Startup verifies that required commands and control operations are present; an incompatible backend is an actionable dependency error. Human-oriented output parsing is confined to this adapter. The adapter must not claim a physical source succeeded unless the backend accepted or verified the physical source descriptor. If the installed backend cannot do this, Mirror is explicitly unsupported while other modes remain available.
 
-A target-level backend failure removes only that target stream. A daemon process failure affects all streams because they share the daemon; the session manager preserves each session's intent, restarts the daemon within its restart budget, and reconnects streams independently. Other sessions remain represented and do not get torn down merely because one target failed.
+A target-level backend failure removes only that target stream. A daemon process failure affects all streams because they share the daemon; the session manager preserves each session's intent, restarts the daemon within its restart budget, and reconnects streams independently against current `ReceiverTarget` values. Other sessions remain represented and do not get torn down merely because one target failed. A second application instance never attaches to or shares this daemon.
+
+Pairing is owned by this transport coordinator. The session manager submits one `PairingChallenge` or pairing input to `pair`; it does not call a separate credential adapter to perform a second pairing operation. Credential storage is an implementation dependency of the coordinator and is described below.
 
 ### KDE virtual-display adapter
 
@@ -198,35 +262,45 @@ A target-level backend failure removes only that target stream. A daemon process
 
 1. verifies that the current session is KDE Wayland;
 2. verifies that `krfb-virtualmonitor` and `kscreen-doctor` are available;
-3. snapshots the relevant KScreen layout before creation;
-4. launches one owned helper process for the requested virtual output;
-5. observes KScreen output data until a new output appears;
-6. enables and configures the new connector through `kscreen-doctor`;
-7. returns a `VirtualOutputSource` and persisted ownership record;
-8. removes the output by stopping the owned helper and waiting for KScreen removal;
-9. restores the pre-create physical-output layout when possible.
+3. acquires a provider-wide creation lock so virtual-output creation is serialized across receivers;
+4. snapshots the relevant KScreen layout and atomically reserves an ownership record before launching a helper;
+5. launches one owned helper process for the requested virtual output;
+6. atomically records the helper PID and process start time, then observes KScreen output data against the pre-create baseline;
+7. accepts exactly one new connector/output matching the helper's requested size and reservation; ambiguity is a failure, never an arbitrary claim;
+8. atomically records the observed output and configures it through `kscreen-doctor`;
+9. publishes the completed ownership record and returns a `VirtualOutputSource`;
+10. removes the output by stopping the owned helper and waiting for KScreen removal;
+11. restores only the provider-owned layout changes when possible.
 
-The provider must observe an output not already owned by another active session. It supports one helper/output per virtual session and verifies distinct output IDs for concurrent virtual displays. If the installed helper cannot provide a distinct second output, the provider reports that capability failure for the new request without disturbing existing sessions.
+The reservation protocol uses durable atomic writes (temporary file, `fsync`, rename, and directory `fsync`) with these stages: `reserved`, `helper_started`, `output_observed`, `published`, and `removing`. The record is reserved before helper launch, so a crash cannot create an output without at least a durable ownership intent. The helper is launched with `AIRPLAY_LINUX_OWNER_UUID` and the exact app-instance runtime directory in its environment; startup reconciliation may match a live helper by that owner UUID plus PID/start time, never by command name alone. If any stage update fails, the provider stops the exact helper it launched, waits for output removal, and reports `CleanupRequired` if removal cannot be confirmed. A `reserved` record with no matching helper or output is discarded after liveness checks; a helper or output found at a later stage is reconciled conservatively.
 
 The persisted non-secret ownership record contains:
 
-- `owner_uuid` generated at creation;
-- `receiver_id`;
-- connector name and KScreen output ID;
+- `owner_uuid` generated at reservation;
+- `receiver_id` and endpoint fingerprint;
+- connector name, KScreen output ID when known, and configured size;
 - requested and observed resolution;
 - helper PID and process start time;
-- creation timestamp;
-- pre-create layout snapshot;
+- creation timestamp and reservation stage;
+- pre-create layout snapshot and baseline hash;
+- last provider-applied layout values;
 - provider version/capability fingerprint.
+
+The provider-wide lock covers baseline capture, helper launch, output observation, and publication, so two receivers cannot both claim the next new output. It supports one helper/output per virtual session and verifies distinct output IDs for concurrent virtual displays. If the installed helper cannot provide a distinct second output, the provider reports that capability failure for the new request without disturbing existing sessions.
 
 Startup reconciliation follows these rules:
 
-- matching record, output, and live helper: adopt the existing output;
-- matching record and output but no helper: show an orphan candidate and ask before removal;
-- record with no output: discard the stale record after logging it;
-- output with no ownership record: never remove automatically; leave it alone and report it only when relevant.
+- a `published` or `output_observed` record with a live helper whose PID/start time matches and an exact output/baseline match enters `Recovering`; the session manager reconstructs a Virtual session with `DisplayState.Owned`, restores the selected-pane metadata, and reconnects transport against the current `ReceiverTarget`;
+- a matching output with no live helper becomes an `Orphan candidate` and requires user approval before removal;
+- a live exact helper with no output is waited on briefly, then becomes `CleanupRequired` if the output never appears;
+- a record with no output and no live helper is discarded after logging it;
+- an output with no ownership record is never removed automatically and is not adopted; it remains an unrelated output unless the user explicitly chooses cleanup through a separate system tool.
 
-A helper or KScreen timeout records `Cleanup required`, never claims success, and leaves the user an actionable cleanup/retry path. The provider owns only outputs represented by its record and exact observed connector/output identity. It does not remove unrelated physical or virtual outputs.
+If an adopted receiver is not currently discovered, the reconstructed session displays `Recovering/Offline`, retains the output, and retries only when the receiver reappears or the user selects Retry. If trust is invalid, the output remains owned while the session enters Pairing with the output-retained variant. A recovered session can always be stopped through the same ordered cleanup path.
+
+Layout restoration is constrained by the saved baseline. On teardown, the provider restores only output properties that it changed and only when those properties still equal the provider's last-applied values. User changes made after creation, and changes to unrelated outputs, are preserved. The provider owns only outputs represented by its exact record and observed connector/output identity. It does not remove unrelated physical or virtual outputs.
+
+A helper or KScreen timeout records `CleanupRequired`, never claims success, and leaves the user an actionable cleanup/retry path.
 
 ### Capture-source adapter
 
@@ -234,66 +308,89 @@ A `CaptureSourceProvider` enumerates physical monitor connectors and requests th
 
 ### Credential adapter
 
-The transport backend's keyring mode is the preferred secret store. The application-facing credential interface exposes trust state and lifecycle operations without exposing stored credentials:
+The transport coordinator is the sole pairing authority. The credential adapter is storage only and exposes no pairing challenge API. Its interface is limited to opaque backend operations such as:
 
 ```text
-has_trust(receiver_id) -> bool
-begin_pairing(receiver_id) -> PairingChallenge
-submit_pairing(challenge, pin_or_password) -> PairingResult
-forget(receiver_id) -> Result
+load_credential_ref(receiver_id) -> OpaqueCredentialRef or Missing
+store_credential_ref(receiver_id, ref) -> Result
+forget_credential_ref(receiver_id) -> Result
+mark_invalid(receiver_id) -> Result
 ```
 
-The backend owns secret reads, writes, rotation, and revocation. The app stores only whether a receiver is trusted and the backend's opaque credential reference. Pairing cancellation returns to Available without recording a failure. Invalid credentials are retryable with a bounded prompt-attempt budget; keyring unavailability is a dependency error and never falls back to plaintext.
+The coordinator exposes the pairing flow to the session manager:
+
+```text
+begin_pairing(target, operation_context) -> PairingChallenge
+submit_pairing(challenge, pin_or_password, operation_context) -> PairingResult
+forget_trust(receiver_id) -> Result
+```
+
+A `PairingChallenge` contains a challenge ID, receiver ID, endpoint fingerprint, operation ID/generation, creation time, expiry time, and an opaque backend correlation token. The session manager accepts user input only through this coordinator. The coordinator rejects expired, cancelled, wrong-target, and stale-generation submissions before contacting the backend. Pairing results are typed as `Trusted`, `InvalidInput`, `ReceiverRejected`, `Cancelled`, `CredentialUnavailable`, or `TransportFailure`.
+
+The backend owns secret reads, writes, rotation, and revocation through its keyring mode. PINs, passwords, opaque backend secrets, and correlation tokens are never written to the application metadata, activity log, test snapshots, or exception messages. Pairing cancellation invalidates the challenge and returns to the appropriate Available/Offline or output-retained cleanup path without changing trust. Invalid input has a bounded prompt-attempt budget. A backend credential-invalid event clears the opaque trust reference, transitions the transport resource to Pairing, and preserves a valid Virtual output while awaiting new trust.
+
+`Forget` is a confirmed action. It is available when no stream is active; while active, the UI requires Stop to complete before calling `forget_trust`. Forget removes the backend credential reference and local trust metadata. Rotation is represented as a new pairing challenge and never silently reuses the old credential.
 
 ### Audio policy
 
-The default `AudioPolicy` is enabled. Startup probes PipeWire and portal capability before a normal audio-enabled start. If audio is unavailable or permission is denied, the normal start is blocked with an actionable reason and the user may explicitly choose `Start video only`. That choice is recorded in the session state and activity log; it is never an implicit downgrade.
+The default `AudioPolicy` is enabled. Startup probes PipeWire and portal capability before a normal audio-enabled start. If audio is unavailable or permission is denied before video is connected, the normal start is blocked in `AudioDecisionRequired`; the user may Retry audio, explicitly choose `Start video only`, or Cancel. That choice is recorded in the session state and activity log; it is never an implicit downgrade.
 
-Mute/unmute is a target-local command and is session-only. A mute failure leaves the prior known state unchanged and reports the backend error. Audio capability, permission, and mute failures use typed transport events and do not stop unrelated receiver sessions.
+Once video is active, an audio failure is video-preserving. The transport resource remains `Streaming`, the audio resource becomes `Unavailable`, mute controls are disabled, and the selected pane shows `Audio unavailable` with Retry audio and Stop. Retry audio creates a new operation context for the audio sub-operation only; success moves audio to Enabled or Muted without interrupting video. A failed retry leaves video and the Unavailable state intact. Audio recovery from a backend event follows the same state update and never changes another receiver session.
+
+Mute/unmute is a target-local command and is session-only. A mute failure leaves the prior known state unchanged and reports the backend error. Audio capability, permission, startup decision, runtime failure, and mute failure use typed transport events.
 
 ## State and Data Flow
 
-The primary state flow is:
+The primary user-visible flow is a projection of independent resources:
 
 ```text
 Available
   | start Mirror
   v
 Pairing/Connecting ---> Mirroring ---> Reconnecting --+
-  |                                                   |
-  +------------------------- retry -------------------+
+  |                         |                         |
+  +-------------------------+------ retry ------------+
 
 Available
   | start Virtual display
   v
-Resolve mode -> Create KDE output -> Connecting -> Virtual display
-                                      ^              |
-                                      |              v
-                                      +-------- Reconnecting
+Resolve mode -> Create output -> Connecting -> Virtual display
+                         |             ^             |
+                         v             |             v
+                   Pairing +       Reconnecting (output retained)
+                   output owned
+
+Virtual display --change resolution--> Reconfiguring
+                                      -> new output -> Connecting
 ```
 
 Important rules:
 
-- Pairing-required is a recoverable state with a PIN/password prompt.
+- Pairing may occur before output creation or after a backend challenge during connection. The display resource is explicitly `None` or `Owned`; cancellation with `Owned` always removes it through `Stopping`.
 - Missing dependencies and unsupported capabilities are explicit terminal states for the attempted command, not global application failures.
 - A failed receiver session does not stop or alter another receiver session.
 - Virtual display reconnects preserve the output and window layout after transport-only failure.
 - Mirror reconnects have no output to preserve; transport may retry without creating a display.
+- Resolution reconfiguration destroys and recreates the output in an ordered transaction; it does not run alongside the old stream.
+- Runtime audio failure preserves video and changes only the audio resource.
 - Stop is idempotent and always releases transport and display resources owned by the session.
-- Every asynchronous event is checked against receiver ID and operation generation before it can change state.
+- Every asynchronous event is checked against receiver ID, endpoint generation, daemon instance UUID, and operation generation before it can change state.
 
-A session record contains at least:
+A persisted session record contains at least:
 
-- stable receiver ID and current network endpoint;
-- current mode and lifecycle state;
+- stable receiver ID, merged service metadata, and current `ReceiverTarget` endpoint generation;
+- current mode, intent, `SessionPhase`, `TransportState`, `DisplayState`, and `AudioState`;
 - selected physical monitor or virtual-output handle;
 - `ResolutionDecision` and observed resolution;
 - audio policy and muted state;
-- owned transport process/session identifiers;
-- owned virtual-display process/output identifiers;
+- owned daemon instance and backend stream identifiers;
+- owned virtual-display process/output identifiers and ownership stage;
 - last error code, user-facing message, and recovery action;
 - reconnect attempt and next retry time;
-- current operation ID and generation.
+- current operation ID and generation;
+- queued next mode only while a confirmed Stop/reconfiguration transaction is active.
+
+The persisted ownership record is authoritative for virtual-output recovery; the session record references it but never treats an unconfirmed output as released.
 
 ## Resolution Policy
 
@@ -307,25 +404,28 @@ The app resolves the mode before creating a virtual output:
 4. remember the chosen or verified mode per receiver after successful setup;
 5. never guess a mode from a display name, stale endpoint, or generic TV category.
 
-Changing a virtual display resolution destroys and recreates the KDE output. The UI warns that windows may need repositioning. If the transport reports a reliable accepted mode after setup and it differs from the decision, the session stops the stream and enters `Resolution mismatch` with the current output retained. The user can explicitly choose `Recreate at accepted mode`, which tears down and recreates the output, or Cancel, which stops Virtual display mode. The application never changes the output silently.
+Changing a virtual display resolution is a `Reconfiguring` transaction. The UI warns that windows may need repositioning. The session manager invalidates the active stream generation, stops transport, waits for stop confirmation, marks the old display `Removing`, stops the helper, waits for KScreen removal, reserves and creates the new output, then reconnects using a new operation generation. The old and new outputs are never owned as active alternatives by the same session, and cancellation after teardown ends in Available/Offline or CleanupRequired rather than reviving the old stream.
+
+If the transport reports a reliable accepted mode after setup and it differs from the decision, the session stops the stream and enters `Resolution mismatch` with the current output retained but not streamed. The user can explicitly choose `Recreate at accepted mode`, which performs the same destroy/recreate transaction, or Stop, which removes the retained output. The application never changes the output silently. A failed recreation reports the exact display/transport resource states and offers Retry or cleanup.
 
 ## Error Handling and Recovery
 
-- No discovered receivers is a normal empty state.
+- No discovered receivers is a normal empty state; a saved receiver with no current record is `Offline`.
 - Avahi or network errors appear as retryable discovery errors while known devices remain visible.
-- Pairing prompts appear only when requested by the receiver.
-- Pairing cancellation returns to Available without changing trust metadata.
+- Removal of a receiver record does not stop an active session; it invalidates the endpoint generation and moves transport to Reconnecting while a Virtual output remains owned.
+- Pairing prompts appear only when requested by the receiver. Pairing cancellation, expiry, wrong-target input, and stale-generation input do not mutate trust.
 - Transport errors remain local to the receiver and expose retry/stop actions.
 - Missing `krfb-virtualmonitor` disables only Virtual display mode.
-- Virtual-display creation is transactional: failure or cancellation stops the helper, waits for output removal, and records cleanup if the timeout expires.
+- Virtual-display creation and reconfiguration are transactional. Failure or cancellation stops the exact helper, waits for output removal, and records CleanupRequired if the timeout expires.
 - Network loss in Virtual display mode shows `Reconnecting`, keeps the output, and retries with bounded exponential backoff.
-- A transport daemon exit restarts within a bounded local-recovery budget; each target then reconnects independently.
-- A helper exit or KScreen disappearance invalidates the virtual source and enters display cleanup/reconciliation.
-- Normal shutdown stops transports and removes owned virtual outputs with bounded cleanup timeouts.
-- Startup scans for orphaned outputs using persisted ownership records and offers explicit cleanup.
-- Portal cancellation, keyring failure, unsupported source, unsupported mode, audio denial, and receiver rejection are distinct actionable errors.
+- A transport daemon exit reconciles the private daemon instance and restarts within a bounded local-recovery budget; each target then reconnects independently against its current endpoint.
+- A helper exit or KScreen disappearance invalidates the virtual source, stops transport, and enters display removal or CleanupRequired. It never claims that the old output is still usable.
+- Normal shutdown invalidates all operation generations, stops transports, removes owned virtual outputs with bounded cleanup timeouts, and records unresolved resources before exit.
+- Runtime audio failure keeps an established video stream active, sets AudioState.Unavailable, disables mute, and offers Retry audio or Stop. Audio failure before video readiness requires an explicit Retry audio, Start video only, or Cancel decision.
+- Startup scans ownership records and exact helper/output evidence. Matching records enter Recovering; output-without-helper records become orphan candidates; unowned outputs are never removed automatically.
+- Portal cancellation, keyring failure, unsupported source, unsupported mode, audio denial, receiver rejection, stale target, stale socket, helper failure, and cleanup timeout are distinct actionable errors.
 
-The activity log records timestamped events and diagnostic detail. The selected receiver pane contains the current actionable error, not just a raw process exit code.
+The activity log records timestamped lifecycle and resource events without secrets. The selected receiver pane contains the current actionable error, resource badges, and recovery action, not just a raw process exit code.
 
 ## Dependencies and Environment Checks
 
@@ -351,53 +451,55 @@ The session manager injects:
 
 - a monotonic clock and scheduler;
 - process runner and process-exit event source;
-- discovery event source;
-- transport command/event source;
+- discovery event source and merged-record identity resolver;
+- transport command/event source and daemon-instance registry;
 - portal/capture-source provider;
-- KScreen observer and command runner;
-- credential/keyring provider;
-- persistent ownership store.
+- KScreen observer, provider-wide creation lock, ownership store, and command runner;
+- credential/keyring storage provider;
+- persistent session and ownership records.
 
-Each seam has a fake implementation with controllable events, delays, failures, and late/stale callbacks.
+Each seam has a fake implementation with controllable events, delays, failures, process start times, endpoint changes, and late/stale callbacks. The fake KScreen provider can interleave two receiver creation attempts and inject a crash at every ownership-record stage.
 
 ### Unit tests
 
-- mDNS identity derivation, identity replacement, collision handling, and stale-device handling;
-- capability and `ResolutionDecision` selection;
-- mode exclusivity per receiver;
+- mDNS record aggregation across AirPlay and RAOP, identity derivation, port/hostname changes, identity replacement, collision handling, trust non-inheritance, and stale-device handling;
+- capability and `ResolutionDecision` selection without circular negotiation or guessed modes;
+- mode exclusivity per receiver and concurrent sessions across receivers;
 - command validation for physical-only Mirror sources;
-- state transitions for every row in the lifecycle table;
-- operation-generation rejection of stale callbacks;
-- cancellation and idempotent Stop from every asynchronous state;
-- reconnect scheduling, cap, retry classification, and cancellation;
-- ownership, transaction rollback, and orphan-reconciliation decisions;
-- keyring metadata boundaries and pairing cancellation;
-- audio policy, explicit video-only fallback, mute failure, and state retention.
+- state/resource transitions for every row in the lifecycle table, including Pairing with an owned output, Offline, Recovering, Reconfiguring, AudioDecisionRequired, Audio unavailable, CleanupRequired, and stop timeout;
+- operation-generation rejection of stale callbacks, stale target endpoint events, stale daemon events, and stale pairing submissions;
+- cancellation and idempotent Stop from every asynchronous state, with transport-before-display cleanup ordering;
+- reconnect scheduling, cap, retry classification, receiver disappearance, endpoint replacement, and cancellation;
+- ownership reservation, atomic publication, crash-point recovery, layout restoration guards, and orphan-reconciliation decisions;
+- keyring metadata boundaries, challenge expiry, forget/revoke/rotation, invalid credential recovery, and secret non-logging;
+- audio policy, explicit video-only fallback, runtime audio failure with video retention, audio retry, mute failure, and state retention;
+- stale daemon lock/socket handling, PID start-time verification, and single-instance rejection.
 
 ### Adapter contract tests
 
-- fake discovery emits deterministic device events;
-- fake transport verifies pairing, start/stop, typed source validation, mute, reconnect, and two concurrent receiver targets;
-- fake process runner covers missing commands, non-zero exit, timeout, malformed output, abrupt termination, and daemon restart;
+- fake discovery emits deterministic cross-service merged records and endpoint generations;
+- fake transport verifies sole-authority pairing, target binding, typed source validation, start/stop, mute, runtime audio recovery, reconnect, wrong-target rejection, daemon restart, and two concurrent receiver targets;
+- fake process runner covers missing commands, non-zero exit, timeout, malformed output, abrupt termination, daemon restart, stale PID reuse, and owner-token mismatch;
 - fake capture provider rejects windows and virtual outputs and supplies only physical monitor descriptors;
-- fake KDE provider verifies create, wait-for-output, configure, distinct concurrent output IDs, reconnect retention, transactional rollback, layout restoration, timeout, and teardown ordering;
-- fake keyring covers store, read, forget, rotation, permission failure, and no-plaintext guarantees.
+- fake KDE provider verifies provider-wide creation serialization, reservation stages, helper-to-output correlation, distinct concurrent output IDs, crash adoption, reconnect retention, transactional rollback, layout restoration guards, timeout, and teardown ordering;
+- fake keyring covers store, read, forget, rotation, permission failure, challenge invalidation, and no-plaintext guarantees.
 
 ### Environment integration tests
 
 - run the installed `doubletake` and `doubletake-ctl` help and control-socket contract checks;
 - run KScreen JSON parsing against a fixture modeled on `kscreen-doctor -j`;
-- run a fake `krfb-virtualmonitor` process through the real provider;
+- run a fake `krfb-virtualmonitor` process through the real provider, including owner UUID and process-start-time reconciliation;
 - run a KDE Plasma Wayland smoke test when the helper and a test-safe virtual output are available;
-- verify that startup orphan reconciliation never removes an unowned output;
+- verify startup orphan reconciliation never removes an unowned output and adopts only an exact live owner record;
 - verify the app remains usable in the current environment where `krfb-virtualmonitor` is absent;
-- exercise two concurrent targets, target-local failure isolation, system audio/mute, reconnect retention, shutdown, and source enforcement against a supported backend contract.
+- exercise two concurrent targets, target-local failure isolation, system audio/mute, runtime audio loss with video retention, reconnect retention, resolution recreation, shutdown, endpoint replacement, and source enforcement against a supported backend contract;
+- verify a second application instance cannot attach to the first instance's daemon or socket.
 
 ### UI tests
 
-Qt tests cover the state matrix, including pairing prompts, mode-selector lockout, explicit stop-before-switch, resolution picker, portal cancellation, reconnect presentation, dependency errors, resolution mismatch, orphan cleanup confirmation, audio-unavailable video-only choice, and per-session mute.
+Qt tests cover every row in the UI matrix: pairing before and after output creation, mode-selector lockout, explicit stop-before-switch, resolution picker, portal cancellation, Offline and Recovering, reconnect presentation with retained output, Reconfiguring, resolution mismatch, dependency errors, orphan cleanup confirmation, CleanupRequired, audio-unavailable video retention and retry, stale pairing submission, forget/revoke flow, and per-session mute. Tests assert that text and controls never expose a conflicting mode action while resources are stopping or uncertain.
 
-Acceptance requires multiple independent receiver sessions, strict per-receiver mode exclusivity, physical-only Mirror source validation, virtual-output creation and cleanup, remembered pairing without plaintext metadata, actionable dependency errors, deterministic cancellation behavior, and isolation of one receiver's failure from another.
+Acceptance requires multiple independent receiver sessions, strict per-receiver mode exclusivity, physical-only Mirror source validation, serialized and recoverable virtual-output creation, exact crash adoption/cleanup behavior, virtual-output creation and cleanup, remembered pairing without plaintext metadata, actionable dependency errors, deterministic cancellation behavior, runtime audio failure without video loss, and isolation of one receiver's failure from another.
 
 ## Risks and Boundaries
 
@@ -416,7 +518,10 @@ Before implementation planning, the design is internally consistent:
 - Mirror and Virtual display are separate per-receiver modes.
 - Only Mirror uses physical-monitor sources.
 - Virtual display owns its KDE output lifecycle and preserves it during transport-only reconnect.
+- Transport, display, and audio resources have independent authoritative states, including output-retained pairing and video-preserving audio failure.
 - KDE Plasma 6 Wayland is guaranteed for v1; other environments are capability-gated.
+- Receiver identity is derived after cross-service aggregation, and endpoint/daemon generations reject stale commands.
+- Provider-wide virtual-output reservation, atomic ownership publication, crash adoption, and conservative orphan cleanup are explicit.
 - Resolution is resolved before output creation and selected explicitly when no reliable value exists.
 - Stale asynchronous events cannot revive a stopped or superseded operation.
 - Daemon and helper ownership, failure classification, and cleanup timeouts are explicit.
