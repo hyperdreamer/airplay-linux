@@ -3882,3 +3882,240 @@ def test_an_ordinary_call_under_a_handler_still_succeeds():
             raise
 
     assert str(handled.value) == HANDLER_CANARY
+
+
+# ============================ accepted capability evidence is a private snapshot
+#
+# ``CapabilityReport`` is frozen, and freezing is not ownership. The caller keeps
+# its own alias to the report, and ``object.__setattr__`` can retype that alias to
+# a subclass that instruments ``__getattribute__``. An export that read the report
+# rather than a private copy would therefore let the caller's later hook decide
+# what the module reports -- echoing backend text, flipping a capability flag, or
+# raising a secret-bearing failure from inside the diagnostics boundary. The same
+# holds per diagnostic record inside the report's collection.
+#
+# So the evidence is read exactly once, when the log accepts it, and only its
+# exact built-in leaves are retained. Everything below is measured after
+# construction, because that is when the caller regains control of its alias.
+
+#: The canary every retained-alias hook below renders or raises; it must never
+#: reach the export, a rejection, or any retained record.
+ALIAS_CANARY: Final[str] = "alias-canary-7714"
+
+
+class AliasCounter:
+    """The instrument the retained-alias hooks report through.
+
+    It is owned by the test rather than by the report, so a nonzero count proves
+    the export read the caller's object. ``ActivityLog`` construction legitimately
+    reads the report once, so each test clears the counter after constructing.
+    """
+
+    def __init__(self) -> None:
+        self.reads: list[str] = []
+
+    def hit(self, label: str) -> None:
+        self.reads.append(label)
+
+    def __len__(self) -> int:
+        return len(self.reads)
+
+
+#: The counter the retyped probes report into. A probe rebinds it just before use.
+_ALIAS: AliasCounter = AliasCounter()
+
+
+def alias_counter() -> AliasCounter:
+    """A fresh counter, rebound so a stale binding cannot hide a read."""
+    global _ALIAS
+    _ALIAS = AliasCounter()
+    return _ALIAS
+
+
+class RecordingReport(CapabilityReport):
+    """A report subclass that records every attribute read and returns the data."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"report.{name}")
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+class AlteredReport(CapabilityReport):
+    """A report subclass whose leaves answer with different, still legal values."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"report.{name}")
+        if name == "discovery":
+            return False
+        if name == "mirror":
+            return False
+        if name == "environment":
+            return _UNKNOWN_ENVIRONMENT_SAMPLE
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+class RaisingReport(CapabilityReport):
+    """A report subclass that raises the canary from every attribute read."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"report.{name}")
+        raise BaseException(ALIAS_CANARY)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+class RecordingDiagnostic(Diagnostic):
+    """A diagnostic subclass that records every attribute read."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"diagnostic.{name}")
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+class AlteredDiagnostic(Diagnostic):
+    """A diagnostic subclass whose code answers with a different legal member."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"diagnostic.{name}")
+        if name == "code":
+            return ErrorCode.transport_failed
+        return object.__getattribute__(self, name)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+class RaisingDiagnostic(Diagnostic):
+    """A diagnostic subclass that raises the canary from every attribute read."""
+
+    def __getattribute__(self, name: str) -> object:
+        _ALIAS.hit(f"diagnostic.{name}")
+        raise BaseException(ALIAS_CANARY)
+
+    def __repr__(self) -> str:
+        return repr(ALIAS_CANARY)
+
+
+#: The environment label the export substitutes for anything it does not know.
+_UNKNOWN_ENVIRONMENT_SAMPLE: Final[str] = "Unknown"
+
+
+def alias_report() -> CapabilityReport:
+    """A complete, accepted report whose diagnostics carry backend text.
+
+    Two codes rather than one, so a substitution cannot pass for the original by
+    coincidence, and a canary in a diagnostic's ``message`` -- the field that
+    holds receiver and backend text -- so any echo is visible in the document.
+    """
+    return CapabilityReport(
+        environment="KDE Plasma 6 Wayland",
+        discovery=True,
+        mirror=True,
+        virtual_display=False,
+        audio=True,
+        remembered_pairing=False,
+        additional_virtual_outputs=False,
+        diagnostics=(
+            Diagnostic(
+                code=ErrorCode.dependency_missing,
+                message=f"backend said {ALIAS_CANARY}",
+                recovery=(RecoveryAction.retry,),
+            ),
+            Diagnostic(
+                code=ErrorCode.audio_unavailable,
+                message=ALIAS_CANARY,
+                recovery=(RecoveryAction.video_only,),
+            ),
+        ),
+    )
+
+
+def pristine_alias_document() -> str:
+    """What the export must say, built from a report no probe has touched."""
+    return ActivityLog(capabilities=alias_report()).export()
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [RecordingReport, AlteredReport, RaisingReport],
+    ids=["recording-hook", "altering-hook", "raising-hook"],
+)
+def test_a_retyped_capability_report_alias_cannot_reach_the_export(hook):
+    # The reproduction: the caller keeps its alias, retypes it in place after the
+    # log has accepted the report, and from then on every attribute the export
+    # reads is answered by caller code.
+    expected = pristine_alias_document()
+    counter = alias_counter()
+    report = alias_report()
+    log = ActivityLog(capabilities=report)
+    counter.reads.clear()
+    object.__setattr__(report, "__class__", hook)
+    assert type(report) is hook, "the probe must really be retyped"
+
+    exported = log.export()
+
+    assert len(counter) == 0, f"caller hooks ran while exporting: {counter.reads}"
+    assert exported == expected, "the export must come from the accepted evidence"
+    assert ALIAS_CANARY not in exported
+
+
+@pytest.mark.parametrize(
+    "hook",
+    [RecordingDiagnostic, AlteredDiagnostic, RaisingDiagnostic],
+    ids=["recording-hook", "altering-hook", "raising-hook"],
+)
+def test_a_retyped_capability_diagnostic_alias_cannot_reach_the_export(hook):
+    # The same defect one level down: the collection is immutable, but the item
+    # inside it is the caller's object, so its code would answer the export.
+    expected = pristine_alias_document()
+    counter = alias_counter()
+    report = alias_report()
+    item = report.diagnostics[0]
+    log = ActivityLog(capabilities=report)
+    counter.reads.clear()
+    object.__setattr__(item, "__class__", hook)
+    assert type(item) is hook, "the probe must really be retyped"
+
+    exported = log.export()
+
+    assert len(counter) == 0, f"caller hooks ran while exporting: {counter.reads}"
+    assert exported == expected, "the export must come from the accepted evidence"
+    assert ALIAS_CANARY not in exported
+
+
+@pytest.mark.parametrize(
+    ("attribute", "payload"),
+    [
+        ("environment", "some other desktop"),
+        ("discovery", False),
+        ("mirror", False),
+        ("virtual_display", True),
+        ("audio", False),
+        ("remembered_pairing", True),
+        ("additional_virtual_outputs", True),
+        ("diagnostics", ()),
+    ],
+)
+def test_a_caller_mutating_its_report_cannot_change_retained_evidence(attribute, payload):
+    # Retyping is the sharpest form of the attack, not the only one: a frozen
+    # record still allows ``object.__setattr__``, so a caller that keeps its alias
+    # can rewrite any leaf the export would otherwise read later.
+    expected = pristine_alias_document()
+    report = alias_report()
+    log = ActivityLog(capabilities=report)
+
+    object.__setattr__(report, attribute, payload)
+    assert getattr(report, attribute) == payload, "the mutation must actually occur"
+
+    assert log.export() == expected
+    assert ALIAS_CANARY not in log.export()

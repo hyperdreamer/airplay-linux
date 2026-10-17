@@ -14,6 +14,16 @@ emission, so a caller cannot route backend text around :func:`safe_activity`.
 Nothing here inspects the type of a caller value: every value crosses
 :mod:`airplay_linux.diagnostics.boundary` once, which accepts exact built-in
 types only and never runs a hook of a caller-supplied object.
+
+Accepting a value is also not the same as owning it. A :class:`CapabilityReport`
+is frozen, but the caller keeps its own alias, and ``object.__setattr__`` can
+retype that alias to a subclass, or rewrite one of its leaves, at any time after
+the log has accepted it. So the report's *evidence* -- the environment label,
+the six capability flags and the validated diagnostic codes -- is normalized
+once, at acceptance, into :class:`_CapabilitySnapshot` and only exact built-in
+leaves are retained. The export reads that private snapshot and never the
+caller's object, so a hook installed later cannot run and a mutation made later
+cannot change the document.
 """
 
 from __future__ import annotations
@@ -23,10 +33,10 @@ import re
 import unicodedata
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.records import ActivityEvent
@@ -150,6 +160,34 @@ FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
 EXPORT_SCHEMA: Final[str] = "airplay-linux-diagnostics/1"
 _SAFE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"KDE Plasma 6 Wayland"})
 _UNKNOWN_ENVIRONMENT: Final[str] = "Unknown"
+
+#: Fixed text of each capability-evidence refusal, written once here and passed
+#: to the boundary call that enforces it. A report's leaves are normalized when
+#: the log accepts it, but a refusal is still reported when the document is
+#: built, so the refusal text and kind a caller sees do not change with the
+#: moment the evidence is read.
+_ENVIRONMENT_MESSAGE: Final[str] = "capabilities environment must be a string"
+_FLAGS_MESSAGE: Final[str] = "capability flags must be booleans"
+_DIAGNOSTICS_MESSAGE: Final[str] = (
+    "capability diagnostics must be an immutable tuple of diagnostics"
+)
+_DIAGNOSTIC_ITEM_MESSAGE: Final[str] = (
+    "capability diagnostics must be domain Diagnostic records; "
+    "arbitrary objects are not capability evidence"
+)
+_DIAGNOSTIC_CODE_MESSAGE: Final[str] = (
+    "capability diagnostics must carry a registered error code"
+)
+
+#: The six capability flags, in the order the export document lists them.
+_CAPABILITY_FLAGS: Final[tuple[str, ...]] = (
+    "discovery",
+    "mirror",
+    "virtual_display",
+    "audio",
+    "remembered_pairing",
+    "additional_virtual_outputs",
+)
 
 #: Fixed message copy per code; a new code needs a line here, not a raw string.
 _MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
@@ -410,7 +448,7 @@ def safe_activity(
     )
 
 
-def _capability_codes(diagnostics: object) -> list[str]:
+def _capability_codes(diagnostics: object) -> tuple[str, ...]:
     """Validate the capability-diagnostic collection before reading any item.
 
     This is a record boundary, not a renderer: only the exact frozen tuple type
@@ -418,22 +456,22 @@ def _capability_codes(diagnostics: object) -> list[str]:
     members may contribute a code. The collection and each item's type are
     decided *before* any attribute is read, so a caller object whose ``code``
     hook raises, advertises a borrowed ``__class__``, or carries backend text is
-    never consulted, and the exported strings are the frozen vocabulary's own.
+    never consulted, and the returned strings are the frozen vocabulary's own.
+
+    The result is a plain built-in tuple of built-in strings, so it is a private
+    snapshot rather than a view of anything the caller can still reach.
     """
     diagnostics = boundary.exact_only(
         diagnostics,
         tuple,
-        message="capability diagnostics must be an immutable tuple of diagnostics",
+        message=_DIAGNOSTICS_MESSAGE,
     )
     codes: set[str] = set()
     for item in diagnostics:  # type: ignore[attr-defined]
         item = boundary.exact_only(
             item,
             Diagnostic,
-            message=(
-                "capability diagnostics must be domain Diagnostic records; "
-                "arbitrary objects are not capability evidence"
-            ),
+            message=_DIAGNOSTIC_ITEM_MESSAGE,
         )
         code = boundary.genuine_error_code(item.code)  # type: ignore[attr-defined]
         # The code is a captured genuine member, so its text comes from the
@@ -443,10 +481,116 @@ def _capability_codes(diagnostics: object) -> list[str]:
                 code,
                 boundary.ERROR_CODE_VOCABULARY,
                 kind=TypeError,
-                message="capability diagnostics must carry a registered error code",
+                message=_DIAGNOSTIC_CODE_MESSAGE,
             ),
         )
-    return sorted(codes)
+    return tuple(sorted(codes))
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilitySnapshot:
+    """Accepted capability evidence, as exact built-in leaves only.
+
+    Every field is an exact built-in the boundary produced: the environment label
+    is the caller's own string data, each flag is a real ``bool``, and the codes
+    are the frozen vocabulary's own text. Nothing here holds a reference to the
+    caller's report, to its diagnostics collection, or to any diagnostic record,
+    so no later mutation or retype of those objects can change what the export
+    says. ``slots=True`` also leaves the instance without a ``__dict__``, so there
+    is no attribute map to rewrite from outside.
+
+    The generated ``__eq__`` and ``__repr__`` compare these built-in leaves only,
+    so neither can consult a caller object.
+    """
+
+    environment: str
+    flags: tuple[tuple[str, bool], ...]
+    diagnostic_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _CapabilityRefusal:
+    """A refusal this module issued while reading accepted evidence.
+
+    A report that cannot be normalized still has to be refused at the export,
+    because that is the point at which a caller observes capability evidence, and
+    refusing at construction instead would change the observable contract. So the
+    refusal is *recorded*: ``kind`` is one of the two built-in kinds and ``text``
+    is the fixed copy :mod:`airplay_linux.diagnostics.boundary` already wrote for
+    it, taken from that module's own scrub rather than from the caller's failure.
+    Nothing the caller supplied is reachable from here.
+
+    Recording it also makes the refusal stable: the second export re-issues the
+    same kind and the same text without touching the report again, which is what
+    keeps a hostile report from being consulted twice.
+    """
+
+    kind: type[Exception]
+    text: str
+
+    def issue(self) -> Exception:
+        """A fresh rejection carrying this recorded kind and fixed text."""
+        if self.kind is TypeError:
+            return boundary.type_rejection(self.text)
+        return boundary.rejection(self.text)
+
+
+@boundary.rejecting
+def _normalized_capabilities(report: object) -> _CapabilitySnapshot:
+    """Read one accepted report's evidence exactly once into a snapshot.
+
+    Each leaf is read here, through :mod:`airplay_linux.diagnostics.boundary`,
+    and only what the boundary returned is retained. The wrapper turns every
+    failure -- a caller ``BaseException`` included -- into one of this module's
+    own fixed rejections, so the caller of this function never has to inspect
+    whatever raised.
+    """
+    environment = boundary.exact_text(
+        getattr(report, "environment"),
+        kind=TypeError,
+        message=_ENVIRONMENT_MESSAGE,
+    )
+    flags: list[tuple[str, bool]] = []
+    for name in _CAPABILITY_FLAGS:
+        value = boundary.exact_only(
+            getattr(report, name),
+            bool,
+            message=_FLAGS_MESSAGE,
+        )
+        flags.append((name, cast(bool, value)))
+    return _CapabilitySnapshot(
+        environment=environment,
+        flags=tuple(flags),
+        diagnostic_codes=_capability_codes(getattr(report, "diagnostics")),
+    )
+
+
+def _accepted_capabilities(
+    capabilities: object,
+) -> _CapabilitySnapshot | _CapabilityRefusal | None:
+    """Take the private snapshot of an accepted report, or record its refusal.
+
+    This is the only moment the caller's report is read. Afterwards the log holds
+    nothing that refers to it, so retyping the caller's alias to instrument
+    ``__getattribute__``, rewriting one of its leaves, or replacing its
+    diagnostics tuple cannot reach the export.
+
+    A refusal is deferred rather than raised here: the export document is where a
+    caller observes capability evidence, so an unacceptable leaf keeps refusing
+    at export with the same built-in kind and the same fixed text it always did.
+    """
+    if capabilities is None:
+        return None
+    try:
+        return cast(_CapabilitySnapshot, _normalized_capabilities(capabilities))
+    except (ValueError, TypeError) as refusal:
+        # ``_normalized_capabilities`` is wrapped, so this is one of the two
+        # built-in kinds carrying fixed text this module wrote. Its own ``args``
+        # are not read: the kind and the text are, and both are source-written.
+        return _CapabilityRefusal(
+            kind=type(refusal),
+            text=str(refusal),
+        )
 
 
 def _sanitize_event(event: ActivityEvent) -> ActivityEvent:
@@ -505,7 +649,9 @@ class ActivityLog:
                 message="capabilities must be a CapabilityReport or None",
             )
         self._max_entries = max_entries
-        self._capabilities = capabilities
+        # The caller's report is read here and only here; what is retained is a
+        # private snapshot of exact built-in leaves (or the refusal to record).
+        self._capabilities = _accepted_capabilities(capabilities)
         self._entries: deque[ActivityEvent] = deque(maxlen=max_entries)
         self._subscribers: list[Callable[[ActivityEvent], None]] = []
 
@@ -588,33 +734,38 @@ class ActivityLog:
         return json.dumps(document, ensure_ascii=True, indent=2, sort_keys=True)
 
     def _capabilities_document(self) -> dict[str, object] | None:
-        report = self._capabilities
-        if report is None:
+        """The capability section, built from the snapshot only.
+
+        No caller object is read here. The snapshot was taken when the log
+        accepted the report, so a caller that retyped its alias to instrument
+        ``__getattribute__``, rewrote a leaf, or replaced the diagnostics tuple
+        afterwards changes nothing about this document and runs no code of its
+        own while it is built.
+        """
+        evidence = self._capabilities
+        if evidence is None:
             return None
-        environment = boundary.exact_text(
-            report.environment,
-            kind=TypeError,
-            message="capabilities environment must be a string",
+        if type(evidence) is _CapabilityRefusal:
+            raise evidence.issue()
+        # Anything else is not the state this log accepted: retained evidence
+        # was replaced from outside, so there is nothing to normalize and the
+        # fixed literal is the only honest answer.
+        snapshot = cast(
+            _CapabilitySnapshot,
+            boundary.exact_only(
+                evidence,
+                _CapabilitySnapshot,
+                kind=ValueError,
+                message=boundary.UNEXPECTED_FAILURE,
+            ),
         )
-        flags: dict[str, bool] = {}
-        for name in (
-            "discovery",
-            "mirror",
-            "virtual_display",
-            "audio",
-            "remembered_pairing",
-            "additional_virtual_outputs",
-        ):
-            flags[name] = boundary.exact_only(  # type: ignore[assignment]
-                getattr(report, name),
-                bool,
-                message="capability flags must be booleans",
-            )
         capabilities: dict[str, object] = {
             "environment": (
-                environment if environment in _SAFE_ENVIRONMENTS else _UNKNOWN_ENVIRONMENT
+                snapshot.environment
+                if snapshot.environment in _SAFE_ENVIRONMENTS
+                else _UNKNOWN_ENVIRONMENT
             ),
-            **flags,
-            "diagnostic_codes": _capability_codes(report.diagnostics),
+            **dict(snapshot.flags),
+            "diagnostic_codes": list(snapshot.diagnostic_codes),
         }
         return capabilities
