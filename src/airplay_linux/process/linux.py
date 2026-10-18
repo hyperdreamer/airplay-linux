@@ -34,6 +34,14 @@ The rules this module implements:
   rather than the child handle's PID. Without a descriptor the runner does not
   degrade to a raw PID signal -- it reports cleanup uncertainty instead, because
   a kill that could land on a recycled PID is worse than a known-leaked child.
+* Cleanup of a launch that never became a tracked child keeps the launch itself
+  when it cannot prove the child gone. A descriptor makes a signal exact; failing
+  that, the launch identity is re-read and validated, because a read that failed
+  at launch time is often readable a moment later. With neither, or when the
+  validated child survives its kill, the obligation is *retained*: the handle
+  stays in a reaper the runner owns and the PID is recorded as cleanup-uncertain
+  until the kernel confirms that exact child was reaped. Finishing a cleanup
+  there would return while a process the runner started may still be alive.
 * Evidence is read immediately before *each* signal, never once per operation,
   and the identity is re-read after the environment read: two file accesses from
   two different moments are not evidence about one process instance.
@@ -226,6 +234,13 @@ class LinuxProcessRunner:
         #: Stream cleanup tasks that reached the terminal deadline still retain
         #: ownership until their cancellation finalizer eventually finishes.
         self._stream_cleanups: set[asyncio.Future[None]] = set()
+        #: PIDs whose cleanup could not be proven, kept until they are reaped.
+        #:
+        #: A cleanup with no exact evidence has no target it may signal, so it
+        #: can neither confirm that child gone nor pretend it finished. The PID
+        #: is recorded here -- and only here, with no captured child text -- so
+        #: the retained obligation is observable instead of silent.
+        self._cleanup_uncertain: set[int] = set()
 
     # -- ProcessPort --------------------------------------------------------
 
@@ -362,6 +377,11 @@ class LinuxProcessRunner:
     def retained_reapers(self) -> int:
         """How many reapers this runner is still holding, for observability."""
         return len(self._reapers)
+
+    @property
+    def cleanup_uncertainty(self) -> frozenset[int]:
+        """PIDs of started children whose cleanup could not be proven."""
+        return frozenset(self._cleanup_uncertain)
 
     def identity(self, pid: int) -> ProcessIdentity | None:
         return read_identity(pid, self._proc_root)
@@ -592,24 +612,81 @@ class LinuxProcessRunner:
         pidfd: int | None,
         identity: ProcessIdentity | None,
     ) -> None:
-        """Kill the exact child this call started, then reap it.
+        """Kill the exact child this call started, then confirm it was reaped.
 
         The descriptor captured at launch is preferred because it names one
-        process instance. Without one, the child's *recorded* identity is
-        re-read and must still match -- that is the only thing standing between
-        a recycled PID and this ``SIGKILL``. With neither, nothing is signalled:
-        the caller then reports cleanup uncertainty, which is honest, whereas a
-        bare-PID kill could land on a stranger.
+        process instance. Without one, the launch identity is reacquired when it
+        was never read, and re-read once more immediately before the signal --
+        the exact start time and this process as parent are the only things
+        standing between a recycled PID and this ``SIGKILL``. When no exact
+        evidence can be obtained, nothing is signalled and the launch is
+        *retained*: uncertainty is recorded and the handle stays watched by a
+        reaper this runner owns, so the obligation is observable instead of
+        silently completed. A signalled child still unreaped at the deadline is
+        retained the same way, so a child that cannot be killed is never
+        abandoned either.
         """
-        if pidfd is None and not (
-            identity is not None and self._is_launched_child(identity)
-        ):
-            return
+        if pidfd is None:
+            if identity is None:
+                identity = self._reacquire_launched_identity(process.pid)
+            if identity is None or not self._is_launched_child(identity):
+                self._retain_cleanup_uncertainty(process)
+                return
         self._signal(pidfd, process.pid, signal.SIGKILL)
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), self.kill_timeout)
+            return
         except (TimeoutError, asyncio.CancelledError):
             pass
+        self._retain_cleanup_uncertainty(process)
+
+    def _reacquire_launched_identity(self, pid: int) -> ProcessIdentity | None:
+        """The identity of the direct child at ``pid``, read again for cleanup.
+
+        A read that failed at launch time is often readable a moment later, so
+        cleanup re-reads rather than concluding it has no target. Only a live
+        entry naming this process as parent can be the child this runner forked;
+        :meth:`_is_launched_child` revalidates it once more immediately before
+        the signal, with no ``await`` in between.
+        """
+        evidence = read_identity_evidence(pid, self._proc_root)
+        if evidence.state is not IdentityState.present or evidence.parent != os.getpid():
+            return None
+        return evidence.identity
+
+    def _retain_cleanup_uncertainty(self, process: asyncio.subprocess.Process) -> None:
+        """Keep a launch whose cleanup cannot be proven, until it is reaped.
+
+        A cleanup with no exact target may not signal, and a signalled child
+        that outlives its deadline cannot be reported gone. Both end in the same
+        obligation: the PID is recorded as cleanup-uncertain, and a watcher this
+        runner owns keeps the child handle alive so only the kernel's own reaping
+        of that exact child clears the record. Completing here instead would
+        return while a process the runner started may still be alive.
+        """
+        pid = process.pid
+        if process.returncode is not None:
+            self._cleanup_uncertain.discard(pid)
+            return
+        if pid in self._cleanup_uncertain:
+            return
+        self._cleanup_uncertain.add(pid)
+        self._retain_reaper(asyncio.ensure_future(self._await_reaped(process)))
+
+    async def _await_reaped(self, process: asyncio.subprocess.Process) -> None:
+        """Hold a cleanup-uncertain child until its reap is confirmed.
+
+        Cancellation is not confirmation: a watcher stopped before the child is
+        reaped leaves the uncertainty recorded, because the runner still cannot
+        prove that child gone.
+        """
+        try:
+            await process.wait()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
+        self._cleanup_uncertain.discard(process.pid)
 
     def _is_launched_child(self, identity: ProcessIdentity) -> bool:
         """Whether ``identity`` still names the direct child this runner forked.

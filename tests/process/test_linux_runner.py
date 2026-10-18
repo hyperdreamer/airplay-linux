@@ -659,6 +659,160 @@ def test_spawn_cancellation_during_identity_evidence_reaps_the_unowned_child(tmp
     assert retained_reapers == 0
 
 
+def test_spawn_cancellation_without_pidfd_or_evidence_retains_cleanup_ownership(
+    tmp_path: Path,
+):
+    """A launch cleanup cannot target is kept, never finished by dropping it.
+
+    The descriptor is what makes a signal exact, and a freshly read launch
+    identity is the only fallback evidence there is. With neither available --
+    a kernel that offers no ``pidfd_open``, or one where the open failed, and
+    identity evidence that cannot be read -- cleanup has no provable target.
+    Completing there would return while a child this runner started is still
+    alive, so the obligation has to stay with the runner: a retained reaper for
+    that exact child, and the uncertainty recorded under its PID. The child is
+    confirmed alive first, then killed and reaped here, because a test may not
+    leave a stray process behind to prove a point.
+    """
+
+    class UnprovableCleanup(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=tmp_path / "empty-proc")
+            self.evidence_started = asyncio.Event()
+            self.launched: asyncio.subprocess.Process | None = None
+            self.signals: list[int] = []
+
+        async def _exec(self, argv, spec, *, stdin, stdout, stderr):  # type: ignore[override]
+            self.launched = await super()._exec(
+                argv, spec, stdin=stdin, stdout=stdout, stderr=stderr,
+            )
+            return self.launched
+
+        async def _read_spawned_identity(self, pid: int):  # type: ignore[override]
+            self.evidence_started.set()
+            return await super()._read_spawned_identity(pid)
+
+        @staticmethod
+        def _open_pidfd(pid: int) -> int | None:
+            return None
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signals.append(signum)
+            return False
+
+    async def scenario():
+        runner = UnprovableCleanup()
+        task = asyncio.create_task(
+            runner.spawn(spec("-c", "import time; time.sleep(60)"))
+        )
+        await asyncio.wait_for(runner.evidence_started.wait(), 2.0)
+        process = runner.launched
+        assert process is not None
+        pid = process.pid
+        try:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10.0)
+            observed = (
+                tuple(runner.signals),
+                read_identity_evidence(pid).state is IdentityState.present,
+                runner.cleanup_uncertainty,
+                runner.retained_reapers,
+            )
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.wait_for(asyncio.shield(process.wait()), 10.0)
+        # A confirmed reap is the one fact that ends the retained obligation.
+        for _ in range(200):
+            if not runner.cleanup_uncertainty and runner.retained_reapers == 0:
+                break
+            await asyncio.sleep(0.02)
+        return (
+            pid,
+            observed,
+            runner.cleanup_uncertainty,
+            runner.retained_reapers,
+            await wait_gone(pid),
+        )
+
+    pid, observed, released, reapers_after, gone = run(scenario())
+    signals, alive, uncertainty, reapers = observed
+    assert signals == ()
+    assert alive is True
+    # Neither silent completion nor an unbacked claim: the child was kept.
+    assert reapers >= 1
+    assert uncertainty == frozenset({pid})
+    assert released == frozenset()
+    assert reapers_after == 0
+    assert gone is True
+
+
+def test_spawn_cancellation_with_a_pidfd_still_reaps_exactly_the_child(tmp_path: Path):
+    """The control for the retained-ownership case: a descriptor needs no fallback.
+
+    Nothing else changes -- the launch is cancelled inside the same identity
+    wait, with identity evidence equally unavailable -- so a difference in the
+    outcome can only come from the descriptor. Exactly that child must be gone
+    and the runner must own nothing afterwards.
+    """
+    if not hasattr(os, "pidfd_open"):
+        pytest.skip("this kernel does not offer pidfd_open")
+
+    class DescriptorCleanup(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=tmp_path / "empty-proc")
+            self.evidence_started = asyncio.Event()
+            self.launched: asyncio.subprocess.Process | None = None
+            self.signals: list[tuple[bool, int]] = []
+
+        async def _exec(self, argv, spec, *, stdin, stdout, stderr):  # type: ignore[override]
+            self.launched = await super()._exec(
+                argv, spec, stdin=stdin, stdout=stdout, stderr=stderr,
+            )
+            return self.launched
+
+        async def _read_spawned_identity(self, pid: int):  # type: ignore[override]
+            self.evidence_started.set()
+            return await super()._read_spawned_identity(pid)
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signals.append((pidfd is not None, signum))
+            return super()._signal(pidfd, pid, signum)
+
+    async def scenario():
+        runner = DescriptorCleanup()
+        task = asyncio.create_task(
+            runner.spawn(spec("-c", "import time; time.sleep(60)"))
+        )
+        await asyncio.wait_for(runner.evidence_started.wait(), 2.0)
+        process = runner.launched
+        assert process is not None
+        pid = process.pid
+        try:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10.0)
+            return (
+                pid,
+                tuple(runner.signals),
+                runner.cleanup_uncertainty,
+                runner.retained_reapers,
+                await wait_gone(pid),
+            )
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.wait_for(asyncio.shield(process.wait()), 10.0)
+
+    pid, signals, uncertainty, reapers, gone = run(scenario())
+    assert signals == ((True, signal.SIGKILL),)
+    assert uncertainty == frozenset()
+    assert reapers == 0
+    assert gone is True
+    assert read_identity(pid) is None
+
+
 def test_spawn_returns_the_real_identity_and_the_child_exits(tmp_path: Path):
     pid_file = tmp_path / "pid"
 
