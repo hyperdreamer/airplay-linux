@@ -258,6 +258,11 @@ class _Evidence:
     online: bool
     invalidated: bool = False
     seeded: bool = False
+    #: Positive model evidence accepted for this identity so far. It is kept
+    #: separately from ``anchor`` because the anchor may be a fallback endpoint
+    #: whose first snapshot carried no model at all; continuity must be judged
+    #: against the strongest evidence ever observed, not against that snapshot.
+    models: tuple[_Record, ...] = ()
 
 
 def _overlap(left: tuple[_Record, ...], right: tuple[_Record, ...]) -> bool:
@@ -274,10 +279,18 @@ def _compatible_models(left: tuple[_Record, ...], right: tuple[_Record, ...]) ->
     confirm nor contradict the identity, so its arrival or departure must not read
     as a replacement. Two snapshots that both name a model are still compared for
     equality, so genuinely conflicting nonempty evidence stays conservative.
+    ``left`` is the retained evidence, so a receiver that once named a model is
+    judged against that model even if the snapshot which first revealed it was
+    otherwise model-less.
     """
     previous = {r.model for r in left if r.model}
     current = {r.model for r in right if r.model}
     return not previous or not current or previous == current
+
+
+def _model_evidence(records: tuple[_Record, ...]) -> tuple[_Record, ...]:
+    """The records of one snapshot that carry positive model evidence."""
+    return tuple(r for r in records if r.model)
 
 
 def _possible_replacement(left: tuple[_Record, ...], right: tuple[_Record, ...]) -> bool:
@@ -337,8 +350,10 @@ class IdentityResolver:
             ):
                 continue
             candidate = replace(candidate, endpoint_generation=endpoint.endpoint_generation + 1)
+            current = _normalized(candidate)
             self._history[item.receiver_id] = _Evidence(
-                candidate, _normalized(candidate), online=False, seeded=True,
+                candidate, current, online=False, seeded=True,
+                models=_model_evidence(current),
             )
             self._unverified_saved.discard(item.receiver_id)
 
@@ -378,12 +393,18 @@ class IdentityResolver:
                     candidate = replace(candidate, replacement_of=replacement, continuity_verified=False)
                 evidence = _Evidence(
                     candidate, current, online=True, invalidated=replacement is not None,
+                    models=_model_evidence(current),
                 )
             else:
                 generation = previous.current.endpoint_generation
                 if candidate.endpoint_fingerprint != previous.current.endpoint_fingerprint:
                     generation += 1
-                compatible = _compatible_models(previous.anchor, current)
+                # Compare against the strongest model evidence ever accepted for
+                # this identity, never against the snapshot that happened to be
+                # seen first. A model-less anchor would otherwise accept every
+                # later model as if no positive evidence existed.
+                observed = _model_evidence(current)
+                compatible = _compatible_models(previous.models, current)
                 if candidate.identity_kind != "device":
                     overlap = _overlap(previous.anchor, current)
                     before, after = _selected(previous.anchor), _selected(current)
@@ -415,6 +436,10 @@ class IdentityResolver:
                 evidence = _Evidence(
                     candidate, previous.anchor, online=True,
                     invalidated=previous.invalidated, seeded=previous.seeded,
+                    # Retain evidence as it becomes available and never drop it:
+                    # a snapshot that omits the model is missing evidence, not a
+                    # reason to forget what this identity already advertised.
+                    models=observed if verified and observed else previous.models,
                 )
             self._history[receiver_id] = evidence
             resolved.append(candidate)

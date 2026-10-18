@@ -1,5 +1,6 @@
 """Conservative identity matching must not transfer preferences to a lookalike."""
 
+import asyncio
 from dataclasses import replace
 from itertools import permutations
 
@@ -10,6 +11,8 @@ from airplay_linux.discovery.identity import (
     normalize_device_id,
     target_for,
 )
+from airplay_linux.discovery.zeroconf_adapter import ServiceChange, ZeroconfDiscovery
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import OpaqueCredentialRef
 from airplay_linux.domain.records import SavedReceiver
@@ -591,3 +594,145 @@ def test_conflicting_nonempty_companion_model_still_marks_a_replacement():
     assert second.receiver_id == first.receiver_id == DEVICE
     assert not second.continuity_verified
     assert second.replacement_of == first.receiver_id
+
+
+def _three_snapshots():
+    """One stable device: model-less RAOP, then AirPlay names a model, then another."""
+    audio = companion(model="")
+    airplay = advertisement(port=7100, **DEVICE_FIELDS)
+    renamed = replace(airplay, model="OtherModel")
+    return audio, airplay, renamed
+
+
+def test_the_strongest_positive_model_evidence_anchors_continuity():
+    audio, airplay, renamed = _three_snapshots()
+    resolver = IdentityResolver()
+    first = resolver.update((audio,))[0]
+    second = resolver.update((audio, airplay))[0]
+    saved = saved_receiver(second)
+    third = resolver.update((audio, renamed))[0]
+    assert first.receiver_id == second.receiver_id == third.receiver_id == DEVICE
+    # Missing companion metadata is missing evidence: it cannot contradict an
+    # identity whose positive model evidence has not changed.
+    assert second.continuity_verified
+    assert second.replacement_of is None
+    assert PreferenceAccess.for_record_set(second, saved) is saved
+    # The original model-less anchor must not make every later model accepted.
+    assert not third.continuity_verified
+    assert third.replacement_of == second.receiver_id
+    assert PreferenceAccess.for_record_set(third, saved) is None
+
+
+def test_the_retained_model_evidence_is_the_anchor_not_the_latest_snapshot():
+    audio, airplay, renamed = _three_snapshots()
+    resolver = IdentityResolver()
+    resolver.update((audio,))
+    resolver.update((audio, airplay))
+    conflicting = resolver.update((audio, renamed))[0]
+    # Neither missing metadata nor repeating the conflicting value silently
+    # promotes the newcomer to the anchor.
+    missing = resolver.update((audio, replace(airplay, model="")))[0]
+    repeated = resolver.update((audio, renamed))[0]
+    # Re-advertising the strongest evidence ever observed is continuity again.
+    restored = resolver.update((audio, airplay))[0]
+    assert conflicting.receiver_id == missing.receiver_id == DEVICE
+    assert not conflicting.continuity_verified
+    assert not repeated.continuity_verified
+    assert repeated.replacement_of == DEVICE
+    assert restored.continuity_verified
+    assert restored.replacement_of is None
+
+
+# ------------------------------------------------------------------ adapter path
+
+
+class _Subscription:
+    """One inert browser handle for the in-memory client below."""
+
+    def close(self):
+        pass
+
+
+class _Mdns:
+    """A ``MdnsClient`` that only answers what the test scripted."""
+
+    def __init__(self):
+        self.callback = None
+        self.answers = {}
+
+    async def browse(self, types, callback):
+        self.callback = callback
+        return Ok(value=_Subscription())
+
+    async def resolve(self, key):
+        queued = self.answers.get(key)
+        if not queued:
+            return Err(error=diagnostic(ErrorCode.discovery_failed))
+        return queued.pop(0)
+
+    async def refresh(self):
+        return Ok(value=None)
+
+    async def close(self):
+        return None
+
+
+async def _deliver(mdns, record):
+    mdns.answers.setdefault(record.key, []).append(Ok(value=record))
+    mdns.callback(ServiceChange(
+        service_type=record.service_type, key=record.key, state="added",
+    ))
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+def test_the_adapter_also_withholds_continuity_after_model_evidence_conflicts():
+    audio, airplay, renamed = _three_snapshots()
+
+    async def scenario():
+        mdns = _Mdns()
+        adapter = ZeroconfDiscovery(IdentityResolver(), FakeClock(1.0), mdns)
+        assert isinstance(await adapter.start(), Ok)
+        await _deliver(mdns, audio)
+        await _deliver(mdns, airplay)
+        second = adapter.current(ReceiverId(DEVICE))
+        await _deliver(mdns, renamed)
+        third = adapter.current(ReceiverId(DEVICE))
+        await adapter.close()
+        return second, third
+
+    second, third = asyncio.run(scenario())
+    assert second is not None and third is not None
+    assert second.record_set.continuity_verified
+    assert second.record_set.replacement_of is None
+    saved = saved_receiver(second.record_set)
+    assert PreferenceAccess.for_record_set(second.record_set, saved) is saved
+    assert not third.record_set.continuity_verified
+    assert third.record_set.replacement_of == second.record_set.receiver_id
+    assert PreferenceAccess.for_record_set(third.record_set, saved) is None
+
+
+def test_saved_model_evidence_is_the_anchor_for_the_first_live_snapshot():
+    original = advertisement(**DEVICE_FIELDS, model="AppleTV6,2")
+    saved = saved_receiver(IdentityResolver().update((original,))[0])
+
+    def restored(record):
+        resolver = IdentityResolver()
+        resolver.seed_saved((saved,))
+        return resolver.update((record,))[0]
+
+    # The saved snapshot named a model, so a conflicting live model is a
+    # replacement even though no live snapshot has been accepted yet.
+    conflicting = restored(replace(original, model="OtherModel"))
+    assert conflicting.continuity_verified is False
+    assert conflicting.replacement_of == saved.receiver_id
+    # A live snapshot that omits the model is still missing evidence, not a
+    # conflict with the saved one.
+    missing = restored(replace(original, model=""))
+    assert missing.continuity_verified
+    assert missing.replacement_of is None
+    assert PreferenceAccess.for_record_set(missing, saved) is saved
+    # The saved model itself remains continuity.
+    same = restored(original)
+    assert same.continuity_verified
+    assert PreferenceAccess.for_record_set(same, saved) is saved
