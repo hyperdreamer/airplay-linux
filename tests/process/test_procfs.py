@@ -22,6 +22,8 @@ from airplay_linux.process.procfs import (
     MAX_ENVIRONMENT_BYTES,
     OWNER_TOKEN_ENV,
     RUNTIME_DIRECTORY_ENV,
+    EnvironmentEvidence,
+    IdentityEvidence,
     IdentityState,
     owner_evidence,
     owned_processes,
@@ -210,15 +212,15 @@ def test_owner_evidence_rejects_a_pid_recycled_during_the_environment_read(
     identity = ProcessIdentity(pid=200, start_ticks=22_000)
     assert owner_evidence(identity, OWNER, RUNTIME, tmp_path) is True
 
-    reading = procfs.read_environment
+    reading = procfs.read_environment_evidence
 
-    def recycling(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str] | None:
+    def recycling(pid: int, proc_root: Path = Path("/proc")) -> EnvironmentEvidence:
         environment = reading(pid, proc_root)
         # The PID is handed to another instance between the two reads.
         entry(tmp_path, pid, start_ticks=99_000, environment=owned_environment())
         return environment
 
-    monkeypatch.setattr(procfs, "read_environment", recycling)
+    monkeypatch.setattr(procfs, "read_environment_evidence", recycling)
     assert owner_evidence(identity, OWNER, RUNTIME, tmp_path) is False
 
 
@@ -269,6 +271,40 @@ def test_owner_evidence_requires_a_uuid_and_an_absolute_runtime_directory(tmp_pa
     assert owner_evidence("not-an-identity", OWNER, RUNTIME, tmp_path) is False  # type: ignore[arg-type]
 
 
+def test_owned_processes_reports_incomplete_when_candidate_evidence_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    entry(tmp_path, 100, environment=owned_environment())
+    entry(tmp_path, 200, environment=owned_environment())
+    reading = procfs.read_identity_evidence
+
+    def unreadable(pid: int, proc_root: Path = Path("/proc")):
+        if pid == 200:
+            return IdentityEvidence(pid=pid, state=IdentityState.unreadable)
+        return reading(pid, proc_root)
+
+    monkeypatch.setattr(procfs, "read_identity_evidence", unreadable)
+    scan = owned_processes(OWNER, RUNTIME, tmp_path)
+
+    assert scan.matches == (ProcessIdentity(pid=100, start_ticks=22_000),)
+    assert scan.complete is False
+
+
+def test_owned_processes_reports_incomplete_when_environment_evidence_is_unreadable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    entry(tmp_path, 200, environment=owned_environment())
+
+    def unreadable(pid: int, proc_root: Path = Path("/proc")) -> EnvironmentEvidence:
+        return EnvironmentEvidence(state=IdentityState.unreadable)
+
+    monkeypatch.setattr(procfs, "read_environment_evidence", unreadable)
+    scan = owned_processes(OWNER, RUNTIME, tmp_path)
+
+    assert scan.matches == ()
+    assert scan.complete is False
+
+
 def test_owned_processes_matches_exact_owner_and_runtime_evidence_only(tmp_path: Path):
     entry(tmp_path, 300, environment=owned_environment())
     entry(tmp_path, 100, comm="krfb-virtualmonitor", environment=owned_environment())
@@ -281,17 +317,26 @@ def test_owned_processes_matches_exact_owner_and_runtime_evidence_only(tmp_path:
     (tmp_path / "sys").mkdir()
     (tmp_path / "meminfo").write_text("")
 
-    assert owned_processes(OWNER, RUNTIME, tmp_path) == (
+    scan = owned_processes(OWNER, RUNTIME, tmp_path)
+    assert scan.matches == (
         ProcessIdentity(pid=100, start_ticks=22_000),
         ProcessIdentity(pid=300, start_ticks=22_000),
     )
+    assert scan.complete is True
+
 
 
 def test_owned_processes_is_empty_without_a_usable_owner_pair(tmp_path: Path):
     entry(tmp_path, 300, environment=owned_environment())
-    assert owned_processes(str(OWNER), RUNTIME, tmp_path) == ()  # type: ignore[arg-type]
-    assert owned_processes(OWNER, "relative/path", tmp_path) == ()
+    scan = owned_processes(str(OWNER), RUNTIME, tmp_path)  # type: ignore[arg-type]
+    assert scan.matches == ()
+    assert scan.complete is False
+    scan = owned_processes(OWNER, "relative/path", tmp_path)
+    assert scan.matches == ()
+    assert scan.complete is False
 
 
 def test_owned_processes_tolerates_a_missing_proc_root(tmp_path: Path):
-    assert owned_processes(OWNER, RUNTIME, tmp_path / "absent") == ()
+    scan = owned_processes(OWNER, RUNTIME, tmp_path / "absent")
+    assert scan.matches == ()
+    assert scan.complete is False

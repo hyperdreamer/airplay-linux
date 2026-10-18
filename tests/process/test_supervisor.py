@@ -25,7 +25,7 @@ from airplay_linux.domain.resources import Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.process.procfs import (
-    OWNER_TOKEN_ENV, RUNTIME_DIRECTORY_ENV, IdentityState,
+    OWNER_TOKEN_ENV, RUNTIME_DIRECTORY_ENV, IdentityState, OwnedProcessScan,
     read_identity, read_identity_evidence,
 )
 from airplay_linux.process.supervisor import DaemonSupervisor, foreground_argv
@@ -200,6 +200,7 @@ while True:
             process=process, store=store, features=FEATURES,
             control_factory=SocketControl, runtime_directory=tmp_path / 'private',
             record_root=tmp_path, executable=str(executable),
+            scan_owned=lambda owner, runtime: OwnedProcessScan(matches=(), complete=True),
         )
         notices = []
         registry.subscribe(notices.append)

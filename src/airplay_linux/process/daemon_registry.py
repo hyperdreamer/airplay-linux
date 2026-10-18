@@ -33,7 +33,8 @@ from airplay_linux.domain.ports import (
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
 from airplay_linux.process.procfs import (
-    IdentityEvidence, IdentityState, owned_processes, read_identity, read_identity_evidence,
+    IdentityEvidence, IdentityState, OwnedProcessScan, owned_processes,
+    read_identity, read_identity_evidence,
 )
 from airplay_linux.process.supervisor import (
     TERMINATION_GRACE, config_pipe, module_environment, private_directory,
@@ -74,10 +75,7 @@ def _token(value: SensitiveText | str) -> str:
     return value.reveal_for_backend() if isinstance(value, SensitiveText) else value
 
 
-def _scan_owned(instance_uuid: UUID, runtime: str) -> tuple[ProcessIdentity, ...]:
-    # owned_processes intentionally tolerates an unavailable proc root. At a
-    # replacement boundary, inability to enumerate must instead fail closed.
-    os.listdir('/proc')
+def _scan_owned(instance_uuid: UUID, runtime: str) -> OwnedProcessScan:
     return owned_processes(instance_uuid, runtime)
 
 
@@ -104,7 +102,7 @@ class DaemonRegistry:
         executable: str = 'doubletake', startup_timeout: float = 3.0,
         restart_limit: int = 3, restart_window: float = 60.0,
         inspect_process: Callable[[int], IdentityEvidence] = read_identity_evidence,
-        scan_owned: Callable[[UUID, str], tuple[ProcessIdentity, ...]] = _scan_owned,
+        scan_owned: Callable[[UUID, str], OwnedProcessScan] = _scan_owned,
     ) -> None:
         self.runtime_directory = Path(runtime_directory)
         self._record_root = Path(record_root) if record_root is not None else self.runtime_directory.parent
@@ -351,9 +349,12 @@ class DaemonRegistry:
     def _live_processes(self, record: DaemonRecord) -> tuple[ProcessIdentity, ...] | Err:
         live: list[ProcessIdentity] = []
         try:
+            scan = self._scan(record.instance_uuid, record.runtime_directory)
+            if not scan.complete:
+                return _error(ErrorCode.ownership_mismatch)
             candidates = tuple(dict.fromkeys((
                 *(p for p in (record.supervisor, record.daemon) if p is not None),
-                *self._scan(record.instance_uuid, record.runtime_directory),
+                *scan.matches,
             )))
             for identity in candidates:
                 state = self._classify(identity, record)

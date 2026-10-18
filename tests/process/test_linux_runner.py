@@ -751,6 +751,63 @@ def test_spawn_cancellation_without_pidfd_or_evidence_retains_cleanup_ownership(
     assert gone is True
 
 
+def test_spawn_cancellation_with_identity_but_failed_no_pidfd_signal_retains_cleanup_ownership():
+    """A failed exact fallback signal must keep the launched child obligation."""
+
+    class SignalBlockedRunner(LinuxProcessRunner):
+        kill_timeout = 0.05
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.evidence_started = asyncio.Event()
+            self.launched: asyncio.subprocess.Process | None = None
+
+        async def _exec(self, argv, spec, *, stdin, stdout, stderr):  # type: ignore[override]
+            self.launched = await super()._exec(
+                argv, spec, stdin=stdin, stdout=stdout, stderr=stderr,
+            )
+            return self.launched
+
+        async def _read_spawned_identity(self, pid: int):  # type: ignore[override]
+            self.evidence_started.set()
+            await asyncio.Event().wait()
+
+        @staticmethod
+        def _open_pidfd(pid: int) -> int | None:
+            return None
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            return False
+
+    async def scenario() -> tuple[int, bool]:
+        runner = SignalBlockedRunner()
+        task = asyncio.create_task(
+            runner.spawn(spec("-c", "import time; time.sleep(60)"))
+        )
+        await asyncio.wait_for(runner.evidence_started.wait(), 2.0)
+        process = runner.launched
+        assert process is not None
+        try:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 10.0)
+            await asyncio.sleep(0)
+            observed = runner.retained_reapers, process.returncode is None
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await asyncio.wait_for(asyncio.shield(process.wait()), 10.0)
+            for _ in range(200):
+                if runner.retained_reapers == 0:
+                    break
+                await asyncio.sleep(0.01)
+        return observed
+
+    retained, alive = run(scenario())
+    assert retained >= 1
+    assert alive is True
+
+
 def test_spawn_cancellation_with_a_pidfd_still_reaps_exactly_the_child(tmp_path: Path):
     """The control for the retained-ownership case: a descriptor needs no fallback.
 
@@ -1050,6 +1107,18 @@ def test_terminate_reports_cleanup_timeout_when_a_child_cannot_be_killed():
     assert elapsed < 15.0
     assert still_there is True
     assert released == Ok(value=None)
+
+
+def test_signal_with_an_open_pidfd_fails_closed_when_the_python_wrapper_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    runner = LinuxProcessRunner()
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(signal, "pidfd_send_signal", None, raising=False)
+    monkeypatch.setattr(os, "kill", lambda pid, signum: sent.append((pid, signum)))
+
+    assert runner._signal(123, 456, signal.SIGKILL) is False
+    assert sent == []
 
 
 def test_terminate_signals_the_validated_instance_through_a_pidfd():

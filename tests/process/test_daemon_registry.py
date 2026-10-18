@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 import socket
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import wraps
 from pathlib import Path
 from uuid import UUID
@@ -20,13 +20,19 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.operations import InstanceId, ProcessIdentity
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
-from airplay_linux.process.procfs import IdentityEvidence, IdentityState
+from airplay_linux.process.procfs import IdentityEvidence, IdentityState, OwnedProcessScan
 from airplay_linux.testing.adapters import FakeProcess, MemoryDaemonStore, SequenceIds
 
 APP = ProcessIdentity(pid=100, start_ticks=10)
 SUPERVISOR = ProcessIdentity(pid=200, start_ticks=20)
 DAEMON = ProcessIdentity(pid=300, start_ticks=30)
 FEATURES = ApplicationContractProfile(socket_path='/unused').features
+
+
+@dataclass(frozen=True)
+class IncompleteScan:
+    matches: tuple[ProcessIdentity, ...] = ()
+    complete: bool = False
 
 
 class Clock:
@@ -149,10 +155,13 @@ class Harness:
         )
 
     def scan(self, owner, runtime):
-        return tuple(
-            identity for pid in self.process.environments()
-            if (identity := self.process.identity(pid)) is not None
-            and self.process.owned(identity, owner, runtime)
+        return OwnedProcessScan(
+            matches=tuple(
+                identity for pid in self.process.environments()
+                if (identity := self.process.identity(pid)) is not None
+                and self.process.owned(identity, owner, runtime)
+            ),
+            complete=True,
         )
 
     async def start(self):
@@ -389,6 +398,21 @@ async def test_surviving_previous_processes_prohibit_replacement_streams(harness
     harness.process.keep_alive = True
     result = await harness.registry.restart()
     assert isinstance(result, Err)
+    assert len(harness.process.spawned) == 1
+    assert harness.store.records
+    assert harness.notices[-1].kind == 'cleanup_required'
+
+
+@run_async
+async def test_incomplete_owner_scan_blocks_cleanup_and_replacement(harness):
+    started = await harness.start()
+    assert isinstance(started, Ok)
+    harness.registry._scan = lambda owner, runtime: IncompleteScan()
+
+    refused = await harness.registry.restart()
+
+    assert isinstance(refused, Err)
+    assert harness.process.terminated == []
     assert len(harness.process.spawned) == 1
     assert harness.store.records
     assert harness.notices[-1].kind == 'cleanup_required'

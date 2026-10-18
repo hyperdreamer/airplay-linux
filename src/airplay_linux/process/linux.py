@@ -617,10 +617,8 @@ class LinuxProcessRunner:
         evidence can be obtained, nothing is signalled and the launch is
         *retained*: uncertainty is recorded and the handle stays watched by a
         reaper this runner owns, so the obligation is observable instead of
-        silently completed. Retention belongs to that no-descriptor path only:
-        a ``SIGKILL`` sent through the launch descriptor names one process
-        instance, so a signalled child still unreaped at the deadline simply
-        completes, as it always has.
+        silently completed. A failed signal or an incomplete bounded wait is
+        retained the same way, including when a pidfd sender is unavailable.
         """
         if pidfd is None:
             if identity is None:
@@ -628,11 +626,13 @@ class LinuxProcessRunner:
             if identity is None or not self._is_launched_child(identity):
                 self._retain_cleanup_uncertainty(process)
                 return
-        self._signal(pidfd, process.pid, signal.SIGKILL)
+        signalled = self._signal(pidfd, process.pid, signal.SIGKILL)
+        if not signalled:
+            self._retain_cleanup_uncertainty(process)
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), self.kill_timeout)
         except (TimeoutError, asyncio.CancelledError):
-            pass
+            self._retain_cleanup_uncertainty(process)
 
     def _reacquire_launched_identity(self, pid: int) -> ProcessIdentity | None:
         """The identity of the direct child at ``pid``, read again for cleanup.
@@ -820,7 +820,9 @@ class LinuxProcessRunner:
         """
         sender = getattr(signal, "pidfd_send_signal", None)
         try:
-            if pidfd is not None and sender is not None:
+            if pidfd is not None:
+                if sender is None:
+                    return False
                 sender(pidfd, signum)
             else:
                 os.kill(pid, signum)

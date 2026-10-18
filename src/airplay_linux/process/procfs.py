@@ -72,6 +72,30 @@ class IdentityState(StrEnum):
     unreadable = "unreadable"
 
 
+class OwnershipState(StrEnum):
+    """Whether ownership was proved, disproved, or could not be inspected."""
+
+    owned = "owned"
+    not_owned = "not_owned"
+    unreadable = "unreadable"
+
+
+@dataclass(frozen=True, kw_only=True)
+class EnvironmentEvidence:
+    """The environment lookup and whether it was complete enough to trust."""
+
+    state: IdentityState
+    environment: dict[str, str] | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnedProcessScan:
+    """Matches from a procfs scan and whether every candidate was inspected."""
+
+    matches: tuple[ProcessIdentity, ...]
+    complete: bool
+
+
 @dataclass(frozen=True, kw_only=True)
 class IdentityEvidence:
     """Everything one PID lookup established, including why it failed."""
@@ -195,24 +219,22 @@ def read_uid(pid: int, proc_root: Path = Path("/proc")) -> int | None:
     return read_identity_evidence(pid, proc_root).uid
 
 
-def read_environment(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str] | None:
-    """The exact environment of ``pid``, or ``None`` when it is not evidence.
-
-    ``None`` means "do not decide ownership from this": the block may have been
-    unreadable for another user's process, truncated by a permission boundary,
-    larger than this module will read, or contain the same name twice (where the
-    kernel keeps only the first, so the file's later value would be a lie).
-    """
+def read_environment_evidence(
+    pid: int, proc_root: Path = Path("/proc"),
+) -> EnvironmentEvidence:
+    """Read an environment while preserving absence versus inaccessible evidence."""
     if not _valid_pid(pid):
-        return None
+        return EnvironmentEvidence(state=IdentityState.absent)
     path = _entry(pid, proc_root) / "environ"
     try:
         with open(path, "rb") as handle:
             data = handle.read(MAX_ENVIRONMENT_BYTES + 1)
+    except FileNotFoundError:
+        return EnvironmentEvidence(state=IdentityState.absent)
     except OSError:
-        return None
+        return EnvironmentEvidence(state=IdentityState.unreadable)
     if len(data) > MAX_ENVIRONMENT_BYTES:
-        return None
+        return EnvironmentEvidence(state=IdentityState.unreadable)
     environment: dict[str, str] = {}
     for block in data.split(b"\0"):
         if not block:
@@ -222,9 +244,19 @@ def read_environment(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str
             continue
         key = os.fsdecode(name)
         if key in environment:
-            return None
+            return EnvironmentEvidence(state=IdentityState.unreadable)
         environment[key] = os.fsdecode(value)
-    return environment
+    return EnvironmentEvidence(
+        state=IdentityState.present, environment=environment,
+    )
+
+
+def read_environment(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str] | None:
+    """The exact environment of ``pid``, or ``None`` when it is not evidence."""
+    evidence = read_environment_evidence(pid, proc_root)
+    if evidence.state is not IdentityState.present:
+        return None
+    return evidence.environment
 
 
 def _valid_owner(owner_uuid: object) -> bool:
@@ -238,6 +270,49 @@ def _valid_runtime_directory(runtime_directory: object) -> bool:
         and runtime_directory.startswith("/")
         and "\0" not in runtime_directory
     )
+
+
+def _owner_evidence_state(
+    identity: ProcessIdentity,
+    owner_uuid: UUID,
+    runtime_directory: str,
+    proc_root: Path = Path("/proc"),
+    expected_uid: int | None = None,
+) -> OwnershipState:
+    if type(identity) is not ProcessIdentity or not _valid_pid(identity.pid):
+        return OwnershipState.not_owned
+    if not _valid_owner(owner_uuid) or not _valid_runtime_directory(runtime_directory):
+        return OwnershipState.not_owned
+    uid = os.getuid() if expected_uid is None else expected_uid
+    evidence = read_identity_evidence(identity.pid, proc_root)
+    if evidence.state is IdentityState.unreadable:
+        return OwnershipState.unreadable
+    if (
+        evidence.state not in (IdentityState.present, IdentityState.terminated)
+        or evidence.identity != identity
+        or evidence.uid != uid
+    ):
+        return OwnershipState.not_owned
+    environment = read_environment_evidence(identity.pid, proc_root)
+    if environment.state is IdentityState.unreadable:
+        return OwnershipState.unreadable
+    rechecked = read_identity_evidence(identity.pid, proc_root)
+    if rechecked.state is IdentityState.unreadable:
+        return OwnershipState.unreadable
+    if (
+        rechecked.state not in (IdentityState.present, IdentityState.terminated)
+        or rechecked.identity != identity
+        or rechecked.uid != uid
+    ):
+        return OwnershipState.not_owned
+    if environment.state is not IdentityState.present or environment.environment is None:
+        return OwnershipState.not_owned
+    if (
+        environment.environment.get(OWNER_TOKEN_ENV) == str(owner_uuid)
+        and environment.environment.get(RUNTIME_DIRECTORY_ENV) == runtime_directory
+    ):
+        return OwnershipState.owned
+    return OwnershipState.not_owned
 
 
 def owner_evidence(
@@ -263,51 +338,49 @@ def owner_evidence(
       environment read from one instance and an identity read from another is
       not evidence about either.
     """
-    if type(identity) is not ProcessIdentity or not _valid_pid(identity.pid):
-        return False
-    if not _valid_owner(owner_uuid) or not _valid_runtime_directory(runtime_directory):
-        return False
-    uid = os.getuid() if expected_uid is None else expected_uid
-    evidence = read_identity_evidence(identity.pid, proc_root)
-    if evidence.identity != identity or evidence.uid != uid:
-        return False
-    environment = read_environment(identity.pid, proc_root)
-    if environment is None:
-        return False
-    rechecked = read_identity_evidence(identity.pid, proc_root)
-    if rechecked.identity != identity or rechecked.uid != uid:
-        return False
-    return (
-        environment.get(OWNER_TOKEN_ENV) == str(owner_uuid)
-        and environment.get(RUNTIME_DIRECTORY_ENV) == runtime_directory
-    )
+    return _owner_evidence_state(
+        identity, owner_uuid, runtime_directory, proc_root, expected_uid,
+    ) is OwnershipState.owned
 
 
 def owned_processes(
     owner_uuid: UUID, runtime_directory: str, proc_root: Path = Path("/proc"),
-) -> tuple[ProcessIdentity, ...]:
-    """Every live process carrying this owner's exact evidence, ordered by PID.
+) -> OwnedProcessScan:
+    """Scan for exact owner evidence and report whether the scan was complete.
 
-    This is the crash-window scan the design requires: a helper launched but not
-    yet recorded still carries the owner pair in its environment, so it can be
-    found without trusting a name, a command line, or "newest process" ordering.
-    Names that are not all digits are skipped: procfs has ``self``, ``thread-self``,
-    ``sys``, and a handful of plain files next to the PID directories.
+    A numeric procfs entry with unreadable stat or environment evidence makes the
+    whole scan incomplete. The registry must retain cleanup ownership in that
+    case, because an empty match list cannot distinguish "no owned process" from
+    "a process that could not be inspected".
     """
     if not _valid_owner(owner_uuid) or not _valid_runtime_directory(runtime_directory):
-        return ()
+        return OwnedProcessScan(matches=(), complete=False)
     try:
         names = os.listdir(proc_root)
     except OSError:
-        return ()
+        return OwnedProcessScan(matches=(), complete=False)
     found: list[ProcessIdentity] = []
+    complete = True
     for name in names:
         if not name or not all(character in _DIGITS for character in name):
             continue
         pid = int(name)
         evidence = read_identity_evidence(pid, proc_root)
-        if not evidence.alive or evidence.identity is None:
+        if evidence.state is IdentityState.absent:
             continue
-        if owner_evidence(evidence.identity, owner_uuid, runtime_directory, proc_root):
+        if evidence.state is IdentityState.unreadable or evidence.identity is None:
+            complete = False
+            continue
+        if evidence.state is IdentityState.terminated:
+            continue
+        ownership = _owner_evidence_state(
+            evidence.identity, owner_uuid, runtime_directory, proc_root,
+        )
+        if ownership is OwnershipState.owned:
             found.append(evidence.identity)
-    return tuple(sorted(found, key=lambda item: (item.pid, item.start_ticks)))
+        elif ownership is OwnershipState.unreadable:
+            complete = False
+    return OwnedProcessScan(
+        matches=tuple(sorted(found, key=lambda item: (item.pid, item.start_ticks))),
+        complete=complete,
+    )
