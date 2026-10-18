@@ -87,6 +87,7 @@ class FakeMdns:
         self.browse_results: list[object] = []
         self.answers: dict[str, list[object]] = {}
         self.resolve_calls: list[str] = []
+        self.refresh_calls = 0
         self.closed = 0
 
     async def browse(
@@ -108,6 +109,10 @@ class FakeMdns:
         if isinstance(answer, Deferred):
             answer = await answer.wait()
         return answer
+
+    async def refresh(self) -> object:
+        self.refresh_calls += 1
+        return Ok(value=None)
 
     async def close(self) -> None:
         self.closed += 1
@@ -549,6 +554,9 @@ async def test_removal_retains_the_last_known_view_offline_with_a_newer_generati
     assert offline is not None and not offline.online
     assert offline.display_name == "Living Room"
     assert offline.record_set.endpoint_generation > online.record_set.endpoint_generation
+    assert offline.record_set.receiver_id == LIVING_ROOM
+    assert offline.record_set.records == ()
+    assert isinstance(target_for(offline.record_set), Err)
     # The retained view never resolves to a usable target while it is offline.
     assert offline.record_set.endpoint_generation != online.record_set.endpoint_generation
 
@@ -581,7 +589,58 @@ async def test_reappearance_after_removal_is_added_again_with_a_current_endpoint
     assert isinstance(target, Ok)
     # Neither the removal nor the reappearance may re-issue a spent generation.
     assert removed.record_set.endpoint_generation > added.record_set.endpoint_generation
-    assert view.record_set.endpoint_generation > removed.record_set.endpoint_generation
+    assert view.record_set.endpoint_generation >= removed.record_set.endpoint_generation
+
+
+@run_async
+async def test_endpoint_round_trip_after_repeated_reappearance_never_reissues_a_target():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    result = target_for(view.record_set)
+    assert isinstance(result, Ok)
+    targets = [result.value]
+
+    for _ in range(2):
+        harness.mdns.withdraw(record.key)
+        await settle()
+        await harness.offer(record)
+        view = harness.view(LIVING_ROOM)
+        assert view is not None
+        result = target_for(view.record_set)
+        assert isinstance(result, Ok)
+        targets.append(result.value)
+
+    for changed in (advertisement(port=7100), record):
+        await harness.offer(changed)
+        view = harness.view(LIVING_ROOM)
+        assert view is not None
+        result = target_for(view.record_set)
+        assert isinstance(result, Ok)
+        targets.append(result.value)
+
+    pairs = [(target.endpoint_fingerprint, target.endpoint_generation) for target in targets]
+    assert len(pairs) == len(set(pairs))
+
+
+@run_async
+async def test_unchanged_refresh_after_reappearance_emits_no_events():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    harness.mdns.withdraw(record.key)
+    await settle()
+    await harness.offer(record)
+    event_count = len(harness.events)
+    for _ in range(2):
+        harness.mdns.answer(record.key, record)
+        assert isinstance(await harness.adapter.refresh(), Ok)
+        assert harness.kinds == ["added", "removed", "added"]
+        assert len(harness.events) == event_count
 
 
 # --------------------------------------------------------------------------- updates
@@ -733,6 +792,35 @@ async def test_feature_bits_are_normalized_in_the_record_and_absent_when_unparse
 
 
 @run_async
+async def test_refresh_retries_announced_keys_after_the_first_resolve_fails():
+    harness = Harness()
+    await harness.start()
+    key = "First Resolve Fails._airplay._tcp.local."
+    record = advertisement(key=key, instance=key)
+    harness.mdns.announce(key)
+    await settle()
+    assert harness.kinds == ["error"]
+
+    before = len(harness.mdns.resolve_calls)
+    harness.mdns.answer(key, record)
+    result = await harness.adapter.refresh()
+    await settle()
+    assert isinstance(result, Ok)
+    assert harness.mdns.resolve_calls[before:] == [key]
+    assert harness.mdns.refresh_calls == 1
+    view = harness.view(LIVING_ROOM)
+    assert view is not None and view.online
+
+    harness.mdns.withdraw(key)
+    await settle()
+    before = len(harness.mdns.resolve_calls)
+    harness.mdns.answer(key, record)
+    assert isinstance(await harness.adapter.refresh(), Ok)
+    assert harness.mdns.resolve_calls[before:] == []
+    assert harness.mdns.refresh_calls == 2
+
+
+@run_async
 async def test_refresh_re_resolves_live_records_without_duplicating_events():
     harness = Harness()
     await harness.start()
@@ -793,7 +881,52 @@ async def test_refresh_is_bounded_by_a_fixed_number_of_keys():
     assert len(harness.mdns.resolve_calls) - before == MAX_REFRESH_KEYS
 
 
+@run_async
+async def test_bounded_refresh_rotates_across_the_full_live_key_set():
+    harness = Harness()
+    await harness.start()
+    keys = [
+        f"Receiver {index}._airplay._tcp.local."
+        for index in range(MAX_REFRESH_KEYS + 5)
+    ]
+    for index, key in enumerate(keys):
+        record = advertisement(key=key, instance=key, device_id=f"aa00000000{index:02x}")
+        harness.mdns.answer(key, record)
+        harness.mdns.announce(key)
+    await settle()
+
+    before = len(harness.mdns.resolve_calls)
+    await harness.adapter.refresh()
+    first = harness.mdns.resolve_calls[before:]
+    before = len(harness.mdns.resolve_calls)
+    await harness.adapter.refresh()
+    second = harness.mdns.resolve_calls[before:]
+
+    ordered = sorted(keys)
+    assert set(first) == set(ordered[:MAX_REFRESH_KEYS])
+    assert set(ordered[MAX_REFRESH_KEYS:]).issubset(second)
+    assert len(second) == MAX_REFRESH_KEYS
+
+
 # --------------------------------------------------------------------------- azc client
+
+
+@run_async
+async def test_azc_client_refresh_updates_every_browser():
+    class Browser:
+        def __init__(self) -> None:
+            self.updates = 0
+
+        async def async_update_records(self) -> None:
+            self.updates += 1
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: object())
+    browsers = [Browser(), Browser()]
+    mdns._browsers.extend(browsers)
+    result = await mdns.refresh()
+    assert isinstance(result, Ok)
+    assert [browser.updates for browser in browsers] == [1, 1]
+    await mdns.close()
 
 
 @run_async
@@ -974,6 +1107,38 @@ async def test_a_real_service_info_converts_into_a_domain_record():
     assert record.port == 7000
     assert record.seen_at == 50.0
     await mdns.close()
+
+
+@run_async
+async def test_parsed_scoped_addresses_preserve_ipv6_only_and_dual_stack_records():
+    async def resolve(info: object) -> ServiceRecord:
+        key = "Living Room._airplay._tcp.local."
+        mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+        mdns._types[key] = AIRPLAY_SERVICE
+        result = await mdns.resolve(key)
+        await mdns.close()
+        assert isinstance(result, Ok), result
+        return result.value
+
+    ipv6_only = _ServiceInfo(addresses=[])
+    ipv6_only.parsed_addresses = lambda: ["fe80::1234"]
+    ipv6_only.parsed_scoped_addresses = lambda: ["fe80::1234%3"]
+    record = await resolve(ipv6_only)
+    assert record.addresses == ("fe80::1234%3",)
+    receiver = IdentityResolver().update((record,))[0]
+    target = target_for(receiver)
+    assert isinstance(target, Ok)
+    assert target.value.canonical_host == "fe80::1234%3"
+
+    dual_stack = _ServiceInfo(addresses=[bytes((192, 0, 2, 10))])
+    dual_stack.parsed_addresses = lambda: ["192.0.2.10", "fe80::1234"]
+    dual_stack.parsed_scoped_addresses = lambda: ["192.0.2.10", "fe80::1234%3"]
+    record = await resolve(dual_stack)
+    assert set(record.addresses) == {"192.0.2.10", "fe80::1234%3"}
+    receiver = IdentityResolver().update((record,))[0]
+    target = target_for(receiver)
+    assert isinstance(target, Ok)
+    assert target.value.canonical_host == "192.0.2.10"
 
 
 @pytest.mark.asyncio

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import ipaddress
 import re
 import socket
 import unicodedata
@@ -57,9 +58,8 @@ AIRPLAY_SERVICE = "_airplay._tcp.local."
 RAOP_SERVICE = "_raop._tcp.local."
 BROWSED_SERVICES: tuple[str, ...] = (AIRPLAY_SERVICE, RAOP_SERVICE)
 
-#: A scan re-resolves at most this many known keys, in key order. The bound is
-#: what makes ``refresh`` a bounded refresh rather than an open-ended sweep; it
-#: never spawns a subprocess and never browses a second time.
+#: A scan re-resolves a rotating window of known keys and refreshes both browsers.
+#: The bound makes ``refresh`` a bounded scan; it never spawns a subprocess.
 MAX_REFRESH_KEYS = 64
 
 _DOMAIN_TYPES: tuple[str, ...] = ("_airplay._tcp", "_raop._tcp")
@@ -96,7 +96,7 @@ class RawAdvertisement:
     type: str
     server: str
     port: int
-    addresses: tuple[bytes, ...]
+    addresses: tuple[bytes | str, ...]
     txt: Mapping[bytes | str, bytes | str | None]
 
 
@@ -108,6 +108,8 @@ class MdnsClient(Protocol):
     ) -> Result[Subscription]: ...
 
     async def resolve(self, key: str) -> Result[ServiceRecord]: ...
+
+    async def refresh(self) -> Result[None]: ...
 
     async def close(self) -> None: ...
 
@@ -191,15 +193,20 @@ def normalize_feature_bits(raw: object) -> str | None:
 
 
 def _socket_address(payload: object) -> str | None:
-    if not isinstance(payload, (bytes, bytearray)):
+    if isinstance(payload, (bytes, bytearray)):
+        try:
+            if len(payload) == 4:
+                return socket.inet_ntop(socket.AF_INET, bytes(payload))
+            if len(payload) == 16:
+                return socket.inet_ntop(socket.AF_INET6, bytes(payload))
+        except (OSError, ValueError):
+            return None
         return None
-    try:
-        if len(payload) == 4:
-            return socket.inet_ntop(socket.AF_INET, bytes(payload))
-        if len(payload) == 16:
-            return socket.inet_ntop(socket.AF_INET6, bytes(payload))
-    except (OSError, ValueError):
-        return None
+    if isinstance(payload, str):
+        try:
+            return str(ipaddress.ip_address(payload.strip()))
+        except ValueError:
+            return None
     return None
 
 
@@ -229,25 +236,23 @@ def _raw(info: object) -> RawAdvertisement:
     if type(port) is not int or not 0 < port < 65536:
         raise TypeError("a resolved service info must carry a usable port")
 
-    addresses: list[bytes] = []
-    for attribute in ("addresses", "parsed_addresses"):
+    addresses: list[bytes | str] = []
+    for attribute in ("addresses", "parsed_scoped_addresses", "parsed_addresses"):
         try:
             raw_addresses = getattr(info, attribute, None)
+            if callable(raw_addresses):
+                raw_addresses = raw_addresses()
         except Exception:
             continue
         if not isinstance(raw_addresses, (list, tuple)):
             continue
+        before = len(addresses)
         for item in raw_addresses:
             if isinstance(item, (bytes, bytearray)) and len(item) in (4, 16):
                 addresses.append(bytes(item))
             elif isinstance(item, str):
-                try:
-                    addresses.append(socket.inet_pton(
-                        socket.AF_INET6 if ":" in item else socket.AF_INET, item,
-                    ))
-                except (OSError, ValueError):
-                    continue
-        if addresses:
+                addresses.append(item)
+        if attribute == "parsed_scoped_addresses" and len(addresses) > before:
             break
 
     properties = getattr(info, "properties", None)
@@ -285,9 +290,9 @@ def record_from_advertisement(raw: RawAdvertisement, seen_at: float) -> ServiceR
     if device_id is None and service_type == "_raop._tcp":
         device_id = _instance_mac(raw.name)
     model = txt.get("model") or txt.get("am") or ""
-    addresses = tuple(
+    addresses = tuple(dict.fromkeys(
         address for address in (_socket_address(item) for item in raw.addresses) if address
-    )
+    ))
     return ServiceRecord(
         key=raw.name,
         service_type=service_type,  # type: ignore[arg-type]
@@ -425,10 +430,11 @@ def _view(record_set: ReceiverRecordSet, online: bool) -> ReceiverView:
 
 @dataclass
 class _Entry:
-    """One raw key's current revision and the record most recently adopted for it."""
+    """One raw key's revision, last adopted record, and announcement state."""
 
     revision: int
     record: ServiceRecord | None = None
+    announced: bool = False
 
 
 class _Subscriptions:
@@ -461,6 +467,7 @@ class ZeroconfDiscovery:
         self._subscribers: list[Callable[[DiscoveryEvent], None]] = []
         self._browsers: list[Subscription] = []
         self._tasks: set[asyncio.Task[None]] = set()
+        self._refresh_cursor = 0
         self._started = False
         self._closed = False
 
@@ -484,17 +491,31 @@ class ZeroconfDiscovery:
         return Ok(value=None)
 
     async def refresh(self) -> Result[None]:
-        """Re-read the known keys, bounded by :data:`MAX_REFRESH_KEYS`."""
+        """Refresh browsers and fairly re-resolve a bounded window of announced keys."""
         if self._closed:
             return _failure()
         if not self._started:
             return await self.start()
-        keys = sorted(key for key, entry in self._entries.items() if entry.record is not None)
-        failure: Diagnostic | None = None
-        for key in keys[:MAX_REFRESH_KEYS]:
-            entry = self._entries[key]
+        try:
+            browser_result = await self._mdns.refresh()
+        except Exception:
+            browser_result = _failure()
+        failure: Diagnostic | None = browser_result.error if isinstance(browser_result, Err) else None
+        keys = sorted(key for key, entry in self._entries.items() if entry.announced)
+        if keys:
+            offset = self._refresh_cursor % len(keys)
+            count = min(MAX_REFRESH_KEYS, len(keys))
+            selected = [keys[(offset + index) % len(keys)] for index in range(count)]
+            self._refresh_cursor = (offset + count) % len(keys)
+        else:
+            selected = []
+            self._refresh_cursor = 0
+        for key in selected:
+            entry = self._entries.get(key)
+            if entry is None or not entry.announced:
+                continue
             revision = entry.revision + 1
-            self._entries[key] = _Entry(revision, entry.record)
+            self._entries[key] = _Entry(revision, entry.record, announced=True)
             result = await self._resolve(key, revision)
             if isinstance(result, Err) and failure is None:
                 failure = result.error
@@ -544,7 +565,9 @@ class ZeroconfDiscovery:
             return
         # Keep the last-known record while the new one is resolved, so a
         # transient re-announcement does not flap the receiver offline.
-        self._entries[change.key] = _Entry(revision, previous.record if previous else None)
+        self._entries[change.key] = _Entry(
+            revision, previous.record if previous else None, announced=True,
+        )
         task = asyncio.ensure_future(self._background(change.key, revision))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -573,7 +596,7 @@ class ZeroconfDiscovery:
         if record.key != key:
             # A client that answers for a different instance is not evidence.
             return Err(error=_diagnostic())
-        self._entries[key] = _Entry(revision, _adopted(record, self._clock.now()))
+        self._entries[key] = _Entry(revision, _adopted(record, self._clock.now()), announced=True)
         self._publish()
         return Ok(value=record)
 
@@ -594,12 +617,10 @@ class ZeroconfDiscovery:
             view = published[receiver_id]
             previous = self._views.get(receiver_id)
             if previous is None or not previous.online:
-                view = _fenced(previous, view)
                 events.append(DiscoveryEvent(kind="added", receiver=view, diagnostic=None))
             elif _signature(previous.record_set) != _signature(view.record_set) or (
                 previous.display_name, previous.pairing_hint
             ) != (view.display_name, view.pairing_hint):
-                view = _fenced(previous, view)
                 events.append(DiscoveryEvent(kind="updated", receiver=view, diagnostic=None))
             published[receiver_id] = view
         self._views.update(published)
@@ -615,6 +636,7 @@ class ZeroconfDiscovery:
                 previous,
                 record_set=replace(
                     previous.record_set,
+                    records=(),
                     endpoint_generation=previous.record_set.endpoint_generation + 1,
                 ),
                 online=False,
@@ -629,30 +651,6 @@ class ZeroconfDiscovery:
         event = DiscoveryEvent(kind="error", receiver=None, diagnostic=error)
         for callback in tuple(self._subscribers):
             callback(event)
-
-
-def _fenced(previous: ReceiverView | None, view: ReceiverView) -> ReceiverView:
-    """Publish a generation this receiver has never issued before.
-
-    The resolver owns the generation, but a receiver that comes back after a
-    removal would otherwise re-issue the number its removal already invalidated,
-    and a later refresh would then publish a *lower* number than the one a
-    consumer is holding. Both are staleness hazards, so the published value is
-    clamped monotonically per receiver and advanced by the reappearance itself.
-    """
-    if previous is None:
-        return view
-    issued = previous.record_set.endpoint_generation
-    generation = max(view.record_set.endpoint_generation, issued)
-    if not previous.online:
-        # Removal charged one generation; coming back charges another, so a
-        # target fenced at either earlier number stays invalid.
-        generation = max(generation, issued + 1)
-    if generation == view.record_set.endpoint_generation:
-        return view
-    return replace(
-        view, record_set=replace(view.record_set, endpoint_generation=generation),
-    )
 
 
 def _adopted(record: ServiceRecord, seen_at: float) -> ServiceRecord:
@@ -761,6 +759,24 @@ class AzcMdnsClient:
         dependency would read as an immediate, unfillable deadline.
         """
         return max(1, int(round(self._resolve_timeout * 1000)))
+
+    async def refresh(self) -> Result[None]:
+        """Ask every active browser to perform its bounded record refresh."""
+        if self._closed:
+            return _failure()
+        failure: Diagnostic | None = None
+        for browser in tuple(self._browsers):
+            update = getattr(browser, "async_update_records", None)
+            if not callable(update):
+                failure = _diagnostic()
+                continue
+            try:
+                await _maybe_await(update())
+            except Exception:
+                failure = _diagnostic()
+        if failure is not None:
+            return Err(error=failure)
+        return Ok(value=None)
 
     async def resolve(self, key: str) -> Result[ServiceRecord]:
         # A closed client must never acquire a fresh backend: doing so would
