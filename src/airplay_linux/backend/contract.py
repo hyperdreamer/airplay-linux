@@ -34,9 +34,44 @@ _KNOWN_STATES: Final[frozenset[str]] = frozenset(
     {"idle", "discovering", "connecting", "streaming", "pin_required"}
 )
 _CREDENTIAL_KINDS: Final[frozenset[str]] = frozenset({"pin", "password"})
-# Help output is only a contract witness for this immutable, published release.
-# Any other version, even if it repeats the same words, remains unverified.
-_VERIFIED_HELP_VERSIONS: Final[frozenset[str]] = frozenset({"0.5.0"})
+
+# Exact published control surface of doubletake 0.5.0, transcribed from the
+# pinned source at e18f85d07f74a3b9d49f448762d28f3f7feb3938:
+#   cmd/doubletake/main.go      every flag.String/Bool/Int declaration
+#   cmd/doubletake-ctl/main.go  the usage() command table
+#
+# That release prints no version banner and has no --version flag: the sender's
+# --help is Go's flag package usage block, and the ctl's --help is a hand-written
+# usage string.  Capability proof therefore cannot rest on a version line the
+# release never emits; it rests on this exact, auditable fingerprint instead.  A
+# help block that matches it exactly is the pinned release's own output, and any
+# other block -- later release, foreign build, or explanatory prose -- proves
+# nothing and leaves every gate closed.
+_PINNED_050_SENDER_FLAGS: Final[frozenset[str]] = frozenset(
+    {
+        "bitrate", "code", "cred-backend", "creds", "daemonize", "debug",
+        "direct-key", "fps", "hwaccel", "no-audio", "no-cursor", "no-encrypt",
+        "pair", "port", "port-range", "socket", "target", "target-latency-ms",
+        "test", "video-codec", "x11-window-id", "x11-window-name",
+    }
+)
+# Argument signature -> number of receivers each documented command addresses.
+_PINNED_050_CTL_COMMANDS: Final[dict[str, str]] = {
+    "status": "",
+    "discover": "",
+    "devices": "",
+    "connect": "[target] [PIN-or-password]",
+    "pin": "<PIN-or-password>",
+    "disconnect": "[target]",
+    "mute": "[target]",
+    "unmute": "[target]",
+}
+_PINNED_050_PROFILE: Final[str] = "doubletake-0.5"
+_PINNED_050_VERSION: Final[str] = "0.5.0"
+# The published ctl usage documents that a target-scoped command addresses only
+# that receiver; without this statement a [target] argument alone would not prove
+# that other concurrent streams stay untouched.
+_PINNED_050_TARGET_SCOPE_STATEMENT: Final[str] = "only the given ip"
 
 
 def _diagnostic(code: ErrorCode, *, command: str | None = None) -> Diagnostic:
@@ -526,33 +561,93 @@ def _version(text: str) -> str:
     return match.group(1) if match else "unknown"
 
 
-def _affirmative_line(text: str, word: str, suffix: str = "") -> bool:
-    """Return true only for a command declaration, never a prose mention."""
-    pattern = rf"^\s*(?:[-*]\s*)?{re.escape(word)}{suffix}(?:\s|$)"
-    for line in text.splitlines():
-        if re.search(pattern, line, flags=re.IGNORECASE) is not None:
-            # The anchored command declaration is affirmative evidence.  We do
-            # not turn arbitrary prose or a negation prefix into capability
-            # evidence, and we do not maintain a negative-word heuristic.
-            return True
-    return False
+_GO_USAGE_LINE: Final[re.Pattern[str]] = re.compile(r"^Usage of \S+:$|^Usage of \S+:")
+_GO_FLAG: Final[re.Pattern[str]] = re.compile(r"^  -([A-Za-z0-9][A-Za-z0-9-]*)(?: [A-Za-z0-9_.]+)?$")
+# "  connect [target] [PIN-or-password]  Start mirroring (to target IP, ...)"
+_CTL_ROW: Final[re.Pattern[str]] = re.compile(
+    r"^  (?P<command>[a-z]+)(?P<arguments> [^ ].*?)?  +(?P<summary>\S.*)$"
+)
 
 
-def _has_line(text: str, word: str) -> bool:
-    return _affirmative_line(text, word)
+def _sender_surface(sender_help: str) -> frozenset[str] | None:
+    """Return the exact flag set of a Go ``flag`` usage block, or None.
+
+    Go's package prints ``Usage of <argv0>:`` followed by ``  -name type`` rows and
+    tab-indented descriptions.  Only a block that parses cleanly under those
+    rules is evidence; anything else is prose and proves nothing.
+    """
+    lines = sender_help.splitlines()
+    if not lines or _GO_USAGE_LINE.match(lines[0]) is None:
+        return None
+    flags: set[str] = set()
+    expecting_description = False
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        flag = _GO_FLAG.match(line)
+        if flag is not None:
+            name = flag.group(1)
+            if name in flags:
+                return None
+            flags.add(name)
+            expecting_description = True
+            continue
+        if expecting_description and line.startswith("    \t"):
+            expecting_description = False
+            continue
+        # A duplicated flag, a stray description, or non-Go indentation means
+        # this is not a verbatim capture of a Go flag usage block.
+        return None
+    if expecting_description:
+        return None
+    return frozenset(flags)
 
 
-def _has_target_command(text: str, word: str) -> bool:
-    return _affirmative_line(text, word, r"\s+\[target\]")
+def _ctl_surface(ctl_help: str) -> dict[str, str] | None:
+    """Return command -> argument signature from the published usage table.
+
+    The ctl's ``usage()`` prints a fixed ``Commands:`` table with two spaces
+    before each command, a padded argument signature, and a summary.  Only rows
+    inside that table count: a command named in prose, a section heading such as
+    ``Unsupported commands:``, or a flag row is not a declaration.
+    """
+    lines = ctl_help.splitlines()
+    if not lines or not lines[0].startswith("Usage: doubletake-ctl "):
+        return None
+    commands: dict[str, str] = {}
+    in_commands = False
+    for line in lines[1:]:
+        if line.strip() == "Commands:":
+            in_commands = True
+            continue
+        if line.strip() in {"Flags:", "Other:"}:
+            in_commands = False
+            continue
+        if not in_commands or not line.strip():
+            continue
+        row = _CTL_ROW.match(line)
+        if row is None:
+            # Any unparseable row inside the table makes the whole table
+            # unverified rather than partially trusted.
+            return None
+        command = row.group("command")
+        if command in commands:
+            return None
+        commands[command] = (row.group("arguments") or "").strip()
+    if not commands:
+        return None
+    return commands
 
 
 def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
-    """Decode the small, verified public help contract conservatively.
+    """Decode the pinned release's published help contract conservatively.
 
-    Help text cannot prove ownership, source typing, pairing transactions, or
-    any other application-private obligation.  Those capabilities are therefore
-    never inferred from keywords.  Public command capabilities are enabled only
-    for the pinned release version and affirmative command declarations.
+    Evidence is an exact match against the control surface transcribed from the
+    pinned source, not keyword presence.  Help text cannot prove ownership,
+    source typing, pairing transactions, or any other application-private
+    obligation, so those capabilities are never inferred at all -- neither from a
+    keyword nor from a negation, and never from a version banner the release does
+    not print.
     """
     if type(sender_help) is not str or type(ctl_help) is not str:
         sender_help = ""
@@ -562,38 +657,58 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
     profile = "unknown" if not combined.strip() else (
         f"doubletake-{version.rsplit('.', 1)[0]}" if version != "unknown" else "doubletake-unknown"
     )
-    verified_public = (
-        version in _VERIFIED_HELP_VERSIONS
-        and re.search(r"(?im)^\s*doubletake\s+0\.5\.0(?:\s|$)", sender_help) is not None
-        and re.search(r"(?im)^\s*doubletake-ctl\s+0\.5\.0(?:\s|$)", ctl_help) is not None
-    )
 
-    documented_controls = verified_public and all(
-        _has_line(ctl_help, command) for command in ("status", "discover", "devices", "connect")
+    sender_flags = _sender_surface(sender_help)
+    ctl_commands = _ctl_surface(ctl_help)
+    verified = (
+        sender_flags is not None
+        and ctl_commands is not None
+        and sender_flags == _PINNED_050_SENDER_FLAGS
+        and ctl_commands == _PINNED_050_CTL_COMMANDS
     )
-    target_controls = verified_public and all(
-        _has_target_command(ctl_help, command)
-        for command in ("disconnect", "mute", "unmute")
-    )
-    multi_target = target_controls and documented_controls and bool(
-        re.search(r"(?i)all\s+(?:streams|targets)|only the given|multiple streams", ctl_help)
-    )
+    if not verified:
+        # Unknown, partial, later, foreign, or merely-similar help text proves no
+        # public capability and no private one.  Report the observed version text
+        # if the block carried one, but do not derive profile support from it.
+        return BackendFeatures(
+            profile="doubletake-unknown",
+            version=version,
+            foreground_control=False,
+            owner_handshake=False,
+            multi_target=False,
+            target_bound_pairing=False,
+            physical_source=False,
+            virtual_source=False,
+            audio_probe=False,
+            audio_restart=False,
+            target_mute=False,
+            keyring=False,
+            provisional_commit=False,
+            cancel_pairing=False,
+            revoke_pairing=False,
+            query_modes=False,
+        )
 
-    # There is no affirmative help-level evidence for these private contracts.
-    # In particular, a line such as "Unsupported: ... handshake ..." is not
-    # evidence and must not open a start or trust gate.
+    # Exactly the pinned surface.  Enable only what its own usage text declares.
+    target_scope = _PINNED_050_TARGET_SCOPE_STATEMENT in ctl_help.lower()
+    target_scoped = (
+        target_scope
+        and ctl_commands.get("disconnect") == "[target]"
+        and ctl_commands.get("mute") == "[target]"
+        and ctl_commands.get("unmute") == "[target]"
+    )
     return BackendFeatures(
-        profile=profile,
-        version=version,
+        profile=_PINNED_050_PROFILE,
+        version=_PINNED_050_VERSION,
         foreground_control=False,
         owner_handshake=False,
-        multi_target=multi_target,
+        multi_target=target_scoped,
         target_bound_pairing=False,
         physical_source=False,
         virtual_source=False,
-        audio_probe=verified_public and _has_line(ctl_help, "status"),
+        audio_probe=True,
         audio_restart=False,
-        target_mute=target_controls,
+        target_mute=target_scoped,
         keyring=False,
         provisional_commit=False,
         cancel_pairing=False,

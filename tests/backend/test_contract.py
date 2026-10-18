@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -41,7 +42,6 @@ def test_published_help_keeps_documented_target_controls_but_fails_closed_on_pri
 
     features = features_from_help(sender, ctl)
 
-    assert features.version == "0.5.0"
     assert features.multi_target
     assert features.target_mute
     assert not features.foreground_control
@@ -53,6 +53,224 @@ def test_published_help_keeps_documented_target_controls_but_fails_closed_on_pri
     assert not features.cancel_pairing
     assert not features.revoke_pairing
     assert not features.query_modes
+
+
+def test_status_fixtures_are_exact_published_response_objects():
+    """A conformance fixture must be a response the pinned daemon can emit.
+
+    ``internal/daemon/daemon.go`` defines the response members; provenance lives
+    in this repository's documentation, not inside the captured body, because a
+    response object with invented top-level members is not source-conformant.
+    """
+    published = {
+        "ok", "state", "device", "device_ip", "has_audio", "audio_muted",
+        "needs_pin", "needs_credential", "credential_kind", "error",
+        "devices", "streams",
+    }
+    published_stream = {
+        "device", "device_ip", "state", "has_audio", "audio_muted",
+        "credential_kind",
+    }
+
+    for name in ("status-0.5.json", "status-0.5-password.json"):
+        payload = json.loads((FIXTURES / name).read_text())
+        assert set(payload) <= published, f"{name} has non-response members"
+        for stream in payload["streams"]:
+            assert set(stream) <= published_stream, f"{name} has a non-StreamInfo member"
+        assert not isinstance(decode_status(payload), Err), f"{name} must decode"
+
+
+def test_status_fixtures_obey_the_published_projection_rules():
+    """Reproduce ``statusResponseLocked`` and require each fixture to match it.
+
+    Streams are sorted by device IP; the legacy device and audio fields come from
+    the first *streaming* entry; the device and credential fields are then
+    overwritten from the first *pin_required* entry, and ``needs_pin`` /
+    ``needs_credential`` / ``credential_kind`` derive from that waiting entry
+    alone.  A fixture that no build of the pinned daemon can produce certifies
+    an impossible response.
+    """
+    for name in ("status-0.5.json", "status-0.5-password.json"):
+        payload = json.loads((FIXTURES / name).read_text())
+        streams = sorted(payload["streams"], key=lambda stream: stream["device_ip"])
+
+        state = "idle"
+        if any(stream["state"] == "pin_required" for stream in streams):
+            state = "pin_required"
+        elif any(stream["state"] == "streaming" for stream in streams):
+            state = "streaming"
+        elif any(stream["state"] == "connecting" for stream in streams):
+            state = "connecting"
+
+        device = device_ip = credential_kind = None
+        has_audio = audio_muted = False
+        for stream in streams:
+            if stream["state"] == "streaming":
+                device, device_ip = stream["device"], stream["device_ip"]
+                has_audio, audio_muted = stream["has_audio"], stream["audio_muted"]
+                break
+        for stream in streams:
+            if stream["state"] == "pin_required":
+                device, device_ip = stream["device"], stream["device_ip"]
+                credential_kind = stream.get("credential_kind") or "pin"
+                break
+
+        assert payload["state"] == state, name
+        assert payload.get("device") == device, name
+        assert payload.get("device_ip") == device_ip, name
+        assert payload["has_audio"] == has_audio, name
+        assert payload["audio_muted"] == audio_muted, name
+        assert payload.get("credential_kind") == credential_kind, name
+        assert payload.get("needs_credential", False) is (credential_kind is not None), name
+        assert payload.get("needs_pin", False) is (credential_kind == "pin"), name
+        # Only a waiting stream may carry a credential kind (omitempty).
+        for stream in streams:
+            if stream["state"] != "pin_required":
+                assert "credential_kind" not in stream, name
+
+
+def test_published_help_fixtures_are_verbatim_help_captures():
+    """The committed help fixtures must be what the pinned release prints.
+
+    The pinned 0.5.0 binaries print no version banner and have no ``--version``
+    flag: ``doubletake --help`` is Go's flag package usage block and
+    ``doubletake-ctl --help`` is a hand-written usage string.  A fixture holding
+    a ``doubletake 0.5.0`` line is therefore not a capture, and a decoder that
+    requires such a banner can never verify the very release it pins.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+
+    assert sender.startswith("Usage of "), sender.splitlines()[:1]
+    assert ctl.startswith("Usage: doubletake-ctl "), ctl.splitlines()[:1]
+    for text in (sender, ctl):
+        assert not re.search(r"(?im)^\s*doubletake(?:-ctl)?\s+v?\d", text), (
+            "the pinned release prints no version banner"
+        )
+    # Go's flag package indents each description with a single tab.
+    assert any(line.startswith("    \t") for line in sender.splitlines())
+
+
+def test_captured_help_proves_the_documented_public_surface():
+    """The release's own usage text proves its documented control surface.
+
+    Capability proof must rest on affirmative declarations in the pinned
+    release's output, not on a version banner it never prints.  Everything the
+    application needs privately (ownership, source typing, trust transactions)
+    stays false regardless, because public help cannot prove it.
+    """
+    features = features_from_help(
+        (FIXTURES / "doubletake-0.5-help.txt").read_text(),
+        (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text(),
+    )
+
+    assert features.multi_target
+    assert features.target_mute
+    assert features.audio_probe
+    assert not features.foreground_control
+    assert not features.owner_handshake
+    assert not features.physical_source
+    assert not features.virtual_source
+    assert not features.audio_restart
+    assert not features.keyring
+    assert not features.provisional_commit
+    assert not features.cancel_pairing
+    assert not features.revoke_pairing
+    assert not features.query_modes
+
+
+def test_a_merely_mentioned_or_negated_contract_proves_nothing():
+    """Only an affirmative usage-table row proves a command."""
+    sender = "Usage of doubletake:\n  -socket string\n    \tUnix socket path\n"
+    ctl = (
+        "Usage: doubletake-ctl [-socket path] <command> [args]\n\n"
+        "Unsupported commands:\n"
+        "  status\n  discover\n  devices\n  connect [target]\n"
+        "  disconnect [target]\n  mute [target]\n  unmute [target]\n"
+        "  all streams, or only the given IP\n"
+        "  -socket path\n"
+    )
+
+    features = features_from_help(sender, ctl)
+
+    assert not features.multi_target
+    assert not features.target_mute
+    assert not features.audio_probe
+    assert features.profile == "doubletake-unknown"
+
+
+def test_a_cleanly_parsed_but_different_flag_set_is_not_the_pinned_release():
+    """Parsing successfully is not proof: the surface must match exactly.
+
+    A later release that adds one flag still emits a perfectly valid Go usage
+    block, so a decoder that gates on parseability alone would verify it and
+    enable capabilities the pinned release never proved.  Only equality with
+    the transcribed surface is evidence.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    later_release = sender.replace(
+        "  -bitrate int",
+        "  -adaptive int\n    \tAdaptive mode\n  -bitrate int",
+        1,
+    )
+    assert later_release != sender
+
+    features = features_from_help(later_release, ctl)
+
+    assert features.profile == "doubletake-unknown"
+    assert not features.multi_target
+    assert not features.target_mute
+    assert not features.audio_probe
+
+
+def test_an_unparseable_row_inside_the_commands_table_unverifies_the_table():
+    """A partially readable table is not a proof of the table's contents.
+
+    Skipping a row that does not fit the usage grammar would let a truncated,
+    mangled, or hand-edited capture pass as the pinned surface merely because
+    the remaining rows happen to be familiar.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    mangled = ctl.replace(
+        "  devices                             List cached discovered devices\n",
+        "  devices                             List cached discovered devices\n"
+        "  frobnicate\n",
+        1,
+    )
+    assert mangled != ctl
+
+    features = features_from_help(sender, mangled)
+
+    assert features.profile == "doubletake-unknown"
+    assert not features.multi_target
+    assert not features.target_mute
+    assert not features.audio_probe
+
+
+def test_target_scoped_rows_without_the_scope_statement_do_not_prove_scope():
+    """A ``[target]`` argument alone does not prove other streams are untouched.
+
+    The published usage states that these commands address only the given IP.
+    Without that statement the same rows could mean "target, or every stream",
+    so per-target mute and concurrent multi-target control stay unproven even
+    though the rest of the surface matches the pinned release exactly.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    unscoped = ctl.replace("all streams, or only the given IP", "a stream")
+    assert unscoped != ctl
+    assert "only the given IP" not in unscoped
+
+    features = features_from_help(sender, unscoped)
+
+    # The surface itself is still recognised: only the scope claim is withdrawn.
+    assert features.profile == "doubletake-0.5"
+    assert features.audio_probe
+    assert not features.multi_target
+    assert not features.target_mute
+
 
 
 def test_status_fixture_decodes_only_typed_public_fields():
