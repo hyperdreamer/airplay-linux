@@ -802,3 +802,54 @@ def test_model_evidence_survives_a_temporarily_unusable_endpoint():
     verified, replacement = _identity_models(resolver, (base, same))
     assert verified is True
     assert replacement is None
+
+
+def test_seeded_endpoint_model_evidence_is_not_lost_to_a_colder_metadata_snapshot():
+    """Stronger positive evidence kept only in ``last_endpoint`` must seed too.
+
+    A saved record may carry model-less *current* metadata while its previously
+    observed endpoint still names the model. Seeding from ``service_metadata``
+    alone dropped that evidence, so after a restart a conflicting model inherited
+    the saved convenience and remembered resolution that an uninterrupted resolver
+    correctly refused.
+    """
+    original = advertisement(device_id="00:11:22:33:44:55")
+    resolved = IdentityResolver().update((original,))[0]
+    endpoint = resolved_target(resolved)
+
+    colder = replace(original, model="")
+    saved = replace(
+        saved_receiver(resolved),
+        service_metadata=(colder,),
+        last_endpoint=endpoint,
+    )
+    assert [r.model for r in saved.service_metadata] == [""]
+    assert any(r.model for r in saved.last_endpoint.service_records), (
+        "this regression is only meaningful while the endpoint carries the model"
+    )
+
+    def restored(record):
+        resolver = IdentityResolver()
+        resolver.seed_saved((saved,))
+        return resolver.update((record,))[0]
+
+    # A conflicting live model must not inherit the saved preferences, exactly as
+    # the uninterrupted resolver already decided.
+    uninterrupted = IdentityResolver()
+    uninterrupted.update((original,))
+    uninterrupted_result = uninterrupted.update((replace(original, model="OtherModel"),))[0]
+
+    conflicting = restored(replace(original, model="OtherModel"))
+    assert conflicting.continuity_verified is False
+    assert conflicting.replacement_of == saved.receiver_id
+    assert conflicting.continuity_verified == uninterrupted_result.continuity_verified
+    assert PreferenceAccess.for_record_set(conflicting, saved) is None
+
+    # Missing and equal model metadata stay compatible across a restart.
+    missing = restored(replace(original, model=""))
+    assert missing.continuity_verified is True
+    assert PreferenceAccess.for_record_set(missing, saved) is saved
+
+    same = restored(original)
+    assert same.continuity_verified is True
+    assert PreferenceAccess.for_record_set(same, saved) is saved

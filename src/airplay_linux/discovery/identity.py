@@ -356,9 +356,26 @@ class IdentityResolver:
                 continue
             candidate = replace(candidate, endpoint_generation=endpoint.endpoint_generation + 1)
             current = _normalized(candidate)
+            # The saved record carries model evidence in two places: the current
+            # service metadata, and the previously observed endpoint's records.
+            # A colder observation may have omitted the model while the endpoint
+            # still names it, so seeding only from ``service_metadata`` would drop
+            # the strongest evidence this identity ever advertised and let a later
+            # conflicting model inherit the saved preferences. Both sides are read
+            # through the same normalization used for live records, so casing and
+            # label normalization cannot make equal models look contradictory.
+            endpoint_models = _model_evidence(
+                tuple(_Record.from_service(r) for r in endpoint.service_records)
+            )
+            saved_models = _model_evidence(current) + endpoint_models
+            if len({record.model for record in saved_models}) > 1:
+                # Contradictory saved evidence cannot authorize continuity. Leave
+                # the unverified-saved guard in place so a later advertisement is
+                # treated as a replacement; the generation fence stays raised.
+                continue
             self._history[item.receiver_id] = _Evidence(
                 candidate, current, online=False, seeded=True,
-                models=_model_evidence(current),
+                models=saved_models,
             )
             self._unverified_saved.discard(item.receiver_id)
 
