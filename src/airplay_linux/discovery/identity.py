@@ -268,7 +268,16 @@ def _overlap(left: tuple[_Record, ...], right: tuple[_Record, ...]) -> bool:
 
 
 def _compatible_models(left: tuple[_Record, ...], right: tuple[_Record, ...]) -> bool:
-    return {r.model for r in left} == {r.model for r in right}
+    """Conflicting *positive* model evidence apart, models do not decide continuity.
+
+    A companion service that omits its model has no model evidence: it can neither
+    confirm nor contradict the identity, so its arrival or departure must not read
+    as a replacement. Two snapshots that both name a model are still compared for
+    equality, so genuinely conflicting nonempty evidence stays conservative.
+    """
+    previous = {r.model for r in left if r.model}
+    current = {r.model for r in right if r.model}
+    return not previous or not current or previous == current
 
 
 def _possible_replacement(left: tuple[_Record, ...], right: tuple[_Record, ...]) -> bool:
@@ -288,6 +297,7 @@ class IdentityResolver:
 
     def __init__(self) -> None:
         self._history: dict[ReceiverId, _Evidence] = {}
+        self._fence: dict[ReceiverId, int] = {}
         self._unverified_saved: set[ReceiverId] = set()
         self._started = False
 
@@ -297,10 +307,20 @@ class IdentityResolver:
             raise ValueError("Saved evidence must be seeded before browsing")
         counts = Counter(s.receiver_id for s in saved)
         self._history.clear()
+        self._fence = {}
         self._unverified_saved = set(counts)
         for item in saved:
             endpoint = item.last_endpoint
-            if endpoint is None or counts[item.receiver_id] != 1:
+            if endpoint is None:
+                continue
+            # The generation is a high-water mark, not a reward for valid
+            # evidence. Rejecting continuity only withholds authorization; the
+            # endpoint it describes was still issued once and must never be
+            # reissued, so duplicates keep the highest applicable generation.
+            self._fence[item.receiver_id] = max(
+                self._fence.get(item.receiver_id, 0), endpoint.endpoint_generation,
+            )
+            if counts[item.receiver_id] != 1:
                 continue
             candidates = _aggregate(item.service_metadata)
             if len(candidates) != 1:
@@ -342,6 +362,14 @@ class IdentityResolver:
             current = normalized[receiver_id]
             previous = self._history.get(receiver_id)
             if previous is None:
+                # Issue this identity above any generation saved evidence already
+                # consumed, including evidence whose continuity claim was rejected.
+                candidate = replace(
+                    candidate,
+                    endpoint_generation=max(
+                        candidate.endpoint_generation, self._fence.get(receiver_id, 0) + 1,
+                    ),
+                )
                 matches = replacements.get(receiver_id, [])
                 replacement = matches[0] if len(matches) == 1 and replacement_counts[matches[0]] == 1 else None
                 if receiver_id in self._unverified_saved:

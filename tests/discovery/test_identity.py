@@ -21,6 +21,7 @@ from airplay_linux.domain.resources import (
     ResolutionEvidence,
     Size,
 )
+from airplay_linux.storage import PreferenceAccess
 from airplay_linux.testing.builders import service
 from airplay_linux.testing.time import FakeClock
 
@@ -507,3 +508,86 @@ def test_no_address_is_not_a_live_target_and_never_persists():
     failure = target_for(receiver)
     assert isinstance(failure, Err)
     assert failure.error.code is ErrorCode.stale_target
+
+
+@pytest.mark.parametrize("broken", ["fingerprint", "metadata", "duplicate"])
+def test_rejected_saved_evidence_still_fences_the_saved_target(broken):
+    records = (
+        advertisement(device_id="00:11:22:33:44:55", port=7100),
+        advertisement("raop", device_id="001122334455", port=5000),
+    )
+    original = IdentityResolver().update(records)[0]
+    saved = saved_receiver(original)
+    if broken == "fingerprint":
+        saved = replace(saved, continuity_fingerprint="unverified-endpoint")
+    elif broken == "metadata":
+        saved = replace(saved, service_metadata=(advertisement(instance="Other Room"),))
+    seeded = (saved, saved) if broken == "duplicate" else (saved,)
+    resolver = IdentityResolver()
+    resolver.seed_saved(seeded)
+    restored = resolver.update(records)[0]
+    assert restored.receiver_id == saved.receiver_id
+    # Rejected evidence authorizes nothing, but it still describes an endpoint
+    # this resolver has already issued: that endpoint may never be reissued.
+    assert not restored.continuity_verified
+    assert restored.endpoint_generation > saved.last_endpoint.endpoint_generation
+    assert resolved_target(restored) != saved.last_endpoint
+    moved = resolver.update(tuple(replace(record, port=record.port + 100) for record in records))[0]
+    assert moved.endpoint_generation > restored.endpoint_generation
+    assert resolved_target(moved) != saved.last_endpoint
+    returned = resolver.update(records)[0]
+    assert returned.endpoint_generation > moved.endpoint_generation
+    assert resolved_target(returned) != saved.last_endpoint
+
+
+def test_duplicate_saved_evidence_fences_the_highest_saved_generation():
+    original = IdentityResolver().update((advertisement(),))[0]
+    saved = saved_receiver(original)
+    highest = replace(saved, last_endpoint=replace(saved.last_endpoint, endpoint_generation=4))
+    resolver = IdentityResolver()
+    resolver.seed_saved((saved, highest))
+    restored = resolver.update((advertisement(),))[0]
+    assert not restored.continuity_verified
+    assert restored.endpoint_generation > highest.last_endpoint.endpoint_generation
+    assert resolved_target(restored) != highest.last_endpoint
+
+
+DEVICE_FIELDS = {"device_id": "00:11:22:33:44:55"}
+
+
+def companion(model=""):
+    return advertisement(
+        "raop", model=model, port=5000,
+        instance="001122334455@Living Room._raop._tcp.local.", **DEVICE_FIELDS,
+    )
+
+
+@pytest.mark.parametrize("order", ["added", "first", "removed"])
+def test_companion_without_model_keeps_stable_device_continuity(order):
+    airplay = advertisement(port=7100, **DEVICE_FIELDS)
+    audio = companion()
+    before, after = {
+        "added": ((airplay,), (airplay, audio)),
+        "first": ((audio,), (audio, airplay)),
+        "removed": ((airplay, audio), (airplay,)),
+    }[order]
+    resolver = IdentityResolver()
+    first = resolver.update(before)[0]
+    saved = saved_receiver(first)
+    second = resolver.update(after)[0]
+    assert second.receiver_id == first.receiver_id == DEVICE
+    # A companion that omits model metadata is missing evidence, not a conflict.
+    assert second.continuity_verified
+    assert second.replacement_of is None
+    assert PreferenceAccess.for_record_set(second, saved) is saved
+
+
+def test_conflicting_nonempty_companion_model_still_marks_a_replacement():
+    airplay = advertisement(port=7100, **DEVICE_FIELDS)
+    conflicting = companion(model="OtherModel")
+    resolver = IdentityResolver()
+    first = resolver.update((airplay,))[0]
+    second = resolver.update((airplay, conflicting))[0]
+    assert second.receiver_id == first.receiver_id == DEVICE
+    assert not second.continuity_verified
+    assert second.replacement_of == first.receiver_id
