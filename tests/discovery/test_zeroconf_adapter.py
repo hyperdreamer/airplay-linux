@@ -1750,3 +1750,38 @@ def _genuine_browser(backend_zeroconf: Any) -> Any:
         backend_zeroconf, AIRPLAY_SERVICE,
         handlers=[_Notification(lambda change: None, AIRPLAY_SERVICE)],
     )
+
+
+@run_async
+async def test_the_default_factory_actually_constructs_with_a_bound_signature():
+    """The adapter's *own* constructor call must bind to the installed class.
+
+    Asserting ``inspect.signature(AsyncZeroconf).bind()`` proves the dependency is
+    callable, not that the adapter calls it correctly: changing the adapter to
+    ``AsyncZeroconf(unsupported=True)`` would leave that check green. So run the
+    real factory with the genuine class replaced by a recorder, and bind the
+    arguments it actually received.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    import airplay_linux.discovery.zeroconf_adapter as adapter_module
+
+    captured: list[tuple[Any, ...]] = []
+
+    class Recorder:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.append((args, kwargs))
+            # Bind against the genuine constructor so a wrong shape raises here.
+            inspect.signature(aio.AsyncZeroconf).bind(*args, **kwargs)
+
+    original = aio.AsyncZeroconf
+    aio.AsyncZeroconf = Recorder  # type: ignore[misc]
+    try:
+        factory = getattr(adapter_module, "_default_factory", None)
+        assert factory is not None, "the adapter must expose its default factory"
+        factory()
+    finally:
+        aio.AsyncZeroconf = original  # type: ignore[misc]
+
+    assert len(captured) == 1, captured
+    args, kwargs = captured[0]
+    inspect.signature(aio.AsyncZeroconf).bind(*args, **kwargs)
