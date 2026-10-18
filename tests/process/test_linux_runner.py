@@ -19,6 +19,7 @@ thin wrapper over ``create_subprocess_exec``:
 from __future__ import annotations
 
 import asyncio
+import errno
 import gc
 import os
 import signal
@@ -471,6 +472,81 @@ def test_run_delivers_stdin_and_closes_it_for_eof():
     assert output.value.stdout == b"CHALLENGE-RESPONSE"
 
 
+def test_run_teardown_is_bounded_when_a_grandchild_holds_unread_stdin(tmp_path: Path):
+    """Closing our pipe must not wait for an unrelated descendant to read it."""
+    ready = tmp_path / "grandchild-ready"
+    release = tmp_path / "release"
+    done = tmp_path / "grandchild-done"
+    os.mkfifo(release)
+    code = (
+        "import pathlib, subprocess, sys\n"
+        "grandchild = (\n"
+        "    \"import os, pathlib, sys\\n\"\n"
+        "    \"pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\\n\"\n"
+        "    \"with open(sys.argv[2], 'rb') as barrier: barrier.read()\\n\"\n"
+        "    \"pathlib.Path(sys.argv[3]).write_text('done')\\n\"\n"
+        ")\n"
+        "subprocess.Popen([sys.executable, '-c', grandchild, "
+        "sys.argv[1], sys.argv[2], sys.argv[3]], stdin=sys.stdin, "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    )
+
+    async def release_barrier() -> None:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                descriptor = os.open(release, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as error:
+                if error.errno != errno.ENXIO:
+                    raise
+                await asyncio.sleep(0.02)
+                continue
+            try:
+                os.write(descriptor, b"release")
+            finally:
+                os.close(descriptor)
+            return
+        raise AssertionError("grandchild never opened the release barrier")
+
+    async def scenario() -> tuple[bool, Ok | Err]:
+        runner = LinuxProcessRunner()
+        task = asyncio.create_task(
+            runner.run(
+                spec("-c", code, str(ready), str(release), str(done)),
+                1.0,
+                stdin=b"x" * (4 * 1024 * 1024),
+            )
+        )
+        try:
+            await wait_for_file(ready)
+            try:
+                await asyncio.wait_for(asyncio.shield(task), 2.0)
+            except TimeoutError:
+                completed_before_release = False
+            else:
+                completed_before_release = True
+            await release_barrier()
+            result = await asyncio.wait_for(asyncio.shield(task), CALL_BOUND)
+            await wait_for_file(done)
+            assert await wait_gone(int(ready.read_text()))
+            return completed_before_release, result
+        finally:
+            if not done.exists():
+                try:
+                    await release_barrier()
+                except (AssertionError, FileNotFoundError):
+                    pass
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+    completed_before_release, output = run(scenario())
+    assert completed_before_release is True
+    assert isinstance(output, Ok)
+    assert output.value.exit_code == 0
+
+
 def test_run_environment_is_the_minimal_inherited_allowlist():
     runner = LinuxProcessRunner()
     output = run(
@@ -525,6 +601,62 @@ def test_run_propagates_cancellation_and_reaps_the_child(tmp_path: Path):
 
 
 # --------------------------------------------------------------------------- spawn
+
+
+def test_spawn_cancellation_during_identity_evidence_reaps_the_unowned_child(tmp_path: Path):
+    """Cancellation cannot leave a launched child between spawn ownership states."""
+
+    class EvidenceBlockedRunner(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=tmp_path / "empty-proc")
+            self.evidence_started = asyncio.Event()
+            self.cleanup_started = asyncio.Event()
+            self.allow_cleanup = asyncio.Event()
+            self.launched: asyncio.subprocess.Process | None = None
+
+        async def _exec(self, argv, spec, *, stdin, stdout, stderr):  # type: ignore[override]
+            self.launched = await super()._exec(
+                argv, spec, stdin=stdin, stdout=stdout, stderr=stderr,
+            )
+            return self.launched
+
+        async def _read_spawned_identity(self, pid: int):  # type: ignore[override]
+            self.evidence_started.set()
+            return await super()._read_spawned_identity(pid)
+
+        async def _kill_direct_child(self, process, pidfd, identity):  # type: ignore[override]
+            self.cleanup_started.set()
+            await self.allow_cleanup.wait()
+            await super()._kill_direct_child(process, pidfd, identity)
+
+    async def scenario() -> tuple[bool, int]:
+        runner = EvidenceBlockedRunner()
+        task = asyncio.create_task(
+            runner.spawn(spec("-c", "import time; time.sleep(60)"))
+        )
+        await asyncio.wait_for(runner.evidence_started.wait(), 2.0)
+        assert runner.launched is not None
+        process = runner.launched
+        task.cancel()
+        await asyncio.wait_for(runner.cleanup_started.wait(), 2.0)
+        assert runner.retained_reapers >= 1
+        runner.allow_cleanup.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        try:
+            await asyncio.wait_for(asyncio.shield(process.wait()), 1.0)
+        except TimeoutError:
+            disappeared = False
+        else:
+            disappeared = True
+        if process.returncode is None:
+            process.kill()
+            await process.wait()
+        return disappeared, runner.retained_reapers
+
+    disappeared, retained_reapers = run(scenario())
+    assert disappeared is True
+    assert retained_reapers == 0
 
 
 def test_spawn_returns_the_real_identity_and_the_child_exits(tmp_path: Path):

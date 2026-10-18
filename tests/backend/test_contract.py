@@ -272,6 +272,36 @@ def test_target_scoped_rows_without_the_scope_statement_do_not_prove_scope():
     assert not features.target_mute
 
 
+@pytest.mark.parametrize(
+    ("published_summary", "contradictory_summary"),
+    [
+        (
+            "Mute mirrored audio (all streams, or only the given IP)",
+            "Mute all streams; target is ignored",
+        ),
+        (
+            "Unmute mirrored audio (all streams, or only the given IP)",
+            "Unmute all streams; target is ignored",
+        ),
+    ],
+)
+def test_mute_scope_evidence_is_bound_to_each_operation_row(
+    published_summary: str, contradictory_summary: str,
+):
+    """Disconnect's target wording cannot prove mute or unmute scope."""
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    mutated = ctl.replace(published_summary, contradictory_summary, 1)
+    assert mutated != ctl
+
+    features = features_from_help(sender, mutated)
+
+    assert features.profile == "doubletake-0.5"
+    assert features.audio_probe
+    assert not features.multi_target
+    assert not features.target_mute
+
+
 
 def test_status_fixture_decodes_only_typed_public_fields():
     status = json.loads((FIXTURES / "status-0.5.json").read_text())
@@ -526,6 +556,21 @@ def test_a_declared_version_still_recognizes_the_surface_it_ships_with():
 
     assert isinstance(result, Ok)
     _assert_pinned_public_surface(result.value)
+
+
+def test_probe_rejects_a_successful_contradictory_version_for_the_pinned_surface():
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    process = _ProbeProcess([
+        _streams(stderr=sender),
+        _streams(stderr=ctl, exit_code=2),
+        _streams(stdout="doubletake version 9.9.9\n", exit_code=0),
+    ])
+
+    result = asyncio.run(probe_backend(process))
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.dependency_incompatible
 
 
 def test_a_usage_block_on_stderr_is_fingerprinted_despite_empty_stdout():

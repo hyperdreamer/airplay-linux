@@ -117,6 +117,9 @@ _POLL_INTERVAL: Final[float] = 0.02
 #: case where a grandchild inherited a pipe and never closes it.
 _DRAIN_GRACE: Final[float] = 0.5
 
+#: Maximum time allowed for the parent's stdin transport to report closed.
+_FEED_CLOSE_TIMEOUT: Final[float] = 0.25
+
 _DEVNULL = asyncio.subprocess.DEVNULL
 _PIPE = asyncio.subprocess.PIPE
 
@@ -220,6 +223,9 @@ class LinuxProcessRunner:
         #: publishes the exit -- and then a long-lived child's death goes
         #: unreported. The runner therefore owns every reaper until it finishes.
         self._reapers: set[asyncio.Task[None]] = set()
+        #: Stream cleanup tasks that reached the terminal deadline still retain
+        #: ownership until their cancellation finalizer eventually finishes.
+        self._stream_cleanups: set[asyncio.Future[None]] = set()
 
     # -- ProcessPort --------------------------------------------------------
 
@@ -277,30 +283,80 @@ class LinuxProcessRunner:
         argv = _validated_argv(spec.argv)
         if argv is None:
             return _missing_command(spec.argv if isinstance(spec.argv, tuple) else ())
-        try:
-            process = await self._exec(
+        launch = asyncio.ensure_future(
+            self._exec(
                 argv, spec, stdin=_DEVNULL, stdout=_DEVNULL, stderr=_DEVNULL,
             )
+        )
+        try:
+            process = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            cleanup = asyncio.ensure_future(self._cleanup_cancelled_launch(launch))
+            self._retain_reaper(cleanup)
+            await asyncio.shield(cleanup)
+            raise
         except (OSError, ValueError):
             return _missing_command(argv)
         pidfd = self._open_pidfd(process.pid)
+        cleanup_started = False
         try:
-            identity = await self._read_spawned_identity(process.pid)
+            try:
+                identity = await self._read_spawned_identity(process.pid)
+            except asyncio.CancelledError:
+                # The child is still unowned at this point.  Transfer the
+                # descriptor and cleanup obligation to a task that remains
+                # strongly held even if cancellation arrives again, then
+                # propagate the caller's cancellation after that obligation is
+                # complete (or retained).
+                cleanup_started = True
+                await self._cleanup_untracked_child(process, pidfd)
+                raise
             if identity is None:
                 # A child that cannot be named is a child that can never be
                 # released safely, so it is killed here rather than handed out
                 # as an identity. No identity means no fallback evidence either,
                 # so only the descriptor may be signalled -- never a bare PID.
-                await self._kill_direct_child(process, pidfd, None)
+                cleanup_started = True
+                await self._cleanup_untracked_child(process, pidfd)
                 return Err(error=diagnostic(ErrorCode.ownership_mismatch))
         finally:
-            self._close_pidfd(pidfd)
+            if not cleanup_started:
+                self._close_pidfd(pidfd)
         child = _Child(identity=identity, process=process)
         self._children[process.pid] = child
         reaper = asyncio.ensure_future(self._monitor(child))
-        self._reapers.add(reaper)
-        reaper.add_done_callback(self._reapers.discard)
+        self._retain_reaper(reaper)
         return Ok(value=identity)
+
+    def _retain_reaper(self, task: asyncio.Task[None]) -> None:
+        """Keep cleanup/reaper tasks alive until their child obligation ends."""
+        self._reapers.add(task)
+        task.add_done_callback(self._reapers.discard)
+
+    async def _cleanup_cancelled_launch(
+        self, launch: asyncio.Future[asyncio.subprocess.Process],
+    ) -> None:
+        """Finish a cancelled launch, then clean it before losing its handle."""
+        try:
+            process = await launch
+        except Exception:
+            return
+        pidfd = self._open_pidfd(process.pid)
+        await self._cleanup_untracked_child(process, pidfd)
+
+    async def _cleanup_untracked_child(
+        self, process: asyncio.subprocess.Process, pidfd: int | None,
+    ) -> None:
+        """Kill/reap an unowned launch while retaining the launch descriptor."""
+        async def cleanup() -> None:
+            try:
+                await self._kill_direct_child(process, pidfd, None)
+            finally:
+                self._close_pidfd(pidfd)
+
+        task = asyncio.ensure_future(cleanup())
+        self._retain_reaper(task)
+        await asyncio.shield(task)
 
     @property
     def retained_reapers(self) -> int:
@@ -429,35 +485,106 @@ class LinuxProcessRunner:
                 sink.extend(chunk[:room])
 
     @staticmethod
+    def _observe_task_exception(task: asyncio.Future[object]) -> None:
+        """Consume a detached close waiter's exception without blocking teardown."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    @staticmethod
+    async def _close_feed_writer(
+        writer: asyncio.StreamWriter, *, abort: bool,
+    ) -> None:
+        """Close stdin without waiting indefinitely for inherited readers."""
+        try:
+            if abort:
+                writer.transport.abort()
+            else:
+                writer.close()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+
+        close_wait = asyncio.ensure_future(writer.wait_closed())
+        close_wait.add_done_callback(LinuxProcessRunner._observe_task_exception)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(close_wait), _FEED_CLOSE_TIMEOUT,
+            )
+            return
+        except asyncio.CancelledError:
+            # A second cancellation must not strand a wait_closed task or leave
+            # the transport trying to drain a pipe whose reader is a grandchild.
+            try:
+                writer.transport.abort()
+            except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+                pass
+            close_wait.cancel()
+            raise
+        except (BrokenPipeError, ConnectionResetError, OSError, TimeoutError, ValueError):
+            pass
+
+        # A close that did not report completion in time is no longer useful as
+        # a graceful close.  Abort only our stdin transport; never signal the
+        # process group or an inherited descendant.
+        try:
+            writer.transport.abort()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            pass
+        if not close_wait.done():
+            _, pending = await asyncio.wait(
+                {close_wait}, timeout=_FEED_CLOSE_TIMEOUT,
+            )
+            if pending:
+                close_wait.cancel()
+
+    @staticmethod
     async def _feed(process: asyncio.subprocess.Process, payload: bytes) -> None:
         """Write stdin once and close it, so the child sees EOF."""
         writer = process.stdin
         if writer is None:
             return
+        cancelled = False
         try:
             writer.write(payload)
             await writer.drain()
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
         except (BrokenPipeError, ConnectionResetError, ValueError):
             pass
         finally:
-            try:
-                writer.close()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
-            try:
-                await writer.wait_closed()
-            except (BrokenPipeError, ConnectionResetError, ValueError):
-                pass
+            await LinuxProcessRunner._close_feed_writer(writer, abort=cancelled)
 
-    @staticmethod
-    async def _finish(tasks: list[asyncio.Future[None]], grace: float) -> None:
-        """Let stream tasks reach EOF, then drop whatever is still running."""
+    def _retain_stream_cleanup(self, task: asyncio.Future[None]) -> None:
+        """Keep unfinished stream cleanup owned after the run's deadline."""
+        self._stream_cleanups.add(task)
+        task.add_done_callback(self._stream_cleanups.discard)
+
+    async def _finish(self, tasks: list[asyncio.Future[None]], grace: float) -> None:
+        """Finish streams under a grace period plus a terminal deadline."""
         if not tasks:
             return
-        _, pending = await asyncio.wait(tasks, timeout=grace)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        loop = asyncio.get_running_loop()
+        terminal_deadline = loop.time() + max(0.0, grace) + _FEED_CLOSE_TIMEOUT
+        _, pending = await asyncio.wait(tasks, timeout=max(0.0, grace))
+        if pending:
+            for task in pending:
+                task.cancel()
+            remaining = max(0.0, terminal_deadline - loop.time())
+            if remaining:
+                _, pending = await asyncio.wait(pending, timeout=remaining)
+            if pending:
+                # Do not gather without a deadline: a cancellation finalizer is
+                # allowed to outlive this call, but never to hold it hostage.
+                for task in pending:
+                    task.cancel()
+                    self._retain_stream_cleanup(task)
+        completed = [task for task in tasks if task.done()]
+        if completed:
+            await asyncio.gather(*completed, return_exceptions=True)
 
     async def _kill_direct_child(
         self,

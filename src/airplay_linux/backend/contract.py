@@ -581,6 +581,12 @@ _CTL_ROW: Final[re.Pattern[str]] = re.compile(
 )
 
 
+@dataclass(frozen=True, kw_only=True)
+class _CtlCommand:
+    arguments: str
+    summary: str
+
+
 def _sender_surface(sender_help: str) -> frozenset[str] | None:
     """Return the exact flag set of a Go ``flag`` usage block, or None.
 
@@ -615,18 +621,20 @@ def _sender_surface(sender_help: str) -> frozenset[str] | None:
     return frozenset(flags)
 
 
-def _ctl_surface(ctl_help: str) -> dict[str, str] | None:
-    """Return command -> argument signature from the published usage table.
+def _ctl_surface(ctl_help: str) -> dict[str, _CtlCommand] | None:
+    """Return each command's argument signature and summary from the usage table.
 
     The ctl's ``usage()`` prints a fixed ``Commands:`` table with two spaces
     before each command, a padded argument signature, and a summary.  Only rows
     inside that table count: a command named in prose, a section heading such as
-    ``Unsupported commands:``, or a flag row is not a declaration.
+    ``Unsupported commands:``, or a flag row is not a declaration.  Keeping the
+    summary attached to its row prevents one command's scope claim from proving
+    another command's semantics.
     """
     lines = ctl_help.splitlines()
     if not lines or not lines[0].startswith("Usage: doubletake-ctl "):
         return None
-    commands: dict[str, str] = {}
+    commands: dict[str, _CtlCommand] = {}
     in_commands = False
     for line in lines[1:]:
         if line.strip() == "Commands:":
@@ -645,10 +653,26 @@ def _ctl_surface(ctl_help: str) -> dict[str, str] | None:
         command = row.group("command")
         if command in commands:
             return None
-        commands[command] = (row.group("arguments") or "").strip()
+        commands[command] = _CtlCommand(
+            arguments=(row.group("arguments") or "").strip(),
+            summary=row.group("summary").strip(),
+        )
     if not commands:
         return None
     return commands
+
+
+def _target_scope_proven(command: _CtlCommand | None) -> bool:
+    """Accept only an affirmative, non-contradictory scope claim on this row."""
+    if command is None:
+        return False
+    summary = " ".join(command.summary.lower().split())
+    if _PINNED_050_TARGET_SCOPE_STATEMENT not in summary:
+        return False
+    # Any negation is explicit contrary evidence, even if another phrase in the
+    # same row happens to mention the pinned wording.  Failing closed is safer
+    # than trying to infer which clause a future wording change intended.
+    return re.search(r"\b(?:not|never|ignor\w*|unsupported|unavailable)\b", summary) is None
 
 
 def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
@@ -676,7 +700,9 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
         sender_flags is not None
         and ctl_commands is not None
         and sender_flags == _PINNED_050_SENDER_FLAGS
-        and ctl_commands == _PINNED_050_CTL_COMMANDS
+        and {
+            name: command.arguments for name, command in ctl_commands.items()
+        } == _PINNED_050_CTL_COMMANDS
     )
     if not verified:
         # Unknown, partial, later, foreign, or merely-similar help text proves no
@@ -701,13 +727,13 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
             query_modes=False,
         )
 
-    # Exactly the pinned surface.  Enable only what its own usage text declares.
-    target_scope = _PINNED_050_TARGET_SCOPE_STATEMENT in ctl_help.lower()
-    target_scoped = (
-        target_scope
-        and ctl_commands.get("disconnect") == "[target]"
-        and ctl_commands.get("mute") == "[target]"
-        and ctl_commands.get("unmute") == "[target]"
+    # Exactly the pinned surface.  Enable only what each operation's own usage
+    # row declares; a scope phrase in ``disconnect`` cannot prove mute semantics.
+    target_scoped = all(
+        ctl_commands.get(command) is not None
+        and ctl_commands[command].arguments == "[target]"
+        and _target_scope_proven(ctl_commands[command])
+        for command in ("disconnect", "mute", "unmute")
     )
     return BackendFeatures(
         profile=_PINNED_050_PROFILE,
@@ -824,8 +850,15 @@ async def probe_backend(process: ports.ProcessPort) -> Result[BackendFeatures]:
     # its error banner in front of the usage block would mask the very surface
     # the fingerprint has to match.
     features = features_from_help(sender_help, ctl_help)
-    if version_text and features.version == "unknown":
-        features = replace(features, version=version_text)
+    if version_text:
+        if features.profile == _PINNED_050_PROFILE and version_text != _PINNED_050_VERSION:
+            # A recognized help surface cannot override affirmative evidence from
+            # a successful version probe.  No compatibility matrix exists for a
+            # different version, so reject the contradictory binary instead of
+            # granting the pinned release's capabilities.
+            return _incompatible()
+        if features.version == "unknown":
+            features = replace(features, version=version_text)
     return Ok(value=features)
 
 
