@@ -196,6 +196,157 @@ def test_run_bounds_stderr_independently_of_stdout():
     assert output.value.stderr == b"e" * 4096
 
 
+def test_run_bounds_stderr_at_one_mebibyte_and_still_exits_normally():
+    """The cap is a bound on each stream, so stderr needs its own boundary case.
+
+    A drain that honours ``OUTPUT_LIMIT`` for stdout while buffering stderr
+    without it would keep every other test here green and still let a chatty
+    helper exhaust memory, so this case exceeds the cap on stderr alone.
+    """
+    runner = LinuxProcessRunner()
+    output = run(
+        runner.run(
+            spec("-c", f"import sys; sys.stderr.write('e' * ({OUTPUT_LIMIT} * 3))"),
+            20.0,
+        )
+    )
+    assert isinstance(output, Ok)
+    assert output.value.exit_code == 0
+    assert len(output.value.stderr) == OUTPUT_LIMIT
+    assert output.value.stderr == b"e" * OUTPUT_LIMIT
+
+
+def test_run_caps_both_streams_at_the_same_limit_simultaneously():
+    """Neither stream may be bounded by the other's budget."""
+    runner = LinuxProcessRunner()
+    output = run(
+        runner.run(
+            spec(
+                "-c",
+                "import sys\n"
+                f"sys.stdout.write('o' * ({OUTPUT_LIMIT} * 2))\n"
+                f"sys.stderr.write('e' * ({OUTPUT_LIMIT} * 2))\n",
+            ),
+            20.0,
+        )
+    )
+    assert isinstance(output, Ok)
+    assert output.value.exit_code == 0
+    assert output.value.stdout == b"o" * OUTPUT_LIMIT
+    assert output.value.stderr == b"e" * OUTPUT_LIMIT
+
+
+def test_run_timeout_kills_through_the_launch_pidfd_not_a_bare_pid(tmp_path: Path, monkeypatch):
+    """Deadline cleanup signals the descriptor taken at launch.
+
+    The child handle's own ``kill`` is a poll-then-``os.kill`` on a bare PID, so
+    a recycle between the poll and the signal would kill a stranger. Making that
+    call fail proves the cleanup really goes through the descriptor instead.
+    """
+    if not hasattr(os, "pidfd_open"):
+        pytest.skip("this kernel does not offer pidfd_open")
+    pid_file = tmp_path / "pid"
+
+    def forbidden_kill(self) -> None:
+        raise AssertionError("deadline cleanup used the child handle's bare-PID kill")
+
+    monkeypatch.setattr(asyncio.base_subprocess.BaseSubprocessTransport, "kill", forbidden_kill)
+
+    class Recording(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.signals: list[tuple[bool, int]] = []
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signals.append((pidfd is not None, signum))
+            return super()._signal(pidfd, pid, signum)
+
+    async def scenario() -> tuple[Err, int, list[tuple[bool, int]]]:
+        runner = Recording()
+        output = await asyncio.wait_for(
+            runner.run(spec(*sleeper(pid_file)[1:]), 1.0), CALL_BOUND,
+        )
+        await wait_for_file(pid_file)
+        return output, int(pid_file.read_text()), list(runner.signals)
+
+    output, pid, signals = run(scenario())
+    assert isinstance(output, Err)
+    assert output.error.code is ErrorCode.cleanup_timeout
+    assert signals == [(True, signal.SIGKILL)]
+    assert run(wait_gone(pid))
+
+
+def test_run_timeout_without_a_pidfd_or_an_identity_signals_nothing(monkeypatch):
+    """Cleanup that cannot prove the child never degrades to a raw PID kill.
+
+    The launch identity is unavailable and no descriptor could be opened, so
+    the only remaining primitive would be ``os.kill`` on a bare PID -- the one
+    thing that can redirect across a recycle. The runner reports the deadline
+    instead, and the child handle is left for the test's own reap.
+    """
+
+    class FakeChild:
+        """A child handle that records the bare-PID kill it must never receive."""
+
+        pid = 4_194_303
+        returncode: int | None = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        async def wait(self) -> int:
+            await asyncio.sleep(60)
+            return 0
+
+        def kill(self) -> None:
+            self.killed = True
+
+    class NoPidfd(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fake = FakeChild()
+            self.signalled: list[int] = []
+
+        async def _exec(self, argv, spec, *, stdin, stdout, stderr):  # type: ignore[override]
+            return self.fake
+
+        @staticmethod
+        def _open_pidfd(pid: int) -> int | None:
+            return None
+
+        def _launch_identity(self, pid: int) -> ProcessIdentity | None:
+            return None
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signalled.append(signum)
+            return True
+
+    raw_kills: list[int] = []
+
+    def recording_kill(pid: int, signum: int) -> None:
+        raw_kills.append(pid)
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr(os, "kill", recording_kill)
+
+    async def scenario() -> tuple[Err, bool, list[int]]:
+        runner = NoPidfd()
+        output = await asyncio.wait_for(
+            runner.run(spec("-c", "pass"), 0.05), CALL_BOUND,
+        )
+        return output, runner.fake.killed, list(runner.signalled)
+
+    output, killed, signalled = run(scenario())
+    assert isinstance(output, Err)
+    assert output.error.code is ErrorCode.cleanup_timeout
+    assert killed is False
+    assert signalled == []
+    assert raw_kills == []
+
+
 def test_run_kills_an_endless_writer_at_the_deadline():
     runner = LinuxProcessRunner()
 
@@ -688,6 +839,72 @@ def test_a_zombie_with_matching_evidence_is_accepted_without_a_signal(tmp_path: 
     assert runner.owned(identity, OWNER, RUNTIME) is True
     assert run(runner.terminate(identity, OWNER, RUNTIME, deadline=1.0)) == Ok(value=None)
     assert runner.signals == []
+
+
+def test_terminate_of_an_unreadable_procfs_entry_is_a_mismatch_not_a_release(tmp_path: Path):
+    """"I could not look" must never be reported as "it is gone".
+
+    An inaccessible entry leaves the recorded process unproven, so cleanup is a
+    mismatch the caller can retry -- not ``Ok``, which would claim a helper was
+    released while it may still be running.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can look into every procfs entry, so EACCES cannot be provoked")
+    _synthetic_entry(tmp_path, 200)
+    identity = ProcessIdentity(pid=200, start_ticks=22_000)
+
+    class Recording(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=tmp_path)
+            self.signals: list[int] = []
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signals.append(signum)
+            return True
+
+    runner = Recording()
+    os.chmod(tmp_path, 0o000)
+    try:
+        refused = run(runner.terminate(identity, OWNER, RUNTIME, deadline=1.0))
+    finally:
+        os.chmod(tmp_path, 0o700)
+    assert runner.signals == []
+    assert isinstance(refused, Err)
+    assert refused.error.code is ErrorCode.ownership_mismatch
+
+
+def test_terminate_revalidates_evidence_immediately_before_the_fallback_sigterm(
+    tmp_path: Path,
+):
+    """A PID handed over between the first check and the signal is never hit.
+
+    Without a descriptor the only defence is evidence re-read at the instant of
+    the signal, so the recycle is forced in exactly that window: nothing may be
+    signalled, and the caller learns the release is unproven.
+    """
+    _synthetic_entry(tmp_path, 200)
+    identity = ProcessIdentity(pid=200, start_ticks=22_000)
+
+    class RecycledBeforeFallback(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=tmp_path)
+            self.signals: list[int] = []
+
+        def _open_pidfd(self, pid: int) -> int | None:
+            # The first evidence check passed and no descriptor is available, so
+            # the bare-PID path is what would be attempted next.
+            _synthetic_entry(tmp_path, pid, start_ticks=99_000)
+            return None
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.signals.append(signum)
+            return True
+
+    runner = RecycledBeforeFallback()
+    refused = run(runner.terminate(identity, OWNER, RUNTIME, deadline=1.0))
+    assert runner.signals == []
+    assert isinstance(refused, Err)
+    assert refused.error.code is ErrorCode.ownership_mismatch
 
 
 def test_a_pid_recycled_after_sigterm_is_not_escalated_to_sigkill(tmp_path: Path):

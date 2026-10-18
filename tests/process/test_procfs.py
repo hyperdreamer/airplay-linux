@@ -17,6 +17,7 @@ from uuid import UUID
 import pytest
 
 from airplay_linux.domain.operations import ProcessIdentity
+from airplay_linux.process import procfs
 from airplay_linux.process.procfs import (
     MAX_ENVIRONMENT_BYTES,
     OWNER_TOKEN_ENV,
@@ -170,6 +171,55 @@ def test_oversized_environment_is_not_evidence(tmp_path: Path):
         b"BIG=" + b"x" * (MAX_ENVIRONMENT_BYTES + 1) + b"\0"
     )
     assert read_environment(200, tmp_path) is None
+
+
+def test_an_inaccessible_entry_is_unreadable_rather_than_absent(tmp_path: Path):
+    """"I could not look" is never reported as "it is not there".
+
+    ``Path.exists()`` answers ``False`` for every lookup failure, so a procfs
+    entry this user may not inspect used to be classified as gone -- and a
+    caller cleaning up would then report a still-running helper as released.
+    """
+    if os.geteuid() == 0:
+        pytest.skip("root can look into every procfs entry, so EACCES cannot be provoked")
+    entry(tmp_path, 200, environment=owned_environment())
+    identity = ProcessIdentity(pid=200, start_ticks=22_000)
+    os.chmod(tmp_path, 0o000)
+    try:
+        evidence = read_identity_evidence(200, tmp_path)
+        owned = owner_evidence(identity, OWNER, RUNTIME, tmp_path)
+    finally:
+        os.chmod(tmp_path, 0o700)
+    assert evidence.state is IdentityState.unreadable
+    assert evidence.identity is None
+    assert evidence.alive is False
+    assert owned is False
+    # The entry was there all along, which is why "unreadable" is the answer.
+    assert read_identity(200, tmp_path) == identity
+
+
+def test_owner_evidence_rejects_a_pid_recycled_during_the_environment_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """An identity read and an environment read from two instances prove nothing.
+
+    The environment is read after the identity, so a PID recycled in between
+    would otherwise lend the recorded start time to a stranger's environment.
+    """
+    entry(tmp_path, 200, environment=owned_environment())
+    identity = ProcessIdentity(pid=200, start_ticks=22_000)
+    assert owner_evidence(identity, OWNER, RUNTIME, tmp_path) is True
+
+    reading = procfs.read_environment
+
+    def recycling(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str] | None:
+        environment = reading(pid, proc_root)
+        # The PID is handed to another instance between the two reads.
+        entry(tmp_path, pid, start_ticks=99_000, environment=owned_environment())
+        return environment
+
+    monkeypatch.setattr(procfs, "read_environment", recycling)
+    assert owner_evidence(identity, OWNER, RUNTIME, tmp_path) is False
 
 
 def test_owner_evidence_requires_ticks_uid_and_the_exact_environment(tmp_path: Path):

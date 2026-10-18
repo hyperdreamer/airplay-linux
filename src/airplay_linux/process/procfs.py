@@ -17,6 +17,12 @@ Three consequences shape this module:
 * A missing, unreadable, oversized, or duplicated-environment entry is *not*
   evidence. It reports what procfs said (``absent``, ``unreadable``) and never
   degrades into "probably ours", because the caller's next step is a signal.
+  ``absent`` is a claim about the kernel's answer, so it is only made when the
+  kernel said ``ENOENT``: a lookup this user is not allowed to perform is
+  ``unreadable``, never "gone".
+* Ownership is established from *one* instant, so the identity is read again
+  after the environment read. Two reads of two different process instances are
+  not evidence about either of them.
 * Nothing here raises for an ordinary procfs condition. A caller that cannot
   read the evidence needs a typed answer, not an ``OSError`` carrying a path.
 """
@@ -90,59 +96,71 @@ def _entry(pid: int, proc_root: Path) -> Path:
     return proc_root / str(pid)
 
 
-def _read_stat(pid: int, proc_root: Path) -> tuple[ProcessIdentity, int, str] | None:
-    """The identity, parent, and run state of ``pid``, or ``None`` if unusable.
+def _read_stat(
+    pid: int, proc_root: Path,
+) -> tuple[ProcessIdentity, int, str] | IdentityState:
+    """The identity, parent, and run state of ``pid``, or why it was not read.
 
     The line is ``pid (comm) state ppid ...`` where ``comm`` may itself contain
     spaces and parentheses, so the *last* ``)`` is the delimiter and the fields
     after it are positional. A line whose leading PID is not this PID's is not
     accepted, because that is precisely how a recycled PID would arrive.
+
+    A ``FileNotFoundError`` for the stat file is the one failure that is
+    *confirmed absence*: the entry was there a moment ago and the kernel no
+    longer has it. Every other ``OSError`` -- ``EACCES`` on a procfs entry this
+    user may not inspect, ``EIO``, a vanished mount -- is ``unreadable``.
     """
     try:
         text = (_entry(pid, proc_root) / "stat").read_bytes().decode("ascii", "replace")
+    except FileNotFoundError:
+        return IdentityState.absent
     except OSError:
-        return None
+        return IdentityState.unreadable
     opened = text.find("(")
     if opened < 0:
-        return None
+        return IdentityState.unreadable
     if text[:opened].strip() != str(pid):
-        return None
+        return IdentityState.unreadable
     closed = text.rfind(")")
     if closed < opened:
-        return None
+        return IdentityState.unreadable
     fields = text[closed + 1 :].split()
     if len(fields) < 20:
-        return None
+        return IdentityState.unreadable
     if len(fields[0]) != 1:
-        return None
+        return IdentityState.unreadable
     try:
         parent = int(fields[1])
         start_ticks = int(fields[19])
     except (IndexError, ValueError):
-        return None
+        return IdentityState.unreadable
     if parent < 0 or start_ticks < 0:
-        return None
+        return IdentityState.unreadable
     return ProcessIdentity(pid=pid, start_ticks=start_ticks), parent, fields[0]
 
 
-def _entry_uid(entry: Path) -> int | None:
-    """The owner of the procfs directory, which is the process's real UID."""
-    try:
-        return entry.stat().st_uid
-    except OSError:
-        return None
-
-
 def read_identity_evidence(pid: int, proc_root: Path = Path("/proc")) -> IdentityEvidence:
-    """Every fact this module can establish about one PID, or why it could not."""
+    """Every fact this module can establish about one PID, or why it could not.
+
+    The entry is inspected with an explicit ``stat`` rather than ``exists()``,
+    because ``exists()`` answers ``False`` for every lookup failure including a
+    permission boundary. Here ``ENOENT`` alone means the process is gone; a
+    lookup this user may not perform is ``unreadable``, so a caller can never
+    mistake "I was not allowed to look" for "it is not there" and report a
+    still-running helper as released.
+    """
     if not _valid_pid(pid):
         return IdentityEvidence(pid=pid, state=IdentityState.absent)
-    entry = _entry(pid, proc_root)
-    if not entry.exists():
+    try:
+        entry_stat = _entry(pid, proc_root).stat()
+    except FileNotFoundError:
         return IdentityEvidence(pid=pid, state=IdentityState.absent)
-    parsed = _read_stat(pid, proc_root)
-    if parsed is None:
+    except OSError:
         return IdentityEvidence(pid=pid, state=IdentityState.unreadable)
+    parsed = _read_stat(pid, proc_root)
+    if isinstance(parsed, IdentityState):
+        return IdentityEvidence(pid=pid, state=parsed)
     identity, parent, run_state = parsed
     state = (
         IdentityState.terminated
@@ -154,7 +172,7 @@ def read_identity_evidence(pid: int, proc_root: Path = Path("/proc")) -> Identit
         state=state,
         identity=identity,
         parent=parent,
-        uid=_entry_uid(entry),
+        uid=entry_stat.st_uid,
     )
 
 
@@ -239,7 +257,11 @@ def owner_evidence(
       cannot be adopted by setting the environment names;
     * its environment holds this owner UUID and this exact runtime directory,
       byte for byte -- a prefix, a sibling instance, or a missing variable is
-      not ownership.
+      not ownership;
+    * the identity still matches *after* the environment read, because the two
+      reads are two file accesses and a PID can be recycled between them. An
+      environment read from one instance and an identity read from another is
+      not evidence about either.
     """
     if type(identity) is not ProcessIdentity or not _valid_pid(identity.pid):
         return False
@@ -251,6 +273,9 @@ def owner_evidence(
         return False
     environment = read_environment(identity.pid, proc_root)
     if environment is None:
+        return False
+    rechecked = read_identity_evidence(identity.pid, proc_root)
+    if rechecked.identity != identity or rechecked.uid != uid:
         return False
     return (
         environment.get(OWNER_TOKEN_ENV) == str(owner_uuid)

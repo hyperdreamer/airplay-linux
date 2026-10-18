@@ -29,6 +29,14 @@ The rules this module implements:
   process instance, so a PID recycled between the check and the signal cannot
   redirect the signal -- which is exactly the race an ownership check alone
   cannot close.
+* A ``pidfd`` is opened for a freshly launched child as well, before the runner
+  awaits anything else, and deadline/cancellation cleanup signals that descriptor
+  rather than the child handle's PID. Without a descriptor the runner does not
+  degrade to a raw PID signal -- it reports cleanup uncertainty instead, because
+  a kill that could land on a recycled PID is worse than a known-leaked child.
+* Evidence is read immediately before *each* signal, never once per operation,
+  and the identity is re-read after the environment read: two file accesses from
+  two different moments are not evidence about one process instance.
 
 The exit channel reports *spawned* children only. ``run`` already returns its
 child's exit code to the caller, and a spawn that could not start has no
@@ -231,6 +239,11 @@ class LinuxProcessRunner:
             )
         except (OSError, ValueError):
             return _missing_command(argv)
+        # Opened and named before the next await, so they identify the instance
+        # this call launched even if the child exits and its PID is recycled
+        # before a deadline or a cancellation has to clean it up.
+        pidfd = self._open_pidfd(process.pid)
+        launch_identity = self._launch_identity(process.pid)
         stdout = bytearray()
         stderr = bytearray()
         streams: list[asyncio.Future[None]] = [
@@ -242,13 +255,15 @@ class LinuxProcessRunner:
         try:
             await asyncio.wait_for(process.wait(), max(0.0, float(timeout)))
         except TimeoutError:
-            await self._kill_direct_child(process)
+            await self._kill_direct_child(process, pidfd, launch_identity)
             await self._finish(streams, _DRAIN_GRACE)
             return _timed_out()
         except asyncio.CancelledError:
-            await self._kill_direct_child(process)
+            await self._kill_direct_child(process, pidfd, launch_identity)
             await self._finish(streams, _DRAIN_GRACE)
             raise
+        finally:
+            self._close_pidfd(pidfd)
         await self._finish(streams, _DRAIN_GRACE)
         return Ok(
             value=ports.CommandOutput(
@@ -268,12 +283,18 @@ class LinuxProcessRunner:
             )
         except (OSError, ValueError):
             return _missing_command(argv)
-        identity = await self._read_spawned_identity(process.pid)
-        if identity is None:
-            # A child that cannot be named is a child that can never be released
-            # safely, so it is killed here rather than handed out as an identity.
-            await self._kill_direct_child(process)
-            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        pidfd = self._open_pidfd(process.pid)
+        try:
+            identity = await self._read_spawned_identity(process.pid)
+            if identity is None:
+                # A child that cannot be named is a child that can never be
+                # released safely, so it is killed here rather than handed out
+                # as an identity. No identity means no fallback evidence either,
+                # so only the descriptor may be signalled -- never a bare PID.
+                await self._kill_direct_child(process, pidfd, None)
+                return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        finally:
+            self._close_pidfd(pidfd)
         child = _Child(identity=identity, process=process)
         self._children[process.pid] = child
         reaper = asyncio.ensure_future(self._monitor(child))
@@ -315,7 +336,13 @@ class LinuxProcessRunner:
                     return Ok(value=None)
                 if reclassified != _OWNED:
                     return Err(error=diagnostic(ErrorCode.ownership_mismatch))
-            self._signal(pidfd, identity.pid, signal.SIGTERM)
+            delivered = self._deliver(
+                identity, owner_uuid, runtime_directory, pidfd, signal.SIGTERM,
+            )
+            if delivered == _GONE:
+                return Ok(value=None)
+            if delivered != _OWNED:
+                return Err(error=diagnostic(ErrorCode.ownership_mismatch))
             if await self._await_exit(identity, pidfd, child, max(0.0, float(deadline))):
                 return Ok(value=None)
             reclassified = self._classify(identity, owner_uuid, runtime_directory)
@@ -323,16 +350,18 @@ class LinuxProcessRunner:
                 return Ok(value=None)
             if reclassified != _OWNED:
                 return Err(error=diagnostic(ErrorCode.ownership_mismatch))
-            self._signal(pidfd, identity.pid, signal.SIGKILL)
+            delivered = self._deliver(
+                identity, owner_uuid, runtime_directory, pidfd, signal.SIGKILL,
+            )
+            if delivered == _GONE:
+                return Ok(value=None)
+            if delivered != _OWNED:
+                return Err(error=diagnostic(ErrorCode.ownership_mismatch))
             if await self._await_exit(identity, pidfd, child, self.kill_timeout):
                 return Ok(value=None)
             return _timed_out()
         finally:
-            if pidfd is not None:
-                try:
-                    os.close(pidfd)
-                except OSError:
-                    pass
+            self._close_pidfd(pidfd)
 
     def subscribe(self, callback: Callable[[ports.ProcessExit], None]) -> ports.Subscription:
         self._subscribers.append(callback)
@@ -430,16 +459,40 @@ class LinuxProcessRunner:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _kill_direct_child(self, process: asyncio.subprocess.Process) -> None:
-        """Kill the exact child this call started, then reap it."""
-        try:
-            process.kill()
-        except OSError:
-            pass
+    async def _kill_direct_child(
+        self,
+        process: asyncio.subprocess.Process,
+        pidfd: int | None,
+        identity: ProcessIdentity | None,
+    ) -> None:
+        """Kill the exact child this call started, then reap it.
+
+        The descriptor captured at launch is preferred because it names one
+        process instance. Without one, the child's *recorded* identity is
+        re-read and must still match -- that is the only thing standing between
+        a recycled PID and this ``SIGKILL``. With neither, nothing is signalled:
+        the caller then reports cleanup uncertainty, which is honest, whereas a
+        bare-PID kill could land on a stranger.
+        """
+        if pidfd is None and not (
+            identity is not None and self._is_launched_child(identity)
+        ):
+            return
+        self._signal(pidfd, process.pid, signal.SIGKILL)
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), self.kill_timeout)
         except (TimeoutError, asyncio.CancelledError):
             pass
+
+    def _is_launched_child(self, identity: ProcessIdentity) -> bool:
+        """Whether ``identity`` still names the direct child this runner forked.
+
+        Re-read now, immediately before the fallback signal: a different start
+        time is a recycled PID, and a different parent means this is no longer
+        the child that was launched here.
+        """
+        evidence = read_identity_evidence(identity.pid, self._proc_root)
+        return evidence.identity == identity and evidence.parent == os.getpid()
 
     # -- exit channel -------------------------------------------------------
 
@@ -489,6 +542,8 @@ class LinuxProcessRunner:
             return _MISMATCH
         evidence = read_identity_evidence(identity.pid, self._proc_root)
         if evidence.state is IdentityState.absent:
+            # Only a confirmed kernel answer means gone; ``unreadable`` falls
+            # through to the mismatch below instead of guessing a cleanup.
             return _GONE
         if evidence.identity != identity:
             # A different process instance holds this PID now.
@@ -503,6 +558,15 @@ class LinuxProcessRunner:
             return _MISMATCH
         return _OWNED
 
+    def _launch_identity(self, pid: int) -> ProcessIdentity | None:
+        """The procfs identity of a child this call has just forked.
+
+        A seam like :meth:`_open_pidfd`: the launch path needs one read of the
+        evidence it will later re-verify before any bare-PID signal, and a test
+        needs to be able to say "that read failed".
+        """
+        return read_identity(pid, self._proc_root)
+
     @staticmethod
     def _open_pidfd(pid: int) -> int | None:
         opener = getattr(os, "pidfd_open", None)
@@ -513,8 +577,49 @@ class LinuxProcessRunner:
         except OSError:
             return None
 
+    @staticmethod
+    def _close_pidfd(pidfd: int | None) -> None:
+        if pidfd is None:
+            return
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
+
+    def _deliver(
+        self,
+        identity: ProcessIdentity,
+        owner_uuid: UUID,
+        runtime_directory: str,
+        pidfd: int | None,
+        signum: int,
+    ) -> str:
+        """Revalidate the exact evidence now, then deliver ``signum``.
+
+        Returns the classification that was re-read immediately before the
+        signal: :data:`_OWNED` after the signal was sent, or :data:`_GONE` /
+        :data:`_MISMATCH` when nothing was sent. The revalidation and the signal
+        are adjacent statements with no ``await`` between them, so nothing of
+        ours can hand the PID to another process in between -- which is the
+        requirement every signal in this module has to meet, whether it travels
+        through a pidfd or through the bare-PID fallback.
+        """
+        classified = self._classify(identity, owner_uuid, runtime_directory)
+        if classified != _OWNED:
+            return classified
+        self._signal(pidfd, identity.pid, signum)
+        return classified
+
     def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
-        """Signal the validated instance: through its pidfd when there is one."""
+        """Signal the validated instance: through its pidfd when there is one.
+
+        Every caller reaches this from :meth:`_deliver` or
+        :meth:`_kill_direct_child`, each of which re-reads the exact evidence
+        immediately before the call and is separated from it by no ``await``.
+        The bare-PID branch exists for kernels that offer no ``pidfd`` at all;
+        it is never a convenience fallback for a descriptor that failed to open
+        for an already-checked process.
+        """
         sender = getattr(signal, "pidfd_send_signal", None)
         try:
             if pidfd is not None and sender is not None:
