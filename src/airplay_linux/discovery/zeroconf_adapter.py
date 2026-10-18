@@ -899,6 +899,16 @@ class _Browsers:
 
 
 async def _cancel(browser: object) -> None:
+    """Cancel one browser at most once; the dependency is not idempotent.
+
+    ``AsyncServiceBrowser._async_cancel`` detaches the browser from the record
+    manager and therefore raises when the browser is already cancelled. Its own
+    ``done`` attribute is set before that detachment, so it is the dependency's
+    answer to "was this browser already released?" and is checked here rather
+    than inferred from an exception.
+    """
+    if getattr(browser, "done", False):
+        return
     cancel = getattr(browser, "async_cancel", None) or getattr(browser, "cancel", None)
     if cancel is None:
         return
@@ -909,7 +919,14 @@ async def _cancel(browser: object) -> None:
 
 
 def _cancel_nowait(browser: object) -> None:
-    """``Subscription.close`` is synchronous, so schedule the async cancel."""
+    """``Subscription.close`` is synchronous, so schedule the async cancel.
+
+    The scheduled task owns its failure: nothing awaits it, so without the
+    ``_consume`` callback a raise here would be reported to the event loop as an
+    unhandled task exception instead of being dropped like :func:`_cancel` does.
+    """
+    if getattr(browser, "done", False):
+        return
     cancel = getattr(browser, "async_cancel", None) or getattr(browser, "cancel", None)
     if cancel is None:
         return
@@ -919,6 +936,12 @@ def _cancel_nowait(browser: object) -> None:
         return
     if inspect.isawaitable(result):
         try:
-            asyncio.ensure_future(result)
+            asyncio.ensure_future(result).add_done_callback(_consume)
         except RuntimeError:
             result.close()  # type: ignore[union-attr]
+
+
+def _consume(task: asyncio.Future[Any]) -> None:
+    """Retrieve a scheduled cancel's outcome; its failure is not actionable."""
+    if not task.cancelled():
+        task.exception()

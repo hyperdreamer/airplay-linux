@@ -11,13 +11,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import base64
+import gc
 import json
+import time
 from collections.abc import Awaitable, Callable
 from functools import wraps
 from pathlib import Path
 from typing import Any
 
 import pytest
+import zeroconf
 
 from airplay_linux.discovery.identity import IdentityResolver, target_for
 from airplay_linux.discovery.zeroconf_adapter import (
@@ -28,6 +31,9 @@ from airplay_linux.discovery.zeroconf_adapter import (
     RawAdvertisement,
     ServiceChange,
     ZeroconfDiscovery,
+    _Browsers,
+    _Notification,
+    _raw,
     decode_txt,
     normalize_feature_bits,
     normalize_service_type,
@@ -1106,7 +1112,7 @@ def _resolving_client(info: object) -> Any:
     return Client()
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_a_real_service_info_converts_into_a_domain_record():
     mdns = AzcMdnsClient(FakeClock(50.0), factory=lambda: _resolving_client(_ServiceInfo()))
     # ``resolve`` only serves keys a browse already registered, exactly as the
@@ -1155,7 +1161,7 @@ async def test_parsed_scoped_addresses_preserve_ipv6_only_and_dual_stack_records
     assert target.value.canonical_host == "192.0.2.10"
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_txt_bytes_that_are_not_utf8_are_dropped_not_replaced():
     info = _ServiceInfo(properties={b"model": b"AppleTV6,2", b"junk": b"\xff\xfe"})
     mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
@@ -1165,7 +1171,7 @@ async def test_txt_bytes_that_are_not_utf8_are_dropped_not_replaced():
     assert result.value.model == "AppleTV6,2"
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_ipv6_addresses_are_carried_through_resolution():
     info = _ServiceInfo(addresses=[bytes(16)[:15] + b"\x01"])
     mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
@@ -1175,7 +1181,7 @@ async def test_ipv6_addresses_are_carried_through_resolution():
     assert result.value.addresses == ("::1",)
 
 
-@pytest.mark.asyncio
+@run_async
 @pytest.mark.parametrize(
     "info",
     [
@@ -1195,7 +1201,7 @@ async def test_a_malformed_service_info_is_a_sanitized_retryable_failure(info):
     assert result.error.code is ErrorCode.discovery_failed
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_unusable_txt_properties_degrade_to_no_evidence_rather_than_failing():
     """A non-mapping ``properties`` is not evidence, and not a crash either.
 
@@ -1213,7 +1219,7 @@ async def test_unusable_txt_properties_degrade_to_no_evidence_rather_than_failin
     assert dict(result.value.txt) == {}
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_resolve_after_close_never_resurrects_a_backend():
     """Closing is final: a later resolve must not reopen discovery resources.
 
@@ -1250,7 +1256,7 @@ async def test_resolve_after_close_never_resurrects_a_backend():
     assert created == [], "a closed client must not acquire a backend"
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_the_backend_receives_a_millisecond_resolve_budget():
     """The dependency documents milliseconds; the adapter's budget is seconds.
 
@@ -1277,7 +1283,7 @@ async def test_the_backend_receives_a_millisecond_resolve_budget():
     assert seen == [2000], f"a 2-second budget must reach the backend as 2000 ms, got {seen}"
 
 
-@pytest.mark.asyncio
+@run_async
 async def test_a_sub_millisecond_budget_never_becomes_zero():
     seen: list[Any] = []
 
@@ -1295,3 +1301,452 @@ async def test_a_sub_millisecond_budget_never_becomes_zero():
     mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
     await mdns.resolve("Living Room._airplay._tcp.local.")
     assert seen == [1], seen
+
+
+# --- the installed dependency's real surface --------------------------------
+#
+# The adapter's calls are only correct if they bind to the signatures the
+# installed ``zeroconf`` actually has. The recorded surface for 0.151.5 is:
+#
+#   AsyncZeroconf()                                        -> no required args
+#   AsyncZeroconf.async_get_service_info(self, type_: str, name: str,
+#                                        timeout: int = 3000,
+#                                        question_type=None) -> AsyncServiceInfo | None
+#       ``timeout`` is in **milliseconds** (the default is 3000 ms), so
+#       ``_backend_timeout`` converts the adapter's seconds budget.
+#   AsyncServiceBrowser(zeroconf, type_, handlers=None, listener=None,
+#                       addr=None, port=5353, delay=10000, question_type=None)
+#       construction registers the listener synchronously; the object is not
+#       awaitable.
+#   AsyncServiceBrowser.async_cancel(self) -> None          (coroutine, not idempotent)
+#   AsyncZeroconf.async_close(self) -> None                 (coroutine)
+#   ServiceInfo.name/type/server/port/properties            -> attributes
+#   ServiceInfo.addresses                                   -> attribute, IPv4 bytes only
+#   ServiceInfo.parsed_scoped_addresses()/parsed_addresses() -> methods, list[str]
+#
+# ``AsyncServiceBrowser`` has no public "scan now" member: its only public
+# surface is async_update_records/async_update_records_complete/done/
+# query_scheduler/service_state_changed/types/update_record/zc.
+
+
+class _CacheOnlyZeroconf:
+    """A Zeroconf-shaped backend with the genuine cache and no sockets.
+
+    Only the members the installed ``AsyncServiceBrowser`` and
+    ``ServiceInfo.async_request`` really call are provided, and the lookup
+    itself is bound to the genuine ``Zeroconf.async_get_service_info`` so the
+    dependency's own arity, positional order, and millisecond deadline are the
+    ones under test.
+
+    ``async_remove_listener`` reproduces the installed ``RecordManager``
+    behaviour: detaching a listener that is already gone raises ``KeyError``.
+    """
+
+    #: The genuine implementation performs the lookup.
+    async_get_service_info = zeroconf.Zeroconf.async_get_service_info
+
+    def __init__(self, loop: Any) -> None:
+        self.cache = zeroconf.DNSCache()
+        self.loop = loop
+        self.started = True
+        self.done = False
+        self.listeners: list[Any] = []
+
+    def async_add_listener(self, listener: Any, question: Any = None) -> None:
+        self.listeners.append(listener)
+
+    def async_remove_listener(self, listener: Any) -> None:
+        self.listeners.remove(listener)
+
+    def async_send(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def async_wait_for_start(self, timeout: float = 9) -> None:
+        return None
+
+
+def _recording_backend(backend_zeroconf: Any) -> Any:
+    """An ``AsyncZeroconf``-shaped seam that records the calls the adapter makes."""
+
+    class Backend:
+        def __init__(self) -> None:
+            self.zeroconf = backend_zeroconf
+            self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls.append((args, kwargs))
+            return await backend_zeroconf.async_get_service_info(*args, **kwargs)
+
+        async def async_close(self) -> None:
+            return None
+
+    return Backend()
+
+
+def _real_service_info(**overrides: Any) -> Any:
+    """A genuine ``zeroconf.ServiceInfo``; no socket is involved in building one."""
+    arguments: dict[str, Any] = {
+        "type_": AIRPLAY_SERVICE,
+        "name": "Living Room._airplay._tcp.local.",
+        "addresses": [bytes([192, 0, 2, 10])],
+        "port": 7000,
+        "properties": {b"deviceid": b"AABBCCDDEEFF", b"model": b"AppleTV6,2"},
+        "server": "living-room.local.",
+    }
+    arguments.update(overrides)
+    return zeroconf.ServiceInfo(**arguments)
+
+
+@run_async
+async def test_every_call_into_zeroconf_binds_to_the_installed_signature():
+    """Bind each call the adapter makes to the genuine signature.
+
+    ``inspect.signature(...).bind`` raises ``TypeError`` for a wrong arity, so a
+    dependency mismatch fails here instead of only against a live network.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+
+    # ``_default_factory`` constructs AsyncZeroconf with no arguments.
+    inspect.signature(aio.AsyncZeroconf).bind()
+
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+    key = "Living Room._airplay._tcp.local."
+    mdns._types[key] = AIRPLAY_SERVICE
+    # An empty cache cannot answer, and this backend has no transport to query
+    # through, so the call shape is observed without any network.
+    assert isinstance(await mdns.resolve(key), Err)
+
+    ((args, kwargs),) = backend.calls
+    bound = inspect.signature(aio.AsyncZeroconf.async_get_service_info).bind(
+        backend, *args, **kwargs,
+    )
+    assert bound.arguments["type_"] == AIRPLAY_SERVICE
+    assert bound.arguments["name"] == key
+    # The dependency documents milliseconds; a 2-second budget is 2000 of them.
+    assert bound.arguments["timeout"] == 2000
+    assert inspect.signature(
+        aio.AsyncZeroconf.async_get_service_info,
+    ).parameters["timeout"].default == 3000
+
+    handler = _Notification(lambda change: None, AIRPLAY_SERVICE)
+    inspect.signature(aio.AsyncServiceBrowser.__init__).bind(
+        object(), backend_zeroconf, AIRPLAY_SERVICE, handlers=[handler],
+    )
+    assert inspect.iscoroutinefunction(aio.AsyncServiceBrowser.async_cancel)
+    inspect.signature(aio.AsyncServiceBrowser.async_cancel).bind(object())
+    assert inspect.iscoroutinefunction(aio.AsyncZeroconf.async_close)
+    inspect.signature(aio.AsyncZeroconf.async_close).bind(object())
+    await mdns.close()
+
+
+@run_async
+async def test_the_service_info_shapes_raw_reads_are_the_installed_ones():
+    """``_raw`` reads three address views and properties; bind them all."""
+    pytest.importorskip("zeroconf.asyncio")
+    info = _real_service_info()
+
+    # Scalar fields are attributes, so ``_raw`` must not call them.
+    for attribute in ("name", "type", "server", "port", "properties"):
+        assert not callable(getattr(info, attribute)), attribute
+    # ``addresses`` is an attribute holding IPv4 bytes; the parsed views are
+    # methods. ``_raw`` decides with ``callable``, which is exactly this split.
+    assert not callable(info.addresses)
+    assert [bytes(item) for item in info.addresses] == [bytes([192, 0, 2, 10])]
+    for method in ("parsed_scoped_addresses", "parsed_addresses"):
+        assert callable(getattr(info, method)), method
+        assert getattr(info, method)() == ["192.0.2.10"]
+
+    raw = _raw(info)
+    assert raw.addresses == (bytes([192, 0, 2, 10]), "192.0.2.10")
+    assert raw.txt == {b"deviceid": b"AABBCCDDEEFF", b"model": b"AppleTV6,2"}
+
+    # An unresolved AsyncServiceInfo carries no server or port; refusing it is
+    # what keeps a lookup race from fabricating a receiver.
+    unresolved = aio_unresolved()
+    assert unresolved.server is None and unresolved.port is None
+    with pytest.raises(TypeError):
+        _raw(unresolved)
+
+
+@run_async
+async def test_a_genuine_cache_lookup_becomes_a_domain_record():
+    """Drive the installed lookup end to end, over a socket-free cache."""
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    info = _real_service_info()
+    backend_zeroconf.cache.async_add_records(
+        [info.dns_service(), info.dns_text(), *info.dns_addresses()],
+    )
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(4.0), factory=lambda: backend)
+    mdns._types[info.name] = AIRPLAY_SERVICE
+
+    result = await mdns.resolve(info.name)
+    assert isinstance(result, Ok), result
+    record = result.value
+    assert (record.device_id, record.model) == ("AABBCCDDEEFF", "AppleTV6,2")
+    assert record.addresses == ("192.0.2.10",)
+    assert (record.host, record.port) == ("living-room.local.", 7000)
+    assert record.seen_at == 4.0
+    await mdns.close()
+
+
+@run_async
+async def test_the_installed_browser_delivers_every_state_to_the_adapter_handler():
+    """Construct the genuine browser and drive its real notification dispatch."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    key = "Living Room._airplay._tcp.local."
+    seen: list[ServiceChange] = []
+    browser = aio.AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE, handlers=[_Notification(seen.append, AIRPLAY_SERVICE)],
+    )
+    assert browser in backend_zeroconf.listeners
+    # Construction starts the browser inline; nothing else needs awaiting.
+    assert not inspect.isawaitable(browser)
+
+    # ``async_update_records`` + ``async_update_records_complete`` are the public
+    # path real traffic takes, delivering added and removed.
+    now = time.time() * 1000
+    fresh = zeroconf.DNSPointer(
+        AIRPLAY_SERVICE, zeroconf.const._TYPE_PTR, zeroconf.const._CLASS_IN, 4500, key,
+    )
+    expired = zeroconf.DNSPointer(
+        AIRPLAY_SERVICE, zeroconf.const._TYPE_PTR, zeroconf.const._CLASS_IN, 4500, key, 0,
+    )
+    for update, expected in (
+        (zeroconf.RecordUpdate(fresh), "added"),
+        (zeroconf.RecordUpdate(expired, fresh), "removed"),
+    ):
+        seen.clear()
+        browser.async_update_records(backend_zeroconf, now, [update])
+        browser.async_update_records_complete()
+        assert [(change.key, change.state) for change in seen] == [(key, expected)]
+
+    # ``updated`` reaches handlers through the same dispatcher the browser calls
+    # once the cache has committed a batch; a genuine Updated needs a cache
+    # dance, so the dispatcher is driven directly.
+    seen.clear()
+    browser._fire_service_state_changed_event(
+        ((key, AIRPLAY_SERVICE), zeroconf.ServiceStateChange.Updated),
+    )
+    assert [(change.key, change.state) for change in seen] == [(key, "updated")]
+    assert {change.service_type for change in seen} == {AIRPLAY_SERVICE}
+
+    await browser.async_cancel()
+    assert browser.done and backend_zeroconf.listeners == []
+
+
+@run_async
+async def test_the_installed_browser_exposes_no_scan_or_refresh_entry_point():
+    """``refresh`` must not invent one; the installed surface has no such member."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    public = {name for name in dir(aio.AsyncServiceBrowser) if not name.startswith("_")}
+    assert public == {
+        "async_cancel",
+        "async_update_records",
+        "async_update_records_complete",
+        "done",
+        "query_scheduler",
+        "service_state_changed",
+        "types",
+        "update_record",
+        "zc",
+    }, sorted(public)
+    # Nothing on the browser asks the network to re-scan; ``refresh`` therefore
+    # re-resolves known keys instead of calling an invented member.
+    assert {name for name in public if any(
+        word in name.lower() for word in ("scan", "refresh", "requery", "resend")
+    )} == set()
+
+
+@run_async
+async def test_closing_a_subscription_after_the_client_never_leaks_a_cancel_failure():
+    """A stale browser handle must not re-cancel a browser the client released.
+
+    The installed ``_async_cancel`` is not idempotent: it detaches the browser
+    from the record manager, which raises ``KeyError`` once it is already gone.
+    ``Subscription.close`` is synchronous, so its cancel runs as a scheduled
+    task, and an exception there is never retrieved -- the event loop reports an
+    unhandled task exception for work nobody can act on.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        backend_zeroconf = _CacheOnlyZeroconf(loop)
+        backend = _recording_backend(backend_zeroconf)
+        mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+        result = await mdns.browse((AIRPLAY_SERVICE,), lambda change: None)
+        assert isinstance(result, Ok), result
+        subscription = result.value
+        await mdns.close()
+        # The client already cancelled every browser it started.
+        assert backend_zeroconf.listeners == []
+        subscription.close()
+        await settle()
+        gc.collect()
+        await settle()
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == [], reported
+
+
+@run_async
+async def test_a_browser_cancelled_by_its_subscription_is_cancelled_once():
+    """The handle's own cancel still runs when the client has not released it."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+    result = await mdns.browse((AIRPLAY_SERVICE,), lambda change: None)
+    assert isinstance(result, Ok), result
+    browser = mdns._browsers[0]
+    result.value.close()
+    await settle()
+    assert browser.done and backend_zeroconf.listeners == []
+    # The client no longer holds the handle, so its own close has nothing to do.
+    await mdns.close()
+    assert backend_zeroconf.listeners == []
+
+
+@run_async
+async def test_a_stale_handle_does_not_re_cancel_a_released_browser():
+    """The handle asks the dependency whether the browser is already released.
+
+    ``Subscription.close`` is synchronous, so a re-cancel it schedules is a task
+    nobody awaits; the installed browser raises on that path. The ``done`` flag
+    is the dependency's own answer, so a released browser is never touched again
+    -- asserted here on a double shaped from the installed attributes without
+    relying on the exception being swallowed downstream.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+
+    class ReleasedBrowser:
+        """The installed browser's released state: ``done`` is already set."""
+
+        done = True
+
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        async def async_cancel(self) -> None:
+            self.cancelled += 1
+
+    browser = ReleasedBrowser()
+    detach = AzcMdnsClient(FakeClock(), factory=lambda: object())._detach
+    handle = _Browsers([browser], {}, detach)
+    handle.close()
+    await settle()
+    assert browser.cancelled == 0, "an already released browser must not be cancelled again"
+    # The installed browser really does carry ``done`` and really does raise when
+    # cancelled after release, so the guard reads a real attribute, not a guess.
+    genuine = aio.AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE, handlers=[_Notification(lambda change: None, AIRPLAY_SERVICE)],
+    )
+    assert genuine.done is False
+    await genuine.async_cancel()
+    assert genuine.done is True
+    with pytest.raises(Exception):
+        await genuine.async_cancel()
+
+
+@run_async
+async def test_a_scheduled_cancel_that_raises_is_retrieved_not_left_unhandled():
+    """A cancel that fails after scheduling must not reach the event loop.
+
+    Nothing awaits the task ``Subscription.close`` schedules, so an unretrieved
+    exception is reported as an unhandled task failure. The callback retrieves
+    it, exactly as the awaited path drops it.
+    """
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        class FailingBrowser:
+            # ``done`` is False, so the guard lets the cancel through and the
+            # failure is what the callback has to retrieve.
+            done = False
+
+            async def async_cancel(self) -> None:
+                raise RuntimeError("release failed")
+
+        detach = AzcMdnsClient(FakeClock(), factory=lambda: object())._detach
+        handle = _Browsers([FailingBrowser()], {}, detach)
+        handle.close()
+        await settle()
+        gc.collect()
+        await settle()
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == [], reported
+
+
+@run_async
+async def test_the_client_does_not_re_cancel_a_browser_its_handle_already_released():
+    """The awaited cancel path reads the same ``done`` flag as the scheduled one.
+
+    A handle that released a browser without the client noticing leaves a
+    cancelled browser in ``_browsers``. Asking the installed dependency to
+    cancel it again raises, and ``close`` would swallow that into silence, so the
+    flag is checked before the dependency is called at all.
+    """
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+
+    class ReleasedBrowser:
+        """Shaped from the installed browser: an ``async_cancel()`` coroutine."""
+
+        done = True
+
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        async def async_cancel(self) -> None:
+            self.cancelled += 1
+
+    released = ReleasedBrowser()
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: object())
+    mdns._browsers.append(released)
+    await mdns.close()
+    assert released.cancelled == 0, "a released browser must not be cancelled again"
+    assert mdns._browsers == []
+
+    # The flag the guard reads is the installed browser's own, and it is set by
+    # a real cancel -- so this is not a guessed attribute.
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    genuine = _genuine_browser(backend_zeroconf)
+    assert genuine.done is False
+    released_genuine = _genuine_browser(backend_zeroconf)
+    await released_genuine.async_cancel()
+    assert released_genuine.done is True
+    await genuine.async_cancel()
+
+
+def aio_unresolved() -> Any:
+    """A genuine, never-populated ``AsyncServiceInfo``."""
+    from zeroconf.asyncio import AsyncServiceInfo
+
+    return AsyncServiceInfo(AIRPLAY_SERVICE, "Nobody._airplay._tcp.local.")
+
+
+def _genuine_browser(backend_zeroconf: Any) -> Any:
+    """A genuine ``AsyncServiceBrowser`` over the socket-free backend."""
+    from zeroconf.asyncio import AsyncServiceBrowser
+
+    return AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE,
+        handlers=[_Notification(lambda change: None, AIRPLAY_SERVICE)],
+    )
