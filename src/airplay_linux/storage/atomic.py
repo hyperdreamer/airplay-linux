@@ -130,6 +130,10 @@ class PosixFilesystem:
         """
         return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
 
+    def can_create_entries(self, path: Path) -> bool:
+        """Whether this user can add entries, independently of directory readability."""
+        return os.access(path, os.W_OK | os.X_OK, effective_ids=True)
+
     def make_root(self, path: Path) -> None:
         """Create the root directory, private regardless of the caller's umask."""
         os.mkdir(path, PRIVATE_DIRECTORY_MODE)
@@ -269,6 +273,9 @@ class AtomicFiles:
     def __init__(self, root: Path, filesystem: PosixFilesystem | None = None) -> None:
         self._filesystem = PosixFilesystem() if filesystem is None else filesystem
         self._root = Path(os.path.abspath(Path(root)))
+        # These parents remain required after failed creation/publication. This
+        # is creation intent, never a cache of successful durability evidence.
+        self._creation_parents: set[Path] = set()
         #: Device/inode of the verified root, pinned so a replacement is noticed.
         #: Pinned at construction when the root already exists: an instance that
         #: has not yet touched the filesystem would otherwise accept a root
@@ -458,7 +465,7 @@ class AtomicFiles:
         self._ensure_private(descriptor, info)
 
     def _create_root(self) -> None:
-        """Create the root, and any missing ancestor, without following links.
+        """Create a real root, allowing configured links strictly above it.
 
         Durability is not claimed here: the caller confirms every entry this
         creation added -- the root's parent and any ancestor created on the way --
@@ -471,14 +478,20 @@ class AtomicFiles:
         while True:
             existing = self._status_path(current)
             if existing is not None:
-                if S_ISLNK(existing.st_mode) or not S_ISDIR(existing.st_mode):
+                if current == self._root:
+                    if S_ISLNK(existing.st_mode) or not S_ISDIR(existing.st_mode):
+                        raise StorageError(PATH_STEP)
+                elif not (S_ISDIR(existing.st_mode) or S_ISLNK(existing.st_mode)):
                     raise StorageError(PATH_STEP)
+                # Links above the root are configuration, not the boundary. The
+                # eventual O_NOFOLLOW root open still verifies the real root.
                 break
             missing.append(current)
             if current == current.parent:
                 raise StorageError("directory")
             current = current.parent
         for path in reversed(missing):
+            self._creation_parents.add(path.parent)
             try:
                 self._filesystem.make_root(path)
             except FileExistsError:
@@ -548,34 +561,42 @@ class AtomicFiles:
         child directory safe: its own sync says nothing about the entry naming it,
         which lives one level further out and is synced afterwards.
 
-        The climb above the root's parent stops at the first directory this
-        process cannot open. That stop is sound rather than lazy: every directory
-        this package creates is ``0700`` (and every pre-existing one it reuses is
-        tightened to ``0700`` first), so a directory this package created is
-        always one this process can open. An unopenable ancestor therefore cannot
-        hold an entry of ours, and neither can anything above it.
+        The root's parent and every known creation parent are mandatory, even
+        when they cannot be opened. On a fresh instance, ancestors where this
+        user can create entries are conservatively mandatory too: write/search
+        permission permits mkdir even without read permission (mode ``0300``).
+        Readability therefore never decides whether those entries need syncing.
+        A traversal-only ancestor that cannot contain a creation by this user
+        may be skipped, but cannot end confirmation of higher required parents.
+        No ancestor's permissions are changed.
         """
         for descriptor in reversed(located.directories):
             self._fsync(descriptor)
         current = self._root.parent
-        while current != current.parent:
-            descriptor = self._open_ancestor(current)
-            if descriptor is None:
+        while True:
+            required = (
+                current == self._root.parent
+                or current in self._creation_parents
+                or self._filesystem.can_create_entries(current)
+            )
+            descriptor = self._open_ancestor(current, required=required)
+            if descriptor is not None:
+                try:
+                    self._fsync(descriptor)
+                finally:
+                    self._close_quietly(descriptor)
+            if current == current.parent:
                 break
-            try:
-                self._fsync(descriptor)
-            finally:
-                self._close_quietly(descriptor)
             current = current.parent
 
-    def _open_ancestor(self, path: Path) -> int | None:
-        """Open an ancestor for syncing, or ``None`` when it cannot be ours."""
+    def _open_ancestor(self, path: Path, *, required: bool) -> int | None:
+        """Only an unrelated traversal-only ancestor may lack read permission."""
         try:
             return self._filesystem.open_ancestor(path)
         except OSError as error:
-            if error.errno in {errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR}:
+            if not required and error.errno in {errno.EACCES, errno.EPERM}:
                 return None
-            raise StorageError(_open_step(error)) from None
+            raise StorageError("directory_fsync") from None
 
     # ---------------------------------------------------------------- helpers
 

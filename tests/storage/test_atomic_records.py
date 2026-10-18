@@ -491,6 +491,177 @@ class DirectoryTrace(PosixFilesystem):
         super().fsync_directory(descriptor)
 
 
+def test_a_write_only_parent_never_confirms_first_publication_or_either_retry(
+    tmp_path: Path,
+):
+    # mkdir needs write/search, not read permission. This real parent permits the
+    # record tree to be created but cannot be opened O_RDONLY for its fsync.
+    parent = tmp_path / "write-only"
+    parent.mkdir(mode=0o700)
+    root = parent / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    os.chmod(parent, 0o300)
+    try:
+        with pytest.raises(PermissionError):
+            PosixFilesystem().open_ancestor(parent)
+        outcomes = []
+        for fresh_instance in (False, False, True):
+            attempt = files_at(root, trace) if fresh_instance else files
+            try:
+                attempt.write("ownership/one.json", b"reservation")
+            except StorageError as error:
+                outcomes.append(error.step)
+            else:
+                outcomes.append("success")
+        assert outcomes == ["directory_fsync"] * 3
+        assert trace.counts(parent) == 0
+        assert mode_of(parent) == 0o300
+
+        os.chmod(parent, 0o700)
+        files_at(root, trace).write("ownership/one.json", b"reservation")
+        assert trace.counts(parent) == 1
+        assert files.read("ownership/one.json") == b"reservation"
+    finally:
+        os.chmod(parent, 0o700)
+
+
+@pytest.mark.parametrize("fresh_instance", [False, True], ids=["same", "fresh"])
+def test_a_failed_parent_fsync_cannot_be_bypassed_by_removing_read_permission(
+    tmp_path: Path, fresh_instance: bool,
+):
+    parent = tmp_path / "write-only"
+    parent.mkdir(mode=0o700)
+    root = parent / "state"
+    trace = DirectoryTrace()
+    trace.fail_at(parent)
+    files = files_at(root, trace)
+    with pytest.raises(StorageError) as failed:
+        files.write("ownership/one.json", b"reservation")
+    assert failed.value.step == "directory_fsync"
+    assert files.read("ownership/one.json") == b"reservation"
+
+    os.chmod(parent, 0o300)
+    try:
+        retry = files_at(root, trace) if fresh_instance else files
+        with pytest.raises(StorageError) as retried:
+            retry.write("ownership/one.json", b"reservation")
+        assert retried.value.step == "directory_fsync"
+        assert trace.counts(parent) == 0
+        assert mode_of(parent) == 0o300
+
+        # Restoring readability alone cannot heal the original fsync failure.
+        os.chmod(parent, 0o700)
+        with pytest.raises(StorageError) as still_failed:
+            retry.write("ownership/one.json", b"reservation")
+        assert still_failed.value.step == "directory_fsync"
+        trace.heal()
+        retry.write("ownership/one.json", b"reservation")
+        assert trace.counts(parent) == 1
+    finally:
+        os.chmod(parent, 0o700)
+
+
+def test_a_reservation_store_reports_a_write_only_parent_as_persistence_failed(
+    tmp_path: Path,
+):
+    parent = tmp_path / "write-only"
+    parent.mkdir(mode=0o700)
+    root = parent / "state"
+    store = JsonOwnershipStore(files_at(root))
+    reserved = ownership(
+        stage="reserved", helper=None, connector=None, output_id=None,
+        observed_size=None,
+    )
+    os.chmod(parent, 0o300)
+    try:
+        result = run(store.write(reserved))
+        assert isinstance(result, Err)
+        assert result.error.code == ErrorCode.persistence_failed
+        assert result.error.detail == "directory_fsync"
+        assert mode_of(parent) == 0o300
+    finally:
+        os.chmod(parent, 0o700)
+
+
+@pytest.mark.parametrize("prior_fsync_failure", [False, True], ids=["first", "failed-fsync"])
+def test_deep_creation_requires_the_parent_of_the_outermost_created_entry(
+    tmp_path: Path, prior_fsync_failure: bool,
+):
+    parent = tmp_path / "write-only"
+    parent.mkdir(mode=0o700)
+    root = parent / "new-state-home" / "nested" / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    if prior_fsync_failure:
+        trace.fail_at(parent)
+        with pytest.raises(StorageError) as failed:
+            files.write("ownership/one.json", b"reservation")
+        assert failed.value.step == "directory_fsync"
+    os.chmod(parent, 0o300)
+    try:
+        outcomes = []
+        for fresh_instance in (False, False, True):
+            attempt = files_at(root, trace) if fresh_instance else files
+            try:
+                attempt.write("ownership/one.json", b"reservation")
+            except StorageError as error:
+                outcomes.append(error.step)
+            else:
+                outcomes.append("success")
+        assert outcomes == ["directory_fsync"] * 3
+        assert trace.counts(parent) == 0
+        assert mode_of(parent) == 0o300
+
+        os.chmod(parent, 0o700)
+        trace.heal()
+        files_at(root, trace).write("ownership/one.json", b"reservation")
+        assert trace.counts(parent) == 1
+    finally:
+        os.chmod(parent, 0o700)
+
+
+def test_a_known_creation_parent_stays_required_after_write_permission_is_lost(
+    tmp_path: Path,
+):
+    parent = tmp_path / "creation-parent"
+    parent.mkdir(mode=0o700)
+    root = parent / "new-state-home" / "state"
+    trace = DirectoryTrace()
+    trace.fail_at(parent)
+    files = files_at(root, trace)
+    with pytest.raises(StorageError) as failed:
+        files.write("ownership/one.json", b"reservation")
+    assert failed.value.step == "directory_fsync"
+    os.chmod(parent, 0o100)
+    try:
+        with pytest.raises(StorageError) as retried:
+            files.write("ownership/one.json", b"reservation")
+        assert retried.value.step == "directory_fsync"
+        assert mode_of(parent) == 0o100
+    finally:
+        os.chmod(parent, 0o700)
+
+
+def test_a_traversal_only_unrelated_ancestor_is_not_required_or_chmodded(
+    tmp_path: Path,
+):
+    outer = tmp_path / "traversal-only"
+    inner = outer / "configured-state"
+    inner.mkdir(parents=True)
+    os.chmod(inner, 0o755)
+    os.chmod(outer, 0o100)
+    try:
+        with pytest.raises(PermissionError):
+            PosixFilesystem().open_ancestor(outer)
+        root = inner / "state"
+        files_at(root).write("sessions/one.json", b"payload")
+        assert files_at(root).read("sessions/one.json") == b"payload"
+        assert mode_of(outer) == 0o100
+    finally:
+        os.chmod(outer, 0o700)
+
+
 def test_a_second_publication_syncs_the_directory_it_changed_again(tmp_path: Path):
     # A directory fsync proves durability of the entries present at that moment,
     # not of a rename that happens later. The second write changes the same
@@ -731,6 +902,27 @@ def test_a_record_path_cannot_leave_the_private_root(tmp_path: Path, relative: s
         files.write(relative, b"payload")
     assert raised.value.step == "path"
     assert list(tmp_path.rglob("*.json")) == []
+
+
+@pytest.mark.parametrize("existing_root", [False, True], ids=["fresh", "existing"])
+def test_a_symlinked_state_home_supports_application_root_publication(
+    tmp_path: Path, existing_root: bool,
+):
+    real = tmp_path / "real-state"
+    real.mkdir(mode=0o750)
+    link = tmp_path / "configured-state"
+    link.symlink_to(real, target_is_directory=True)
+    root = state_root({"XDG_STATE_HOME": str(link)})
+    if existing_root:
+        (real / "airplay-linux").mkdir(mode=0o700)
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    files.write("sessions/one.json", b"payload")
+    assert files.read("sessions/one.json") == b"payload"
+    assert (real / "airplay-linux/sessions/one.json").read_bytes() == b"payload"
+    assert trace.counts(real) >= 1
+    assert link.is_symlink()
+    assert mode_of(real) == 0o750
 
 
 def test_a_symlinked_application_root_is_refused(tmp_path: Path):
