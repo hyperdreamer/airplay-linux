@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "provenance": "captured-advertisement-fixture",
+  "note": "AsyncZeroconf-shaped raw advertisements. Every TXT value and every address is base64 of the raw bytes, so a value that is not valid UTF-8, or one padded with NUL, survives the fixture verbatim instead of being replaced. 'browsed_type' is the browser that reported the instance, which is how one physical receiver is advertised twice -- once per service type.",
+  "services": [
+    {
+      "browsed_type": "_airplay._tcp.local.",
+      "properties": {
+        "name": "Living Room._airplay._tcp.local.",
+        "type": "_airplay._tcp.local.",
+        "type_enum": 65536,
+        "server": "Living-Room.local.",
+        "port": 7000,
+        "addresses": [
+          "wAACDA=="
+        ],
+        "weight": 0,
+        "priority": 0,
+        "txt": {
+          "deviceid": "QUFCQkNDRERFRUZG",
+          "model": "QXBwbGVUVjYsMg==",
+          "features": "MHg1QTdGRkZGNywweDFF",
+          "pk": "QkVEUk9PTS1QVUJMSUMtS0VZ",
+          "flags": "MHg0",
+          "srcvers": "MjIwLjY4"
+        }
+      }
+    },
+    {
+      "browsed_type": "_raop._tcp.local.",
+      "properties": {
+        "name": "AABBCCDDEEFF@Living Room._raop._tcp.local.",
+        "type": "_raop._tcp.local.",
+        "type_enum": 65537,
+        "server": "Living-Room.local.",
+        "port": 5000,
+        "addresses": [
+          "wAACDA=="
+        ],
+        "weight": 0,
+        "priority": 0,
+        "txt": {
+          "deviceid": "QUE6QkI6Q0M6REQ6RUU6RkY=",
+          "am": "QXBwbGVUVjYsMgA=",
+          "features": "MHg1QTdGRkZGNywweDFF",
+          "sf": "MHgw",
+          "vs": "MjIwLjY4"
+        }
+      }
+    },
+    {
+      "browsed_type": "_airplay._tcp.local.",
+      "properties": {
+        "name": "Kitchen Speaker._airplay._tcp.local.",
+        "type": "_airplay._tcp.local.",
+        "type_enum": 65536,
+        "server": "kitchen.local.",
+        "port": 7001,
+        "addresses": [
+          "wAACCw=="
+        ],
+        "weight": 0,
+        "priority": 0,
+        "txt": {
+          "md": "S2l0Y2hlbiBTcGVha2VyAAAA",
+          "features": "//4=",
+          "flags": "MHgw",
+          "model": "QXVkaW9BY2Nlc3Nvcnk1LDE="
+        }
+      }
+    }
+  ]
+}
