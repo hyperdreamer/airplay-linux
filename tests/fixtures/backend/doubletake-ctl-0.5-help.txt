@@ -1,0 +1,14 @@
+Usage: doubletake-ctl [-socket path] <command> [args]
+
+Commands:
+  status                              Show daemon state and all active streams
+  discover                            Discover AirPlay devices on the network
+  devices                             List cached discovered devices
+  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)
+  pin <PIN-or-password>               Submit pairing credentials for a waiting device
+  disconnect [target]                 Stop mirroring (all streams, or only the given IP)
+  mute [target]                       Mute mirrored audio (all streams, or only the given IP)
+  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)
+
+Flags:
+  -socket path                        Override daemon socket path (default: /run/user/1000/doubletake.sock)
