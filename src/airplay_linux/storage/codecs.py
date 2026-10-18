@@ -115,8 +115,9 @@ class RecordError(Exception):
 
     ``reason`` is one of a closed set of source-written tokens: ``malformed_json``,
     ``not_an_object``, ``unknown_schema``, ``unknown_version``, ``unknown_field``,
-    ``missing_field``, or ``invalid_value``. It never carries the offending value,
-    so a quarantined record's diagnostics cannot echo what corrupted it.
+    ``missing_field``, ``invalid_value``, or ``unsupported_credential_ref``. It
+    never carries the offending value, so a quarantined record's diagnostics
+    cannot echo what corrupted it.
     """
 
     def __init__(self, reason: str) -> None:
@@ -183,7 +184,14 @@ def _integer(value: object, *, low: int = 0, high: int = 2**63 - 1) -> int:
 def _number(value: object) -> float:
     if type(value) not in (int, float):
         _invalid()
-    number = float(value)
+    try:
+        # A JSON integer is unbounded, so ``10**400`` is a perfectly legal
+        # document that floats cannot represent. That is a rejected value, not an
+        # exception escaping the codec: one out-of-range number must quarantine
+        # its own record instead of aborting a whole load.
+        number = float(value)
+    except (OverflowError, ValueError, TypeError):
+        _invalid()
     if not math.isfinite(number):
         _invalid()
     return number
@@ -898,22 +906,34 @@ _RECEIVER_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
 def encode_receiver(saved: SavedReceiver) -> bytes:
     """Non-secret receiver preferences, including the remembered resolution.
 
-    ``credential_ref`` is deliberately *not* written. The reference is opaque by
-    construction -- the frozen DTO exposes no readable form and refuses
-    serialization -- and it is a keyring handle rather than a preference. The
-    ``CredentialStore`` port resolves it by receiver identity
-    (``load_credential_ref(receiver_id)``), so a durable copy would be a second
-    source of truth for state the backend already owns.
+    ``credential_ref`` is *not* representable in version 1 of this record, and a
+    saved receiver that holds one is refused rather than silently stripped.
+
+    This is a recorded interface conflict, not a design choice: the brief requires
+    persisting an opaque committed keyring reference identifier, while the frozen
+    ``OpaqueCredentialRef`` exposes no readable or serializable form (its
+    ``__getstate__``/``__reduce__`` raise, and only ``SensitiveText`` may be
+    revealed, at the backend boundary). The two supported resolutions are for the
+    owning interface to publish a persistence representation for a *committed*
+    reference only, or for the record schema to keep resolving the reference
+    through ``CredentialStore.load_credential_ref``. Until one is chosen, dropping
+    the field would lose required non-secret metadata while reporting success, so
+    the write fails closed instead. Provisional references, backend tokens, and
+    secret contents are never written under any resolution.
     """
     if not isinstance(saved, SavedReceiver):
         _invalid()
     if is_ambiguous_identity(saved.receiver_id):
         _invalid()
+    if saved.credential_ref is not None:
+        raise RecordError("unsupported_credential_ref")
     return _dump_document(RECEIVER_SCHEMA, _fields_of(saved, _RECEIVER_FIELDS))
 
 
 def decode_receiver(payload: bytes) -> SavedReceiver:
     values = _load_document(payload, RECEIVER_SCHEMA, _RECEIVER_FIELDS)
+    # Version 1 has no field for a committed reference, and a decoder may not
+    # invent one. A record therefore never claims a reference it cannot hold.
     values["credential_ref"] = None
     return _construct(SavedReceiver, values)  # type: ignore[return-value]
 

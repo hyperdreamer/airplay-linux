@@ -129,7 +129,17 @@ class JsonSessionStore:
     async def load_all(self) -> tuple[SessionSnapshot, ...]:
         self._quarantine = []
         loaded: list[SessionSnapshot] = []
-        for name in self._files.names(SESSION_DIRECTORY):
+        try:
+            names = self._files.names(SESSION_DIRECTORY)
+        except StorageError as error:
+            # Enumerating the session directory failed, so the set of sessions is
+            # *unknown*, not empty. The frozen contract returns a tuple, so the
+            # failure is surfaced through the quarantine list rather than by
+            # raising: one unreachable directory must not make a storage failure
+            # escape session recovery.
+            self._quarantine.append(_with_reason(error.step))
+            return ()
+        for name in names:
             if not name.endswith(SUFFIX):
                 continue
             try:

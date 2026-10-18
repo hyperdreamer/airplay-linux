@@ -203,13 +203,42 @@ def test_a_session_holding_a_restore_token_and_lease_writes_neither():
     assert b"DP-1" in payload
 
 
-def test_a_receiver_holding_a_credential_reference_writes_no_reference():
-    payload = encode_receiver(saved_receiver())
+def test_a_receiver_holding_provisional_credentials_writes_no_secret():
+    """A saved receiver may never be persisted with a credential reference.
+
+    Version 1 has no representation for a committed reference (a recorded
+    interface conflict), so the write is refused rather than silently dropping
+    required non-secret metadata. What matters for this module's boundary is that
+    the refusal is a fixed token: no reference value, provisional or committed,
+    can reach disk, a diagnostic, or a failure's text either way.
+    """
+    payload_candidate = saved_receiver()
+    with pytest.raises(RecordError) as raised:
+        encode_receiver(payload_candidate)
+    assert raised.value.reason == "unsupported_credential_ref"
+    assert_secret_free(repr(raised.value).encode())
+    assert PROVISIONAL_CANARY not in str(raised.value)
+
+
+def test_a_receiver_without_a_credential_reference_writes_no_reference_field():
+    payload = encode_receiver(replace(saved_receiver(), credential_ref=None))
     assert_secret_free(payload)
     assert b"credential_ref" not in payload
     assert b"opaquecredentialref" not in payload.lower()
-    # The keyring owns the reference; a decoded record never claims one.
+    # Nothing is invented on the way back: a decode never claims a reference.
     assert decode_receiver(payload).credential_ref is None
+
+
+def test_a_receiver_store_refuses_a_record_holding_a_credential_reference(
+    tmp_path: Path,
+):
+    root = tmp_path / "state"
+    store = JsonReceiverStore(AtomicFiles(root=root))
+    refused = run(store.put(saved_receiver()))
+    assert refused.error.code is ErrorCode.persistence_failed
+    assert refused.error.detail == "unsupported_credential_ref"
+    assert PROVISIONAL_CANARY not in repr(refused)
+    assert list(root.rglob("*.json")) == []
 
 
 def test_an_ownership_record_writes_no_capture_or_backend_identity():
@@ -299,8 +328,8 @@ def test_a_quarantine_report_never_repeats_the_corrupt_record(tmp_path: Path):
 
 def test_a_store_failure_reports_a_fixed_step_and_never_a_path_or_record(tmp_path: Path):
     class Exploding(PosixFilesystem):
-        def write(self, path: Path, payload: bytes) -> None:
-            raise OSError(f"cannot write {path}: {PIN_CANARY}")
+        def write(self, parent: int, name: str, payload: bytes) -> None:
+            raise OSError(f"cannot write {name}: {PIN_CANARY}")
 
     store = JsonSessionStore(AtomicFiles(root=tmp_path / "state", filesystem=Exploding()))
     failed = run(store.save(source_snapshot()))
@@ -314,8 +343,8 @@ def test_a_store_failure_reports_a_fixed_step_and_never_a_path_or_record(tmp_pat
 
 def test_a_storage_error_carries_only_its_step_token(tmp_path: Path):
     class Exploding(PosixFilesystem):
-        def fsync_directory(self, directory: Path) -> None:
-            raise OSError(f"cannot fsync {directory}: {SECRET_CANARY}")
+        def fsync_directory(self, descriptor: int) -> None:
+            raise OSError(f"cannot fsync {descriptor}: {SECRET_CANARY}")
 
     files = AtomicFiles(root=tmp_path / "state", filesystem=Exploding())
     with pytest.raises(StorageError) as raised:

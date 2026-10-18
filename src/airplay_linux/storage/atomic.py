@@ -14,22 +14,44 @@ whole answer to "did this publish?", and it travels with the raised
 ``OSError`` message can quote a path or a caller value, and a storage adapter's
 failure text must not become user-visible copy.
 
-Two boundaries are enforced here rather than at each call site:
+Four boundaries are enforced here rather than at each call site, and each one is
+re-established on *every* access rather than once at construction, because a
+process can crash between any two steps and a filesystem can change under a
+long-lived process:
 
 * a record path is a *relative* path of plain components. Absolute paths,
   ``.``/``..`` components, empty components, control characters, and
   leading-dot components are refused, so nothing can name a file outside the
   private root or one of this module's own temporary artifacts.
-* nothing is ever written or read through a symbolic link. The root, every
-  directory in the chain, and the record itself are checked.
+* the root itself is part of the boundary. A symlinked application root is
+  refused, the root's device/inode identity is pinned, and every operation is
+  anchored to a directory descriptor opened with ``O_NOFOLLOW`` -- so replacing
+  the root, or a directory inside it, cannot redirect a read, a write, or a
+  delete into a directory this package does not own.
+* every directory this package creates or reuses under the root must be a real
+  directory owned by this user, and is tightened to ``0700``. A pre-existing
+  ``0755``/``0777`` record directory would let another user replace metadata.
+* a publication is not reported successful until the directory entries it
+  depends on are ``fsync``ed -- and "the directory exists" is never accepted as
+  proof that a previous attempt confirmed it. The confirmation runs after the
+  publication point and covers the whole chain down from the root's parent, so a
+  retry after any failed ``directory_fsync`` re-establishes the entries an
+  earlier, failed attempt left behind. The same rule makes deletion idempotent:
+  a delete re-``fsync``s the containing directory even when the record is
+  already gone, so a retry after a failed unlink publication establishes durable
+  *absence* rather than assuming it.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import string
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from stat import S_IMODE, S_ISDIR, S_ISLNK, S_ISREG
 from typing import Final
 
 #: Directories this package creates are private to the user.
@@ -46,7 +68,8 @@ _PATH_CHARACTERS: Final[frozenset[str]] = frozenset(
     string.ascii_letters + string.digits + "%._-~",
 )
 
-#: Fixed token for a path that is not a plain relative record path.
+#: Fixed token for a path that is not a plain relative record path, or for a
+#: directory in the chain that is not a real directory this package may use.
 PATH_STEP: Final[str] = "path"
 
 
@@ -73,13 +96,85 @@ class PosixFilesystem:
     Subclassing this is the supported way to inject a failure at exactly one
     step: the real system calls stay in place, so the test observes the true
     on-disk result of the steps that did run before the failure.
+
+    The calls *below* the root take a directory descriptor and one path
+    component. That shape is what anchors an operation: the descriptor names a
+    verified directory, so no later rename or symlink at the same path can
+    redirect the call. Only the calls at and above the root take a path, and only
+    the root itself is opened with ``O_NOFOLLOW``.
     """
 
-    def write(self, path: Path, payload: bytes) -> None:
+    # -- at and above the root -------------------------------------------------
+
+    def status_path(self, path: Path) -> os.stat_result | None:
+        """``lstat`` for a path, with confirmed absence kept apart from failure."""
+        try:
+            return os.stat(path, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def open_root(self, path: Path) -> int:
+        """Open the root directory without following a final symlink."""
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+
+    def open_ancestor(self, path: Path) -> int:
+        """Open a directory above the root, following links.
+
+        An ancestor is ordinary user configuration -- a state directory reached
+        through a linked parent -- and is not part of this package's boundary. It
+        is opened only to sync the directory entry it holds.
+        """
+        return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+    def make_root(self, path: Path) -> None:
+        """Create the root directory, private regardless of the caller's umask."""
+        os.mkdir(path, PRIVATE_DIRECTORY_MODE)
+        # ``mkdir`` applies the process umask, so the requested mode is only an
+        # upper bound: a 0o777 umask leaves the directory at 0o000, where not even
+        # its owner can open it to set the mode properly. ``chmod`` by path works
+        # because this process owns the directory it just created.
+        os.chmod(path, PRIVATE_DIRECTORY_MODE)
+
+    def close(self, descriptor: int) -> None:
+        os.close(descriptor)
+
+    # -- inside the root, anchored to a directory descriptor -------------------
+
+    def open_directory(self, parent: int, name: str) -> int:
+        return os.open(
+            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent,
+        )
+
+    def make_directory(self, parent: int, name: str) -> None:
+        os.mkdir(name, PRIVATE_DIRECTORY_MODE, dir_fd=parent)
+        # Same umask reasoning as the root; ``chmod`` needs no descriptor, so a
+        # directory created under a 0o777 umask is recoverable.
+        os.chmod(name, PRIVATE_DIRECTORY_MODE, dir_fd=parent)
+
+    def status(self, parent: int, name: str) -> os.stat_result | None:
+        """``lstat`` one entry, with confirmed absence kept apart from failure.
+
+        A failed lookup must never be reported as absence: an inaccessible
+        ownership directory would otherwise read as a successfully empty set of
+        owned resources.
+        """
+        try:
+            return os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+
+    def describe(self, descriptor: int) -> os.stat_result:
+        return os.fstat(descriptor)
+
+    def chmod_private(self, descriptor: int) -> None:
+        os.fchmod(descriptor, PRIVATE_DIRECTORY_MODE)
+
+    def write(self, parent: int, name: str, payload: bytes) -> None:
         descriptor = os.open(
-            path,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
             PRIVATE_FILE_MODE,
+            dir_fd=parent,
         )
         try:
             # ``os.open`` applies the process umask, so the requested mode is only
@@ -96,25 +191,21 @@ class PosixFilesystem:
         finally:
             os.close(descriptor)
 
-    def fsync(self, path: Path) -> None:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    def fsync_file(self, parent: int, name: str) -> None:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
 
-    def replace(self, source: Path, destination: Path) -> None:
-        os.replace(source, destination)
+    def replace(self, parent: int, source: str, destination: str) -> None:
+        os.replace(source, destination, src_dir_fd=parent, dst_dir_fd=parent)
 
-    def fsync_directory(self, directory: Path) -> None:
-        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+    def fsync_directory(self, descriptor: int) -> None:
+        os.fsync(descriptor)
 
-    def read(self, path: Path) -> bytes:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    def read(self, parent: int, name: str) -> bytes:
+        descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
         try:
             chunks: list[bytes] = []
             while True:
@@ -125,116 +216,154 @@ class PosixFilesystem:
         finally:
             os.close(descriptor)
 
-    def names(self, directory: Path) -> tuple[str, ...]:
-        return tuple(os.listdir(directory))
+    def names(self, descriptor: int) -> tuple[str, ...]:
+        return tuple(os.listdir(descriptor))
 
-    def unlink(self, path: Path) -> None:
-        os.unlink(path)
+    def unlink(self, parent: int, name: str) -> None:
+        os.unlink(name, dir_fd=parent)
 
-    def mkdir(self, path: Path) -> None:
-        os.mkdir(path, PRIVATE_DIRECTORY_MODE)
-        # ``mkdir`` applies the process umask; the directory holds receiver
-        # identities and must be private regardless of the caller's umask.
-        os.chmod(path, PRIVATE_DIRECTORY_MODE)
-    def exists(self, path: Path) -> bool:
-        return os.path.lexists(path)
 
-    def is_symlink(self, path: Path) -> bool:
-        return os.path.islink(path)
+def _open_step(error: OSError) -> str:
+    """Translate a directory-open failure into one of this module's step tokens.
 
-    def is_directory(self, path: Path) -> bool:
-        return os.path.isdir(path) and not os.path.islink(path)
+    A symlink or a non-directory is a boundary refusal and says so; a permission
+    or I/O failure is an inspection failure and stays ``read``. Both are
+    failures -- neither is reported as absence.
+    """
+    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+        return PATH_STEP
+    return "read"
 
-    def is_regular_file(self, path: Path) -> bool:
-        return os.path.isfile(path) and not os.path.islink(path)
+
+@dataclass(frozen=True, kw_only=True)
+class _Located:
+    """An open record directory together with the chain that reaches it.
+
+    ``directories`` runs outermost-first (existing ancestors above the root, the
+    root, then each subdirectory) and ``paths`` names the same directories, so a
+    publication can confirm the durability of every entry it used rather than of
+    the last one only. ``missing`` records that the chain stops early: the named
+    record directory does not exist, and ``parent`` is the deepest directory that
+    does.
+    """
+
+    parent: int | None
+    directories: tuple[int, ...]
+    paths: tuple[Path, ...]
+    missing: bool = False
 
 
 class AtomicFiles:
     """A private root whose records are published atomically and durably.
 
-    The root is resolved to its real path once, at construction. A symlinked
-    *root* is ordinary user configuration -- a dotfile directory linked elsewhere
-    is common -- so it is followed deliberately rather than rejected, and every
-    path check below is then made against the directory the records really live
-    in. A symlink *inside* the root is a different matter: it is how a record
-    path could reach a file this package does not own, so those are refused.
+    The root's identity is pinned on first use and re-verified on every
+    operation. A symlinked *root* is refused rather than followed: the storage
+    boundary is the root, so "the records really live elsewhere" is exactly the
+    redirection this module must not allow. Symlinked ancestors *above* the root
+    are ordinary user configuration, so only the root itself is opened with
+    ``O_NOFOLLOW``.
     """
 
     def __init__(self, root: Path, filesystem: PosixFilesystem | None = None) -> None:
-        self._root = Path(os.path.realpath(Path(root)))
         self._filesystem = PosixFilesystem() if filesystem is None else filesystem
+        self._root = Path(os.path.abspath(Path(root)))
+        #: Device/inode of the verified root, pinned so a replacement is noticed.
+        #: Pinned at construction when the root already exists: an instance that
+        #: has not yet touched the filesystem would otherwise accept a root
+        #: swapped in before its first operation.
+        self._identity: tuple[int, int] | None = None
+        existing = self._status_path(self._root)
+        if existing is not None:
+            if S_ISLNK(existing.st_mode) or not S_ISDIR(existing.st_mode):
+                raise StorageError(PATH_STEP)
+            self._identity = (existing.st_dev, existing.st_ino)
+        #: Directories whose own entries this instance has already made durable.
+        self._confirmed: set[Path] = set()
 
     @property
     def root(self) -> Path:
         return self._root
 
+    # ------------------------------------------------------------------ records
+
     def write(self, relative: str, payload: bytes) -> None:
         """Publish ``payload`` at ``relative``; raise :class:`StorageError` otherwise."""
-        target = self._resolve(relative)
-        self._ensure_directory(target.parent)
-        temporary = target.with_name(f".{target.name}.tmp")
-        step = "write"
-        try:
-            self._filesystem.write(temporary, payload)
-            step = "fsync"
-            self._filesystem.fsync(temporary)
-            step = "rename"
-            self._filesystem.replace(temporary, target)
-            step = "directory_fsync"
-            self._filesystem.fsync_directory(target.parent)
-        except OSError:
-            self._discard(temporary)
-            raise StorageError(step) from None
+        parts = self._components(relative)
+        with self._directory(parts[:-1], create=True) as located:
+            parent = located.parent
+            if parent is None or located.missing:
+                raise StorageError(PATH_STEP)
+            target = parts[-1]
+            self._require_record_slot(parent, target)
+            temporary = f".{target}.tmp"
+            step = "write"
+            try:
+                self._filesystem.write(parent, temporary, payload)
+                step = "fsync"
+                self._filesystem.fsync_file(parent, temporary)
+                step = "rename"
+                self._filesystem.replace(parent, temporary, target)
+            except OSError:
+                self._discard(parent, temporary)
+                raise StorageError(step) from None
+            # The rename is the publication point; the directories that carry it
+            # are confirmed durable before the caller is told the write
+            # succeeded, so a failure here reports an *uncertain* publication
+            # rather than success.
+            self._confirm(located)
 
     def read(self, relative: str) -> bytes | None:
-        """The record at ``relative``, or ``None`` when it does not exist."""
-        target = self._resolve(relative)
-        if not self._filesystem.exists(target):
-            return None
-        if not self._filesystem.is_regular_file(target):
-            raise StorageError(PATH_STEP)
-        try:
-            return self._filesystem.read(target)
-        except OSError:
-            raise StorageError("read") from None
+        """The record at ``relative``, or ``None`` when it is confirmed absent."""
+        parts = self._components(relative)
+        with self._directory(parts[:-1], create=False) as located:
+            if located.missing or located.parent is None:
+                return None
+            found = self._lookup(located.parent, parts[-1])
+            if found is None:
+                return None
+            if not S_ISREG(found.st_mode):
+                raise StorageError(PATH_STEP)
+            try:
+                return self._filesystem.read(located.parent, parts[-1])
+            except OSError:
+                raise StorageError("read") from None
 
     def delete(self, relative: str) -> None:
-        """Remove the record at ``relative``; removing an absent record is not an error."""
-        target = self._resolve(relative)
-        if not self._filesystem.exists(target):
-            return
-        if not self._filesystem.is_regular_file(target):
-            raise StorageError(PATH_STEP)
-        try:
-            self._filesystem.unlink(target)
-        except OSError:
-            raise StorageError("delete") from None
-        try:
-            self._filesystem.fsync_directory(target.parent)
-        except OSError:
-            raise StorageError("directory_fsync") from None
+        """Remove the record at ``relative`` and establish durable absence.
+
+        Removing a record that is already gone is not an error, but it is still a
+        publication of *absence*: the containing directory is confirmed durable
+        either way, so a retry after a failed unlink publication cannot report
+        success while the removal is unconfirmed on durable storage.
+        """
+        parts = self._components(relative)
+        with self._directory(parts[:-1], create=False) as located:
+            if located.parent is not None and not located.missing:
+                found = self._lookup(located.parent, parts[-1])
+                if found is not None:
+                    if not S_ISREG(found.st_mode):
+                        raise StorageError(PATH_STEP)
+                    try:
+                        self._filesystem.unlink(located.parent, parts[-1])
+                    except OSError:
+                        raise StorageError("delete") from None
+                # Confirmed even when the record was already gone: absence, like
+                # presence, is only a durable fact once the entry is synced.
+                self._confirm(located)
 
     def names(self, relative: str) -> tuple[str, ...]:
         """Settled record names in ``relative``, sorted, without temporary artifacts."""
-        directory = self._resolve(relative)
-        if not self._filesystem.exists(directory):
-            return ()
-        if not self._filesystem.is_directory(directory):
-            raise StorageError(PATH_STEP)
-        try:
-            entries = self._filesystem.names(directory)
-        except OSError:
-            raise StorageError("read") from None
+        parts = self._components(relative)
+        with self._directory(parts, create=False) as located:
+            if located.parent is None or located.missing:
+                return ()
+            try:
+                entries = self._filesystem.names(located.parent)
+            except OSError:
+                raise StorageError("read") from None
         return tuple(sorted(name for name in entries if not name.startswith(".")))
 
-    def _resolve(self, relative: str) -> Path:
-        parts = self._components(relative)
-        path = self._root
-        for part in parts:
-            path = path / part
-            if self._filesystem.is_symlink(path):
-                raise StorageError(PATH_STEP)
-        return path
+    # -------------------------------------------------------------------- paths
 
     @staticmethod
     def _components(relative: str) -> tuple[str, ...]:
@@ -250,35 +379,260 @@ class AtomicFiles:
                 raise StorageError(PATH_STEP)
         return parts
 
-    def _ensure_directory(self, directory: Path) -> None:
+    @contextmanager
+    def _directory(
+        self, parts: tuple[str, ...], *, create: bool,
+    ) -> Iterator[_Located]:
+        """Open (and optionally create) the directory holding a record.
+
+        Every link is verified and entered through a descriptor, so the yielded
+        directory is the one that was checked rather than a path that could be
+        re-pointed after the check. ``missing`` reports that the chain stops
+        before the requested directory: what exists is still reported, so a
+        caller can confirm the durability of the deepest entry it does have.
+        """
+        descriptors: list[int] = []
+        paths: list[Path] = []
+        try:
+            root = self._root_descriptor(create=create)
+            if root is None:
+                yield _Located(parent=None, directories=(), paths=(), missing=True)
+                return
+            descriptors.append(root)
+            paths.append(self._root)
+            parent = root
+            for part in parts:
+                entered = self._enter(parent, part, create=create)
+                if entered is None:
+                    yield _Located(
+                        parent=parent,
+                        directories=tuple(descriptors),
+                        paths=tuple(paths),
+                        missing=True,
+                    )
+                    return
+                descriptors.append(entered)
+                parent = entered
+                paths.append(paths[-1] / part)
+            yield _Located(
+                parent=parent,
+                directories=tuple(descriptors),
+                paths=tuple(paths),
+            )
+        finally:
+            for descriptor in reversed(descriptors):
+                try:
+                    self._filesystem.close(descriptor)
+                except OSError:
+                    pass
+
+    # ----------------------------------------------------------------- the root
+
+    def _root_descriptor(self, *, create: bool) -> int | None:
+        try:
+            descriptor = self._filesystem.open_root(self._root)
+        except FileNotFoundError:
+            if not create:
+                return None
+            self._create_root()
+            try:
+                descriptor = self._filesystem.open_root(self._root)
+            except OSError as error:
+                raise StorageError(_open_step(error)) from None
+        except OSError as error:
+            # ``ELOOP`` here means the root is a symlink, which is refused.
+            raise StorageError(_open_step(error)) from None
+        try:
+            self._verify_root(descriptor)
+        except BaseException:
+            self._close_quietly(descriptor)
+            raise
+        return descriptor
+
+    def _verify_root(self, descriptor: int) -> None:
+        try:
+            info = self._filesystem.describe(descriptor)
+        except OSError:
+            raise StorageError("read") from None
+        if S_ISLNK(info.st_mode) or not S_ISDIR(info.st_mode):
+            raise StorageError(PATH_STEP)
+        identity = (info.st_dev, info.st_ino)
+        if self._identity is None:
+            self._identity = identity
+        elif identity != self._identity:
+            # The path now names a different directory than the one this instance
+            # verified: a replacement cannot inherit our records.
+            raise StorageError(PATH_STEP)
+        self._ensure_private(descriptor, info)
+
+    def _create_root(self) -> None:
+        """Create the root, and any missing ancestor, without following links.
+
+        Durability is not claimed here: the caller confirms every entry this
+        creation added -- the root's parent and any ancestor created on the way --
+        after publication, so a failure between creating a directory and syncing
+        its parent is repaired by any later write or delete rather than assumed
+        away.
+        """
         missing: list[Path] = []
-        current = directory
+        current = self._root
         while True:
-            if self._filesystem.is_symlink(current):
-                raise StorageError(PATH_STEP)
-            if self._filesystem.is_directory(current):
+            existing = self._status_path(current)
+            if existing is not None:
+                if S_ISLNK(existing.st_mode) or not S_ISDIR(existing.st_mode):
+                    raise StorageError(PATH_STEP)
                 break
-            if self._filesystem.exists(current):
-                raise StorageError(PATH_STEP)
             missing.append(current)
             if current == current.parent:
-                break
+                raise StorageError("directory")
             current = current.parent
         for path in reversed(missing):
             try:
-                self._filesystem.mkdir(path)
+                self._filesystem.make_root(path)
+            except FileExistsError:
+                # Another instance created it first; the descriptor verification
+                # still decides whether it is a directory this package may use.
+                continue
             except OSError:
                 raise StorageError("directory") from None
-            try:
-                self._filesystem.fsync_directory(path.parent)
-            except OSError:
-                raise StorageError("directory_fsync") from None
 
-    def _discard(self, temporary: Path) -> None:
+    # ------------------------------------------------------------- the chain
+
+    def _enter(self, parent: int, name: str, *, create: bool) -> int | None:
+        found = self._lookup(parent, name)
+        if found is None:
+            if not create:
+                return None
+            try:
+                self._filesystem.make_directory(parent, name)
+            except FileExistsError:
+                pass
+            except OSError:
+                raise StorageError("directory") from None
+            found = self._lookup(parent, name)
+            if found is None:
+                raise StorageError("directory")
+        if S_ISLNK(found.st_mode) or not S_ISDIR(found.st_mode):
+            raise StorageError(PATH_STEP)
+        try:
+            descriptor = self._filesystem.open_directory(parent, name)
+        except OSError as error:
+            raise StorageError(_open_step(error)) from None
+        try:
+            try:
+                opened = self._filesystem.describe(descriptor)
+            except OSError:
+                raise StorageError("read") from None
+            if (opened.st_dev, opened.st_ino) != (found.st_dev, found.st_ino):
+                # The entry was replaced between the lookup and the open.
+                raise StorageError(PATH_STEP)
+            self._ensure_private(descriptor, opened)
+        except BaseException:
+            self._close_quietly(descriptor)
+            raise
+        return descriptor
+
+    def _confirm(self, located: _Located) -> None:
+        """Establish the durability of the directory entries a publication used.
+
+        A directory that exists proves only that some attempt created it; that
+        attempt may have failed before its parent was synced. So the confirmation
+        is repeated for every new instance -- which is exactly the retry case a
+        crashed or failed publication leaves behind -- and it covers every entry
+        this package's own creation can have added: the record directory, each
+        directory between it and the root, the root, its parent, and any ancestor
+        a crashed attempt may have created on the way.
+
+        Deepest entry first: a child's entry is only durable once the directory
+        that holds it has been synced, so the outer directories are confirmed
+        after the inner ones.
+
+        The climb above the root's parent stops at the first directory this
+        process cannot open. That stop is sound rather than lazy: every directory
+        this package creates is ``0700`` (and every pre-existing one it reuses is
+        tightened to ``0700`` first), so a directory this package created is
+        always one this process can open. An unopenable ancestor therefore cannot
+        hold an entry of ours, and neither can anything above it.
+        """
+        for descriptor, path in reversed(list(zip(located.directories, located.paths))):
+            if path in self._confirmed:
+                continue
+            self._fsync(descriptor)
+            self._confirmed.add(path)
+        current = self._root.parent
+        while current != current.parent:
+            if current not in self._confirmed:
+                descriptor = self._open_ancestor(current)
+                if descriptor is None:
+                    break
+                try:
+                    self._fsync(descriptor)
+                finally:
+                    self._close_quietly(descriptor)
+                self._confirmed.add(current)
+            current = current.parent
+
+    def _open_ancestor(self, path: Path) -> int | None:
+        """Open an ancestor for syncing, or ``None`` when it cannot be ours."""
+        try:
+            return self._filesystem.open_ancestor(path)
+        except OSError as error:
+            if error.errno in {errno.EACCES, errno.EPERM, errno.ELOOP, errno.ENOTDIR}:
+                return None
+            raise StorageError(_open_step(error)) from None
+
+    # ---------------------------------------------------------------- helpers
+
+    def _fsync(self, descriptor: int) -> None:
+        try:
+            self._filesystem.fsync_directory(descriptor)
+        except OSError:
+            raise StorageError("directory_fsync") from None
+
+    def _status_path(self, path: Path) -> os.stat_result | None:
+        try:
+            return self._filesystem.status_path(path)
+        except OSError:
+            raise StorageError("read") from None
+
+    def _lookup(self, parent: int, name: str) -> os.stat_result | None:
+        try:
+            return self._filesystem.status(parent, name)
+        except OSError:
+            # An entry this process could not inspect is *unknown*, not absent:
+            # reporting absence could turn a live reservation into an unowned one.
+            raise StorageError("read") from None
+
+    def _ensure_private(self, descriptor: int, info: os.stat_result) -> None:
+        """Ensure a directory this package uses is owned by us and is ``0700``."""
+        if info.st_uid != os.geteuid():
+            raise StorageError("directory")
+        if S_IMODE(info.st_mode) == PRIVATE_DIRECTORY_MODE:
+            return
+        try:
+            self._filesystem.chmod_private(descriptor)
+        except OSError:
+            raise StorageError("directory") from None
+
+    def _require_record_slot(self, parent: int, name: str) -> None:
+        found = self._lookup(parent, name)
+        if found is not None and not S_ISREG(found.st_mode):
+            # A directory, device, or symlink at the record name is never
+            # replaced and never written through.
+            raise StorageError(PATH_STEP)
+
+    def _close_quietly(self, descriptor: int) -> None:
+        try:
+            self._filesystem.close(descriptor)
+        except OSError:
+            pass
+
+    def _discard(self, parent: int, name: str) -> None:
         """Remove this module's temporary artifact; the published record is untouched."""
         try:
-            if self._filesystem.exists(temporary) and not self._filesystem.is_symlink(temporary):
-                self._filesystem.unlink(temporary)
+            found = self._filesystem.status(parent, name)
+            if found is not None and S_ISREG(found.st_mode):
+                self._filesystem.unlink(parent, name)
         except OSError:
             # The failure being reported is the durable step, not the cleanup of
             # an artifact a later write overwrites anyway.

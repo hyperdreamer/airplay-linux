@@ -36,6 +36,7 @@ from airplay_linux.domain.operations import (
     ChallengeView,
     InstanceId,
     LeaseId,
+    OpaqueCredentialRef,
     OperationId,
     OwnerId,
     ProcessIdentity,
@@ -327,8 +328,211 @@ def test_a_delete_reports_a_failed_unlink(tmp_path: Path):
     assert files.read("ownership/one.json") == b"one"
 
 
+def test_a_delete_retry_establishes_durable_absence(tmp_path: Path):
+    # The unlink succeeded on the first attempt but its directory fsync did not,
+    # so absence is unconfirmed. A retry that sees the path already gone and
+    # returns immediately would claim a durable deletion it never synced.
+    root = tmp_path / "state"
+    files_at(root).write("ownership/one.json", b"one")
+    with pytest.raises(StorageError) as raised:
+        files_at(root, FaultyFilesystem("directory_fsync")).delete("ownership/one.json")
+    assert raised.value.step == "directory_fsync"
+    assert files_at(root).read("ownership/one.json") is None
+
+    retry = FaultyFilesystem("never")
+    files_at(root, retry).delete("ownership/one.json")
+    assert "directory_fsync" in retry.attempts
+
+
+def test_a_delete_retry_reports_a_still_undurable_absence(tmp_path: Path):
+    root = tmp_path / "state"
+    files_at(root).write("ownership/one.json", b"one")
+    with pytest.raises(StorageError):
+        files_at(root, FaultyFilesystem("directory_fsync")).delete("ownership/one.json")
+    with pytest.raises(StorageError) as raised:
+        files_at(root, FaultyFilesystem("directory_fsync")).delete("ownership/one.json")
+    assert raised.value.step == "directory_fsync"
+
+
+class FailAtPath(PosixFilesystem):
+    """Fail a directory sync for exactly the directories named by path identity.
+
+    ``FaultyFilesystem`` fails by *step*, which cannot tell the root's parent
+    apart from the root itself. A retry that re-establishes an earlier attempt's
+    directory entry has to be shown to sync *that* directory, so this class
+    compares the descriptor's identity against the named paths instead.
+    """
+
+    def __init__(self, paths: set[Path]) -> None:
+        self.paths = paths
+        self.synced: list[Path] = []
+        self.failed: list[Path] = []
+
+    def _identity(self, path: Path) -> tuple[int, int]:
+        info = os.stat(path)
+        return (info.st_dev, info.st_ino)
+
+    def _path_of(self, descriptor: int) -> Path | None:
+        info = os.fstat(descriptor)
+        for path in self.paths:
+            try:
+                if self._identity(path) == (info.st_dev, info.st_ino):
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def fsync_directory(self, descriptor: int) -> None:
+        matched = self._path_of(descriptor)
+        if matched is not None:
+            self.failed.append(matched)
+            raise OSError(errno.EIO, "scripted directory sync failure")
+        info = os.fstat(descriptor)
+        self.synced.append(Path(f"{info.st_dev}:{info.st_ino}"))
+        super().fsync_directory(descriptor)
+
+
+def test_a_write_retry_reconfirms_a_directory_entry_created_by_a_failed_attempt(
+    tmp_path: Path,
+):
+    # The first attempt created the root and failed a directory fsync, so the root's
+    # own entry may not be durable. The retry must not treat "the directory exists"
+    # as proof that a previous attempt confirmed it -- and the entry at risk is the
+    # one in the root's *parent*, so that sync is what has to happen again.
+    root = tmp_path / "state"
+    assert root.parent == tmp_path
+    with pytest.raises(StorageError) as raised:
+        files_at(root, FaultyFilesystem("directory_fsync")).write(
+            "ownership/one.json", b"one",
+        )
+    assert raised.value.step == "directory_fsync"
+    assert root.is_dir()
+
+    # A retry that still cannot sync the root's parent entry must not report a
+    # successful publication: the reservation would not survive a crash.
+    blocked = FailAtPath({tmp_path})
+    with pytest.raises(StorageError) as retried:
+        files_at(root, blocked).write("ownership/one.json", b"one")
+    assert retried.value.step == "directory_fsync"
+    assert blocked.failed == [tmp_path]
+
+    # With that entry confirmable, the retry succeeds and does sync it.
+    retry = FailAtPath(set())
+    files_at(root, retry).write("ownership/one.json", b"one")
+    assert files_at(root).read("ownership/one.json") == b"one"
+    assert retry.synced
+
+
+def test_a_write_retry_reports_an_unconfirmed_directory_entry_it_cannot_sync(
+    tmp_path: Path,
+):
+    # After the record directory exists, the publication's own directory fsync is
+    # the one that fails. The retry must confirm it again and, while it cannot,
+    # must keep reporting uncertainty -- even though the rename is already visible.
+    root = tmp_path / "state"
+    (root / "ownership").mkdir(parents=True)
+    with pytest.raises(StorageError) as raised:
+        files_at(root, FaultyFilesystem("directory_fsync")).write(
+            "ownership/one.json", b"one",
+        )
+    assert raised.value.step == "directory_fsync"
+    assert files_at(root).read("ownership/one.json") == b"one"
+    with pytest.raises(StorageError) as retried:
+        files_at(root, FaultyFilesystem("directory_fsync")).write(
+            "ownership/one.json", b"two",
+        )
+    assert retried.value.step == "directory_fsync"
+    assert files_at(root).read("ownership/one.json") == b"two"
+
+
+def test_an_existing_directory_from_a_prior_instance_is_reconfirmed(tmp_path: Path):
+    # A *new* AtomicFiles instance never inherits durability evidence from another
+    # instance: the directories it uses are synced again before it publishes.
+    root = tmp_path / "state"
+    (root / "ownership").mkdir(parents=True)
+    retry = FaultyFilesystem("never")
+    files_at(root, retry).write("ownership/one.json", b"one")
+    assert retry.attempts.count("directory_fsync") >= 3
+
+    # And the directory that holds the root's entry is one of them.
+    traced = FailAtPath(set())
+    files_at(root, traced).write("ownership/two.json", b"two")
+    parent = os.stat(tmp_path)
+    assert f"{parent.st_dev}:{parent.st_ino}" in {str(path) for path in traced.synced}
+
+
+def test_a_publication_is_refused_when_the_root_entry_is_still_unsyncable(
+    tmp_path: Path,
+):
+    # Pre-existing directories are not evidence of durability, so a syncable root
+    # entry is required even when nothing has to be created this time.
+    root = tmp_path / "state"
+    (root / "ownership").mkdir(parents=True)
+    with pytest.raises(StorageError) as raised:
+        files_at(root, FailAtPath({tmp_path})).write("ownership/one.json", b"one")
+    assert raised.value.step == "directory_fsync"
+    # The rename is the publication point, so the bytes may exist; the answer is
+    # "uncertain", never "published".
+    assert files_at(root).read("ownership/one.json") == b"one"
+
+
+def test_a_deep_missing_ancestor_that_the_root_creation_added_is_reconfirmed(
+    tmp_path: Path,
+):
+    # Creating the root can itself add more than one entry: a state directory whose
+    # ``.local/state`` levels do not exist yet. Each of those entries lives in its
+    # own parent, so each has to be synced, not only the root's immediate parent.
+    root = tmp_path / "a" / "b" / "state"
+    files = files_at(root)
+    files.write("sessions/one.json", b"payload")
+    assert files.read("sessions/one.json") == b"payload"
+    assert mode_of(root) == 0o700
+
+    # A retry through a fresh instance re-establishes the same entries rather
+    # than trusting that its predecessor's creation was synced. The entries at
+    # risk are in the base directory and in ``a``, both created on the way down.
+    blocked = FailAtPath({tmp_path, tmp_path / "a"})
+    with pytest.raises(StorageError) as raised:
+        files_at(root, blocked).write("sessions/two.json", b"payload")
+    assert raised.value.step == "directory_fsync"
+    assert set(blocked.failed) <= {tmp_path, tmp_path / "a"}
+    assert blocked.failed
+
+    # With those entries confirmable, the retry publishes and syncs them.
+    retry = FailAtPath(set())
+    files_at(root, retry).write("sessions/two.json", b"payload")
+    assert files_at(root).read("sessions/two.json") == b"payload"
+    synced = {str(entry) for entry in retry.synced}
+    for path in (tmp_path, tmp_path / "a", root):
+        info = os.stat(path)
+        assert f"{info.st_dev}:{info.st_ino}" in synced, f"{path} was never synced"
+
+
+def test_an_unreadable_ancestor_above_the_root_parent_does_not_break_storage(
+    tmp_path: Path,
+):
+    # This package never adds or removes an entry above the root's parent, so it
+    # must not require a sync it did not earn -- a home directory at 0711 is a
+    # normal configuration, not a storage failure.
+    outer = tmp_path / "outer"
+    (outer / "inner").mkdir(parents=True)
+    os.chmod(outer, 0o711)
+    try:
+        root = outer / "inner" / "state"
+        files_at(root).write("sessions/one.json", b"payload")
+        assert files_at(root).read("sessions/one.json") == b"payload"
+        assert mode_of(root) == 0o700
+    finally:
+        os.chmod(outer, 0o700)
+
+
 class FaultyFilesystem(PosixFilesystem):
-    """Real atomic publication with exactly one injected operating-system failure."""
+    """Real atomic publication with exactly one injected operating-system failure.
+
+    The failure may be scoped to one step name only. Every call is recorded, so a
+    test can assert which durable steps a retry actually performed -- the whole
+    point of the retry coverage below.
+    """
 
     def __init__(self, step: str) -> None:
         self.step = step
@@ -339,25 +543,25 @@ class FaultyFilesystem(PosixFilesystem):
         if step == self.step:
             raise OSError(errno.EIO, "scripted atomic write failure")
 
-    def write(self, path: Path, payload: bytes) -> None:
+    def write(self, parent: int, name: str, payload: bytes) -> None:
         self._maybe_fail("write")
-        super().write(path, payload)
+        super().write(parent, name, payload)
 
-    def fsync(self, path: Path) -> None:
+    def fsync_file(self, parent: int, name: str) -> None:
         self._maybe_fail("fsync")
-        super().fsync(path)
+        super().fsync_file(parent, name)
 
-    def replace(self, source: Path, destination: Path) -> None:
+    def replace(self, parent: int, source: str, destination: str) -> None:
         self._maybe_fail("rename")
-        super().replace(source, destination)
+        super().replace(parent, source, destination)
 
-    def fsync_directory(self, directory: Path) -> None:
+    def fsync_directory(self, descriptor: int) -> None:
         self._maybe_fail("directory_fsync")
-        super().fsync_directory(directory)
+        super().fsync_directory(descriptor)
 
-    def unlink(self, path: Path) -> None:
+    def unlink(self, parent: int, name: str) -> None:
         self._maybe_fail("delete")
-        super().unlink(path)
+        super().unlink(parent, name)
 
 
 @pytest.mark.parametrize("step", ["write", "fsync", "rename", "directory_fsync"])
@@ -409,18 +613,211 @@ def test_a_record_path_cannot_leave_the_private_root(tmp_path: Path, relative: s
     assert list(tmp_path.rglob("*.json")) == []
 
 
-def test_a_symlinked_root_is_followed_deliberately(tmp_path: Path):
-    # A dotfile directory linked elsewhere is ordinary configuration; the records
-    # still land in the real directory, and every check below runs against it.
+def test_a_symlinked_application_root_is_refused(tmp_path: Path):
+    # The root *is* the storage boundary. Following a symlink there would mean the
+    # records this package reads, writes, and deletes are decided by whoever
+    # controls the link, so it is refused rather than resolved.
     real = tmp_path / "real"
     real.mkdir()
     link = tmp_path / "link"
     link.symlink_to(real, target_is_directory=True)
-    files = files_at(link)
-    files.write("sessions/one.json", b"payload")
-    assert (real / "sessions" / "one.json").read_bytes() == b"payload"
-    assert files.read("sessions/one.json") == b"payload"
-    assert mode_of(real / "sessions") == 0o700
+    with pytest.raises(StorageError) as raised:
+        files_at(link)
+    assert raised.value.step == "path"
+    assert list(real.rglob("*.json")) == []
+
+
+def test_a_symlinked_application_root_is_refused_on_every_operation(tmp_path: Path):
+    # The refusal is not only a construction-time convenience: an instance built
+    # while the root did not exist yet must refuse once a symlink appears there.
+    real = tmp_path / "real"
+    real.mkdir()
+    root = tmp_path / "state"
+    pending = files_at(root)
+    root.symlink_to(real, target_is_directory=True)
+    with pytest.raises(StorageError) as raised:
+        pending.write("sessions/one.json", b"payload")
+    assert raised.value.step == "path"
+    assert list(real.rglob("*.json")) == []
+
+
+def test_a_root_replaced_by_a_symlink_cannot_redirect_any_operation(tmp_path: Path):
+    # Containment is re-verified per operation, not once at construction: a
+    # replaced root must not let a write, read, or delete reach foreign bytes.
+    root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    (outside / "sessions").mkdir(parents=True)
+    (outside / "sessions" / "one.json").write_bytes(b"foreign record")
+    files_at(root).write("sessions/one.json", b"mine")
+    verified = files_at(root)
+    root.rename(tmp_path / "moved")
+    root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(StorageError) as read_back:
+        verified.read("sessions/one.json")
+    assert read_back.value.step == "path"
+    with pytest.raises(StorageError) as written:
+        verified.write("sessions/two.json", b"mine again")
+    assert written.value.step == "path"
+    with pytest.raises(StorageError) as deleted:
+        verified.delete("sessions/one.json")
+    assert deleted.value.step == "path"
+    # A retry through a fresh instance is refused as well, before any operation.
+    with pytest.raises(StorageError) as reopened:
+        files_at(root)
+    assert reopened.value.step == "path"
+
+    # The foreign directory is untouched in all three directions.
+    assert (outside / "sessions" / "one.json").read_bytes() == b"foreign record"
+    assert sorted(path.name for path in (outside / "sessions").iterdir()) == ["one.json"]
+
+
+def test_a_root_swapped_for_a_different_real_directory_is_refused(tmp_path: Path):
+    # A rename between two real directories is not a symlink, so identity -- not
+    # a path string -- has to decide whether the verified root is still ours.
+    root = tmp_path / "state"
+    files_at(root).write("sessions/one.json", b"mine")
+    verified = files_at(root)
+    root.rename(tmp_path / "moved")
+    root.mkdir()
+    with pytest.raises(StorageError) as raised:
+        verified.read("sessions/one.json")
+    assert raised.value.step == "path"
+    assert files_at(root).names("sessions") == ()
+
+
+def test_an_existing_permissive_root_is_tightened_before_use(tmp_path: Path):
+    # 0700 enforced only at creation is not an invariant: a root left behind by an
+    # earlier attempt, a restore, or a backup carries its own modes.
+    root = tmp_path / "state"
+    (root / "sessions").mkdir(parents=True)
+    os.chmod(root, 0o755)
+    os.chmod(root / "sessions", 0o777)
+    files_at(root).write("sessions/one.json", b"payload")
+    assert mode_of(root) == 0o700
+    assert mode_of(root / "sessions") == 0o700
+    assert mode_of(root / "sessions" / "one.json") == 0o600
+
+
+def test_an_existing_permissive_record_directory_is_tightened_by_a_read(tmp_path: Path):
+    root = tmp_path / "state"
+    files_at(root).write("sessions/one.json", b"payload")
+    os.chmod(root / "sessions", 0o757)
+    assert files_at(root).read("sessions/one.json") == b"payload"
+    assert mode_of(root / "sessions") == 0o700
+
+
+def test_a_directory_owned_by_another_user_is_refused(tmp_path: Path):
+    class ForeignOwner(PosixFilesystem):
+        def describe(self, descriptor: int):
+            info = super().describe(descriptor)
+            values = list(info)
+            values[stat.ST_UID] = info.st_uid + 1
+            return os.stat_result(values)
+
+    root = tmp_path / "state"
+    (root / "sessions").mkdir(parents=True)
+    files = files_at(root, ForeignOwner())
+    with pytest.raises(StorageError) as raised:
+        files.write("sessions/one.json", b"payload")
+    assert raised.value.step == "directory"
+    assert list(root.rglob("*.json")) == []
+
+
+def test_an_uninspectable_directory_is_not_reported_as_absent(tmp_path: Path):
+    # A failed lookup is not confirmed absence: reporting it as one would let an
+    # ownership set read as empty while its records are intact but unreadable.
+    class Unreadable(PosixFilesystem):
+        def status(self, parent: int, name: str):
+            if name == "ownership":
+                raise PermissionError(errno.EACCES, "denied")
+            return super().status(parent, name)
+
+    root = tmp_path / "state"
+    files_at(root).write("ownership/one.json", b"one")
+    with pytest.raises(StorageError) as raised:
+        files_at(root, Unreadable()).read("ownership/one.json")
+    assert raised.value.step == "read"
+    with pytest.raises(StorageError) as listed:
+        files_at(root, Unreadable()).names("ownership")
+    assert listed.value.step == "read"
+    with pytest.raises(StorageError) as deleted:
+        files_at(root, Unreadable()).delete("ownership/one.json")
+    assert deleted.value.step == "read"
+    assert files_at(root).read("ownership/one.json") == b"one"
+
+
+def test_a_directory_that_cannot_be_inspected_or_repaired_is_not_reported_as_absent(
+    tmp_path: Path,
+):
+    # The real filesystem refuses to search this directory, and the mode repair is
+    # refused too, so the failure cannot be silently repaired into "empty".
+    class Unrepairable(PosixFilesystem):
+        def chmod_private(self, descriptor: int) -> None:
+            raise PermissionError(errno.EACCES, "denied")
+
+    root = tmp_path / "state"
+    files_at(root).write("ownership/one.json", b"one")
+    os.chmod(root, 0o600)
+    try:
+        with pytest.raises(StorageError) as raised:
+            files_at(root, Unrepairable()).read("ownership/one.json")
+        assert raised.value.step == "directory"
+    finally:
+        os.chmod(root, 0o700)
+    assert files_at(root).read("ownership/one.json") == b"one"
+
+
+def test_a_record_lookup_failure_is_reported_as_unreadable_not_missing(tmp_path: Path):
+    class Unreadable(PosixFilesystem):
+        def status(self, parent: int, name: str):
+            if name.endswith(".json"):
+                raise PermissionError(errno.EACCES, "denied")
+            return super().status(parent, name)
+
+    root = tmp_path / "state"
+    files_at(root).write("ownership/one.json", b"one")
+    with pytest.raises(StorageError) as raised:
+        files_at(root, Unreadable()).read("ownership/one.json")
+    assert raised.value.step == "read"
+    with pytest.raises(StorageError) as deleted:
+        files_at(root, Unreadable()).delete("ownership/one.json")
+    assert deleted.value.step == "read"
+    assert files_at(root).read("ownership/one.json") == b"one"
+
+
+def test_a_directory_swapped_during_a_publication_cannot_redirect_the_write(
+    tmp_path: Path,
+):
+    # Checking a path string once is not anchoring: the verified directory has to be
+    # the one the record is actually written into. Here ``sessions/`` is renamed
+    # away and replaced with a symlink to a foreign directory mid-publication, and
+    # the write must still land in the directory that was verified.
+    class SwapOnWrite(PosixFilesystem):
+        def __init__(self, root: Path, foreign: Path) -> None:
+            self.root = root
+            self.foreign = foreign
+            self.swapped = False
+
+        def write(self, parent: int, name: str, payload: bytes) -> None:
+            if not self.swapped:
+                self.swapped = True
+                target = self.root / "sessions"
+                target.rename(self.root / "sessions-real")
+                target.symlink_to(self.foreign, target_is_directory=True)
+            super().write(parent, name, payload)
+
+    root = tmp_path / "state"
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    files_at(root).write("sessions/one.json", b"first")
+    files_at(root, SwapOnWrite(root, foreign)).write("sessions/two.json", b"second")
+
+    assert list(foreign.iterdir()) == []
+    assert sorted(path.name for path in (root / "sessions-real").iterdir()) == [
+        "one.json",
+        "two.json",
+    ]
 
 
 def test_a_symlinked_directory_is_never_written_through(tmp_path: Path):
@@ -552,6 +949,25 @@ def test_a_malformed_payload_is_rejected_with_a_reason(payload: bytes, reason: s
     assert raised.value.reason == reason
 
 
+@pytest.mark.parametrize("huge", [10**400, -(10**400), 10**4000])
+def test_an_out_of_range_number_is_a_rejected_value_not_an_escaping_exception(huge: int):
+    # JSON integers are unbounded, so this is a legal document that floats cannot
+    # represent. It must quarantine its own record rather than abort a load.
+    document = json.loads(encode_session(SessionSnapshot.idle(target().receiver_id)))
+    document["next_retry_at"] = huge
+    with pytest.raises(RecordError) as raised:
+        decode_session(json.dumps(document).encode())
+    assert raised.value.reason == "invalid_value"
+
+
+def test_a_huge_seen_at_number_is_rejected_in_a_receiver_target():
+    document = json.loads(encode_receiver(saved()))
+    document["last_endpoint"]["service_records"][0]["seen_at"] = 10**400
+    with pytest.raises(RecordError) as raised:
+        decode_receiver(json.dumps(document).encode())
+    assert raised.value.reason == "invalid_value"
+
+
 def test_an_unknown_record_version_is_rejected():
     document = json.loads(encode_session(SessionSnapshot.idle(target().receiver_id)))
     document["version"] = 2
@@ -660,6 +1076,38 @@ def test_receiver_record_round_trips_its_non_secret_preferences():
     assert decode_receiver(encode_receiver(stored)) == stored
     bare = saved(last_endpoint=None, remembered_resolution=None, service_metadata=())
     assert decode_receiver(encode_receiver(bare)) == bare
+
+
+def test_a_committed_credential_reference_is_not_silently_dropped():
+    """Recorded interface conflict: version 1 cannot represent a committed ref.
+
+    The brief requires persisting an opaque committed keyring reference, and the
+    frozen ``OpaqueCredentialRef`` exposes no persistence representation. Until the
+    owning interface resolves that, the write fails closed instead of reporting a
+    successful save while losing required non-secret metadata.
+    """
+    stored = saved(credential_ref=OpaqueCredentialRef("committed-keyring-reference"))
+    with pytest.raises(RecordError) as raised:
+        encode_receiver(stored)
+    assert raised.value.reason == "unsupported_credential_ref"
+    # The rejection text never quotes the reference.
+    assert "committed-keyring-reference" not in repr(raised.value)
+    assert "committed-keyring-reference" not in str(raised.value)
+
+
+def test_the_receiver_store_reports_an_unrepresentable_credential_reference(tmp_path: Path):
+    root = tmp_path / "state"
+    store = JsonReceiverStore(files_at(root))
+    stored = saved(credential_ref=OpaqueCredentialRef("committed-keyring-reference"))
+    refused = run(store.put(stored))
+    assert isinstance(refused, Err)
+    assert refused.error.code is ErrorCode.persistence_failed
+    assert refused.error.detail == "unsupported_credential_ref"
+    assert "committed-keyring-reference" not in repr(refused)
+    # No partial record was published, so a saved receiver cannot exist without
+    # the reference the caller asked to persist.
+    assert list(root.rglob("*.json")) == []
+    assert run(store.get(stored.receiver_id)) == Ok(value=None)
 
 
 def test_an_ambiguous_receiver_is_never_persisted():
@@ -783,11 +1231,11 @@ def test_a_record_written_under_a_restrictive_umask_is_still_owner_only(tmp_path
     try:
         files = files_at(tmp_path / "state")
         files.write("sessions/receiver.json", b"payload")
+        assert mode_of(tmp_path / "state") == 0o700
+        assert mode_of(tmp_path / "state" / "sessions") == 0o700
+        assert mode_of(tmp_path / "state" / "sessions" / "receiver.json") == 0o600
     finally:
         os.umask(previous)
-    assert mode_of(tmp_path / "state") == 0o700
-    assert mode_of(tmp_path / "state" / "sessions") == 0o700
-    assert mode_of(tmp_path / "state" / "sessions" / "receiver.json") == 0o600
 
 
 def test_the_session_store_reports_a_failed_directory_fsync_as_uncertain(tmp_path: Path):
@@ -848,6 +1296,104 @@ def test_the_receiver_store_fails_closed_on_a_corrupt_sibling(tmp_path: Path):
     assert failed.error.code is ErrorCode.persistence_failed
     assert failed.error.detail == "malformed_json"
     assert files.read("receivers/broken.json") == b"{ not json"
+
+
+def test_the_session_store_quarantines_a_huge_number_and_keeps_readable_siblings(
+    tmp_path: Path,
+):
+    # One out-of-range numeric value must not abort a session load: the record is
+    # quarantined and every other session stays readable.
+    files = files_at(tmp_path / "state")
+    good = rich_snapshot()
+    files.write("sessions/good.json", encode_session(good))
+    document = json.loads(encode_session(SessionSnapshot.idle(OTHER)))
+    document["next_retry_at"] = 10**400
+    files.write("sessions/huge.json", json.dumps(document).encode())
+    store = JsonSessionStore(files)
+
+    assert run(store.load_all()) == (good,)
+    assert [item.detail for item in store.quarantined()] == ["invalid_value"]
+    assert files.read("sessions/huge.json") is not None
+
+
+def test_the_session_store_surfaces_a_listing_failure_without_raising(tmp_path: Path):
+    # ``load_all`` returns a tuple; an enumeration failure must not escape it. The
+    # unknown set is reported through the quarantine channel instead of being
+    # mistaken for "no sessions".
+    class Unlistable(PosixFilesystem):
+        def names(self, descriptor: int):
+            raise OSError(errno.EIO, "listing failed")
+
+    root = tmp_path / "state"
+    files_at(root).write("sessions/one.json", encode_session(rich_snapshot()))
+    store = JsonSessionStore(files_at(root, Unlistable()))
+    assert run(store.load_all()) == ()
+    quarantined = store.quarantined()
+    assert [item.code for item in quarantined] == [ErrorCode.persistence_failed]
+    assert [item.detail for item in quarantined] == ["read"]
+    assert not any(str(root) in repr(item) for item in quarantined)
+    # The record is still there, and a healthy store reads it.
+    assert run(JsonSessionStore(files_at(root)).load_all()) == (rich_snapshot(),)
+
+
+def test_the_session_store_surfaces_a_rejected_session_directory(tmp_path: Path):
+    root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    root.mkdir()
+    (root / "sessions").symlink_to(outside, target_is_directory=True)
+    store = JsonSessionStore(files_at(root))
+    assert run(store.load_all()) == ()
+    assert [item.detail for item in store.quarantined()] == ["path"]
+
+
+def test_the_session_store_quarantines_an_unreadable_record(tmp_path: Path):
+    class Unreadable(PosixFilesystem):
+        def read(self, parent: int, name: str) -> bytes:
+            raise PermissionError(errno.EACCES, "denied")
+
+    root = tmp_path / "state"
+    files_at(root).write("sessions/one.json", encode_session(rich_snapshot()))
+    store = JsonSessionStore(files_at(root, Unreadable()))
+    assert run(store.load_all()) == ()
+    assert [item.detail for item in store.quarantined()] == ["read"]
+
+
+def test_an_authoritative_store_fails_closed_when_its_directory_is_unreadable(
+    tmp_path: Path,
+):
+    # Ownership is authoritative: an inaccessible directory is an unknown set, not
+    # an empty one, so the read fails rather than understating owned resources.
+    class Denied(PosixFilesystem):
+        def status(self, parent: int, name: str):
+            if name == "ownership":
+                raise PermissionError(errno.EACCES, "denied")
+            return super().status(parent, name)
+
+    root = tmp_path / "state"
+    record = ownership()
+    assert run(JsonOwnershipStore(files_at(root)).write(record)) == Ok(value=None)
+    failed = run(JsonOwnershipStore(files_at(root, Denied())).all())
+    assert isinstance(failed, Err)
+    assert failed.error.code is ErrorCode.persistence_failed
+    assert failed.error.detail == "read"
+    # The record is intact and readable again without the injected failure.
+    assert run(JsonOwnershipStore(files_at(root)).all()) == Ok(value=(record,))
+
+
+def test_an_authoritative_store_fails_closed_on_a_huge_number(tmp_path: Path):
+    root = tmp_path / "state"
+    files = files_at(root)
+    document = json.loads(encode_receiver(saved()))
+    document["last_endpoint"]["service_records"][0]["seen_at"] = 10**400
+    files.write(
+        f"receivers/{quote(str(saved().receiver_id), safe='')}.json",
+        json.dumps(document).encode(),
+    )
+    failed = run(JsonReceiverStore(files).all())
+    assert isinstance(failed, Err)
+    assert failed.error.code is ErrorCode.persistence_failed
+    assert failed.error.detail == "invalid_value"
 
 
 def test_the_ownership_store_round_trips_and_deletes_an_exact_owner(tmp_path: Path):
