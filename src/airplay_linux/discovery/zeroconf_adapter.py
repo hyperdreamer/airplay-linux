@@ -747,6 +747,12 @@ class AzcMdnsClient:
         return Ok(value=_Browsers(browsers, self._types, self._detach))
 
     async def resolve(self, key: str) -> Result[ServiceRecord]:
+        # A closed client must never acquire a fresh backend: doing so would
+        # reopen discovery resources that ``close`` has already declared
+        # released, and its own idempotence guard would then refuse to release
+        # them again.
+        if self._closed:
+            return _failure()
         service_type = self._types.get(key) or _type_suffix(key)
         if service_type is None:
             return _failure()

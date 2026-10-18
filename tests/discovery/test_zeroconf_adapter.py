@@ -1032,3 +1032,40 @@ async def test_unusable_txt_properties_degrade_to_no_evidence_rather_than_failin
     assert result.value.addresses == ("192.0.2.10",)
     assert result.value.device_id is None
     assert dict(result.value.txt) == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_after_close_never_resurrects_a_backend():
+    """Closing is final: a later resolve must not reopen discovery resources.
+
+    An unconditional acquire in ``resolve`` would recreate the backend after
+    ``close`` had already declared every resource released, and the idempotence
+    guard would then refuse to release the replacement.
+    """
+    created: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def async_get_service_info(self, *_args: Any, **_kwargs: Any) -> object:
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            self.closed += 1
+
+    def factory() -> Backend:
+        backend = Backend()
+        created.append(backend)
+        return backend
+
+    mdns = AzcMdnsClient(FakeClock(), factory=factory)
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    await mdns.close()
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    await mdns.close()
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.discovery_failed
+    assert created == [], "a closed client must not acquire a backend"
