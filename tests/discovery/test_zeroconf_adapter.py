@@ -926,3 +926,109 @@ async def test_azc_client_closes_every_browser_it_started():
     # it still held them; an already-detached handle is never cancelled again.
     assert [browser.cancelled for browser in browsers] == [1, 1]
     assert original is None or callable(original)
+
+
+# --- the concrete resolve path: the seam the fake client never exercised -----
+
+
+class _ServiceInfo:
+    """A duck-typed stand-in for ``zeroconf.ServiceInfo``; no socket involved."""
+
+    def __init__(self, **overrides: Any) -> None:
+        self.name = "Living Room._airplay._tcp.local."
+        self.type = "_airplay._tcp.local."
+        self.server = "living-room.local."
+        self.port = 7000
+        self.addresses = [bytes([192, 0, 2, 10])]
+        self.properties = {b"model": b"AppleTV6,2", b"deviceid": b"00:11:22:33:44:55"}
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+def _resolving_client(info: object) -> Any:
+    class Client:
+        def __init__(self) -> None:
+            self.zeroconf = object()
+
+        async def async_get_service_info(self, *_args: Any, **_kwargs: Any) -> object:
+            return info
+
+        async def async_close(self) -> None:
+            return None
+
+    return Client()
+
+
+@pytest.mark.asyncio
+async def test_a_real_service_info_converts_into_a_domain_record():
+    mdns = AzcMdnsClient(FakeClock(50.0), factory=lambda: _resolving_client(_ServiceInfo()))
+    # ``resolve`` only serves keys a browse already registered, exactly as the
+    # adapter's contract requires; seed that map rather than weakening resolve.
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    record = result.value
+    assert record.device_id == "00:11:22:33:44:55"
+    assert record.model == "AppleTV6,2"
+    assert record.addresses == ("192.0.2.10",)
+    assert record.port == 7000
+    assert record.seen_at == 50.0
+    await mdns.close()
+
+
+@pytest.mark.asyncio
+async def test_txt_bytes_that_are_not_utf8_are_dropped_not_replaced():
+    info = _ServiceInfo(properties={b"model": b"AppleTV6,2", b"junk": b"\xff\xfe"})
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.model == "AppleTV6,2"
+
+
+@pytest.mark.asyncio
+async def test_ipv6_addresses_are_carried_through_resolution():
+    info = _ServiceInfo(addresses=[bytes(16)[:15] + b"\x01"])
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.addresses == ("::1",)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "info",
+    [
+        _ServiceInfo(name=None),
+        _ServiceInfo(type=None),
+        _ServiceInfo(server=None),
+        _ServiceInfo(port="7000"),
+        _ServiceInfo(port=0),
+    ],
+    ids=["no-name", "no-type", "no-server", "port-text", "port-zero"],
+)
+async def test_a_malformed_service_info_is_a_sanitized_retryable_failure(info):
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.discovery_failed
+
+
+@pytest.mark.asyncio
+async def test_unusable_txt_properties_degrade_to_no_evidence_rather_than_failing():
+    """A non-mapping ``properties`` is not evidence, and not a crash either.
+
+    Dropping it yields a record with no TXT-derived identity, which the resolver
+    then treats as a weaker candidate. Refusing the whole advertisement would
+    throw away a receiver whose address and port are perfectly usable.
+    """
+    info = _ServiceInfo(properties=["not", "a", "mapping"])
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.addresses == ("192.0.2.10",)
+    assert result.value.device_id is None
+    assert dict(result.value.txt) == {}

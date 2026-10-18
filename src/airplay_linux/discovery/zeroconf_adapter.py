@@ -209,6 +209,62 @@ def _instance_mac(key: str) -> str | None:
     return prefix.strip() if separator and _MAC.fullmatch(prefix.strip()) else None
 
 
+def _raw(info: object) -> RawAdvertisement:
+    """Convert one zeroconf ``ServiceInfo`` into the adapter-private image.
+
+    Only the four fields :func:`record_from_advertisement` consumes are read, and
+    each is read defensively: a ``ServiceInfo`` is produced by a third-party
+    browser, so a missing or oddly-typed attribute must not escape the exception
+    handler that guards the resolve call.  TXT values stay as raw bytes; decoding
+    is :func:`decode_txt`'s job and it drops bytes that are not usable text.
+    """
+    name = getattr(info, "name", None)
+    service_type = getattr(info, "type", None)
+    server = getattr(info, "server", None)
+    port = getattr(info, "port", None)
+    if not isinstance(name, str) or not isinstance(service_type, str):
+        raise TypeError("a resolved service info must carry a name and a type")
+    if not isinstance(server, str):
+        raise TypeError("a resolved service info must carry a server name")
+    if type(port) is not int or not 0 < port < 65536:
+        raise TypeError("a resolved service info must carry a usable port")
+
+    addresses: list[bytes] = []
+    for attribute in ("addresses", "parsed_addresses"):
+        try:
+            raw_addresses = getattr(info, attribute, None)
+        except Exception:
+            continue
+        if not isinstance(raw_addresses, (list, tuple)):
+            continue
+        for item in raw_addresses:
+            if isinstance(item, (bytes, bytearray)) and len(item) in (4, 16):
+                addresses.append(bytes(item))
+            elif isinstance(item, str):
+                try:
+                    addresses.append(socket.inet_pton(
+                        socket.AF_INET6 if ":" in item else socket.AF_INET, item,
+                    ))
+                except (OSError, ValueError):
+                    continue
+        if addresses:
+            break
+
+    properties = getattr(info, "properties", None)
+    txt: Mapping[bytes | str, bytes | str | None] = (
+        properties if isinstance(properties, Mapping) else {}
+    )
+
+    return RawAdvertisement(
+        name=name,
+        type=service_type,
+        server=server,
+        port=port,
+        addresses=tuple(addresses),
+        txt=dict(txt),
+    )
+
+
 def record_from_advertisement(raw: RawAdvertisement, seen_at: float) -> ServiceRecord | None:
     """Build a domain record from one raw advertisement, or refuse it.
 
@@ -692,17 +748,26 @@ class AzcMdnsClient:
 
     async def resolve(self, key: str) -> Result[ServiceRecord]:
         service_type = self._types.get(key) or _type_suffix(key)
-        if service_type is None or self._client is None:
+        if service_type is None:
+            return _failure()
+        client = await self._acquire()
+        if client is None:
             return _failure()
         try:
-            info = await self._client.async_get_service_info(
+            info = await client.async_get_service_info(
                 service_type, key, timeout=self._resolve_timeout,
             )
         except Exception:
             return _failure()
         if info is None:
             return _failure()
-        record = record_from_advertisement(_raw(info), self._clock.now())
+        try:
+            raw = _raw(info)
+        except Exception:
+            # A malformed or unexpectedly typed ServiceInfo is a retryable
+            # discovery failure, never an escaping exception.
+            return _failure()
+        record = record_from_advertisement(raw, self._clock.now())
         if record is None:
             return _failure()
         self._types[record.key] = service_type
