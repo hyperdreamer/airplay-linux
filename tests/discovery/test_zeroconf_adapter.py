@@ -1,0 +1,1787 @@
+"""Zeroconf discovery is proven against an in-memory mDNS client, never a socket.
+
+Every test drives the adapter through the same ``MdnsClient`` seam the real
+``AsyncZeroconf`` client implements, so both browsers, the raw-bytes TXT seam,
+out-of-order resolve/removal, refresh idempotence, offline retention, and the
+typed diagnostics are pinned without opening multicast.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import base64
+import gc
+import json
+import time
+from collections.abc import Awaitable, Callable
+from functools import wraps
+from pathlib import Path
+from typing import Any
+
+import pytest
+import zeroconf
+
+from airplay_linux.discovery.identity import IdentityResolver, target_for
+from airplay_linux.discovery.zeroconf_adapter import (
+    AIRPLAY_SERVICE,
+    RAOP_SERVICE,
+    MAX_REFRESH_KEYS,
+    AzcMdnsClient,
+    RawAdvertisement,
+    ServiceChange,
+    ZeroconfDiscovery,
+    _Browsers,
+    _Notification,
+    _raw,
+    decode_txt,
+    normalize_feature_bits,
+    normalize_service_type,
+    record_from_advertisement,
+)
+from airplay_linux.domain.identity import ReceiverId, ServiceRecord
+from airplay_linux.domain.messages import DiscoveryEvent
+from airplay_linux.domain.resources import Err, ErrorCode, Ok, RecoveryAction
+from airplay_linux.testing import Deferred
+from airplay_linux.testing.builders import service
+from airplay_linux.testing.time import FakeClock
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "discovery" / "services.json"
+LIVING_ROOM = ReceiverId("airplay-device:aabbccddeeff")
+REPLACEMENT = ReceiverId("airplay-device:112233445566")
+ADDRESS = "192.0.2.12"
+
+
+def run_async(test: Callable[..., Awaitable[None]]) -> Callable[..., None]:
+    """The suite has no asyncio plugin, so each test runs its own loop."""
+    @wraps(test)
+    def wrapper(*args: Any, **kwargs: Any) -> None:
+        asyncio.run(test(*args, **kwargs))
+
+    return wrapper
+
+
+async def settle() -> None:
+    """Let every scheduled resolve advance to its next await point."""
+    for _ in range(3):
+        await asyncio.sleep(0)
+
+
+# --------------------------------------------------------------------------- fake mdns
+
+
+class FakeSubscription:
+    """One browser handle; ``close`` is idempotent like the real subscription."""
+
+    def __init__(self, service_type: str) -> None:
+        self.service_type = service_type
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class FakeMdns:
+    """In-memory ``MdnsClient``: browsers capture callbacks, resolves are scripted.
+
+    A resolve is answered explicitly, so "the resolve finished after the removal"
+    is the test's own ordering rather than a race.
+    """
+
+    def __init__(self) -> None:
+        self.browsed: list[tuple[tuple[str, ...], Callable[[ServiceChange], None]]] = []
+        self.subscriptions: list[FakeSubscription] = []
+        self.browse_results: list[object] = []
+        self.answers: dict[str, list[object]] = {}
+        self.resolve_calls: list[str] = []
+        self.refresh_calls = 0
+        self.closed = 0
+
+    async def browse(
+        self, types: tuple[str, ...], callback: Callable[[ServiceChange], None],
+    ) -> object:
+        self.browsed.append((types, callback))
+        subscription = FakeSubscription(types[0])
+        self.subscriptions.append(subscription)
+        if self.browse_results:
+            return self.browse_results.pop(0)
+        return Ok(value=subscription)
+
+    async def resolve(self, key: str) -> object:
+        self.resolve_calls.append(key)
+        queued = self.answers.get(key)
+        if not queued:
+            return _failure()
+        answer = queued.pop(0)
+        if isinstance(answer, Deferred):
+            answer = await answer.wait()
+        return answer
+
+    async def refresh(self) -> object:
+        self.refresh_calls += 1
+        return Ok(value=None)
+
+    async def close(self) -> None:
+        self.closed += 1
+
+    # -- driving ------------------------------------------------------------
+
+    def announce(self, key: str, browser: int = -1) -> None:
+        service_types, callback = self.browsed[browser]
+        callback(ServiceChange(service_type=service_types[0], key=key, state="added"))
+
+    def withdraw(self, key: str, browser: int = -1) -> None:
+        service_types, callback = self.browsed[browser]
+        callback(ServiceChange(service_type=service_types[0], key=key, state="removed"))
+
+    def answer(self, key: str, record: ServiceRecord) -> None:
+        self.answers.setdefault(key, []).append(Ok(value=record))
+
+    def defer(self, key: str) -> Deferred[object]:
+        pending: Deferred[object] = Deferred()
+        self.answers.setdefault(key, []).append(pending)
+        return pending
+
+
+def _failure() -> Err:
+    from airplay_linux.diagnostics import diagnostic
+
+    return Err(error=diagnostic(ErrorCode.discovery_failed))
+
+
+class Harness:
+    """The adapter wired to fake time, a real resolver, and the fake client."""
+
+    def __init__(self, resolver: IdentityResolver | None = None) -> None:
+        self.clock = FakeClock(100.0)
+        self.mdns = FakeMdns()
+        self.resolver = resolver or IdentityResolver()
+        self.adapter = ZeroconfDiscovery(self.resolver, self.clock, self.mdns)
+        self.events: list[DiscoveryEvent] = []
+        self.subscription = self.adapter.subscribe(self.events.append)
+
+    @property
+    def kinds(self) -> list[str]:
+        return [event.kind for event in self.events]
+
+    def view(self, receiver_id: ReceiverId):
+        return self.adapter.current(receiver_id)
+
+    async def start(self) -> None:
+        result = await self.adapter.start()
+        assert isinstance(result, Ok)
+
+    async def offer(self, record: ServiceRecord) -> None:
+        """Announce a key the client can resolve, then let the adapter settle."""
+        self.mdns.answer(record.key, record)
+        self.mdns.announce(record.key)
+        await settle()
+
+
+def advertisement(kind: str = "airplay", **overrides: Any) -> ServiceRecord:
+    """A record whose raw key keeps the trailing dot mDNS actually reports."""
+    defaults: dict[str, Any] = {
+        "key": f"Living Room._{kind}._tcp.local.",
+        "instance": f"Living Room._{kind}._tcp.local.",
+        "device_id": "AABBCCDDEEFF",
+        "model": "AppleTV6,2",
+        "txt": {"deviceid": "AABBCCDDEEFF", "model": "AppleTV6,2"},
+    }
+    return service(kind=kind, **{**defaults, **overrides, "addresses": overrides.get("addresses", (ADDRESS,))})
+
+
+def fixture_services() -> list[dict[str, Any]]:
+    return json.loads(FIXTURES.read_text(encoding="utf-8"))["services"]
+
+
+def fixture_raw(entry: dict[str, Any]) -> RawAdvertisement:
+    """Rebuild the captured advertisement, base64 back into raw bytes."""
+    properties = entry["properties"]
+    return RawAdvertisement(
+        name=properties["name"],
+        type=properties["type"],
+        server=properties["server"],
+        port=properties["port"],
+        addresses=tuple(base64.b64decode(value) for value in properties["addresses"]),
+        txt={
+            key.encode("utf-8"): base64.b64decode(value, validate=True)
+            for key, value in properties["txt"].items()
+        },
+    )
+
+
+# --------------------------------------------------------------------------- lifecycle
+
+
+def test_discovery_can_close_without_network():
+    class Client:
+        async def close(self):
+            self.closed = True
+
+    client = Client()
+    adapter = ZeroconfDiscovery(IdentityResolver(), FakeClock(), client)
+    asyncio.run(adapter.close())
+    assert client.closed
+
+
+@run_async
+async def test_start_browses_both_service_types_once():
+    harness = Harness()
+    await harness.start()
+    await harness.start()
+    assert [types for types, _ in harness.mdns.browsed] == [(AIRPLAY_SERVICE, RAOP_SERVICE)]
+    assert (AIRPLAY_SERVICE, RAOP_SERVICE) == ("_airplay._tcp.local.", "_raop._tcp.local.")
+
+
+@run_async
+async def test_browse_failure_is_a_retryable_diagnostic_and_does_not_fabricate_a_receiver():
+    harness = Harness()
+    harness.mdns.browse_results.append(_failure())
+    result = await harness.adapter.start()
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.discovery_failed
+    assert RecoveryAction.retry in result.error.recovery
+    assert harness.kinds == ["error"]
+    assert harness.events[0].diagnostic is not None
+    assert harness.view(LIVING_ROOM) is None
+
+
+@run_async
+async def test_a_failed_browse_leaves_no_browser_behind_and_a_retry_rebrowses():
+    harness = Harness()
+    harness.mdns.browse_results.append(_failure())
+    assert isinstance(await harness.adapter.start(), Err)
+    # A failed browse subscribes nothing, so no handle is registered to close.
+    assert harness.mdns.subscriptions == [harness.mdns.subscriptions[0]]
+    closed = harness.mdns.subscriptions[0].closed
+    await harness.start()
+    assert len(harness.mdns.browsed) == 2
+    assert harness.mdns.subscriptions[0].closed == closed
+    assert harness.mdns.subscriptions[-1].closed == 0
+    await harness.offer(advertisement())
+    assert harness.kinds == ["error", "added"]
+
+
+@run_async
+async def test_close_after_a_failed_start_closes_the_client_and_no_browser():
+    harness = Harness()
+    harness.mdns.browse_results.append(_failure())
+    await harness.adapter.start()
+    await harness.adapter.close()
+    assert harness.mdns.closed == 1
+    assert [subscription.closed for subscription in harness.mdns.subscriptions] == [0]
+
+
+@run_async
+async def test_close_unsubscribes_every_browser_and_closes_the_client_once():
+    harness = Harness()
+    await harness.start()
+    await harness.adapter.close()
+    await harness.adapter.close()
+    assert harness.mdns.closed == 1
+    assert [subscription.closed for subscription in harness.mdns.subscriptions] == [1]
+
+
+@run_async
+async def test_close_before_start_still_closes_the_client():
+    harness = Harness()
+    await harness.adapter.close()
+    assert harness.mdns.closed == 1
+    assert harness.mdns.browsed == []
+
+
+@run_async
+async def test_notifications_after_close_are_ignored():
+    harness = Harness()
+    await harness.start()
+    await harness.adapter.close()
+    harness.mdns.announce(advertisement().key)
+    await settle()
+    assert harness.events == []
+    assert harness.mdns.resolve_calls == []
+
+
+@run_async
+async def test_subscription_close_stops_delivery():
+    harness = Harness()
+    await harness.start()
+    harness.subscription.close()
+    harness.subscription.close()
+    await harness.offer(advertisement())
+    assert harness.events == []
+
+
+# --------------------------------------------------------------------------- added
+
+
+@run_async
+async def test_announcement_resolves_the_key_and_emits_one_added_view():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    assert harness.kinds == ["added"]
+    view = harness.events[0].receiver
+    assert view is not None and view.online
+    assert view.display_name == "Living Room"
+    assert view.record_set.receiver_id == LIVING_ROOM
+    assert view.record_set.canonical_address == ADDRESS
+    assert harness.mdns.resolve_calls == ["Living Room._airplay._tcp.local."]
+    assert harness.view(LIVING_ROOM) == view
+
+
+@run_async
+async def test_repeated_announcement_of_the_same_record_emits_nothing_new():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    await harness.offer(advertisement())
+    assert harness.kinds == ["added"]
+
+
+@run_async
+async def test_airplay_and_raop_merge_into_one_receiver_and_both_resolve():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    await harness.offer(advertisement("raop", port=5000))
+    assert harness.kinds == ["added", "updated"]
+    view = harness.view(LIVING_ROOM)
+    assert view is not None and len(view.record_set.records) == 2
+    assert sorted(harness.mdns.resolve_calls) == [
+        "Living Room._airplay._tcp.local.",
+        "Living Room._raop._tcp.local.",
+    ]
+
+
+@run_async
+async def test_unknown_receiver_is_none():
+    harness = Harness()
+    await harness.start()
+    assert harness.adapter.current(ReceiverId("airplay-device:ffff")) is None
+
+
+@run_async
+async def test_seen_at_comes_from_the_injected_clock():
+    harness = Harness()
+    await harness.start()
+    harness.clock.advance(7.5)
+    await harness.offer(advertisement(seen_at=0.0))
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert [record.seen_at for record in view.record_set.records] == [107.5]
+
+
+# --------------------------------------------------------------------------- seam
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("_airplay._tcp.local.", "_airplay._tcp"),
+        ("_airplay._tcp", "_airplay._tcp"),
+        ("_RAOP._TCP.LOCAL.", "_raop._tcp"),
+        ("_raop._tcp.local", "_raop._tcp"),
+        ("_http._tcp.local.", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_normalize_service_type_accepts_only_the_two_browsed_types(raw, expected):
+    assert normalize_service_type(raw) == expected
+
+
+def test_decode_txt_trims_padding_and_keeps_utf8():
+    assert decode_txt({b"model": b"AppleTV6,2\x00", b"md": b"Kitchen\x00\x00"}) == {
+        "model": "AppleTV6,2",
+        "md": "Kitchen",
+    }
+
+
+def test_decode_txt_drops_undecodable_keys_and_values_instead_of_guessing():
+    decoded = decode_txt({b"\xff\xfe": b"\xff\xfe", b"features": b"0x5A7FFFF7,0x1E"})
+    assert decoded == {"features": "0x5A7FFFF7,0x1E"}
+
+
+def test_decode_txt_accepts_str_keys_and_rejects_non_mappings():
+    assert decode_txt({"name": "Living Room", b"flags": b"0x4"}) == {
+        "name": "Living Room",
+        "flags": "0x4",
+    }
+    with pytest.raises(TypeError):
+        decode_txt(b"model=AppleTV")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0x5A7FFFF7,0x1E", "0x5a7ffff7,0x1e"),
+        ("0X5A7FFFF7 , 0X1E", "0x5a7ffff7,0x1e"),
+        ("0x4", "0x4"),
+        ("", None),
+        (None, None),
+        ("not-hex", None),
+        ("0x", None),
+        ("0x1,0x2,0x3", None),
+    ],
+)
+def test_normalize_feature_bits_is_canonical_or_absent(raw, expected):
+    assert normalize_feature_bits(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect"),
+    [
+        (b"\xc0\x00\x02\x0c", "192.0.2.12"),
+        (b"\x20\x01\x0d\xb8" + b"\x00" * 11 + b"\x01", "2001:db8::1"),
+        (b"\x01\x02", None),
+        (b"", None),
+    ],
+)
+def test_record_from_advertisement_decodes_socket_addresses(raw, expect):
+    record = record_from_advertisement(
+        RawAdvertisement(
+            name="Living Room._airplay._tcp.local.",
+            type="_airplay._tcp.local.",
+            server="Living-Room.local.",
+            port=7000,
+            addresses=(raw,),
+            txt={b"model": b"AppleTV6,2"},
+        ),
+        1.0,
+    )
+    assert record is not None
+    assert record.addresses == (() if expect is None else (expect,))
+
+
+def test_record_from_advertisement_keeps_the_instance_and_normalizes_only_the_type():
+    record = record_from_advertisement(fixture_raw(fixture_services()[0]), 42.0)
+    assert record is not None
+    assert (record.service_type, record.instance) == ("_airplay._tcp", "Living Room._airplay._tcp.local.")
+    assert record.key == "Living Room._airplay._tcp.local."
+    assert (record.device_id, record.model, record.host, record.port) == (
+        "AABBCCDDEEFF", "AppleTV6,2", "Living-Room.local.", 7000,
+    )
+    assert record.addresses == (ADDRESS,)
+    assert record.seen_at == 42.0
+    # The seam decodes raw bytes; the feature word is canonicalized on adoption.
+    assert record.txt["features"] == "0x5A7FFFF7,0x1E"
+    assert record.txt["pk"] == "BEDROOM-PUBLIC-KEY"
+
+
+def test_record_from_advertisement_never_substitutes_replacement_characters():
+    kitchen = record_from_advertisement(fixture_raw(fixture_services()[2]), 1.0)
+    assert kitchen is not None
+    assert kitchen.txt["md"] == "Kitchen Speaker"
+    # The capturable bytes 0xff 0xfe are not a feature word, so no value is invented.
+    assert "features" not in kitchen.txt
+    assert all("\ufffd" not in value for value in kitchen.txt.values())
+
+
+def test_record_from_advertisement_refuses_an_unbrowsed_service_type():
+    raw = RawAdvertisement(
+        name="Printer._ipp._tcp.local.",
+        type="_ipp._tcp.local.",
+        server="printer.local.",
+        port=631,
+        addresses=(),
+        txt={},
+    )
+    assert record_from_advertisement(raw, 1.0) is None
+
+
+# --------------------------------------------------------------------------- ordering
+
+
+@run_async
+async def test_resolve_after_removal_cannot_restore_a_vanished_endpoint():
+    harness = Harness()
+    await harness.start()
+    key = advertisement().key
+    pending = harness.mdns.defer(key)
+    harness.mdns.announce(key)
+    await settle()
+    harness.mdns.withdraw(key)
+    await settle()
+    pending.resolve(Ok(value=advertisement()))
+    await settle()
+    assert harness.kinds == []
+    assert harness.view(LIVING_ROOM) is None
+
+
+@run_async
+async def test_a_stale_resolve_cannot_overwrite_a_newer_announcement():
+    harness = Harness()
+    await harness.start()
+    key = advertisement().key
+    await harness.offer(advertisement())
+    stale = harness.mdns.defer(key)
+    harness.mdns.announce(key)
+    await settle()
+    harness.mdns.answer(key, advertisement(instance="Renamed._airplay._tcp.local."))
+    harness.mdns.announce(key)
+    await settle()
+    stale.resolve(Ok(value=advertisement()))
+    await settle()
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.display_name == "Renamed"
+    assert harness.kinds == ["added", "updated"]
+
+
+@run_async
+async def test_resolve_failure_keeps_known_receivers_and_reports_a_retryable_error():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    harness.mdns.announce("Ghost._airplay._tcp.local.")
+    await settle()
+    assert harness.kinds[-1] == "error"
+    diagnostic = harness.events[-1].diagnostic
+    assert diagnostic is not None
+    assert diagnostic.code is ErrorCode.discovery_failed
+    assert RecoveryAction.retry in diagnostic.recovery
+    known = harness.view(LIVING_ROOM)
+    assert known is not None and known.online
+
+
+@run_async
+async def test_removal_retains_the_last_known_view_offline_with_a_newer_generation():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    online = harness.view(LIVING_ROOM)
+    assert online is not None and online.online
+    harness.mdns.withdraw(record.key)
+    await settle()
+    assert harness.kinds == ["added", "removed"]
+    removed = harness.events[-1].receiver
+    assert removed is not None and not removed.online
+    offline = harness.view(LIVING_ROOM)
+    assert offline is not None and not offline.online
+    assert offline.display_name == "Living Room"
+    assert offline.record_set.endpoint_generation > online.record_set.endpoint_generation
+    assert offline.record_set.receiver_id == LIVING_ROOM
+    assert offline.record_set.records == ()
+    assert isinstance(target_for(offline.record_set), Err)
+    # The retained view never resolves to a usable target while it is offline.
+    assert offline.record_set.endpoint_generation != online.record_set.endpoint_generation
+
+
+@run_async
+async def test_removal_of_an_unknown_key_emits_nothing():
+    harness = Harness()
+    await harness.start()
+    harness.mdns.withdraw("Nobody._airplay._tcp.local.")
+    await settle()
+    assert harness.events == []
+
+
+@run_async
+async def test_reappearance_after_removal_is_added_again_with_a_current_endpoint():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    added = harness.view(LIVING_ROOM)
+    harness.mdns.withdraw(record.key)
+    await settle()
+    removed = harness.view(LIVING_ROOM)
+    assert added is not None and removed is not None
+    await harness.offer(record)
+    assert harness.kinds == ["added", "removed", "added"]
+    view = harness.view(LIVING_ROOM)
+    assert view is not None and view.online
+    target = target_for(view.record_set)
+    assert isinstance(target, Ok)
+    # Neither the removal nor the reappearance may re-issue a spent generation.
+    assert removed.record_set.endpoint_generation > added.record_set.endpoint_generation
+    assert view.record_set.endpoint_generation >= removed.record_set.endpoint_generation
+
+
+@run_async
+async def test_endpoint_round_trip_after_repeated_reappearance_never_reissues_a_target():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    result = target_for(view.record_set)
+    assert isinstance(result, Ok)
+    targets = [result.value]
+
+    for _ in range(2):
+        harness.mdns.withdraw(record.key)
+        await settle()
+        await harness.offer(record)
+        view = harness.view(LIVING_ROOM)
+        assert view is not None
+        result = target_for(view.record_set)
+        assert isinstance(result, Ok)
+        targets.append(result.value)
+
+    for changed in (advertisement(port=7100), record):
+        await harness.offer(changed)
+        view = harness.view(LIVING_ROOM)
+        assert view is not None
+        result = target_for(view.record_set)
+        assert isinstance(result, Ok)
+        targets.append(result.value)
+
+    pairs = [(target.endpoint_fingerprint, target.endpoint_generation) for target in targets]
+    assert len(pairs) == len(set(pairs))
+
+
+@run_async
+async def test_unchanged_refresh_after_reappearance_emits_no_events():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    harness.mdns.withdraw(record.key)
+    await settle()
+    await harness.offer(record)
+    event_count = len(harness.events)
+    for _ in range(2):
+        harness.mdns.answer(record.key, record)
+        assert isinstance(await harness.adapter.refresh(), Ok)
+        assert harness.kinds == ["added", "removed", "added"]
+        assert len(harness.events) == event_count
+
+
+# --------------------------------------------------------------------------- updates
+
+
+@run_async
+async def test_display_name_change_is_an_update_of_the_same_receiver():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    await harness.offer(advertisement(instance="Lounge._airplay._tcp.local.", key=advertisement().key))
+    assert harness.kinds == ["added", "updated"]
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.display_name == "Lounge"
+    assert view.record_set.endpoint_generation == 1
+
+
+@run_async
+async def test_address_change_is_an_update_with_a_newer_generation():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    await harness.offer(advertisement(addresses=("192.0.2.13",)))
+    assert harness.kinds == ["added", "updated"]
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.record_set.canonical_address == "192.0.2.13"
+    assert view.record_set.endpoint_generation == 2
+
+
+@run_async
+async def test_a_published_generation_never_goes_backwards_for_a_receiver():
+    """A later event must never publish an older generation than an earlier one.
+
+    Removal and reappearance charge generations the resolver itself does not
+    track, so an ordinary update afterwards would otherwise publish a number the
+    adapter already issued and a consumer already treated as stale.
+    """
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    harness.mdns.withdraw(record.key)
+    await settle()
+    await harness.offer(record)
+    await harness.offer(advertisement(instance="Lounge._airplay._tcp.local."))
+    await harness.offer(advertisement(addresses=("192.0.2.13",)))
+    assert harness.kinds == ["added", "removed", "added", "updated", "updated"]
+    generations = [
+        event.receiver.record_set.endpoint_generation
+        for event in harness.events
+        if event.receiver is not None and event.receiver.record_set.receiver_id == LIVING_ROOM
+    ]
+    assert generations == sorted(generations)
+    assert len(generations) == len(harness.events)
+    # A refresh of an unchanged receiver is not history, so it publishes nothing
+    # and therefore cannot lower the number either.
+    harness.mdns.answer(record.key, advertisement(addresses=("192.0.2.13",)))
+    assert isinstance(await harness.adapter.refresh(), Ok)
+    assert len(harness.events) == len(generations)
+
+
+
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement())
+    await harness.offer(advertisement(device_id="112233445566", txt={"deviceid": "112233445566"}))
+    assert harness.kinds == ["added", "added", "removed"]
+    added, removed = harness.events[1], harness.events[2]
+    assert added.receiver is not None
+    assert added.receiver.record_set.receiver_id == REPLACEMENT
+    assert added.receiver.record_set.replacement_of == LIVING_ROOM
+    assert added.receiver.record_set.continuity_verified is False
+    assert removed.receiver is not None
+    assert removed.receiver.record_set.receiver_id == LIVING_ROOM
+    assert removed.receiver.online is False
+    assert harness.view(LIVING_ROOM) is not None
+    assert harness.view(LIVING_ROOM).online is False
+
+
+# --------------------------------------------------------------------------- hints
+
+
+@run_async
+async def test_a_display_name_or_model_alone_produces_no_pairing_hint():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(
+        advertisement(txt={"deviceid": "AABBCCDDEEFF", "model": "AppleTV6,2"}),
+    )
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.pairing_hint is None
+    assert harness.events[0].diagnostic is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "txt", "hint"),
+    [
+        ("raop", {"deviceid": "AABBCCDDEEFF", "pw": "1"}, "password"),
+        ("airplay", {"deviceid": "AABBCCDDEEFF", "flags": "0x4"}, "pin"),
+        ("raop", {"deviceid": "AABBCCDDEEFF", "sf": "0x4"}, "pin"),
+        ("airplay", {"deviceid": "AABBCCDDEEFF", "flags": "0x0"}, None),
+        ("airplay", {"deviceid": "AABBCCDDEEFF", "flags": "0x2000004"}, "pin"),
+        ("airplay", {"deviceid": "AABBCCDDEEFF", "flags": "garbage"}, None),
+    ],
+)
+@run_async
+async def test_pairing_hints_are_normalized_from_explicit_keys(kind, txt, hint):
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement(kind, txt=txt))
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.pairing_hint == hint
+
+
+@run_async
+async def test_the_airplay_record_supplies_the_pairing_hint_when_both_services_disagree():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement("raop", port=5000, txt={"deviceid": "AABBCCDDEEFF", "pw": "1"}))
+    await harness.offer(advertisement(txt={"deviceid": "AABBCCDDEEFF", "flags": "0x4"}))
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.pairing_hint == "pin"
+
+
+@run_async
+async def test_feature_bits_are_normalized_in_the_record_and_absent_when_unparseable():
+    harness = Harness()
+    await harness.start()
+    await harness.offer(advertisement(txt={"deviceid": "AABBCCDDEEFF", "features": "0X5A7FFFF7"}))
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert view.record_set.records[0].txt["features"] == "0x5a7ffff7"
+    harness.mdns.withdraw("Living Room._airplay._tcp.local.")
+    await settle()
+    await harness.offer(
+        advertisement(txt={"deviceid": "AABBCCDDEEFF", "features": "nonsense"}),
+    )
+    view = harness.view(LIVING_ROOM)
+    assert view is not None
+    assert "features" not in view.record_set.records[0].txt
+
+
+# --------------------------------------------------------------------------- refresh
+
+
+@run_async
+async def test_refresh_retries_announced_keys_after_the_first_resolve_fails():
+    harness = Harness()
+    await harness.start()
+    key = "First Resolve Fails._airplay._tcp.local."
+    record = advertisement(key=key, instance=key)
+    harness.mdns.announce(key)
+    await settle()
+    assert harness.kinds == ["error"]
+
+    before = len(harness.mdns.resolve_calls)
+    harness.mdns.answer(key, record)
+    result = await harness.adapter.refresh()
+    await settle()
+    assert isinstance(result, Ok)
+    assert harness.mdns.resolve_calls[before:] == [key]
+    assert harness.mdns.refresh_calls == 1
+    view = harness.view(LIVING_ROOM)
+    assert view is not None and view.online
+
+    harness.mdns.withdraw(key)
+    await settle()
+    before = len(harness.mdns.resolve_calls)
+    harness.mdns.answer(key, record)
+    assert isinstance(await harness.adapter.refresh(), Ok)
+    assert harness.mdns.resolve_calls[before:] == []
+    assert harness.mdns.refresh_calls == 2
+
+
+@run_async
+async def test_refresh_re_resolves_live_records_without_duplicating_events():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    before = len(harness.mdns.resolve_calls)
+    harness.mdns.answer(record.key, record)
+    result = await harness.adapter.refresh()
+    await settle()
+    assert isinstance(result, Ok)
+    assert harness.mdns.resolve_calls[before:] == [record.key]
+    assert harness.kinds == ["added"]
+
+
+@run_async
+async def test_refresh_starts_browsing_when_the_adapter_is_not_started():
+    harness = Harness()
+    result = await harness.adapter.refresh()
+    assert isinstance(result, Ok)
+    assert [types for types, _ in harness.mdns.browsed] == [(AIRPLAY_SERVICE, RAOP_SERVICE)]
+
+
+@run_async
+async def test_refresh_failure_keeps_known_receivers_and_reports_a_retryable_error():
+    harness = Harness()
+    await harness.start()
+    record = advertisement()
+    await harness.offer(record)
+    harness.mdns.answers.pop(record.key)
+    result = await harness.adapter.refresh()
+    await settle()
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.discovery_failed
+    assert RecoveryAction.retry in result.error.recovery
+    assert harness.kinds == ["added", "error"]
+    view = harness.view(LIVING_ROOM)
+    assert view is not None and view.online
+
+
+@run_async
+async def test_refresh_is_bounded_by_a_fixed_number_of_keys():
+    harness = Harness()
+    await harness.start()
+    for index in range(MAX_REFRESH_KEYS + 5):
+        record = advertisement(
+            key=f"Receiver {index}._airplay._tcp.local.",
+            instance=f"Receiver {index}._airplay._tcp.local.",
+            device_id=f"aa00000000{index:02x}",
+            addresses=("192.0.2.12",),
+        )
+        harness.mdns.answer(record.key, record)
+        harness.mdns.announce(record.key)
+    await settle()
+    before = len(harness.mdns.resolve_calls)
+    assert before == MAX_REFRESH_KEYS + 5
+    await harness.adapter.refresh()
+    await settle()
+    assert len(harness.mdns.resolve_calls) - before == MAX_REFRESH_KEYS
+
+
+@run_async
+async def test_bounded_refresh_rotates_across_the_full_live_key_set():
+    harness = Harness()
+    await harness.start()
+    keys = [
+        f"Receiver {index}._airplay._tcp.local."
+        for index in range(MAX_REFRESH_KEYS + 5)
+    ]
+    for index, key in enumerate(keys):
+        record = advertisement(key=key, instance=key, device_id=f"aa00000000{index:02x}")
+        harness.mdns.answer(key, record)
+        harness.mdns.announce(key)
+    await settle()
+
+    before = len(harness.mdns.resolve_calls)
+    await harness.adapter.refresh()
+    first = harness.mdns.resolve_calls[before:]
+    before = len(harness.mdns.resolve_calls)
+    await harness.adapter.refresh()
+    second = harness.mdns.resolve_calls[before:]
+
+    ordered = sorted(keys)
+    assert set(first) == set(ordered[:MAX_REFRESH_KEYS])
+    assert set(ordered[MAX_REFRESH_KEYS:]).issubset(second)
+    assert len(second) == MAX_REFRESH_KEYS
+
+
+# --------------------------------------------------------------------------- azc client
+
+
+@run_async
+async def test_azc_client_refresh_never_invents_a_browser_call():
+    """zeroconf has no public "scan now" call, so refresh must not fabricate one.
+
+    ``AsyncServiceBrowser`` exposes only ``async_update_records(zc, now, records)``,
+    which *delivers* records rather than requesting them, and the query scheduler
+    behind it is private and Cython-compiled. This test pins the real dependency's
+    shape: any invented invocation with the wrong arity would raise here.
+
+    Use the genuine class to bind the call, so a fake cannot hide a signature
+    mismatch.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    browser_cls = aio.AsyncServiceBrowser
+    bound = inspect.signature(browser_cls.async_update_records)
+    assert list(bound.parameters)[:4] == ["self", "zc", "now", "records"], bound
+    assert not hasattr(browser_cls, "async_scan")
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: object())
+    # A browser object whose only real method needs three arguments: if refresh
+    # ever calls it bare, this raises TypeError and the test fails.
+    class Browser:
+        async def async_update_records(self, zc: Any, now: Any, records: Any) -> None:
+            raise AssertionError("refresh must not invoke async_update_records")
+
+    mdns._browsers.extend([Browser(), Browser()])
+    result = await mdns.refresh()
+    assert isinstance(result, Ok), result
+    await mdns.close()
+
+
+@run_async
+async def test_azc_client_reports_a_missing_implementation_as_retryable():
+    def factory() -> object:
+        raise RuntimeError("zeroconf is not importable")
+
+    client = AzcMdnsClient(FakeClock(), factory=factory)
+    result = await client.browse((AIRPLAY_SERVICE, RAOP_SERVICE), lambda key, change: None)
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.discovery_failed
+    assert RecoveryAction.retry in result.error.recovery
+    # No backend exception text reaches the diagnostic.
+    assert "zeroconf" not in result.error.message
+    await client.close()
+
+
+@run_async
+async def test_azc_client_close_is_safe_before_start_and_idempotent():
+    client = AzcMdnsClient(FakeClock(), factory=lambda: (_ for _ in ()).throw(RuntimeError()))
+    await client.close()
+    await client.close()
+
+
+@run_async
+async def test_azc_client_resolve_without_a_browser_fails_closed():
+    client = AzcMdnsClient(FakeClock(), factory=lambda: (_ for _ in ()).throw(RuntimeError()))
+    result = await client.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.discovery_failed
+
+
+def test_notification_handler_uses_the_instance_name_not_the_service_type():
+    """zeroconf's real signatures must map onto one change, never the wrong key."""
+    from airplay_linux.discovery.zeroconf_adapter import _Notification
+
+    class Change:
+        name = "removed"
+
+    seen: list[ServiceChange] = []
+    handler = _Notification(seen.append, AIRPLAY_SERVICE)
+    # Positional form: (zeroconf, service_type, name, state_change).
+    handler(None, AIRPLAY_SERVICE, "Living Room._airplay._tcp.local.", Change())
+    # Keyword form, which is what a newer zeroconf uses.
+    handler(name="Lounge._airplay._tcp.local.", state_change="added")
+    assert [(change.key, change.state) for change in seen] == [
+        ("Living Room._airplay._tcp.local.", "removed"),
+        ("Lounge._airplay._tcp.local.", "added"),
+    ]
+    assert {change.service_type for change in seen} == {AIRPLAY_SERVICE}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        (),
+        (None, AIRPLAY_SERVICE),
+        (None, AIRPLAY_SERVICE, "", "added"),
+        (None, AIRPLAY_SERVICE, "Living Room._airplay._tcp.local.", "bogus"),
+        (None, AIRPLAY_SERVICE, 42, "added"),
+    ],
+)
+def test_notification_handler_ignores_malformed_notifications(args):
+    from airplay_linux.discovery.zeroconf_adapter import _Notification
+
+    seen: list[ServiceChange] = []
+    _Notification(seen.append, AIRPLAY_SERVICE)(*args)
+    assert seen == []
+
+
+@run_async
+async def test_azc_client_closes_every_browser_it_started():
+    class Browser:
+        def __init__(self, *args, **kwargs):
+            self.cancelled = 0
+
+        async def async_cancel(self):
+            self.cancelled += 1
+
+    class Client:
+        def __init__(self):
+            self.zeroconf = object()
+            self.closed = 0
+
+        async def async_close(self):
+            self.closed += 1
+
+    client = Client()
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: client)
+    import airplay_linux.discovery.zeroconf_adapter as adapter_module
+
+    original = adapter_module.AsyncServiceBrowser if hasattr(
+        adapter_module, "AsyncServiceBrowser",
+    ) else None
+    browsers: list[Browser] = []
+
+    def make(*args, **kwargs):
+        browser = Browser()
+        browsers.append(browser)
+        return browser
+
+    # No zeroconf is installed here, so the browser is injected at the seam the
+    # client imports it from rather than by installing the dependency.
+    monkey = pytest.MonkeyPatch()
+    try:
+        import sys
+        import types
+
+        fake = types.ModuleType("zeroconf.asyncio")
+        fake.AsyncServiceBrowser = make  # type: ignore[attr-defined]
+        fake.AsyncZeroconf = lambda: client  # type: ignore[attr-defined]
+        monkey.setitem(sys.modules, "zeroconf", types.ModuleType("zeroconf"))
+        monkey.setitem(sys.modules, "zeroconf.asyncio", fake)
+        result = await mdns.browse((AIRPLAY_SERVICE, RAOP_SERVICE), lambda change: None)
+    finally:
+        monkey.undo()
+    assert isinstance(result, Ok)
+    assert len(browsers) == 2
+    # ``Subscription.close`` is synchronous, so the async cancel it schedules has
+    # to be observed on the loop rather than assumed to have run inline.
+    result.value.close()
+    await settle()
+    assert [browser.cancelled for browser in browsers] == [1, 1]
+    result.value.close()
+    await settle()
+    assert [browser.cancelled for browser in browsers] == [1, 1]
+    await mdns.close()
+    assert client.closed == 1
+    # Closing the client itself cancelled every browser exactly once more only if
+    # it still held them; an already-detached handle is never cancelled again.
+    assert [browser.cancelled for browser in browsers] == [1, 1]
+    assert original is None or callable(original)
+
+
+# --- the concrete resolve path: the seam the fake client never exercised -----
+
+
+class _ServiceInfo:
+    """A duck-typed stand-in for ``zeroconf.ServiceInfo``; no socket involved."""
+
+    def __init__(self, **overrides: Any) -> None:
+        self.name = "Living Room._airplay._tcp.local."
+        self.type = "_airplay._tcp.local."
+        self.server = "living-room.local."
+        self.port = 7000
+        self.addresses = [bytes([192, 0, 2, 10])]
+        self.properties = {b"model": b"AppleTV6,2", b"deviceid": b"00:11:22:33:44:55"}
+        for key, value in overrides.items():
+            setattr(self, key, value)
+
+
+def _resolving_client(info: object) -> Any:
+    class Client:
+        def __init__(self) -> None:
+            self.zeroconf = object()
+
+        async def async_get_service_info(self, *_args: Any, **_kwargs: Any) -> object:
+            return info
+
+        async def async_close(self) -> None:
+            return None
+
+    return Client()
+
+
+@run_async
+async def test_a_real_service_info_converts_into_a_domain_record():
+    mdns = AzcMdnsClient(FakeClock(50.0), factory=lambda: _resolving_client(_ServiceInfo()))
+    # ``resolve`` only serves keys a browse already registered, exactly as the
+    # adapter's contract requires; seed that map rather than weakening resolve.
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    record = result.value
+    assert record.device_id == "00:11:22:33:44:55"
+    assert record.model == "AppleTV6,2"
+    assert record.addresses == ("192.0.2.10",)
+    assert record.port == 7000
+    assert record.seen_at == 50.0
+    await mdns.close()
+
+
+@run_async
+async def test_parsed_scoped_addresses_preserve_ipv6_only_and_dual_stack_records():
+    async def resolve(info: object) -> ServiceRecord:
+        key = "Living Room._airplay._tcp.local."
+        mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+        mdns._types[key] = AIRPLAY_SERVICE
+        result = await mdns.resolve(key)
+        await mdns.close()
+        assert isinstance(result, Ok), result
+        return result.value
+
+    ipv6_only = _ServiceInfo(addresses=[])
+    ipv6_only.parsed_addresses = lambda: ["fe80::1234"]
+    ipv6_only.parsed_scoped_addresses = lambda: ["fe80::1234%3"]
+    record = await resolve(ipv6_only)
+    assert record.addresses == ("fe80::1234%3",)
+    receiver = IdentityResolver().update((record,))[0]
+    target = target_for(receiver)
+    assert isinstance(target, Ok)
+    assert target.value.canonical_host == "fe80::1234%3"
+
+    dual_stack = _ServiceInfo(addresses=[bytes((192, 0, 2, 10))])
+    dual_stack.parsed_addresses = lambda: ["192.0.2.10", "fe80::1234"]
+    dual_stack.parsed_scoped_addresses = lambda: ["192.0.2.10", "fe80::1234%3"]
+    record = await resolve(dual_stack)
+    assert set(record.addresses) == {"192.0.2.10", "fe80::1234%3"}
+    receiver = IdentityResolver().update((record,))[0]
+    target = target_for(receiver)
+    assert isinstance(target, Ok)
+    assert target.value.canonical_host == "192.0.2.10"
+
+
+@run_async
+async def test_txt_bytes_that_are_not_utf8_are_dropped_not_replaced():
+    info = _ServiceInfo(properties={b"model": b"AppleTV6,2", b"junk": b"\xff\xfe"})
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.model == "AppleTV6,2"
+
+
+@run_async
+async def test_ipv6_addresses_are_carried_through_resolution():
+    info = _ServiceInfo(addresses=[bytes(16)[:15] + b"\x01"])
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.addresses == ("::1",)
+
+
+@run_async
+@pytest.mark.parametrize(
+    "info",
+    [
+        _ServiceInfo(name=None),
+        _ServiceInfo(type=None),
+        _ServiceInfo(server=None),
+        _ServiceInfo(port="7000"),
+        _ServiceInfo(port=0),
+    ],
+    ids=["no-name", "no-type", "no-server", "port-text", "port-zero"],
+)
+async def test_a_malformed_service_info_is_a_sanitized_retryable_failure(info):
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.discovery_failed
+
+
+@run_async
+async def test_unusable_txt_properties_degrade_to_no_evidence_rather_than_failing():
+    """A non-mapping ``properties`` is not evidence, and not a crash either.
+
+    Dropping it yields a record with no TXT-derived identity, which the resolver
+    then treats as a weaker candidate. Refusing the whole advertisement would
+    throw away a receiver whose address and port are perfectly usable.
+    """
+    info = _ServiceInfo(properties=["not", "a", "mapping"])
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: _resolving_client(info))
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert result.value.addresses == ("192.0.2.10",)
+    assert result.value.device_id is None
+    assert dict(result.value.txt) == {}
+
+
+@run_async
+async def test_resolve_after_close_never_resurrects_a_backend():
+    """Closing is final: a later resolve must not reopen discovery resources.
+
+    An unconditional acquire in ``resolve`` would recreate the backend after
+    ``close`` had already declared every resource released, and the idempotence
+    guard would then refuse to release the replacement.
+    """
+    created: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        def __init__(self) -> None:
+            self.closed = 0
+
+        async def async_get_service_info(self, *_args: Any, **_kwargs: Any) -> object:
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            self.closed += 1
+
+    def factory() -> Backend:
+        backend = Backend()
+        created.append(backend)
+        return backend
+
+    mdns = AzcMdnsClient(FakeClock(), factory=factory)
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    await mdns.close()
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    await mdns.close()
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.discovery_failed
+    assert created == [], "a closed client must not acquire a backend"
+
+
+@run_async
+async def test_the_backend_receives_a_millisecond_resolve_budget():
+    """The dependency documents milliseconds; the adapter's budget is seconds.
+
+    Passing the seconds value straight through asked for a two-millisecond
+    lookup, which no real network answer can meet — and a fake that returns
+    immediately cannot reveal the mismatch.
+    """
+    seen: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> object:
+            seen.append(kwargs.get("timeout"))
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            return None
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: Backend())
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert seen == [2000], f"a 2-second budget must reach the backend as 2000 ms, got {seen}"
+
+
+@run_async
+async def test_a_sub_millisecond_budget_never_becomes_zero():
+    seen: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> object:
+            seen.append(kwargs.get("timeout"))
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            return None
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: Backend(), resolve_timeout=0.0001)
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert seen == [1], seen
+
+
+# --- the installed dependency's real surface --------------------------------
+#
+# The adapter's calls are only correct if they bind to the signatures the
+# installed ``zeroconf`` actually has. The recorded surface for 0.151.5 is:
+#
+#   AsyncZeroconf()                                        -> no required args
+#   AsyncZeroconf.async_get_service_info(self, type_: str, name: str,
+#                                        timeout: int = 3000,
+#                                        question_type=None) -> AsyncServiceInfo | None
+#       ``timeout`` is in **milliseconds** (the default is 3000 ms), so
+#       ``_backend_timeout`` converts the adapter's seconds budget.
+#   AsyncServiceBrowser(zeroconf, type_, handlers=None, listener=None,
+#                       addr=None, port=5353, delay=10000, question_type=None)
+#       construction registers the listener synchronously; the object is not
+#       awaitable.
+#   AsyncServiceBrowser.async_cancel(self) -> None          (coroutine, not idempotent)
+#   AsyncZeroconf.async_close(self) -> None                 (coroutine)
+#   ServiceInfo.name/type/server/port/properties            -> attributes
+#   ServiceInfo.addresses                                   -> attribute, IPv4 bytes only
+#   ServiceInfo.parsed_scoped_addresses()/parsed_addresses() -> methods, list[str]
+#
+# ``AsyncServiceBrowser`` has no public "scan now" member: its only public
+# surface is async_update_records/async_update_records_complete/done/
+# query_scheduler/service_state_changed/types/update_record/zc.
+
+
+class _CacheOnlyZeroconf:
+    """A Zeroconf-shaped backend with the genuine cache and no sockets.
+
+    Only the members the installed ``AsyncServiceBrowser`` and
+    ``ServiceInfo.async_request`` really call are provided, and the lookup
+    itself is bound to the genuine ``Zeroconf.async_get_service_info`` so the
+    dependency's own arity, positional order, and millisecond deadline are the
+    ones under test.
+
+    ``async_remove_listener`` reproduces the installed ``RecordManager``
+    behaviour: detaching a listener that is already gone raises ``KeyError``.
+    """
+
+    #: The genuine implementation performs the lookup.
+    async_get_service_info = zeroconf.Zeroconf.async_get_service_info
+
+    def __init__(self, loop: Any) -> None:
+        self.cache = zeroconf.DNSCache()
+        self.loop = loop
+        self.started = True
+        self.done = False
+        self.listeners: list[Any] = []
+
+    def async_add_listener(self, listener: Any, question: Any = None) -> None:
+        self.listeners.append(listener)
+
+    def async_remove_listener(self, listener: Any) -> None:
+        self.listeners.remove(listener)
+
+    def async_send(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def async_wait_for_start(self, timeout: float = 9) -> None:
+        return None
+
+
+def _recording_backend(backend_zeroconf: Any) -> Any:
+    """An ``AsyncZeroconf``-shaped seam that records the calls the adapter makes."""
+
+    class Backend:
+        def __init__(self) -> None:
+            self.zeroconf = backend_zeroconf
+            self.calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> Any:
+            self.calls.append((args, kwargs))
+            return await backend_zeroconf.async_get_service_info(*args, **kwargs)
+
+        async def async_close(self) -> None:
+            return None
+
+    return Backend()
+
+
+def _real_service_info(**overrides: Any) -> Any:
+    """A genuine ``zeroconf.ServiceInfo``; no socket is involved in building one."""
+    arguments: dict[str, Any] = {
+        "type_": AIRPLAY_SERVICE,
+        "name": "Living Room._airplay._tcp.local.",
+        "addresses": [bytes([192, 0, 2, 10])],
+        "port": 7000,
+        "properties": {b"deviceid": b"AABBCCDDEEFF", b"model": b"AppleTV6,2"},
+        "server": "living-room.local.",
+    }
+    arguments.update(overrides)
+    return zeroconf.ServiceInfo(**arguments)
+
+
+@run_async
+async def test_every_call_into_zeroconf_binds_to_the_installed_signature():
+    """Bind each call the adapter makes to the genuine signature.
+
+    ``inspect.signature(...).bind`` raises ``TypeError`` for a wrong arity, so a
+    dependency mismatch fails here instead of only against a live network.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+
+    # ``_default_factory`` constructs AsyncZeroconf with no arguments.
+    inspect.signature(aio.AsyncZeroconf).bind()
+
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+    key = "Living Room._airplay._tcp.local."
+    mdns._types[key] = AIRPLAY_SERVICE
+    # An empty cache cannot answer, and this backend has no transport to query
+    # through, so the call shape is observed without any network.
+    assert isinstance(await mdns.resolve(key), Err)
+
+    ((args, kwargs),) = backend.calls
+    bound = inspect.signature(aio.AsyncZeroconf.async_get_service_info).bind(
+        backend, *args, **kwargs,
+    )
+    assert bound.arguments["type_"] == AIRPLAY_SERVICE
+    assert bound.arguments["name"] == key
+    # The dependency documents milliseconds; a 2-second budget is 2000 of them.
+    assert bound.arguments["timeout"] == 2000
+    assert inspect.signature(
+        aio.AsyncZeroconf.async_get_service_info,
+    ).parameters["timeout"].default == 3000
+
+    handler = _Notification(lambda change: None, AIRPLAY_SERVICE)
+    inspect.signature(aio.AsyncServiceBrowser.__init__).bind(
+        object(), backend_zeroconf, AIRPLAY_SERVICE, handlers=[handler],
+    )
+    assert inspect.iscoroutinefunction(aio.AsyncServiceBrowser.async_cancel)
+    inspect.signature(aio.AsyncServiceBrowser.async_cancel).bind(object())
+    assert inspect.iscoroutinefunction(aio.AsyncZeroconf.async_close)
+    inspect.signature(aio.AsyncZeroconf.async_close).bind(object())
+    await mdns.close()
+
+
+@run_async
+async def test_the_service_info_shapes_raw_reads_are_the_installed_ones():
+    """``_raw`` reads three address views and properties; bind them all."""
+    pytest.importorskip("zeroconf.asyncio")
+    info = _real_service_info()
+
+    # Scalar fields are attributes, so ``_raw`` must not call them.
+    for attribute in ("name", "type", "server", "port", "properties"):
+        assert not callable(getattr(info, attribute)), attribute
+    # ``addresses`` is an attribute holding IPv4 bytes; the parsed views are
+    # methods. ``_raw`` decides with ``callable``, which is exactly this split.
+    assert not callable(info.addresses)
+    assert [bytes(item) for item in info.addresses] == [bytes([192, 0, 2, 10])]
+    for method in ("parsed_scoped_addresses", "parsed_addresses"):
+        assert callable(getattr(info, method)), method
+        assert getattr(info, method)() == ["192.0.2.10"]
+
+    raw = _raw(info)
+    assert raw.addresses == (bytes([192, 0, 2, 10]), "192.0.2.10")
+    assert raw.txt == {b"deviceid": b"AABBCCDDEEFF", b"model": b"AppleTV6,2"}
+
+    # An unresolved AsyncServiceInfo carries no server or port; refusing it is
+    # what keeps a lookup race from fabricating a receiver.
+    unresolved = aio_unresolved()
+    assert unresolved.server is None and unresolved.port is None
+    with pytest.raises(TypeError):
+        _raw(unresolved)
+
+
+@run_async
+async def test_a_genuine_cache_lookup_becomes_a_domain_record():
+    """Drive the installed lookup end to end, over a socket-free cache."""
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    info = _real_service_info()
+    backend_zeroconf.cache.async_add_records(
+        [info.dns_service(), info.dns_text(), *info.dns_addresses()],
+    )
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(4.0), factory=lambda: backend)
+    mdns._types[info.name] = AIRPLAY_SERVICE
+
+    result = await mdns.resolve(info.name)
+    assert isinstance(result, Ok), result
+    record = result.value
+    assert (record.device_id, record.model) == ("AABBCCDDEEFF", "AppleTV6,2")
+    assert record.addresses == ("192.0.2.10",)
+    assert (record.host, record.port) == ("living-room.local.", 7000)
+    assert record.seen_at == 4.0
+    await mdns.close()
+
+
+@run_async
+async def test_the_installed_browser_delivers_every_state_to_the_adapter_handler():
+    """Construct the genuine browser and drive its real notification dispatch."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    key = "Living Room._airplay._tcp.local."
+    seen: list[ServiceChange] = []
+    browser = aio.AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE, handlers=[_Notification(seen.append, AIRPLAY_SERVICE)],
+    )
+    assert browser in backend_zeroconf.listeners
+    # Construction starts the browser inline; nothing else needs awaiting.
+    assert not inspect.isawaitable(browser)
+
+    # ``async_update_records`` + ``async_update_records_complete`` are the public
+    # path real traffic takes, delivering added and removed.
+    now = time.time() * 1000
+    fresh = zeroconf.DNSPointer(
+        AIRPLAY_SERVICE, zeroconf.const._TYPE_PTR, zeroconf.const._CLASS_IN, 4500, key,
+    )
+    expired = zeroconf.DNSPointer(
+        AIRPLAY_SERVICE, zeroconf.const._TYPE_PTR, zeroconf.const._CLASS_IN, 4500, key, 0,
+    )
+    for update, expected in (
+        (zeroconf.RecordUpdate(fresh), "added"),
+        (zeroconf.RecordUpdate(expired, fresh), "removed"),
+    ):
+        seen.clear()
+        browser.async_update_records(backend_zeroconf, now, [update])
+        browser.async_update_records_complete()
+        assert [(change.key, change.state) for change in seen] == [(key, expected)]
+
+    # ``updated`` reaches handlers through the same dispatcher the browser calls
+    # once the cache has committed a batch; a genuine Updated needs a cache
+    # dance, so the dispatcher is driven directly.
+    seen.clear()
+    browser._fire_service_state_changed_event(
+        ((key, AIRPLAY_SERVICE), zeroconf.ServiceStateChange.Updated),
+    )
+    assert [(change.key, change.state) for change in seen] == [(key, "updated")]
+    assert {change.service_type for change in seen} == {AIRPLAY_SERVICE}
+
+    await browser.async_cancel()
+    assert browser.done and backend_zeroconf.listeners == []
+
+
+@run_async
+async def test_the_installed_browser_exposes_no_scan_or_refresh_entry_point():
+    """``refresh`` must not invent one; the installed surface has no such member."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    public = {name for name in dir(aio.AsyncServiceBrowser) if not name.startswith("_")}
+    assert public == {
+        "async_cancel",
+        "async_update_records",
+        "async_update_records_complete",
+        "done",
+        "query_scheduler",
+        "service_state_changed",
+        "types",
+        "update_record",
+        "zc",
+    }, sorted(public)
+    # Nothing on the browser asks the network to re-scan; ``refresh`` therefore
+    # re-resolves known keys instead of calling an invented member.
+    assert {name for name in public if any(
+        word in name.lower() for word in ("scan", "refresh", "requery", "resend")
+    )} == set()
+
+
+@run_async
+async def test_closing_a_subscription_after_the_client_never_leaks_a_cancel_failure():
+    """A stale browser handle must not re-cancel a browser the client released.
+
+    The installed ``_async_cancel`` is not idempotent: it detaches the browser
+    from the record manager, which raises ``KeyError`` once it is already gone.
+    ``Subscription.close`` is synchronous, so its cancel runs as a scheduled
+    task, and an exception there is never retrieved -- the event loop reports an
+    unhandled task exception for work nobody can act on.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        backend_zeroconf = _CacheOnlyZeroconf(loop)
+        backend = _recording_backend(backend_zeroconf)
+        mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+        result = await mdns.browse((AIRPLAY_SERVICE,), lambda change: None)
+        assert isinstance(result, Ok), result
+        subscription = result.value
+        await mdns.close()
+        # The client already cancelled every browser it started.
+        assert backend_zeroconf.listeners == []
+        subscription.close()
+        await settle()
+        gc.collect()
+        await settle()
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == [], reported
+
+
+@run_async
+async def test_a_browser_cancelled_by_its_subscription_is_cancelled_once():
+    """The handle's own cancel still runs when the client has not released it."""
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    backend = _recording_backend(backend_zeroconf)
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: backend)
+    result = await mdns.browse((AIRPLAY_SERVICE,), lambda change: None)
+    assert isinstance(result, Ok), result
+    browser = mdns._browsers[0]
+    result.value.close()
+    await settle()
+    assert browser.done and backend_zeroconf.listeners == []
+    # The client no longer holds the handle, so its own close has nothing to do.
+    await mdns.close()
+    assert backend_zeroconf.listeners == []
+
+
+@run_async
+async def test_a_stale_handle_does_not_re_cancel_a_released_browser():
+    """The handle asks the dependency whether the browser is already released.
+
+    ``Subscription.close`` is synchronous, so a re-cancel it schedules is a task
+    nobody awaits; the installed browser raises on that path. The ``done`` flag
+    is the dependency's own answer, so a released browser is never touched again
+    -- asserted here on a double shaped from the installed attributes without
+    relying on the exception being swallowed downstream.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+
+    class ReleasedBrowser:
+        """The installed browser's released state: ``done`` is already set."""
+
+        done = True
+
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        async def async_cancel(self) -> None:
+            self.cancelled += 1
+
+    browser = ReleasedBrowser()
+    detach = AzcMdnsClient(FakeClock(), factory=lambda: object())._detach
+    handle = _Browsers([browser], {}, detach)
+    handle.close()
+    await settle()
+    assert browser.cancelled == 0, "an already released browser must not be cancelled again"
+    # The installed browser really does carry ``done`` and really does raise when
+    # cancelled after release, so the guard reads a real attribute, not a guess.
+    genuine = aio.AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE, handlers=[_Notification(lambda change: None, AIRPLAY_SERVICE)],
+    )
+    assert genuine.done is False
+    await genuine.async_cancel()
+    assert genuine.done is True
+    with pytest.raises(Exception):
+        await genuine.async_cancel()
+
+
+@run_async
+async def test_a_scheduled_cancel_that_raises_is_retrieved_not_left_unhandled():
+    """A cancel that fails after scheduling must not reach the event loop.
+
+    Nothing awaits the task ``Subscription.close`` schedules, so an unretrieved
+    exception is reported as an unhandled task failure. The callback retrieves
+    it, exactly as the awaited path drops it.
+    """
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+    reported: list[dict[str, Any]] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        class FailingBrowser:
+            # ``done`` is False, so the guard lets the cancel through and the
+            # failure is what the callback has to retrieve.
+            done = False
+
+            async def async_cancel(self) -> None:
+                raise RuntimeError("release failed")
+
+        detach = AzcMdnsClient(FakeClock(), factory=lambda: object())._detach
+        handle = _Browsers([FailingBrowser()], {}, detach)
+        handle.close()
+        await settle()
+        gc.collect()
+        await settle()
+    finally:
+        loop.set_exception_handler(previous)
+    assert reported == [], reported
+
+
+@run_async
+async def test_the_client_does_not_re_cancel_a_browser_its_handle_already_released():
+    """The awaited cancel path reads the same ``done`` flag as the scheduled one.
+
+    A handle that released a browser without the client noticing leaves a
+    cancelled browser in ``_browsers``. Asking the installed dependency to
+    cancel it again raises, and ``close`` would swallow that into silence, so the
+    flag is checked before the dependency is called at all.
+    """
+    pytest.importorskip("zeroconf.asyncio")
+    loop = asyncio.get_running_loop()
+
+    class ReleasedBrowser:
+        """Shaped from the installed browser: an ``async_cancel()`` coroutine."""
+
+        done = True
+
+        def __init__(self) -> None:
+            self.cancelled = 0
+
+        async def async_cancel(self) -> None:
+            self.cancelled += 1
+
+    released = ReleasedBrowser()
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: object())
+    mdns._browsers.append(released)
+    await mdns.close()
+    assert released.cancelled == 0, "a released browser must not be cancelled again"
+    assert mdns._browsers == []
+
+    # The flag the guard reads is the installed browser's own, and it is set by
+    # a real cancel -- so this is not a guessed attribute.
+    backend_zeroconf = _CacheOnlyZeroconf(loop)
+    genuine = _genuine_browser(backend_zeroconf)
+    assert genuine.done is False
+    released_genuine = _genuine_browser(backend_zeroconf)
+    await released_genuine.async_cancel()
+    assert released_genuine.done is True
+    await genuine.async_cancel()
+
+
+def aio_unresolved() -> Any:
+    """A genuine, never-populated ``AsyncServiceInfo``."""
+    from zeroconf.asyncio import AsyncServiceInfo
+
+    return AsyncServiceInfo(AIRPLAY_SERVICE, "Nobody._airplay._tcp.local.")
+
+
+def _genuine_browser(backend_zeroconf: Any) -> Any:
+    """A genuine ``AsyncServiceBrowser`` over the socket-free backend."""
+    from zeroconf.asyncio import AsyncServiceBrowser
+
+    return AsyncServiceBrowser(
+        backend_zeroconf, AIRPLAY_SERVICE,
+        handlers=[_Notification(lambda change: None, AIRPLAY_SERVICE)],
+    )
+
+
+@run_async
+async def test_the_default_factory_actually_constructs_with_a_bound_signature():
+    """The adapter's *own* constructor call must bind to the installed class.
+
+    Asserting ``inspect.signature(AsyncZeroconf).bind()`` proves the dependency is
+    callable, not that the adapter calls it correctly: changing the adapter to
+    ``AsyncZeroconf(unsupported=True)`` would leave that check green. So run the
+    real factory with the genuine class replaced by a recorder, and bind the
+    arguments it actually received.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    import airplay_linux.discovery.zeroconf_adapter as adapter_module
+
+    captured: list[tuple[Any, ...]] = []
+
+    class Recorder:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            captured.append((args, kwargs))
+            # Bind against the genuine constructor so a wrong shape raises here.
+            inspect.signature(aio.AsyncZeroconf).bind(*args, **kwargs)
+
+    original = aio.AsyncZeroconf
+    aio.AsyncZeroconf = Recorder  # type: ignore[misc]
+    try:
+        factory = getattr(adapter_module, "_default_factory", None)
+        assert factory is not None, "the adapter must expose its default factory"
+        factory()
+    finally:
+        aio.AsyncZeroconf = original  # type: ignore[misc]
+
+    assert len(captured) == 1, captured
+    args, kwargs = captured[0]
+    inspect.signature(aio.AsyncZeroconf).bind(*args, **kwargs)
