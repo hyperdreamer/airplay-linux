@@ -32,14 +32,18 @@ long-lived process:
   directory owned by this user, and is tightened to ``0700``. A pre-existing
   ``0755``/``0777`` record directory would let another user replace metadata.
 * a publication is not reported successful until the directory entries it
-  depends on are ``fsync``ed -- and "the directory exists" is never accepted as
-  proof that a previous attempt confirmed it. The confirmation runs after the
-  publication point and covers the whole chain down from the root's parent, so a
-  retry after any failed ``directory_fsync`` re-establishes the entries an
-  earlier, failed attempt left behind. The same rule makes deletion idempotent:
-  a delete re-``fsync``s the containing directory even when the record is
-  already gone, so a retry after a failed unlink publication establishes durable
-  *absence* rather than assuming it.
+  depends on are ``fsync``ed -- and no earlier ``fsync`` is ever accepted as
+  proof about a later mutation. A directory ``fsync`` makes durable the entries
+  present *when it ran*; a rename or unlink performed afterwards is a new entry
+  mutation that only a later ``fsync`` of the same directory can make durable.
+  So the confirmation runs after every publication point, over the whole chain
+  from the changed entry up to the root's parent, and nothing is remembered
+  between publications or between retries on the same instance. That single rule
+  covers the three cases a confirmation cache got wrong: a second write to a
+  directory that was already synced, a delete (whose containing directory must be
+  synced after the unlink even when the record was already gone, because absence
+  is a publication too), and a newly created child directory (whose *parent* must
+  be synced, since the entry naming the child lives there).
 """
 
 from __future__ import annotations
@@ -239,8 +243,7 @@ def _open_step(error: OSError) -> str:
 class _Located:
     """An open record directory together with the chain that reaches it.
 
-    ``directories`` runs outermost-first (existing ancestors above the root, the
-    root, then each subdirectory) and ``paths`` names the same directories, so a
+    ``directories`` runs outermost-first (the root, then each subdirectory), so a
     publication can confirm the durability of every entry it used rather than of
     the last one only. ``missing`` records that the chain stops early: the named
     record directory does not exist, and ``parent`` is the deepest directory that
@@ -249,7 +252,6 @@ class _Located:
 
     parent: int | None
     directories: tuple[int, ...]
-    paths: tuple[Path, ...]
     missing: bool = False
 
 
@@ -277,8 +279,6 @@ class AtomicFiles:
             if S_ISLNK(existing.st_mode) or not S_ISDIR(existing.st_mode):
                 raise StorageError(PATH_STEP)
             self._identity = (existing.st_dev, existing.st_ino)
-        #: Directories whose own entries this instance has already made durable.
-        self._confirmed: set[Path] = set()
 
     @property
     def root(self) -> Path:
@@ -392,14 +392,12 @@ class AtomicFiles:
         caller can confirm the durability of the deepest entry it does have.
         """
         descriptors: list[int] = []
-        paths: list[Path] = []
         try:
             root = self._root_descriptor(create=create)
             if root is None:
-                yield _Located(parent=None, directories=(), paths=(), missing=True)
+                yield _Located(parent=None, directories=(), missing=True)
                 return
             descriptors.append(root)
-            paths.append(self._root)
             parent = root
             for part in parts:
                 entered = self._enter(parent, part, create=create)
@@ -407,18 +405,12 @@ class AtomicFiles:
                     yield _Located(
                         parent=parent,
                         directories=tuple(descriptors),
-                        paths=tuple(paths),
                         missing=True,
                     )
                     return
                 descriptors.append(entered)
                 parent = entered
-                paths.append(paths[-1] / part)
-            yield _Located(
-                parent=parent,
-                directories=tuple(descriptors),
-                paths=tuple(paths),
-            )
+            yield _Located(parent=parent, directories=tuple(descriptors))
         finally:
             for descriptor in reversed(descriptors):
                 try:
@@ -535,17 +527,26 @@ class AtomicFiles:
     def _confirm(self, located: _Located) -> None:
         """Establish the durability of the directory entries a publication used.
 
-        A directory that exists proves only that some attempt created it; that
-        attempt may have failed before its parent was synced. So the confirmation
-        is repeated for every new instance -- which is exactly the retry case a
-        crashed or failed publication leaves behind -- and it covers every entry
-        this package's own creation can have added: the record directory, each
-        directory between it and the root, the root, its parent, and any ancestor
-        a crashed attempt may have created on the way.
+        This runs after every publication point, and it remembers nothing. A
+        ``fsync`` of a directory makes durable the entries that existed when it
+        ran; the rename or unlink that follows is a *new* mutation of that same
+        directory, so an earlier sync is not evidence about it. There is
+        therefore no per-instance or per-pathname confirmation to inherit, on a
+        fresh instance or on a retry through the same one -- which is exactly the
+        case a failed or crashed publication leaves behind.
+
+        The chain covers every entry this package's own creation can have added:
+        the record directory (whose entry the rename or unlink just changed),
+        each directory between it and the root, the root, its parent, and any
+        ancestor a crashed attempt may have created on the way. A directory that
+        merely exists proves only that some attempt reached ``mkdir``; that
+        attempt may have failed before the entry naming it was synced.
 
         Deepest entry first: a child's entry is only durable once the directory
         that holds it has been synced, so the outer directories are confirmed
-        after the inner ones.
+        after the inner ones. That ordering is also what makes a newly created
+        child directory safe: its own sync says nothing about the entry naming it,
+        which lives one level further out and is synced afterwards.
 
         The climb above the root's parent stops at the first directory this
         process cannot open. That stop is sound rather than lazy: every directory
@@ -554,22 +555,17 @@ class AtomicFiles:
         always one this process can open. An unopenable ancestor therefore cannot
         hold an entry of ours, and neither can anything above it.
         """
-        for descriptor, path in reversed(list(zip(located.directories, located.paths))):
-            if path in self._confirmed:
-                continue
+        for descriptor in reversed(located.directories):
             self._fsync(descriptor)
-            self._confirmed.add(path)
         current = self._root.parent
         while current != current.parent:
-            if current not in self._confirmed:
-                descriptor = self._open_ancestor(current)
-                if descriptor is None:
-                    break
-                try:
-                    self._fsync(descriptor)
-                finally:
-                    self._close_quietly(descriptor)
-                self._confirmed.add(current)
+            descriptor = self._open_ancestor(current)
+            if descriptor is None:
+                break
+            try:
+                self._fsync(descriptor)
+            finally:
+                self._close_quietly(descriptor)
             current = current.parent
 
     def _open_ancestor(self, path: Path) -> int | None:

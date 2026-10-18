@@ -51,6 +51,7 @@ from airplay_linux.domain.resources import (
     Size,
 )
 from airplay_linux.storage import (
+    CREDENTIAL_REFERENCE_CONFLICT,
     AtomicFiles,
     JsonDaemonStore,
     JsonOwnershipStore,
@@ -206,16 +207,17 @@ def test_a_session_holding_a_restore_token_and_lease_writes_neither():
 def test_a_receiver_holding_provisional_credentials_writes_no_secret():
     """A saved receiver may never be persisted with a credential reference.
 
-    Version 1 has no representation for a committed reference (a recorded
-    interface conflict), so the write is refused rather than silently dropping
-    required non-secret metadata. What matters for this module's boundary is that
-    the refusal is a fixed token: no reference value, provisional or committed,
-    can reach disk, a diagnostic, or a failure's text either way.
+    Version 1 has no representation for a committed reference (the open interface
+    conflict recorded as ``CREDENTIAL_REFERENCE_CONFLICT``), so the write is
+    refused rather than silently dropping required non-secret metadata. What
+    matters for this module's boundary is that the refusal is a fixed token: no
+    reference value, provisional or committed, can reach disk, a diagnostic, or a
+    failure's text either way.
     """
     payload_candidate = saved_receiver()
     with pytest.raises(RecordError) as raised:
         encode_receiver(payload_candidate)
-    assert raised.value.reason == "unsupported_credential_ref"
+    assert raised.value.reason == CREDENTIAL_REFERENCE_CONFLICT.reason
     assert_secret_free(repr(raised.value).encode())
     assert PROVISIONAL_CANARY not in str(raised.value)
 
@@ -236,9 +238,26 @@ def test_a_receiver_store_refuses_a_record_holding_a_credential_reference(
     store = JsonReceiverStore(AtomicFiles(root=root))
     refused = run(store.put(saved_receiver()))
     assert refused.error.code is ErrorCode.persistence_failed
-    assert refused.error.detail == "unsupported_credential_ref"
+    assert refused.error.detail == CREDENTIAL_REFERENCE_CONFLICT.reason
     assert PROVISIONAL_CANARY not in repr(refused)
     assert list(root.rglob("*.json")) == []
+
+
+def test_a_recorded_conflict_never_quotes_the_reference_it_describes():
+    # The conflict record is a diagnostic-adjacent artifact: it is published in a
+    # refusal message and read by reviewers, so it must describe the conflict
+    # without carrying any value a credential reference could have held.
+    rendered = repr(CREDENTIAL_REFERENCE_CONFLICT)
+    assert_secret_free(rendered.encode())
+    for text in (
+        CREDENTIAL_REFERENCE_CONFLICT.producer,
+        CREDENTIAL_REFERENCE_CONFLICT.consumer,
+        CREDENTIAL_REFERENCE_CONFLICT.observed,
+        CREDENTIAL_REFERENCE_CONFLICT.evidence,
+        CREDENTIAL_REFERENCE_CONFLICT.proposed_resolution,
+        *CREDENTIAL_REFERENCE_CONFLICT.alternatives,
+    ):
+        assert_secret_free(text.encode())
 
 
 def test_an_ownership_record_writes_no_capture_or_backend_identity():

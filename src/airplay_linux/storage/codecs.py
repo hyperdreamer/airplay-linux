@@ -31,6 +31,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Final, NamedTuple, NoReturn
 from uuid import UUID
 
@@ -907,26 +908,25 @@ def encode_receiver(saved: SavedReceiver) -> bytes:
     """Non-secret receiver preferences, including the remembered resolution.
 
     ``credential_ref`` is *not* representable in version 1 of this record, and a
-    saved receiver that holds one is refused rather than silently stripped.
-
-    This is a recorded interface conflict, not a design choice: the brief requires
-    persisting an opaque committed keyring reference identifier, while the frozen
-    ``OpaqueCredentialRef`` exposes no readable or serializable form (its
-    ``__getstate__``/``__reduce__`` raise, and only ``SensitiveText`` may be
-    revealed, at the backend boundary). The two supported resolutions are for the
-    owning interface to publish a persistence representation for a *committed*
-    reference only, or for the record schema to keep resolving the reference
-    through ``CredentialStore.load_credential_ref``. Until one is chosen, dropping
-    the field would lose required non-secret metadata while reporting success, so
-    the write fails closed instead. Provisional references, backend tokens, and
-    secret contents are never written under any resolution.
+    saved receiver that holds one is refused rather than silently stripped. That
+    refusal is the storage side of an **open integration conflict** recorded as
+    :data:`CREDENTIAL_REFERENCE_CONFLICT`: the brief requires persisting an opaque
+    committed keyring reference identifier, while the frozen ``OpaqueCredentialRef``
+    exposes no readable or serializable form (its ``__getstate__``/``__reduce__``
+    raise, and only ``SensitiveText`` may be revealed, at the backend boundary).
+    The conflict record carries the evidence and the proposed contractual
+    resolution for the lane's final review to adjudicate; this module does not
+    resolve it by serializing a private value, and it cannot resolve it by
+    dropping required non-secret metadata while reporting success. Provisional
+    references, backend tokens, and secret contents are never written under any
+    resolution.
     """
     if not isinstance(saved, SavedReceiver):
         _invalid()
     if is_ambiguous_identity(saved.receiver_id):
         _invalid()
     if saved.credential_ref is not None:
-        raise RecordError("unsupported_credential_ref")
+        raise RecordError(CREDENTIAL_REFERENCE_CONFLICT.reason)
     return _dump_document(RECEIVER_SCHEMA, _fields_of(saved, _RECEIVER_FIELDS))
 
 
@@ -938,7 +938,124 @@ def decode_receiver(payload: bytes) -> SavedReceiver:
     return _construct(SavedReceiver, values)  # type: ignore[return-value]
 
 
+# ----------------------------------------------------------------- open conflicts
+
+
+@dataclass(frozen=True, kw_only=True)
+class _InterfaceConflict:
+    """A concrete, unresolved conflict between this producer and a frozen consumer.
+
+    An interface conflict is an integration finding, not permission for a lane to
+    change a path it does not own. This record is the finding: it names the
+    identities that disagree, states the requirement each side is held to, and
+    carries the evidence a reviewer can re-run against the consumed revision.
+    ``proposed_resolution`` is deliberately the *smallest* change that satisfies
+    both sides -- a published accessor for the one value that must be durable --
+    rather than a storage-side workaround that would serialize a private value.
+
+    ``status`` stays ``"open"`` until the lane's final review adjudicates it;
+    nothing here is a silent acceptance of data loss.
+    """
+
+    id: str
+    status: str
+    producer: str
+    consumer: str
+    requirement: str
+    observed: str
+    evidence: str
+    impact: str
+    reason: str
+    proposed_resolution: str
+    alternatives: tuple[str, ...]
+    resolution_owner: str
+    forbidden_workarounds: tuple[str, ...]
+
+
+#: The receiver record cannot persist the committed keyring reference the brief
+#: requires, because the frozen ``OpaqueCredentialRef`` publishes no
+#: representation for it. Recorded here, beside the refusal that enforces it.
+CREDENTIAL_REFERENCE_CONFLICT: Final[_InterfaceConflict] = _InterfaceConflict(
+    id="credential-reference-persistence",
+    status="open",
+    producer=(
+        "airplay_linux.domain.records.SavedReceiver.credential_ref is typed "
+        "OpaqueCredentialRef | None (frozen, foundation lane). "
+        "OpaqueCredentialRef subclasses _PrivateValue, which stores its value in a "
+        "name-mangled slot and refuses __getstate__/__reduce__/__reduce_ex__ with "
+        "TypeError; it defines no accessor, and its repr is '<redacted>'."
+    ),
+    consumer=(
+        "airplay_linux.storage.encode_receiver / JsonReceiverStore.put, which "
+        "must persist non-secret receiver metadata for ReceiverStore"
+    ),
+    requirement=(
+        "The brief requires that a receiver record persist an opaque keyring "
+        "reference identifier for a *committed* credential, so a later load can "
+        "hand the reference back to CredentialStore; it also forbids writing "
+        "provisional references, backend tokens, and secret contents to metadata."
+    ),
+    observed=(
+        "Version 1 of the receiver record has no field for a committed reference. "
+        "Writing one is impossible without a representation the type does not "
+        "expose, and decoding would have to invent a value the document does not "
+        "contain, so the encoder refuses the write instead of dropping the field."
+    ),
+    evidence=(
+        "Reproduce against the frozen domain type: OpaqueCredentialRef('x') has no "
+        "public attribute or method other than '_PrivateValue__value'; "
+        "__getstate__, __reduce__, and __reduce_ex__ each raise TypeError; "
+        "repr() renders 'OpaqueCredentialRef(<redacted>)'; only SensitiveText "
+        "exposes reveal_for_backend, and only for transient user input at the "
+        "backend boundary. tests/storage/test_atomic_records.py pins each of these "
+        "claims, so this record cannot drift from the plant it describes."
+    ),
+    impact=(
+        "A SavedReceiver holding a committed reference cannot be saved at all: "
+        "JsonReceiverStore.put returns persistence_failed with detail "
+        "'unsupported_credential_ref' and publishes no record. Receiver "
+        "preferences therefore cannot be persisted together with committed "
+        "trust, and a caller must not treat this as a successful save."
+    ),
+    reason="unsupported_credential_ref",
+    proposed_resolution=(
+        "Smallest contractual resolution, owned by the foundation lane: add one "
+        "public, non-secret accessor to OpaqueCredentialRef -- "
+        "persistence_key() -> str -- returning the identifier that a committed "
+        "reference names in the backend keyring, and nothing else. Keep the "
+        "accessor on the committed type only: OpaqueProvisionalCredentialRef and "
+        "OpaqueBackendToken stay unrepresentable, so a provisional reference or a "
+        "backend token still has no persistence path. The storage side then adds a "
+        "'credential_reference' field to version 1 of the receiver record, written "
+        "via that accessor and validated as a bounded identifier, and decoding "
+        "rebuilds OpaqueCredentialRef from it. No private value is serialized, and "
+        "no secret content is read: the backend keyring remains the only holder of "
+        "the credential itself."
+    ),
+    alternatives=(
+        "Alternative A, resolution owner the foundation lane: the record keeps no "
+        "reference at all and decoding leaves credential_ref None, with the "
+        "reference resolved on load through CredentialStore.load_credential_ref. "
+        "This is smaller on the storage side but makes ReceiverStore incomplete for "
+        "its own schema, and it needs every reader to hold a CredentialStore.",
+        "Alternative B, resolution owner the foundation lane: widen the record to "
+        "carry a CredentialStore-owned opaque key type instead of "
+        "OpaqueCredentialRef, so storage never handles the reference itself. This "
+        "changes the frozen SavedReceiver type and every consumer of it.",
+    ),
+    resolution_owner="foundation lane (owner of src/airplay_linux/domain)",
+    forbidden_workarounds=(
+        "Serializing a private value by re-implementing __getstate__, pickling, or "
+        "reading the mangled '_PrivateValue__value' slot.",
+        "Adding a generic projection such as asdict/vars to reach the value.",
+        "Persisting the field as optional and reporting success when it is dropped.",
+        "Persisting provisional references, backend tokens, or secret content.",
+    ),
+)
+
+
 __all__ = [
+    "CREDENTIAL_REFERENCE_CONFLICT",
     "DAEMON_SCHEMA",
     "DESIRED_STATES",
     "OWNERSHIP_SCHEMA",

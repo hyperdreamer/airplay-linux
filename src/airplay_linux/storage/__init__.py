@@ -18,6 +18,7 @@ from .atomic import (
     state_root,
 )
 from .codecs import (
+    CREDENTIAL_REFERENCE_CONFLICT,
     DAEMON_SCHEMA,
     DESIRED_STATES,
     OWNERSHIP_SCHEMA,
@@ -50,6 +51,7 @@ from .repositories import (
 
 __all__ = [
     "AtomicFiles",
+    "CREDENTIAL_REFERENCE_CONFLICT",
     "DAEMON_DIRECTORY",
     "DAEMON_SCHEMA",
     "DESIRED_STATES",

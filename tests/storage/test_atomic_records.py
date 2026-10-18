@@ -21,6 +21,7 @@ import errno
 import hashlib
 import json
 import os
+import pickle
 import stat
 from dataclasses import replace
 from pathlib import Path
@@ -68,6 +69,7 @@ from airplay_linux.domain.resources import (
     TrustState,
 )
 from airplay_linux.storage import (
+    CREDENTIAL_REFERENCE_CONFLICT,
     AtomicFiles,
     JsonDaemonStore,
     JsonOwnershipStore,
@@ -443,6 +445,116 @@ def test_a_write_retry_reports_an_unconfirmed_directory_entry_it_cannot_sync(
         )
     assert retried.value.step == "directory_fsync"
     assert files_at(root).read("ownership/one.json") == b"two"
+
+
+class DirectoryTrace(PosixFilesystem):
+    """Record every directory ``fsync`` by the identity of the directory synced.
+
+    A directory ``fsync`` is evidence only for the entries that existed when it
+    ran, so a trace has to say *which* directory was synced and *how often* per
+    publication. Counting by path would be wrong as well: the question is whether
+    the directory that now carries a changed entry was synced after the change.
+    """
+
+    def __init__(self) -> None:
+        self.synced: list[tuple[int, int]] = []
+        self._fail: tuple[int, int] | None = None
+
+    @staticmethod
+    def identity(path: Path) -> tuple[int, int]:
+        info = os.stat(path)
+        return (info.st_dev, info.st_ino)
+
+    def fail_at(self, path: Path) -> None:
+        self._fail = self.identity(path)
+
+    def heal(self) -> None:
+        self._fail = None
+
+    def counts(self, path: Path) -> int:
+        return self.synced.count(self.identity(path))
+
+    def fsync_directory(self, descriptor: int) -> None:
+        info = os.fstat(descriptor)
+        identity = (info.st_dev, info.st_ino)
+        if identity == self._fail:
+            raise OSError(errno.EIO, "scripted directory sync failure")
+        self.synced.append(identity)
+        super().fsync_directory(descriptor)
+
+
+def test_a_second_publication_syncs_the_directory_it_changed_again(tmp_path: Path):
+    # A directory fsync proves durability of the entries present at that moment,
+    # not of a rename that happens later. The second write changes the same
+    # directory again, so that directory has to be synced again: one earlier sync
+    # is not evidence for a later mutation.
+    root = tmp_path / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    files.write("sessions/one.json", b"one")
+    assert trace.counts(root / "sessions") >= 1
+    files.write("sessions/two.json", b"two")
+    assert trace.counts(root / "sessions") >= 2
+
+
+def test_a_delete_syncs_the_directory_whose_entry_it_removed(tmp_path: Path):
+    # An unlink is a directory-entry change like a rename, so the containing
+    # directory is synced after it -- and again on an idempotent retry, because a
+    # retry that found the record absent has still published *absence* that an
+    # earlier failed attempt may not have made durable.
+    root = tmp_path / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    files.write("ownership/one.json", b"one")
+    before = trace.counts(root / "ownership")
+    files.delete("ownership/one.json")
+    assert trace.counts(root / "ownership") == before + 1
+    files.delete("ownership/one.json")
+    assert trace.counts(root / "ownership") == before + 2
+
+
+def test_a_new_child_directory_syncs_the_parent_that_gained_the_entry(tmp_path: Path):
+    # Creating a child directory adds an entry to its parent. That entry is only
+    # durable once the *parent* is synced, and a sync of the child says nothing
+    # about the parent's new entry.
+    root = tmp_path / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    files.write("ownership/one.json", b"one")
+    assert trace.counts(root) >= 1
+    before = trace.counts(root)
+
+    # ``sessions`` does not exist yet, so this publication adds an entry to the
+    # root itself -- the directory an earlier publication already synced once.
+    files.write("sessions/one.json", b"payload")
+    assert trace.counts(root) == before + 1
+    assert trace.counts(root / "sessions") >= 1
+
+
+def test_a_same_instance_retry_after_a_failed_sync_cannot_inherit_confirmation(
+    tmp_path: Path,
+):
+    # One instance performs both attempts. The first publication synced the record
+    # directory successfully; the second changes that same directory and its sync
+    # fails. A retry on the *same* instance must not treat the first publication's
+    # sync as confirmation of the second publication's rename.
+    root = tmp_path / "state"
+    trace = DirectoryTrace()
+    files = files_at(root, trace)
+    files.write("sessions/one.json", b"one")
+    assert trace.counts(root / "sessions") >= 1
+
+    trace.fail_at(root / "sessions")
+    with pytest.raises(StorageError) as raised:
+        files.write("sessions/two.json", b"two")
+    assert raised.value.step == "directory_fsync"
+    # The rename is the publication point, so the bytes are visible; the answer is
+    # "uncertain", never "published".
+    assert files_at(root).read("sessions/two.json") == b"two"
+
+    trace.heal()
+    files.write("sessions/two.json", b"two")
+    assert trace.counts(root / "sessions") >= 2
 
 
 def test_an_existing_directory_from_a_prior_instance_is_reconfirmed(tmp_path: Path):
@@ -1079,23 +1191,80 @@ def test_receiver_record_round_trips_its_non_secret_preferences():
 
 
 def test_a_committed_credential_reference_is_not_silently_dropped():
-    """Recorded interface conflict: version 1 cannot represent a committed ref.
+    """The open interface conflict, refused rather than silently resolved.
 
     The brief requires persisting an opaque committed keyring reference, and the
-    frozen ``OpaqueCredentialRef`` exposes no persistence representation. Until the
-    owning interface resolves that, the write fails closed instead of reporting a
-    successful save while losing required non-secret metadata.
+    frozen ``OpaqueCredentialRef`` exposes no persistence representation. The
+    conflict is recorded as :data:`CREDENTIAL_REFERENCE_CONFLICT` for the lane's
+    final review; until the owning interface resolves it, the write fails closed
+    instead of reporting a successful save while losing required non-secret
+    metadata, and no private value is serialized to work around it.
     """
     stored = saved(credential_ref=OpaqueCredentialRef("committed-keyring-reference"))
     with pytest.raises(RecordError) as raised:
         encode_receiver(stored)
     assert raised.value.reason == "unsupported_credential_ref"
+    assert CREDENTIAL_REFERENCE_CONFLICT.status == "open"
     # The rejection text never quotes the reference.
     assert "committed-keyring-reference" not in repr(raised.value)
     assert "committed-keyring-reference" not in str(raised.value)
 
 
-def test_the_receiver_store_reports_an_unrepresentable_credential_reference(tmp_path: Path):
+def test_the_credential_reference_conflict_is_recorded_for_adjudication():
+    conflict = CREDENTIAL_REFERENCE_CONFLICT
+    assert conflict.status == "open"
+    assert conflict.id == "credential-reference-persistence"
+    assert "OpaqueCredentialRef" in conflict.producer
+    assert "ReceiverStore" in conflict.producer or "encode_receiver" in conflict.consumer
+    assert conflict.requirement
+    assert conflict.observed
+    assert conflict.evidence
+    assert conflict.proposed_resolution
+    assert conflict.alternatives
+    assert conflict.resolution_owner
+
+
+def test_the_recorded_conflict_evidence_holds_for_the_frozen_credential_type():
+    """The recorded evidence is a claim this test keeps honest against the plant."""
+    reference = OpaqueCredentialRef("committed-keyring-reference")
+    # No supported serialization: every private value refuses state extraction.
+    with pytest.raises(TypeError):
+        reference.__getstate__()
+    with pytest.raises(TypeError):
+        reference.__reduce__()
+    with pytest.raises(TypeError):
+        pickle.dumps(reference)
+    # No readable rendering, and no public accessor that could stand in for one.
+    assert "committed-keyring-reference" not in repr(reference)
+    assert [name for name in dir(reference) if not name.startswith("_")] == []
+    for name in ("reveal_for_backend", "value", "persistence_key", "identifier"):
+        assert not hasattr(reference, name)
+    # The asymmetry the recorded resolution turns on: the *only* reveal in the
+    # frozen domain belongs to transient user input, at the backend boundary.
+    from airplay_linux.domain.operations import SensitiveText
+
+    assert hasattr(SensitiveText("pin"), "reveal_for_backend")
+
+
+def test_the_recorded_conflict_proposes_the_smallest_contractual_resolution():
+    conflict = CREDENTIAL_REFERENCE_CONFLICT
+    resolution = conflict.proposed_resolution
+    # A committed-reference accessor owned by the producer, not a storage-side
+    # guess at the private value.
+    assert "OpaqueCredentialRef" in resolution
+    assert "persistence_key" in resolution
+    assert "committed" in resolution
+    assert "provisional" in resolution
+    assert any(
+        "load_credential_ref" in alternative for alternative in conflict.alternatives
+    ), "the CredentialStore-only alternative must stay on the record"
+    # No private-value serialization is proposed anywhere in the record.
+    assert "pickle" not in resolution and "__getstate__" not in resolution
+
+
+def test_the_receiver_store_reports_an_unrepresentable_credential_reference(
+    tmp_path: Path,
+):
     root = tmp_path / "state"
     store = JsonReceiverStore(files_at(root))
     stored = saved(credential_ref=OpaqueCredentialRef("committed-keyring-reference"))
