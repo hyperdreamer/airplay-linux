@@ -1,0 +1,46 @@
+doubletake 0.5.0
+Usage of /usr/bin/doubletake:
+  -bitrate int
+     Video bitrate in kbps (0 = auto, default tunes for resolution/FPS)
+  -code string
+     Pairing PIN shown on the receiver, or the password set on it when "Require Password" is enabled; prefer $DOUBLETAKE_CODE so it stays out of shell history and ps output
+  -cred-backend string
+     Credential storage backend: file or keyring (system keyring via Secret Service) (default "file")
+  -creds string
+     Path to saved pairing credentials (default "/home/henry/.config/doubletake/credentials.json")
+  -daemonize
+     Run as background daemon with Unix socket control interface
+  -debug
+     Enable verbose debug logging
+  -direct-key
+     Use shk/shiv directly without SHA-512 derivation
+  -fps int
+     Frames per second (default 30)
+  -hwaccel string
+     Encoder: auto, nvenc, vaapi, openh264, none (x264/x265) (default "auto")
+  -no-audio
+     Disable audio streaming
+  -no-cursor
+     Don't show the mouse cursor in the captured video
+  -no-encrypt
+     Disable RTSP header encryption (debugging only; video frames are always encrypted)
+  -pair
+     Force new pairing even if credentials exist
+  -port int
+     AirPlay port (default 7000)
+  -port-range string
+     Local UDP port range for receiver timing/audio (e.g. "60000-60010"); empty = OS ephemeral. Needs at least 3 ports.
+  -socket string
+     Unix socket path for daemon control interface (default "/run/user/1000/doubletake.sock")
+  -target string
+     Apple TV IP address or hostname (skip discovery)
+  -target-latency-ms int
+     Joint audio/video playout latency override in milliseconds (0 = automatic connection profile)
+  -test
+     Use synthetic video (videotestsrc) instead of screen capture for debugging
+  -video-codec string
+     Screen codec: auto, h264, or hevc (auto uses H.264 for receiver compatibility)
+  -x11-window-id string
+     X11 window id, decimal or 0xhex
+  -x11-window-name string
+     X11 window name; prefer -x11-window-id

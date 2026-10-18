@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profile": "application-contract-v1",
+  "provenance": "application-contract-fixture",
+  "live_support_proven": false,
+  "protocol_version": "v1",
+  "features": {
+    "foreground_control": true,
+    "owner_handshake": true,
+    "multi_target": true,
+    "target_bound_pairing": true,
+    "physical_source": true,
+    "virtual_source": true,
+    "audio_probe": true,
+    "audio_restart": true,
+    "target_mute": true,
+    "keyring": true,
+    "provisional_commit": true,
+    "cancel_pairing": true,
+    "revoke_pairing": true,
+    "query_modes": true
+  }
+}

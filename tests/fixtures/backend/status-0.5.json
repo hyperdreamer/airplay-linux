@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "state": "pin_required",
+  "device": "Living Room",
+  "device_ip": "192.0.2.10",
+  "has_audio": false,
+  "audio_muted": false,
+  "needs_pin": false,
+  "needs_credential": true,
+  "credential_kind": "password",
+  "streams": [
+    {
+      "device": "Bedroom",
+      "device_ip": "192.0.2.10",
+      "state": "pin_required",
+      "has_audio": false,
+      "audio_muted": false,
+      "credential_kind": "pin"
+    },
+    {
+      "device": "Office",
+      "device_ip": "192.0.2.11",
+      "state": "streaming",
+      "has_audio": true,
+      "audio_muted": true
+    }
+  ]
+}
