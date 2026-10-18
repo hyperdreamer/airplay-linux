@@ -90,8 +90,16 @@ from airplay_linux.storage import (
     is_ambiguous_identity,
     state_root,
 )
+from airplay_linux.testing.adapters import FakeCredentialStore
 from airplay_linux.testing.builders import target, virtual_handle
 
+DESIGN_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "docs"
+    / "superpowers"
+    / "specs"
+    / "2026-10-17-airplay-mirroring-design.md"
+)
 DIGEST = hashlib.sha256(b"one-record-set").hexdigest()
 AMBIGUOUS = ReceiverId(f"airplay-ambiguous:{DIGEST}")
 FINGERPRINT = ReceiverId(f"airplay-fingerprint:{DIGEST}")
@@ -1190,38 +1198,97 @@ def test_receiver_record_round_trips_its_non_secret_preferences():
     assert decode_receiver(encode_receiver(bare)) == bare
 
 
-def test_a_committed_credential_reference_is_not_silently_dropped():
-    """The open interface conflict, refused rather than silently resolved.
+def test_a_non_null_credential_reference_is_refused_by_the_decided_resolution():
+    """Enforces the resolved decision: a reference is not storage metadata.
 
-    The brief requires persisting an opaque committed keyring reference, and the
-    frozen ``OpaqueCredentialRef`` exposes no persistence representation. The
-    conflict is recorded as :data:`CREDENTIAL_REFERENCE_CONFLICT` for the lane's
-    final review; until the owning interface resolves it, the write fails closed
-    instead of reporting a successful save while losing required non-secret
-    metadata, and no private value is serialized to work around it.
+    :data:`CREDENTIAL_REFERENCE_CONFLICT` is *resolved*, not open: the design
+    resolves the committed reference through the credential adapter's
+    ``load_credential_ref(receiver_id)`` contract and keeps secrets out of
+    application metadata, so version 1 of the receiver record has no field for a
+    reference. A record holding one is therefore refused instead of being
+    stripped and reported as a successful save.
     """
     stored = saved(credential_ref=OpaqueCredentialRef("committed-keyring-reference"))
     with pytest.raises(RecordError) as raised:
         encode_receiver(stored)
     assert raised.value.reason == "unsupported_credential_ref"
-    assert CREDENTIAL_REFERENCE_CONFLICT.status == "open"
+    assert CREDENTIAL_REFERENCE_CONFLICT.status == "resolved"
     # The rejection text never quotes the reference.
     assert "committed-keyring-reference" not in repr(raised.value)
     assert "committed-keyring-reference" not in str(raised.value)
 
 
-def test_the_credential_reference_conflict_is_recorded_for_adjudication():
+def test_receiver_metadata_round_trips_while_the_keyring_owns_the_reference(
+    tmp_path: Path,
+):
+    """Pins the resolved decision end to end: metadata here, reference there.
+
+    One receiver, two owners. Storage persists every non-secret field of the
+    metadata record; the committed reference is re-derived from the credential
+    adapter by receiver id, because the design gives that adapter
+    ``load_credential_ref(receiver_id) -> OpaqueCredentialRef or Missing`` and
+    requires that secrets stay inside the backend/keyring adapter and are never
+    copied into application metadata. ``credential_ref`` being ``None`` after a
+    load is therefore the contract working, not data loss.
+    """
+    t = target()
+    credentials = FakeCredentialStore()
+    committed = credentials.seed_trusted(t.receiver_id)
+    # What a CredentialStore-backed load puts in memory, and the metadata portion
+    # of it that storage is responsible for.
+    in_memory = saved(credential_ref=committed)
+    metadata = replace(in_memory, credential_ref=None)
+
+    root = tmp_path / "state"
+    store = JsonReceiverStore(files_at(root))
+    assert run(store.put(metadata)) == Ok(value=None)
+
+    loaded = run(store.get(t.receiver_id))
+    assert isinstance(loaded, Ok)
+    recorded = loaded.value
+    assert recorded is not None
+
+    # Every non-secret field survives the round trip exactly.
+    assert recorded == metadata
+    assert replace(recorded, credential_ref=None) == replace(
+        in_memory, credential_ref=None
+    )
+
+    # The record never claims a reference...
+    assert recorded.credential_ref is None
+    # ...and the reference is not storage metadata at all: it resolves from the
+    # credential adapter, keyed by the receiver id the record does carry.
+    resolved = run(credentials.load_credential_ref(recorded.receiver_id))
+    assert isinstance(resolved, Ok)
+    assert resolved.value == committed
+    assert [
+        call["receiver_id"]
+        for call in credentials.journal.calls("credential_store.load_credential_ref")
+    ] == [t.receiver_id]
+    # The keyring value has no path into the durable record.
+    written = b"".join(
+        path.read_bytes() for path in (root / "receivers").glob("*.json")
+    )
+    assert b"fake-trusted-credential" not in written
+
+
+def test_the_credential_reference_conflict_is_recorded_as_resolved():
     conflict = CREDENTIAL_REFERENCE_CONFLICT
-    assert conflict.status == "open"
+    assert conflict.status == "resolved"
     assert conflict.id == "credential-reference-persistence"
     assert "OpaqueCredentialRef" in conflict.producer
     assert "ReceiverStore" in conflict.producer or "encode_receiver" in conflict.consumer
     assert conflict.requirement
     assert conflict.observed
     assert conflict.evidence
-    assert conflict.proposed_resolution
-    assert conflict.alternatives
+    assert conflict.impact
+    assert conflict.resolution
+    assert conflict.decision_authority
+    assert conflict.history
+    assert conflict.rejected_alternatives
     assert conflict.resolution_owner
+    # A decided record does not still carry a proposal.
+    assert not hasattr(conflict, "proposed_resolution")
 
 
 def test_the_recorded_conflict_evidence_holds_for_the_frozen_credential_type():
@@ -1246,23 +1313,41 @@ def test_the_recorded_conflict_evidence_holds_for_the_frozen_credential_type():
     assert hasattr(SensitiveText("pin"), "reveal_for_backend")
 
 
-def test_the_recorded_conflict_proposes_the_smallest_contractual_resolution():
+def test_the_decided_resolution_cites_the_credential_adapter_contract():
     conflict = CREDENTIAL_REFERENCE_CONFLICT
-    resolution = conflict.proposed_resolution
-    # A committed-reference accessor owned by the producer, not a storage-side
-    # guess at the private value.
-    assert "OpaqueCredentialRef" in resolution
-    assert "persistence_key" in resolution
-    assert "committed" in resolution
-    assert "provisional" in resolution
+    resolution = conflict.resolution
+    # The decision is that storage does not persist the reference: it resolves
+    # through the credential adapter by receiver id and stays out of metadata.
+    assert "load_credential_ref(receiver_id)" in resolution
+    assert "never copied into application metadata" in resolution
+    assert "credential_ref" in resolution
+    assert str(DESIGN_PATH.name) in resolution
+    assert DESIGN_PATH.name in conflict.decision_authority
+    # Round 2's accessor proposal is withdrawn, and stays on the record as a
+    # rejected alternative so a later round cannot quietly re-propose it.
+    assert "persistence_key" not in resolution
     assert any(
-        "load_credential_ref" in alternative for alternative in conflict.alternatives
-    ), "the CredentialStore-only alternative must stay on the record"
-    # No private-value serialization is proposed anywhere in the record.
+        "persistence_key" in alternative
+        for alternative in conflict.rejected_alternatives
+    )
+    # No private-value serialization survives anywhere in the record.
     assert "pickle" not in resolution and "__getstate__" not in resolution
 
 
-def test_the_receiver_store_reports_an_unrepresentable_credential_reference(
+def test_the_cited_design_text_still_says_what_the_resolution_claims():
+    """The resolution quotes the approved authority, so pin the quotes."""
+    assert DESIGN_PATH.exists()
+    design = DESIGN_PATH.read_text(encoding="utf-8")
+    assert "load_credential_ref(receiver_id) -> OpaqueCredentialRef or Missing" in design
+    assert "never copied into application metadata" in design
+    assert "It never stores a PIN or credential in this record." in design
+    # The two clauses the resolution is built on belong to the credential
+    # adapter's section of the design, not to an unrelated paragraph.
+    adapter = design.split("### Credential adapter", 1)[1]
+    assert "load_credential_ref(receiver_id)" in adapter.split("```", 2)[1]
+
+
+def test_the_receiver_store_refuses_a_non_null_credential_reference(
     tmp_path: Path,
 ):
     root = tmp_path / "state"
@@ -1273,8 +1358,8 @@ def test_the_receiver_store_reports_an_unrepresentable_credential_reference(
     assert refused.error.code is ErrorCode.persistence_failed
     assert refused.error.detail == "unsupported_credential_ref"
     assert "committed-keyring-reference" not in repr(refused)
-    # No partial record was published, so a saved receiver cannot exist without
-    # the reference the caller asked to persist.
+    # The store does not silently persist a metadata-only record in its place:
+    # a caller that means to save metadata passes metadata.
     assert list(root.rglob("*.json")) == []
     assert run(store.get(stored.receiver_id)) == Ok(value=None)
 
