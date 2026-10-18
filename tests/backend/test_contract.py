@@ -394,6 +394,41 @@ def _output(text: str, *, exit_code: int = 0) -> Ok:
     return Ok(value=CommandOutput(exit_code=exit_code, stdout=text.encode(), stderr=b""))
 
 
+def _streams(
+    *, stdout: str = "", stderr: str = "", exit_code: int = 0,
+) -> Ok:
+    """Build a command result with an explicitly chosen stream per channel."""
+    return Ok(value=CommandOutput(
+        exit_code=exit_code, stdout=stdout.encode(), stderr=stderr.encode(),
+    ))
+
+
+# Go's flag package prints this before the usage block when a build has no
+# ``--version`` flag, which is exactly what the pinned 0.5.0 binaries do.
+_REJECTED_VERSION_FLAG = "flag provided but not defined: -version\n"
+
+
+def _assert_pinned_public_surface(features: BackendFeatures) -> None:
+    """Assert the recognized profile and the public capabilities it proves."""
+    assert features.profile == "doubletake-0.5"
+    assert features.version == "0.5.0"
+    assert features.multi_target
+    assert features.target_mute
+    assert features.audio_probe
+    # Public help proves nothing about application-private obligations.
+    assert not features.foreground_control
+    assert not features.owner_handshake
+    assert not features.physical_source
+    assert not features.virtual_source
+    assert not features.audio_restart
+    assert not features.target_bound_pairing
+    assert not features.keyring
+    assert not features.provisional_commit
+    assert not features.cancel_pairing
+    assert not features.revoke_pairing
+    assert not features.query_modes
+
+
 def test_compatibility_doc_pins_the_peeled_source_and_real_client_path():
     document = (Path(__file__).parents[2] / "docs" / "backend-compatibility.md").read_text()
 
@@ -433,8 +468,180 @@ def test_probe_is_read_only_and_does_not_send_stdin():
     result = asyncio.run(probe_backend(process))
 
     assert isinstance(result, Ok)
+    _assert_pinned_public_surface(result.value)
     assert all(stdin is None for _, _, stdin in process.calls)
     assert all(spec.argv[-1] in {"--help", "--version"} for spec, _, _ in process.calls)
+
+
+def test_probe_recognizes_the_pinned_surface_when_version_is_rejected():
+    """The observed 0.5.0 sequence must yield the profile, not merely ``Ok``.
+
+    The installed binaries write usage to stderr and leave stdout empty; they
+    have no ``--version`` flag, so that probe exits 2 with Go's
+    ``flag provided but not defined: -version`` banner followed by the usage
+    block.  A probe that splices that rejected banner in front of the help text
+    destroys the fingerprint's first line and silently reports an unknown
+    backend, so the recognized profile and public capabilities are asserted
+    here rather than the presence of a result object.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    process = _ProbeProcess([
+        _streams(stderr=sender),
+        _streams(stderr=ctl, exit_code=2),
+        _streams(stderr=_REJECTED_VERSION_FLAG + sender, exit_code=2),
+    ])
+
+    result = asyncio.run(probe_backend(process))
+
+    assert isinstance(result, Ok)
+    _assert_pinned_public_surface(result.value)
+    assert result.value.supports("multi_target")
+    assert result.value.supports("target_mute")
+    assert result.value.supports("audio_probe")
+    assert not result.value.supports("owner_handshake")
+    assert [spec.argv for spec, _, _ in process.calls] == [
+        ("doubletake", "--help"),
+        ("doubletake-ctl", "--help"),
+        ("doubletake", "--version"),
+    ]
+
+
+def test_a_declared_version_still_recognizes_the_surface_it_ships_with():
+    """A build that does answer ``--version`` must not gain a fake fingerprint.
+
+    Version evidence is optional and separate: when the banner names the pinned
+    release the surface is still fingerprinted from the usage block alone, and
+    the declared version is reported without promoting any private capability.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    process = _ProbeProcess([
+        _streams(stderr=sender),
+        _streams(stderr=ctl, exit_code=2),
+        _streams(stdout="doubletake 0.5.0\n", exit_code=0),
+    ])
+
+    result = asyncio.run(probe_backend(process))
+
+    assert isinstance(result, Ok)
+    _assert_pinned_public_surface(result.value)
+
+
+def test_a_usage_block_on_stderr_is_fingerprinted_despite_empty_stdout():
+    """The blank-line hazard: an empty stdout must not precede the usage block.
+
+    Go's flag package writes ``--help`` to stderr and nothing to stdout.  Joining
+    the two streams puts an empty line before ``Usage of doubletake:``, so the
+    first line stops being the usage header and the surface is never recognized.
+    The same help text is therefore required to fingerprint identically whether
+    it arrives on either stream, including when stdout carries a stray newline.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+
+    def probe(sender_streams: dict, ctl_streams: dict) -> BackendFeatures:
+        process = _ProbeProcess([
+            _streams(**sender_streams),
+            _streams(**ctl_streams, exit_code=2),
+            _streams(stderr=_REJECTED_VERSION_FLAG + sender, exit_code=2),
+        ])
+        result = asyncio.run(probe_backend(process))
+        assert isinstance(result, Ok), result
+        return result.value
+
+    on_stdout = probe({"stdout": sender}, {"stdout": ctl})
+    on_stderr = probe({"stderr": sender}, {"stderr": ctl})
+    blank_stdout = probe({"stdout": "\n", "stderr": sender}, {"stdout": "\n", "stderr": ctl})
+    stray_stdout = probe(
+        {"stdout": "deprecation: prefer -x11-window-id\n", "stderr": sender},
+        {"stdout": "deprecation: prefer -x11-window-id\n", "stderr": ctl},
+    )
+
+    for features in (on_stdout, on_stderr, blank_stdout, stray_stdout):
+        _assert_pinned_public_surface(features)
+
+
+def test_version_evidence_is_reported_as_a_version_and_never_as_the_raw_banner():
+    """A ``--version`` line is extracted, not spliced, and an error is not a version.
+
+    ``--version`` output is optional evidence that arrives on its own stream.  It
+    must be reduced to the version it declares: the banner text itself belongs
+    nowhere in the decoded features, and Go's ``flag provided but not defined``
+    rejection must contribute no version at all rather than being read as one.
+    When the surface itself is recognized its own fingerprint names the version,
+    so an unrecognized banner can never overwrite it.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    later_release = sender.replace(
+        "  -bitrate int",
+        "  -adaptive int\n    \tAdaptive mode\n  -bitrate int",
+        1,
+    )
+
+    def probe(sender_help: str, version_stdout: str, version_stderr: str) -> BackendFeatures:
+        process = _ProbeProcess([
+            _streams(stderr=sender_help),
+            _streams(stderr=ctl, exit_code=2),
+            _streams(stdout=version_stdout, stderr=version_stderr),
+        ])
+        result = asyncio.run(probe_backend(process))
+        assert isinstance(result, Ok), result
+        return result.value
+
+    declared = probe(later_release, "doubletake 9.9.9\n", "")
+    on_stderr = probe(later_release, "", "doubletake 9.9.9\n")
+    rejected = probe(later_release, "", _REJECTED_VERSION_FLAG)
+    pinned_with_rejected = probe(sender, "", _REJECTED_VERSION_FLAG)
+
+    assert declared.version == "9.9.9"
+    assert on_stderr.version == "9.9.9"
+    # Go's rejected-flag banner is not a version declaration.
+    assert rejected.version == "unknown"
+    assert pinned_with_rejected.version == "0.5.0"
+    _assert_pinned_public_surface(pinned_with_rejected)
+    for features in (declared, on_stderr, rejected):
+        # Version evidence never promotes a capability on an unrecognized surface.
+        assert features.profile == "doubletake-unknown"
+        assert not features.multi_target
+        assert not features.target_mute
+        assert not features.audio_probe
+
+
+def test_probe_still_fails_closed_on_an_unrecognized_help_surface():
+    """Recognizing the pinned stderr capture must not weaken the fingerprint.
+
+    A later release emits a perfectly valid Go usage block plus one new flag, and
+    a foreign build emits prose that is not a Go usage block at all.  Both are
+    served on the same stderr stream as the real capture and must still decode as
+    the unknown profile with every capability off, including the public ones.
+    """
+    sender = (FIXTURES / "doubletake-0.5-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    later_release = sender.replace(
+        "  -bitrate int",
+        "  -adaptive int\n    \tAdaptive mode\n  -bitrate int",
+        1,
+    )
+    assert later_release != sender
+
+    for unknown_sender in (later_release, "Usage of doubletake:\n  not a flag row\n"):
+        process = _ProbeProcess([
+            _streams(stderr=unknown_sender),
+            _streams(stderr=ctl, exit_code=2),
+            _streams(stderr=_REJECTED_VERSION_FLAG + unknown_sender, exit_code=2),
+        ])
+
+        result = asyncio.run(probe_backend(process))
+
+        assert isinstance(result, Ok), result
+        assert result.value.profile == "doubletake-unknown"
+        assert not result.value.multi_target
+        assert not result.value.target_mute
+        assert not result.value.audio_probe
+        assert not result.value.supports("multi_target")
+        assert not result.value.supports("audio_probe")
 
 
 def test_probe_reports_missing_tool_as_a_fixed_dependency_diagnostic():

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Final, TypeAlias
 from uuid import UUID
 
@@ -561,6 +561,18 @@ def _version(text: str) -> str:
     return match.group(1) if match else "unknown"
 
 
+def _version_banner(text: str) -> str:
+    """Return a version declared by a standalone ``--version`` run, or ``""``.
+
+    Only the first line participates: Go's flag package prints
+    ``flag provided but not defined: -version`` before the usage block when a
+    build rejects the flag, and that banner must yield no version at all.
+    """
+    first = text.splitlines()[0] if text.splitlines() else ""
+    version = _version(first)
+    return "" if version == "unknown" else version
+
+
 _GO_USAGE_LINE: Final[re.Pattern[str]] = re.compile(r"^Usage of \S+:$|^Usage of \S+:")
 _GO_FLAG: Final[re.Pattern[str]] = re.compile(r"^  -([A-Za-z0-9][A-Za-z0-9-]*)(?: [A-Za-z0-9_.]+)?$")
 # "  connect [target] [PIN-or-password]  Start mirroring (to target IP, ...)"
@@ -739,10 +751,37 @@ def _output_text(output: ports.CommandOutput) -> str:
     for value in (output.stdout, output.stderr):
         if type(value) is bytes:
             try:
-                chunks.append(value.decode("utf-8", errors="replace"))
+                text = value.decode("utf-8", errors="replace")
             except Exception:
-                pass
+                continue
+            if text.strip():
+                chunks.append(text)
     return "\n".join(chunks)
+
+
+def _surface_text(output: ports.CommandOutput) -> str:
+    """Return the single stream that carries the usage block, verbatim.
+
+    Go's flag package writes ``--help`` to stderr and leaves stdout empty, so a
+    naive concatenation would put an empty line in front of ``Usage of ...`` and
+    the fingerprint would never match.  When a stream holds the usage block it is
+    returned alone, unpadded; otherwise the combined evidence is returned so an
+    unrecognized surface still fails closed.
+    """
+    texts: list[str] = []
+    for value in (output.stdout, output.stderr):
+        if type(value) is not bytes:
+            continue
+        try:
+            text = value.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        if text.strip():
+            texts.append(text)
+    for text in texts:
+        if text.lstrip().startswith("Usage"):
+            return text
+    return "\n".join(texts)
 
 
 async def probe_backend(process: ports.ProcessPort) -> Result[BackendFeatures]:
@@ -772,15 +811,22 @@ async def probe_backend(process: ports.ProcessPort) -> Result[BackendFeatures]:
     if isinstance(version_result, Ok) and isinstance(version_result.value, ports.CommandOutput):
         if not _probe_exit_ok(version_result.value, frozenset({0, 2})):
             return _incompatible()
-        version_text = _output_text(version_result.value)
+        version_text = _version_banner(_output_text(version_result.value))
     elif isinstance(version_result, Err) and version_result.error.code is ErrorCode.dependency_missing:
         return Err(error=_diagnostic(ErrorCode.dependency_missing, command="doubletake"))
 
-    sender_help = _output_text(sender_result.value)
-    ctl_help = _output_text(ctl_result.value)
+    sender_help = _surface_text(sender_result.value)
+    ctl_help = _surface_text(ctl_result.value)
     if not sender_help.strip() or not ctl_help.strip():
         return _incompatible()
-    return Ok(value=features_from_help(f"{version_text}\n{sender_help}", ctl_help))
+    # The fingerprint is the sender's ``--help`` block alone.  ``--version`` is
+    # optional evidence: the pinned release rejects it with exit 2, so splicing
+    # its error banner in front of the usage block would mask the very surface
+    # the fingerprint has to match.
+    features = features_from_help(sender_help, ctl_help)
+    if version_text and features.version == "unknown":
+        features = replace(features, version=version_text)
+    return Ok(value=features)
 
 
 __all__ = [
