@@ -736,3 +736,69 @@ def test_saved_model_evidence_is_the_anchor_for_the_first_live_snapshot():
     same = restored(original)
     assert same.continuity_verified
     assert PreferenceAccess.for_record_set(same, saved) is saved
+
+
+def _identity_models(resolver, records):
+    """Return (continuity_verified, replacement_of) for the single identity."""
+    result = resolver.update(records)
+    assert len(result) == 1, result
+    only = result[0]
+    return only.continuity_verified, only.replacement_of
+
+
+def test_a_snapshot_contradicting_itself_never_authorizes_continuity():
+    """Two of one snapshot's records naming different models is not evidence.
+
+    Retaining both would make the contradiction agree with itself on every later
+    snapshot, so a receiver could inherit the previous receiver's trust.
+    """
+    base = service(kind="raop", device_id="00:11:22:33:44:55", model="")
+    other = service(kind="raop", device_id="00:11:22:33:44:55", model="OtherModel")
+    apple = service(kind="airplay", device_id="00:11:22:33:44:55", model="AppleTV6,2")
+
+    resolver = IdentityResolver()
+    resolver.update((base,))
+    verified, replacement = _identity_models(resolver, (other, apple))
+    assert verified is False
+    assert replacement == "airplay-device:001122334455"
+    # Repetition must not launder the contradiction into agreement.
+    verified, _ = _identity_models(resolver, (other, apple))
+    assert verified is False
+
+
+def test_a_contradictory_first_snapshot_is_never_authorized():
+    other = service(kind="raop", device_id="00:11:22:33:44:55", model="OtherModel")
+    apple = service(kind="airplay", device_id="00:11:22:33:44:55", model="AppleTV6,2")
+    resolver = IdentityResolver()
+    verified, replacement = _identity_models(resolver, (other, apple))
+    assert verified is False
+    assert replacement == "airplay-device:001122334455"
+
+
+def test_model_evidence_survives_a_temporarily_unusable_endpoint():
+    """An address-less snapshot must not erase the model this identity advertised.
+
+    Retention otherwise depended on ``verified``, which also requires a currently
+    usable endpoint; forgetting the model there let a later conflicting model pass.
+    """
+    base = service(kind="raop", device_id="00:11:22:33:44:55", model="")
+    addr_less = service(
+        kind="airplay", device_id="00:11:22:33:44:55", model="AppleTV6,2", addresses=(),
+    )
+    conflicting = service(kind="airplay", device_id="00:11:22:33:44:55", model="OtherModel")
+    same = service(kind="airplay", device_id="00:11:22:33:44:55", model="AppleTV6,2")
+
+    resolver = IdentityResolver()
+    resolver.update((base,))
+    resolver.update((base, addr_less))
+    verified, replacement = _identity_models(resolver, (base, conflicting))
+    assert verified is False
+    assert replacement == "airplay-device:001122334455"
+
+    # The legitimate case still verifies: the restored endpoint names the same model.
+    resolver = IdentityResolver()
+    resolver.update((base,))
+    resolver.update((base, addr_less))
+    verified, replacement = _identity_models(resolver, (base, same))
+    assert verified is True
+    assert replacement is None

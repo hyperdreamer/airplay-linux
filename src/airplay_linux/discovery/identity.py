@@ -279,12 +279,17 @@ def _compatible_models(left: tuple[_Record, ...], right: tuple[_Record, ...]) ->
     confirm nor contradict the identity, so its arrival or departure must not read
     as a replacement. Two snapshots that both name a model are still compared for
     equality, so genuinely conflicting nonempty evidence stays conservative.
-    ``left`` is the retained evidence, so a receiver that once named a model is
-    judged against that model even if the snapshot which first revealed it was
-    otherwise model-less.
+
+    A single snapshot may also contradict *itself*: if two of its records name
+    different models, neither can be trusted as this receiver's model, so the
+    snapshot carries no usable evidence and must not authorize continuity. Without
+    that check the contradiction would be retained and then accepted against
+    itself forever.
     """
     previous = {r.model for r in left if r.model}
     current = {r.model for r in right if r.model}
+    if len(current) > 1 or len(previous) > 1:
+        return False
     return not previous or not current or previous == current
 
 
@@ -389,11 +394,19 @@ class IdentityResolver:
                 replacement = matches[0] if len(matches) == 1 and replacement_counts[matches[0]] == 1 else None
                 if receiver_id in self._unverified_saved:
                     replacement = replacement or receiver_id
+                observed = _model_evidence(current)
+                # A snapshot that contradicts itself names no usable model, so it
+                # cannot establish continuity on first sight and must not retain
+                # the contradiction. Without this, two contradictory records would
+                # agree with each other forever after.
+                self_consistent = _compatible_models((), current)
+                if not self_consistent:
+                    replacement = replacement or receiver_id
                 if replacement is not None:
                     candidate = replace(candidate, replacement_of=replacement, continuity_verified=False)
                 evidence = _Evidence(
                     candidate, current, online=True, invalidated=replacement is not None,
-                    models=_model_evidence(current),
+                    models=observed if self_consistent else (),
                 )
             else:
                 generation = previous.current.endpoint_generation
@@ -433,13 +446,19 @@ class IdentityResolver:
                     candidate, endpoint_generation=generation,
                     continuity_verified=verified, replacement_of=replacement,
                 )
+                # Keep positive model evidence whenever it is internally
+                # consistent and compatible with what this identity already
+                # named — independently of ``verified``, which also requires a
+                # currently usable endpoint. A receiver whose address is briefly
+                # missing has not stopped being the same receiver, and forgetting
+                # its model there would let a later conflicting model pass.
+                model_evidence_usable = bool(observed) and _compatible_models(
+                    previous.models, current,
+                )
                 evidence = _Evidence(
                     candidate, previous.anchor, online=True,
                     invalidated=previous.invalidated, seeded=previous.seeded,
-                    # Retain evidence as it becomes available and never drop it:
-                    # a snapshot that omits the model is missing evidence, not a
-                    # reason to forget what this identity already advertised.
-                    models=observed if verified and observed else previous.models,
+                    models=observed if model_evidence_usable else previous.models,
                 )
             self._history[receiver_id] = evidence
             resolved.append(candidate)
