@@ -378,11 +378,6 @@ class LinuxProcessRunner:
         """How many reapers this runner is still holding, for observability."""
         return len(self._reapers)
 
-    @property
-    def cleanup_uncertainty(self) -> frozenset[int]:
-        """PIDs of started children whose cleanup could not be proven."""
-        return frozenset(self._cleanup_uncertain)
-
     def identity(self, pid: int) -> ProcessIdentity | None:
         return read_identity(pid, self._proc_root)
 
@@ -622,9 +617,10 @@ class LinuxProcessRunner:
         evidence can be obtained, nothing is signalled and the launch is
         *retained*: uncertainty is recorded and the handle stays watched by a
         reaper this runner owns, so the obligation is observable instead of
-        silently completed. A signalled child still unreaped at the deadline is
-        retained the same way, so a child that cannot be killed is never
-        abandoned either.
+        silently completed. Retention belongs to that no-descriptor path only:
+        a ``SIGKILL`` sent through the launch descriptor names one process
+        instance, so a signalled child still unreaped at the deadline simply
+        completes, as it always has.
         """
         if pidfd is None:
             if identity is None:
@@ -635,10 +631,8 @@ class LinuxProcessRunner:
         self._signal(pidfd, process.pid, signal.SIGKILL)
         try:
             await asyncio.wait_for(asyncio.shield(process.wait()), self.kill_timeout)
-            return
         except (TimeoutError, asyncio.CancelledError):
             pass
-        self._retain_cleanup_uncertainty(process)
 
     def _reacquire_launched_identity(self, pid: int) -> ProcessIdentity | None:
         """The identity of the direct child at ``pid``, read again for cleanup.

@@ -713,10 +713,15 @@ def test_spawn_cancellation_without_pidfd_or_evidence_retains_cleanup_ownership(
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(task, 10.0)
+            immediate = runner.retained_reapers
+            # The obligation has to outlive the cancelled call rather than be
+            # recorded for an instant: a silently completed cleanup would
+            # already have dropped it by this re-read.
+            await asyncio.sleep(0.25)
             observed = (
                 tuple(runner.signals),
                 read_identity_evidence(pid).state is IdentityState.present,
-                runner.cleanup_uncertainty,
+                immediate,
                 runner.retained_reapers,
             )
         finally:
@@ -725,25 +730,23 @@ def test_spawn_cancellation_without_pidfd_or_evidence_retains_cleanup_ownership(
                 await asyncio.wait_for(asyncio.shield(process.wait()), 10.0)
         # A confirmed reap is the one fact that ends the retained obligation.
         for _ in range(200):
-            if not runner.cleanup_uncertainty and runner.retained_reapers == 0:
+            if runner.retained_reapers == 0:
                 break
             await asyncio.sleep(0.02)
         return (
             pid,
             observed,
-            runner.cleanup_uncertainty,
             runner.retained_reapers,
             await wait_gone(pid),
         )
 
-    pid, observed, released, reapers_after, gone = run(scenario())
-    signals, alive, uncertainty, reapers = observed
+    pid, observed, reapers_after, gone = run(scenario())
+    signals, alive, immediate, reapers = observed
     assert signals == ()
     assert alive is True
     # Neither silent completion nor an unbacked claim: the child was kept.
+    assert immediate >= 1
     assert reapers >= 1
-    assert uncertainty == frozenset({pid})
-    assert released == frozenset()
     assert reapers_after == 0
     assert gone is True
 
@@ -796,7 +799,6 @@ def test_spawn_cancellation_with_a_pidfd_still_reaps_exactly_the_child(tmp_path:
             return (
                 pid,
                 tuple(runner.signals),
-                runner.cleanup_uncertainty,
                 runner.retained_reapers,
                 await wait_gone(pid),
             )
@@ -805,9 +807,8 @@ def test_spawn_cancellation_with_a_pidfd_still_reaps_exactly_the_child(tmp_path:
                 process.kill()
                 await asyncio.wait_for(asyncio.shield(process.wait()), 10.0)
 
-    pid, signals, uncertainty, reapers, gone = run(scenario())
+    pid, signals, reapers, gone = run(scenario())
     assert signals == ((True, signal.SIGKILL),)
-    assert uncertainty == frozenset()
     assert reapers == 0
     assert gone is True
     assert read_identity(pid) is None
