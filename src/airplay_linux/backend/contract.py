@@ -34,6 +34,9 @@ _KNOWN_STATES: Final[frozenset[str]] = frozenset(
     {"idle", "discovering", "connecting", "streaming", "pin_required"}
 )
 _CREDENTIAL_KINDS: Final[frozenset[str]] = frozenset({"pin", "password"})
+# Help output is only a contract witness for this immutable, published release.
+# Any other version, even if it repeats the same words, remains unverified.
+_VERIFIED_HELP_VERSIONS: Final[frozenset[str]] = frozenset({"0.5.0"})
 
 
 def _diagnostic(code: ErrorCode, *, command: str | None = None) -> Diagnostic:
@@ -380,6 +383,13 @@ def decode_status(value: object) -> StatusReply | Err:
         return _incompatible()
     if legacy_pin and credential not in (None, "pin"):
         return _incompatible()
+    # The published daemon emits credentials only for waiting streams.  A
+    # credential attached to a streaming/idle entry is not a harmless extra;
+    # accepting it would let a stale prompt masquerade as live state.
+    if any(stream.credential_kind is not None and stream.state != "pin_required" for stream in streams):
+        return _incompatible()
+    if credential is not None and state != "pin_required":
+        return _incompatible()
     stream_credentials = {stream.credential_kind for stream in streams if stream.credential_kind}
     if len(stream_credentials) > 1 and state != "pin_required":
         return _incompatible()
@@ -387,8 +397,14 @@ def decode_status(value: object) -> StatusReply | Err:
         credential = "pin"
     if credential is None and needs and len(stream_credentials) == 1:
         credential = next(iter(stream_credentials))
-    if credential is None and stream_credentials and state == "pin_required":
-        credential = sorted(stream_credentials)[0]
+    if credential is None and state == "pin_required":
+        pending_credentials = [
+            stream.credential_kind
+            for stream in streams
+            if stream.state == "pin_required" and stream.credential_kind is not None
+        ]
+        if pending_credentials:
+            credential = pending_credentials[0]
     if stream_credentials:
         needs = True
     if needs and credential is None:
@@ -403,6 +419,41 @@ def decode_status(value: object) -> StatusReply | Err:
         return _incompatible()
     valid, target = _optional_text(data, "device_ip")
     if not valid:
+        return _incompatible()
+
+    # Reproduce statusResponseLocked's legacy projection rather than trusting
+    # aggregate fields independently of the stream list: a waiting stream wins
+    # for device/target, while audio always comes from the first streaming
+    # stream.  This also makes impossible PIN/password combinations fail closed.
+    waiting = [stream for stream in streams if stream.state == "pin_required"]
+    streaming = [stream for stream in streams if stream.state == "streaming"]
+    connecting = [stream for stream in streams if stream.state == "connecting"]
+    if waiting:
+        projected_device, projected_target = waiting[0].device, waiting[0].target
+        projected_credential = waiting[0].credential_kind
+        if state != "pin_required":
+            return _incompatible()
+    elif streaming:
+        projected_device, projected_target = streaming[0].device, streaming[0].target
+        projected_credential = None
+        if state != "streaming":
+            return _incompatible()
+    else:
+        projected_device = projected_target = projected_credential = None
+        if connecting and state != "connecting":
+            return _incompatible()
+        if not connecting and state not in {"idle", "discovering"}:
+            return _incompatible()
+    streaming_audio = streaming[0] if streaming else None
+    if top_has_audio != (streaming_audio.has_audio if streaming_audio else False):
+        return _incompatible()
+    if top_audio_muted != (streaming_audio.audio_muted if streaming_audio else False):
+        return _incompatible()
+    if device != projected_device or target != projected_target:
+        return _incompatible()
+    if credential != projected_credential:
+        return _incompatible()
+    if needs != bool(waiting) or legacy_pin != (projected_credential == "pin"):
         return _incompatible()
     valid, metadata = _metadata(data)
     if not valid:
@@ -433,7 +484,10 @@ def decode_devices(value: object) -> DevicesReply | Err:
     data = _exact_dict(parsed)
     if data is None or _required_bool(data, "ok") is not True:
         return _incompatible()
-    raw_devices = data.get("devices")
+    # DeviceInfo is tagged omitempty in the published Response type.  A valid
+    # empty discovery therefore has no devices member; an explicitly present
+    # non-list value is still malformed and must not be treated as empty.
+    raw_devices = data.get("devices", [])
     if type(raw_devices) is not list:
         return _incompatible()
     devices: list[BackendDevice] = []
@@ -472,19 +526,34 @@ def _version(text: str) -> str:
     return match.group(1) if match else "unknown"
 
 
+def _affirmative_line(text: str, word: str, suffix: str = "") -> bool:
+    """Return true only for a command declaration, never a prose mention."""
+    pattern = rf"^\s*(?:[-*]\s*)?{re.escape(word)}{suffix}(?:\s|$)"
+    for line in text.splitlines():
+        if re.search(pattern, line, flags=re.IGNORECASE) is not None:
+            # The anchored command declaration is affirmative evidence.  We do
+            # not turn arbitrary prose or a negation prefix into capability
+            # evidence, and we do not maintain a negative-word heuristic.
+            return True
+    return False
+
+
 def _has_line(text: str, word: str) -> bool:
-    return re.search(rf"(?im)^\s*(?:[-*]\s*)?{re.escape(word)}(?:\s|\[|<|$)", text) is not None
+    return _affirmative_line(text, word)
 
 
 def _has_target_command(text: str, word: str) -> bool:
-    return re.search(
-        rf"(?im)^\s*(?:[-*]\s*)?{re.escape(word)}\s+\[target\]",
-        text,
-    ) is not None
+    return _affirmative_line(text, word, r"\s+\[target\]")
 
 
 def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
-    """Decode only explicit, independently named evidence from help text."""
+    """Decode the small, verified public help contract conservatively.
+
+    Help text cannot prove ownership, source typing, pairing transactions, or
+    any other application-private obligation.  Those capabilities are therefore
+    never inferred from keywords.  Public command capabilities are enabled only
+    for the pinned release version and affirmative command declarations.
+    """
     if type(sender_help) is not str or type(ctl_help) is not str:
         sender_help = ""
         ctl_help = ""
@@ -493,66 +562,43 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
     profile = "unknown" if not combined.strip() else (
         f"doubletake-{version.rsplit('.', 1)[0]}" if version != "unknown" else "doubletake-unknown"
     )
+    verified_public = (
+        version in _VERIFIED_HELP_VERSIONS
+        and re.search(r"(?im)^\s*doubletake\s+0\.5\.0(?:\s|$)", sender_help) is not None
+        and re.search(r"(?im)^\s*doubletake-ctl\s+0\.5\.0(?:\s|$)", ctl_help) is not None
+    )
 
-    documented_controls = all(
+    documented_controls = verified_public and all(
         _has_line(ctl_help, command) for command in ("status", "discover", "devices", "connect")
     )
-    target_controls = all(
+    target_controls = verified_public and all(
         _has_target_command(ctl_help, command)
         for command in ("disconnect", "mute", "unmute")
     )
-    multi_target = documented_controls and target_controls and bool(
-        re.search(r"(?i)multi[- ]target|multiple|concurrent|all active", ctl_help)
+    multi_target = target_controls and documented_controls and bool(
+        re.search(r"(?i)all\s+(?:streams|targets)|only the given|multiple streams", ctl_help)
     )
-    if not multi_target:
-        # A line documenting both a target argument and the all-target behaviour
-        # is sufficient; a bare command name is deliberately not.
-        multi_target = documented_controls and target_controls and "target" in ctl_help.lower()
 
+    # There is no affirmative help-level evidence for these private contracts.
+    # In particular, a line such as "Unsupported: ... handshake ..." is not
+    # evidence and must not open a start or trust gate.
     return BackendFeatures(
         profile=profile,
         version=version,
-        foreground_control=(
-            bool(re.search(r"(?i)foreground", sender_help))
-            and bool(re.search(r"(?i)owner[- ]token", combined))
-            and bool(re.search(r"(?i)handshake", combined))
-        ),
-        owner_handshake=(
-            bool(re.search(r"(?i)owner[- ]token", combined))
-            and bool(re.search(r"(?i)instance[- ]uuid", combined))
-            and bool(re.search(r"(?i)handshake", combined))
-        ),
+        foreground_control=False,
+        owner_handshake=False,
         multi_target=multi_target,
-        target_bound_pairing=(
-            bool(re.search(r"(?i)target[- ]bound", combined))
-            and bool(re.search(r"(?i)credential", combined))
-            and bool(re.search(r"(?i)pair", combined))
-        ),
-        physical_source=(
-            bool(re.search(r"(?i)physical (?:monitor|source)", combined))
-            and bool(re.search(r"(?i)connector", combined))
-            and bool(re.search(r"(?i)verify", combined))
-        ),
-        virtual_source=(
-            bool(re.search(r"(?i)virtual source", combined))
-            and bool(re.search(r"(?i)connector", combined))
-            and bool(re.search(r"(?i)verify", combined))
-        ),
-        audio_probe=(
-            _has_line(ctl_help, "status")
-            and bool(re.search(r"(?i)status|active streams", ctl_help))
-        ),
-        audio_restart=bool(re.search(r"(?i)(?:start|restart)[_ -]audio", combined)),
+        target_bound_pairing=False,
+        physical_source=False,
+        virtual_source=False,
+        audio_probe=verified_public and _has_line(ctl_help, "status"),
+        audio_restart=False,
         target_mute=target_controls,
-        keyring=bool(re.search(r"(?i)(?:keyring|secret service).*(?:transaction|prepare|commit)", combined)),
-        provisional_commit=bool(
-            re.search(r"(?i)provisional", combined)
-            and re.search(r"(?i)commit", combined)
-            and re.search(r"(?i)pair", combined)
-        ),
-        cancel_pairing=bool(re.search(r"(?i)cancel[_ -]pairing", combined)),
-        revoke_pairing=bool(re.search(r"(?i)revoke[_ -]pairing", combined)),
-        query_modes=bool(re.search(r"(?i)(?:query[_ -]modes|supported modes)", combined)),
+        keyring=False,
+        provisional_commit=False,
+        cancel_pairing=False,
+        revoke_pairing=False,
+        query_modes=False,
     )
 
 

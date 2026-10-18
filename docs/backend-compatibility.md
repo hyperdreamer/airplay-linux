@@ -5,15 +5,17 @@ release. The evidence was collected from the Arch `doubletake-bin` 0.5.0-1
 package and the upstream release source:
 
 - Release tag: [`v0.5.0`](https://github.com/omarroth/doubletake/releases/tag/v0.5.0)
-- Source commit: [`c896e3689ab85c3ed520e502308dedfbb5a4c221`](https://github.com/omarroth/doubletake/commit/c896e3689ab85c3ed520e502308dedfbb5a4c221)
-- Sender source: [`internal/daemon/daemon.go`](https://github.com/omarroth/doubletake/blob/c896e3689ab85c3ed520e502308dedfbb5a4c221/internal/daemon/daemon.go)
-- Client source: [`daemonclient/client.go`](https://github.com/omarroth/doubletake/blob/c896e3689ab85c3ed520e502308dedfbb5a4c221/daemonclient/client.go)
+- Annotated release tag object: `c896e3689ab85c3ed520e502308dedfbb5a4c221` (the `v0.5.0` tag)
+- Peeled source commit: [`e18f85d07f74a3b9d49f448762d28f3f7feb3938`](https://github.com/omarroth/doubletake/commit/e18f85d07f74a3b9d49f448762d28f3f7feb3938)
+- Sender source: [`internal/daemon/daemon.go`](https://github.com/omarroth/doubletake/blob/e18f85d07f74a3b9d49f448762d28f3f7feb3938/internal/daemon/daemon.go)
+- Client source: [`internal/daemon/daemonclient/client.go`](https://github.com/omarroth/doubletake/blob/e18f85d07f74a3b9d49f448762d28f3f7feb3938/internal/daemon/daemonclient/client.go)
 
 The captured command output is retained in:
 
 - `tests/fixtures/backend/doubletake-0.5-help.txt`
 - `tests/fixtures/backend/doubletake-ctl-0.5-help.txt`
-- `tests/fixtures/backend/status-0.5.json`
+- `tests/fixtures/backend/status-0.5.json` (concurrent PIN-waiting and streaming)
+- `tests/fixtures/backend/status-0.5-password.json` (password-waiting and streaming)
 
 ## Verified v0.5 surface
 

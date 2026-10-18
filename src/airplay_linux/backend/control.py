@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -239,6 +240,28 @@ def _default_features() -> BackendFeatures:
     )
 
 
+def _application_contract_features() -> BackendFeatures:
+    """Capabilities of the deterministic, non-live adapter contract fixture."""
+    return BackendFeatures(
+        profile="application-contract-v1",
+        version="v1",
+        foreground_control=True,
+        owner_handshake=True,
+        multi_target=True,
+        target_bound_pairing=True,
+        physical_source=True,
+        virtual_source=True,
+        audio_probe=True,
+        audio_restart=True,
+        target_mute=True,
+        keyring=True,
+        provisional_commit=True,
+        cancel_pairing=True,
+        revoke_pairing=True,
+        query_modes=True,
+    )
+
+
 @dataclass(frozen=True, kw_only=True, repr=False)
 class PublishedDoubletakeProfile:
     """The externally documented v0.5 command mapping.
@@ -338,6 +361,74 @@ class PublishedDoubletakeProfile:
         return result.value
 
 
+@dataclass(frozen=True, kw_only=True, repr=False)
+class ApplicationContractProfile(PublishedDoubletakeProfile):
+    """Explicit v1 application fixture profile; never an installed backend claim.
+
+    Its argv is a deterministic test transport name, not a doubletake command.
+    Keeping this profile separate from :class:`PublishedDoubletakeProfile` makes
+    it impossible for help probing to silently advertise the application schema.
+    """
+
+    name: str = "application-contract-v1"
+    version: str = "v1"
+    provenance: str = "application-contract-fixture"
+    live_support_proven: bool = False
+    features: BackendFeatures = field(default_factory=_application_contract_features)
+    protocol_version: str | None = "v1"
+
+    def __post_init__(self) -> None:
+        if self.provenance != "application-contract-fixture":
+            raise ValueError("application contract provenance is fixed")
+        if self.live_support_proven:
+            raise ValueError("application contract cannot claim live support")
+        if self.protocol_version != "v1":
+            raise ValueError("application contract protocol must be v1")
+        if self.features.profile != "application-contract-v1":
+            raise ValueError("application contract feature profile mismatch")
+
+    def try_argv(
+        self,
+        operation: BackendOperation | str,
+        target: ReceiverTarget | None,
+        payload: BackendPayload,
+    ) -> Result[tuple[str, ...]]:
+        op = self._operation(operation)
+        if op is None:
+            return _err(ErrorCode.unsupported_operation)
+        if (
+            type(self.socket_path) is not str
+            or not self.socket_path
+            or not self.socket_path.startswith("/")
+            or "\x00" in self.socket_path
+        ):
+            return _err(ErrorCode.stale_socket)
+        if not isinstance(
+            payload,
+            (EmptyPayload, ConnectPayload, CredentialPayload, MutePayload,
+             SourcePayload, PairingPayload, ModesPayload),
+        ):
+            return _err(ErrorCode.invalid_input)
+        target_text: str | None = None
+        if target is not None:
+            if not isinstance(target, ReceiverTarget) or type(target.canonical_host) is not str:
+                return _err(ErrorCode.invalid_input)
+            if not target.canonical_host or any(char.isspace() for char in target.canonical_host):
+                return _err(ErrorCode.invalid_input)
+            target_text = target.canonical_host
+        reads = {BackendOperation.status, BackendOperation.discover, BackendOperation.devices}
+        target_operations = set(BackendOperation) - reads - {BackendOperation.shutdown}
+        if op in reads or op is BackendOperation.shutdown:
+            if target is not None:
+                return _err(ErrorCode.invalid_input)
+        elif op in target_operations and target_text is None:
+            return _err(ErrorCode.unsupported_operation)
+        # Payload values, including credentials, are consumed by the fake
+        # socket/process harness and are intentionally never placed in argv.
+        argv = ("application-contract-v1", "-socket", self.socket_path, op.value)
+        return Ok(value=argv + ((target_text,) if target_text is not None else ()))
+
+
 class UnsupportedControl:
     """Fail-closed implementation used when no compatible backend is proven."""
 
@@ -383,6 +474,7 @@ class PublishedDoubletakeControl:
         self._clock = clock
         self._closed = False
         self._callbacks: list[Callable[[BackendNotice], None]] = []
+        self._handshake: Handshake | None = None
 
     def subscribe(self, callback: Callable[[BackendNotice], None]) -> Subscription:
         self._callbacks.append(callback)
@@ -406,6 +498,11 @@ class PublishedDoubletakeControl:
         features = self._profile.features
         if operation in {BackendOperation.status, BackendOperation.discover, BackendOperation.devices}:
             return True
+        # A socket path is routing information, not an ownership proof.  Every
+        # operation that can mutate daemon state requires the independently
+        # authenticated handshake recorded by ``handshake``.
+        if not features.owner_handshake:
+            return False
         if operation is BackendOperation.disconnect:
             return features.multi_target
         if operation in {BackendOperation.mute, BackendOperation.unmute}:
@@ -425,6 +522,8 @@ class PublishedDoubletakeControl:
             )
         if operation is BackendOperation.query_modes:
             return features.query_modes
+        if operation is BackendOperation.shutdown:
+            return features.owner_handshake
         if operation in {BackendOperation.start_audio, BackendOperation.restart_audio}:
             return features.audio_restart
         if operation is BackendOperation.begin_pairing:
@@ -476,8 +575,11 @@ class PublishedDoubletakeControl:
             return _err(ErrorCode.dependency_incompatible)
         if not isinstance(value, Ok) or not isinstance(value.value, CommandOutput):
             return _err(ErrorCode.dependency_incompatible)
-        if type(value.value.exit_code) is not int or value.value.exit_code != 0:
-            return _err(ErrorCode.daemon_failed)
+        # doubletake-ctl serializes a valid {"ok": false, ...} response and
+        # exits 1 for a receiver-level rejection.  Preserve the output for the
+        # typed decoder; launch/transport failures have already returned above.
+        if type(value.value.exit_code) is not int:
+            return _err(ErrorCode.dependency_incompatible)
         return value
 
     def _ownership_check(self, status: StatusReply) -> Result[None]:
@@ -503,9 +605,64 @@ class PublishedDoubletakeControl:
     @staticmethod
     def _response_object(output: CommandOutput) -> object:
         try:
-            return output.stdout.decode("utf-8")
-        except (AttributeError, UnicodeDecodeError):
+            raw = output.stdout.decode("utf-8")
+            return json.loads(raw)
+        except (AttributeError, UnicodeDecodeError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _is_mutation(operation: BackendOperation) -> bool:
+        return operation not in {
+            BackendOperation.status,
+            BackendOperation.discover,
+            BackendOperation.devices,
+        }
+
+    async def _revalidate_ownership(self) -> Result[None]:
+        """Recheck the exact authenticated daemon before each mutation."""
+        handshake = self._handshake
+        if handshake is None:
+            return _err(ErrorCode.dependency_incompatible)
+        argv_result = self._profile.try_argv(
+            BackendOperation.status, None, EmptyPayload(),
+        )
+        if isinstance(argv_result, Err):
+            return argv_result
+        process_result = await self._run(argv_result.value)
+        if isinstance(process_result, Err):
+            return process_result
+        output = process_result.value
+        response = self._response_object(output)
+        if not isinstance(response, dict):
+            return _err(
+                ErrorCode.daemon_failed
+                if output.exit_code != 0
+                else ErrorCode.dependency_incompatible
+            )
+        if response.get("ok") is not True:
+            return _err(ErrorCode.ownership_mismatch)
+        if output.exit_code != 0:
+            return _err(ErrorCode.daemon_failed)
+        status = decode_status(response)
+        if isinstance(status, Err):
+            return status
+        ownership = self._ownership_check(status)
+        if isinstance(ownership, Err):
+            self._handshake = None
+            return ownership
+        expected_owner = _secret_text(handshake.owner_token)
+        if (
+            status.socket_path != self._profile.socket_path
+            or status.instance_uuid != handshake.instance_uuid
+            or status.owner_token != expected_owner
+            or status.daemon != handshake.daemon
+            or status.protocol_version != handshake.protocol_version
+        ):
+            self._handshake = None
+            if status.socket_path != self._profile.socket_path:
+                return _err(ErrorCode.stale_socket)
+            return _err(ErrorCode.ownership_mismatch)
+        return Ok(value=None)
 
     async def request(
         self,
@@ -525,15 +682,34 @@ class PublishedDoubletakeControl:
         if not self._available(op):
             return _err(ErrorCode.dependency_incompatible)
 
+        if self._is_mutation(op):
+            ownership = await self._revalidate_ownership()
+            if isinstance(ownership, Err):
+                return ownership
+
         process_result = await self._run(argv_result.value)
         if isinstance(process_result, Err):
             return process_result
-        raw = self._response_object(process_result.value)
-        if raw is None:
-            return _err(ErrorCode.dependency_incompatible)
+        output = process_result.value
+        response = self._response_object(output)
+        if not isinstance(response, dict) or type(response.get("ok")) is not bool:
+            return _err(
+                ErrorCode.daemon_failed
+                if output.exit_code != 0
+                else ErrorCode.dependency_incompatible
+            )
+        if response["ok"] is False:
+            # The published CLI uses exit 1 for this valid rejection envelope.
+            # Keep rejection fixed and operation-specific; never copy its free
+            # form ``error`` field into a diagnostic.
+            if output.exit_code not in {0, 1}:
+                return _err(ErrorCode.daemon_failed)
+            return _err(_rejection_code(op))
+        if output.exit_code != 0:
+            return _err(ErrorCode.daemon_failed)
 
         if op is BackendOperation.status:
-            decoded = decode_status(raw)
+            decoded = decode_status(response)
             if isinstance(decoded, Err):
                 return decoded
             ownership = self._ownership_check(decoded)
@@ -542,12 +718,15 @@ class PublishedDoubletakeControl:
             self._emit(BackendNotice(kind=BackendNoticeKind.status, status=decoded))
             return Ok(value=decoded)
         if op in {BackendOperation.discover, BackendOperation.devices}:
-            decoded = decode_devices(raw)
+            decoded = decode_devices(response)
             if isinstance(decoded, Err):
                 return decoded
             return Ok(value=decoded)
 
-        parsed = _parse_ack(raw, op, target)
+        if op in {BackendOperation.mute, BackendOperation.unmute}:
+            parsed = _parse_mute_ack(response, op, target)
+        else:
+            parsed = _parse_ack(response, op, target)
         if isinstance(parsed, Err):
             return parsed
         self._emit(BackendNotice(kind=BackendNoticeKind.stream, target=parsed.target))
@@ -562,27 +741,47 @@ class PublishedDoubletakeControl:
             return _err(ErrorCode.dependency_incompatible)
         if _secret_text(owner_token) is None or not isinstance(instance_uuid, UUID):
             return _err(ErrorCode.invalid_input)
+        expected_owner = _secret_text(owner_token)
+        if expected_owner is None:
+            return _err(ErrorCode.invalid_input)
+        configured_owner = _secret_text(self._profile.owner_token)
+        if configured_owner is not None and configured_owner != expected_owner:
+            return _err(ErrorCode.ownership_mismatch)
+        if self._profile.instance_uuid is not None and self._profile.instance_uuid != instance_uuid:
+            return _err(ErrorCode.ownership_mismatch)
         result = await self.request(BackendOperation.status, None, EmptyPayload(), None)
         if isinstance(result, Err):
             return result
         status = result.value
-        if status.owner_token != _secret_text(owner_token):
-            return _err(ErrorCode.ownership_mismatch)
-        if status.instance_uuid != instance_uuid:
-            return _err(ErrorCode.ownership_mismatch)
-        if status.daemon is None or not status.protocol_version:
-            return _err(ErrorCode.dependency_incompatible)
-        return Ok(
-            value=Handshake(
-                instance_uuid=instance_uuid,
-                owner_token=owner_token,
-                daemon=status.daemon,
-                protocol_version=status.protocol_version,
+        if (
+            status.owner_token != expected_owner
+            or status.instance_uuid != instance_uuid
+            or status.socket_path != self._profile.socket_path
+            or status.daemon is None
+            or not status.protocol_version
+        ):
+            return _err(
+                ErrorCode.stale_socket
+                if status.socket_path != self._profile.socket_path
+                else ErrorCode.ownership_mismatch
             )
+        if (
+            self._profile.protocol_version is not None
+            and status.protocol_version != self._profile.protocol_version
+        ):
+            return _err(ErrorCode.dependency_incompatible)
+        handshake = Handshake(
+            instance_uuid=instance_uuid,
+            owner_token=owner_token,
+            daemon=status.daemon,
+            protocol_version=status.protocol_version,
         )
+        self._handshake = handshake
+        return Ok(value=handshake)
 
     async def close(self) -> None:
         self._closed = True
+        self._handshake = None
         self._callbacks.clear()
 
 
@@ -597,17 +796,19 @@ def _secret_text(value: SensitiveText | str | None) -> str | None:
     return None
 
 
+def _rejection_code(operation: BackendOperation) -> ErrorCode:
+    if operation in {BackendOperation.mute, BackendOperation.unmute}:
+        return ErrorCode.audio_mute_failed
+    if operation in {BackendOperation.start_audio, BackendOperation.restart_audio}:
+        return ErrorCode.audio_unavailable
+    return ErrorCode.receiver_rejected
+
+
 def _parse_ack(
-    raw: str,
+    value: object,
     operation: BackendOperation,
     target: ReceiverTarget | None,
 ) -> AckReply | Err:
-    try:
-        import json
-
-        value = json.loads(raw)
-    except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
-        return _err(ErrorCode.dependency_incompatible)
     if type(value) is not dict or type(value.get("ok")) is not bool:
         return _err(ErrorCode.dependency_incompatible)
     if value["ok"] is not True:
@@ -626,8 +827,34 @@ def _parse_ack(
     )
 
 
+def _parse_mute_ack(
+    value: object,
+    operation: BackendOperation,
+    target: ReceiverTarget | None,
+) -> AckReply | Err:
+    """Confirm mute from exactly one matching published stream entry."""
+    if target is None:
+        return _err(ErrorCode.audio_mute_failed)
+    status = decode_status(value)
+    if isinstance(status, Err):
+        return _err(ErrorCode.audio_mute_failed)
+    matches = [stream for stream in status.streams if stream.target == target.canonical_host]
+    if len(matches) != 1:
+        return _err(ErrorCode.audio_mute_failed)
+    expected = operation is BackendOperation.mute
+    if matches[0].audio_muted is not expected:
+        return _err(ErrorCode.audio_mute_failed)
+    return AckReply(
+        operation=operation.value,
+        state=status.state,
+        target=target.canonical_host,
+        muted=matches[0].audio_muted,
+    )
+
+
 __all__ = [
     "AckReply",
+    "ApplicationContractProfile",
     "BackendControl",
     "BackendDevice",
     "BackendFeatures",

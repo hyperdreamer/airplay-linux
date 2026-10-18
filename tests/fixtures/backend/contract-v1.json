@@ -4,6 +4,7 @@
   "provenance": "application-contract-fixture",
   "live_support_proven": false,
   "protocol_version": "v1",
+  "published_source_commit": "e18f85d07f74a3b9d49f448762d28f3f7feb3938",
   "features": {
     "foreground_control": true,
     "owner_handshake": true,
@@ -19,5 +20,50 @@
     "cancel_pairing": true,
     "revoke_pairing": true,
     "query_modes": true
-  }
+  },
+  "requests": [
+    {"operation": "status", "payload": "empty"},
+    {"operation": "discover", "payload": "empty"},
+    {"operation": "devices", "payload": "empty"},
+    {"operation": "connect", "payload": "connect"},
+    {"operation": "disconnect", "payload": "empty"},
+    {"operation": "mute", "payload": "mute"},
+    {"operation": "unmute", "payload": "mute"},
+    {"operation": "query_modes", "payload": "modes"},
+    {"operation": "start_audio", "payload": "source"},
+    {"operation": "restart_audio", "payload": "source"},
+    {"operation": "begin_pairing", "payload": "pairing"},
+    {"operation": "submit_pairing", "payload": "pairing"},
+    {"operation": "cancel_pairing", "payload": "empty"},
+    {"operation": "prepare_pairing", "payload": "pairing"},
+    {"operation": "commit_pairing", "payload": "pairing"},
+    {"operation": "revoke_pairing", "payload": "pairing"},
+    {"operation": "mark_invalid", "payload": "pairing"},
+    {"operation": "shutdown", "payload": "empty"}
+  ],
+  "replies": [
+    {"operation": "status", "tag": "status_reply"},
+    {"operation": "discover", "tag": "devices_reply"},
+    {"operation": "devices", "tag": "devices_reply"},
+    {"operation": "connect", "tag": "ack_reply"},
+    {"operation": "disconnect", "tag": "ack_reply"},
+    {"operation": "mute", "tag": "ack_reply"},
+    {"operation": "unmute", "tag": "ack_reply"},
+    {"operation": "query_modes", "tag": "modes_reply"},
+    {"operation": "start_audio", "tag": "ack_reply"},
+    {"operation": "restart_audio", "tag": "ack_reply"},
+    {"operation": "begin_pairing", "tag": "challenge_reply"},
+    {"operation": "submit_pairing", "tag": "pairing_reply"},
+    {"operation": "cancel_pairing", "tag": "ack_reply"},
+    {"operation": "prepare_pairing", "tag": "pairing_reply"},
+    {"operation": "commit_pairing", "tag": "pairing_reply"},
+    {"operation": "revoke_pairing", "tag": "ack_reply"},
+    {"operation": "mark_invalid", "tag": "ack_reply"},
+    {"operation": "shutdown", "tag": "ack_reply"}
+  ],
+  "notices": [
+    {"kind": "status", "fields": ["state", "streams"]},
+    {"kind": "stream", "fields": ["target", "state"]},
+    {"kind": "pairing", "fields": ["challenge_id", "credential_kind"]}
+  ]
 }

@@ -14,6 +14,7 @@ from .contract import (
 )
 from .control import (
     AckReply,
+    ApplicationContractProfile,
     BackendControl,
     BackendNotice,
     BackendNoticeKind,
@@ -34,6 +35,7 @@ from .control import (
 
 __all__ = [
     "AckReply",
+    "ApplicationContractProfile",
     "BackendControl",
     "BackendDevice",
     "BackendFeatures",

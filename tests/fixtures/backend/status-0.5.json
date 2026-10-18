@@ -1,13 +1,15 @@
 {
+  "source_commit": "e18f85d07f74a3b9d49f448762d28f3f7feb3938",
+  "source_path": "internal/daemon/daemon.go",
   "ok": true,
   "state": "pin_required",
-  "device": "Living Room",
+  "device": "Bedroom",
   "device_ip": "192.0.2.10",
-  "has_audio": false,
-  "audio_muted": false,
-  "needs_pin": false,
+  "has_audio": true,
+  "audio_muted": true,
+  "needs_pin": true,
   "needs_credential": true,
-  "credential_kind": "password",
+  "credential_kind": "pin",
   "streams": [
     {
       "device": "Bedroom",
