@@ -9,6 +9,7 @@ typed diagnostics are pinned without opening multicast.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import base64
 import json
 from collections.abc import Awaitable, Callable
@@ -912,20 +913,33 @@ async def test_bounded_refresh_rotates_across_the_full_live_key_set():
 
 
 @run_async
-async def test_azc_client_refresh_updates_every_browser():
-    class Browser:
-        def __init__(self) -> None:
-            self.updates = 0
+async def test_azc_client_refresh_never_invents_a_browser_call():
+    """zeroconf has no public "scan now" call, so refresh must not fabricate one.
 
-        async def async_update_records(self) -> None:
-            self.updates += 1
+    ``AsyncServiceBrowser`` exposes only ``async_update_records(zc, now, records)``,
+    which *delivers* records rather than requesting them, and the query scheduler
+    behind it is private and Cython-compiled. This test pins the real dependency's
+    shape: any invented invocation with the wrong arity would raise here.
+
+    Use the genuine class to bind the call, so a fake cannot hide a signature
+    mismatch.
+    """
+    aio = pytest.importorskip("zeroconf.asyncio")
+    browser_cls = aio.AsyncServiceBrowser
+    bound = inspect.signature(browser_cls.async_update_records)
+    assert list(bound.parameters)[:4] == ["self", "zc", "now", "records"], bound
+    assert not hasattr(browser_cls, "async_scan")
 
     mdns = AzcMdnsClient(FakeClock(), factory=lambda: object())
-    browsers = [Browser(), Browser()]
-    mdns._browsers.extend(browsers)
+    # A browser object whose only real method needs three arguments: if refresh
+    # ever calls it bare, this raises TypeError and the test fails.
+    class Browser:
+        async def async_update_records(self, zc: Any, now: Any, records: Any) -> None:
+            raise AssertionError("refresh must not invoke async_update_records")
+
+    mdns._browsers.extend([Browser(), Browser()])
     result = await mdns.refresh()
-    assert isinstance(result, Ok)
-    assert [browser.updates for browser in browsers] == [1, 1]
+    assert isinstance(result, Ok), result
     await mdns.close()
 
 

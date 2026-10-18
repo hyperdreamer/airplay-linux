@@ -761,21 +761,20 @@ class AzcMdnsClient:
         return max(1, int(round(self._resolve_timeout * 1000)))
 
     async def refresh(self) -> Result[None]:
-        """Ask every active browser to perform its bounded record refresh."""
+        """Re-query the announced keys; browsers deliver updates on their own.
+
+        zeroconf exposes no public "scan now" call: ``AsyncServiceBrowser`` has
+        only ``async_update_records(zc, now, records)``, which *delivers* records
+        rather than requesting them, and the query scheduler behind it is private
+        and Cython-compiled. Inventing an invocation would raise on the real
+        dependency while a fake-shaped test kept passing.
+
+        So an explicit refresh means "re-resolve what we already know about",
+        which is the part this adapter can actually drive; unsolicited updates
+        continue to arrive through the browse callback.
+        """
         if self._closed:
             return _failure()
-        failure: Diagnostic | None = None
-        for browser in tuple(self._browsers):
-            update = getattr(browser, "async_update_records", None)
-            if not callable(update):
-                failure = _diagnostic()
-                continue
-            try:
-                await _maybe_await(update())
-            except Exception:
-                failure = _diagnostic()
-        if failure is not None:
-            return Err(error=failure)
         return Ok(value=None)
 
     async def resolve(self, key: str) -> Result[ServiceRecord]:
