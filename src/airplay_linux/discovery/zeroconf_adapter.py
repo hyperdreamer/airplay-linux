@@ -704,6 +704,13 @@ class AzcMdnsClient:
         *,
         resolve_timeout: float = 2.0,
     ) -> None:
+        """``resolve_timeout`` is a budget in **seconds**, as the rest of the app uses.
+
+        ``AsyncZeroconf.async_get_service_info`` takes **milliseconds** (its own
+        default is 3000), so the value is converted at the dependency boundary by
+        :attr:`_backend_timeout`. Passing seconds straight through asked for a
+        two-millisecond lookup, which no real network answer can meet.
+        """
         self._clock = clock
         self._factory = factory or _default_factory
         self._resolve_timeout = resolve_timeout
@@ -746,6 +753,15 @@ class AzcMdnsClient:
         self._browsers.extend(browsers)
         return Ok(value=_Browsers(browsers, self._types, self._detach))
 
+    @property
+    def _backend_timeout(self) -> int:
+        """The resolve budget in the unit the backend actually documents.
+
+        Rounded up so a sub-millisecond budget never becomes ``0``, which the
+        dependency would read as an immediate, unfillable deadline.
+        """
+        return max(1, int(round(self._resolve_timeout * 1000)))
+
     async def resolve(self, key: str) -> Result[ServiceRecord]:
         # A closed client must never acquire a fresh backend: doing so would
         # reopen discovery resources that ``close`` has already declared
@@ -761,7 +777,7 @@ class AzcMdnsClient:
             return _failure()
         try:
             info = await client.async_get_service_info(
-                service_type, key, timeout=self._resolve_timeout,
+                service_type, key, timeout=self._backend_timeout,
             )
         except Exception:
             return _failure()

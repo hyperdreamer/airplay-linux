@@ -1069,3 +1069,50 @@ async def test_resolve_after_close_never_resurrects_a_backend():
     assert isinstance(result, Err), result
     assert result.error.code is ErrorCode.discovery_failed
     assert created == [], "a closed client must not acquire a backend"
+
+
+@pytest.mark.asyncio
+async def test_the_backend_receives_a_millisecond_resolve_budget():
+    """The dependency documents milliseconds; the adapter's budget is seconds.
+
+    Passing the seconds value straight through asked for a two-millisecond
+    lookup, which no real network answer can meet — and a fake that returns
+    immediately cannot reveal the mismatch.
+    """
+    seen: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> object:
+            seen.append(kwargs.get("timeout"))
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            return None
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: Backend())
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    result = await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert isinstance(result, Ok), result
+    assert seen == [2000], f"a 2-second budget must reach the backend as 2000 ms, got {seen}"
+
+
+@pytest.mark.asyncio
+async def test_a_sub_millisecond_budget_never_becomes_zero():
+    seen: list[Any] = []
+
+    class Backend:
+        zeroconf = object()
+
+        async def async_get_service_info(self, *args: Any, **kwargs: Any) -> object:
+            seen.append(kwargs.get("timeout"))
+            return _ServiceInfo()
+
+        async def async_close(self) -> None:
+            return None
+
+    mdns = AzcMdnsClient(FakeClock(), factory=lambda: Backend(), resolve_timeout=0.0001)
+    mdns._types["Living Room._airplay._tcp.local."] = AIRPLAY_SERVICE
+    await mdns.resolve("Living Room._airplay._tcp.local.")
+    assert seen == [1], seen
