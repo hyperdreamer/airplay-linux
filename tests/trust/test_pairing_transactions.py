@@ -684,3 +684,73 @@ def test_pending_receiver_does_not_serialize_another_receivers_pairing():
         gate.release()
         assert isinstance(await cancellation, Ok)
     asyncio.run(scenario())
+
+
+def test_submit_fences_before_backend_when_cancelled_before_submit_starts(monkeypatch):
+    async def scenario():
+        h = Harness()
+        challenge = await h.begin()
+        original_submit = h.coordinator._submit
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_submit(attempt, value, context):
+            entered.set()
+            await release.wait()
+            return await original_submit(attempt, value, context)
+
+        monkeypatch.setattr(h.coordinator, "_submit", delayed_submit)
+        submission = asyncio.create_task(h.submit(challenge))
+        await entered.wait()
+        cancellation = asyncio.create_task(
+            h.coordinator.cancel_pairing(h.target.receiver_id, challenge.challenge_id, h.context)
+        )
+        await asyncio.sleep(0)
+        assert h.coordinator.pending_cleanup(h.target.receiver_id)
+        assert h.fences.get(h.target.receiver_id).active_challenge_id is None
+        release.set()
+
+        result = await submission
+        assert isinstance(await cancellation, Ok)
+        assert result.kind == "Cancelled"
+        assert not any(
+            entry[1]["operation"] is BackendOperation.submit_pairing
+            for entry in h.control.journal.entries
+        )
+        assert h.credentials.stored == {}
+        assert h.credentials.provisional == {}
+        assert h.credentials.committed == {}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("invalidation", ["cancel", "expiry", "forget", "invalid"])
+def test_confirmed_invalidation_advances_generation_and_fences_old_context(invalidation):
+    async def scenario():
+        h = Harness()
+        challenge = await h.begin()
+        stale_context = h.current_context()
+        initial_generation = h.fences.get(h.target.receiver_id).trust_generation
+
+        if invalidation == "cancel":
+            outcome = await h.coordinator.cancel_pairing(
+                h.target.receiver_id, challenge.challenge_id, stale_context
+            )
+        elif invalidation == "expiry":
+            h.scheduler.advance(120)
+            outcome = await h.coordinator.retry_revocation(
+                h.target.receiver_id, h.current_context()
+            )
+        elif invalidation == "forget":
+            outcome = await h.coordinator.forget_trust(h.target.receiver_id, stale_context)
+        else:
+            outcome = await h.coordinator.mark_invalid(h.target.receiver_id, stale_context)
+
+        assert isinstance(outcome, Ok)
+        assert h.fences.get(h.target.receiver_id).trust_generation == initial_generation + 1
+        assert not h.coordinator.pending_cleanup(h.target.receiver_id)
+        blocked = await h.coordinator.begin_pairing(h.target, stale_context)
+        assert isinstance(blocked, Err)
+        assert blocked.error.code is ErrorCode.stale_target
+
+    asyncio.run(scenario())
