@@ -724,6 +724,55 @@ def test_submit_fences_before_backend_when_cancelled_before_submit_starts(monkey
     asyncio.run(scenario())
 
 
+def test_submit_fences_before_prepare_when_cancelled_during_backend_submit(monkeypatch):
+    async def scenario():
+        h = Harness()
+        challenge = await h.begin()
+        gate = h.control.submit_gate = Gate()
+        cancelled = asyncio.Event()
+        original_cancel = h.credentials.cancel_pairing
+
+        async def confirmed_cancel(challenge):
+            result = await original_cancel(challenge)
+            assert isinstance(result, Ok)
+            cancelled.set()
+            return result
+
+        monkeypatch.setattr(h.credentials, "cancel_pairing", confirmed_cancel)
+        submission = asyncio.create_task(h.submit(challenge))
+        await gate.entered.wait()
+        cancellation = asyncio.create_task(
+            h.coordinator.cancel_pairing(h.target.receiver_id, challenge.challenge_id, h.context)
+        )
+        # Confirm backend cancellation before releasing submit; full cleanup
+        # must still wait for that in-flight backend outcome.
+        await cancelled.wait()
+        assert len(h.credentials.journal.calls("credential_store.cancel_pairing")) == 1
+        assert h.fences.get(h.target.receiver_id).active_challenge_id is None
+        assert h.coordinator.pending_cleanup(h.target.receiver_id)
+        assert not submission.done()
+        assert not cancellation.done()
+        assert h.credentials.provisional == {}
+
+        gate.release()
+        result = await submission
+        assert isinstance(await cancellation, Ok)
+        assert result.kind == "Cancelled"
+        assert result.credential_ref is None
+        assert not h.coordinator.pending_cleanup(h.target.receiver_id)
+        assert [
+            entry[1]["operation"] for entry in h.control.journal.entries
+        ] == [BackendOperation.submit_pairing]
+        # Final state alone can hide a late prepare behind compensation.
+        assert len(h.credentials.journal.calls("credential_store.prepare_pairing")) == 0
+        assert h.credentials.journal.calls("credential_store.commit_pairing") == []
+        assert h.credentials.provisional == {}
+        assert h.credentials.committed == {}
+        assert h.credentials.stored == {}
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("invalidation", ["cancel", "expiry", "forget", "invalid"])
 def test_confirmed_invalidation_advances_generation_and_fences_old_context(invalidation):
     async def scenario():
