@@ -18,7 +18,7 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import MutePayload, TransportEventKind
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.records import DaemonRecord
-from airplay_linux.domain.resources import AudioPolicy, Err, ErrorCode, Ok
+from airplay_linux.domain.resources import AudioPolicy, AudioState, Err, ErrorCode, Ok
 from airplay_linux.storage import AtomicFiles, JsonReceiverStore
 from airplay_linux.testing.adapters import Deferred, FakeCapture, Journal, SequenceIds
 from airplay_linux.testing.builders import context, physical, target, virtual_handle
@@ -605,6 +605,25 @@ async def test_connect_records_audio_intent_and_only_separate_audio_start_enable
 
 
 @pytest.mark.asyncio
+async def test_video_only_stream_records_disabled_audio_distinct_from_unavailable(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle(enabled=False)
+    audio = h.transport._streams[handle.lease_id].audio
+    assert audio is AudioState.Disabled
+    assert audio is not AudioState.Unavailable
+
+
+@pytest.mark.asyncio
+async def test_video_only_stream_rejects_mute_without_backend_io(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle(enabled=False)
+    before = list(h.control.journal.entries)
+    result = await h.transport.set_muted(handle, True, context())
+    assert h.control.journal.entries == before
+    assert_error(result, ErrorCode.audio_unavailable)
+
+
+@pytest.mark.asyncio
 async def test_audio_capability_failure_preserves_video_and_disables_mute(tmp_path):
     h = Harness(tmp_path, audio_restart=False)
     handle = await h.handle()
@@ -711,6 +730,26 @@ async def test_old_daemon_and_ambiguous_backend_notices_cannot_change_new_stream
     assert len(h.events) == count
     assert isinstance(await h.transport.start_audio(current, context(lease=2)), Ok)
     assert h.factory(h.registry.record).audio == {h.a.receiver_id}
+
+
+@pytest.mark.asyncio
+async def test_first_old_daemon_exit_after_new_daemon_stream_preserves_current_controls(tmp_path):
+    h = Harness(tmp_path)
+    old = await h.handle()
+    h.registry.record = daemon(10)
+    current = await h.handle(h.b, ctx=context(lease=2))
+    assert current.daemon_instance_uuid != old.daemon_instance_uuid
+    assert isinstance(await h.transport.start_audio(current, context(lease=2)), Ok)
+
+    # The first exit for the old daemon arrives only after the new stream is live.
+    h.registry.emit("exit", old.daemon_instance_uuid)
+    exited = [event.stream for event in h.events if event.kind is TransportEventKind.daemon_exit]
+    assert exited == [old]
+    assert isinstance(await h.transport.set_muted(current, True, context(lease=2)), Ok)
+    current_control = h.factory(h.registry.record)
+    assert current_control.muted == {h.b.receiver_id: True}
+    assert isinstance(await h.transport.stop_stream(current, context(lease=2)), Ok)
+    assert current_control.connected == set()
 
 
 @pytest.mark.asyncio
