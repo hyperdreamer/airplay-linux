@@ -264,10 +264,11 @@ class DoubleTakeTransport:
        control. A control whose ``request`` cannot accept a fence is rejected
        before invocation, so it receives no command at all.
     2. ``PublishedDoubletakeControl.request`` refuses those six operations when no
-       fence is supplied, and otherwise evaluates the supplied fence after its own
-       daemon-ownership await and immediately before spawning the mutating child.
-       A typed ``Err`` prevents the mutation. Ownership-status children may already
-       have run: the guarantee is *no target mutation*, not *no subprocess*.
+       fence is supplied, before performing any I/O at all, and otherwise evaluates
+       the supplied fence after its own daemon-ownership await and immediately
+       before spawning the mutating child. A typed ``Err`` prevents the mutation.
+       When the fence *rejects*, the ownership-status child may already have run:
+       the guarantee is *no target mutation*, not *no subprocess*.
     3. With trusted controls and wrappers that forward the original predicate and
        the unchanged target, target invalidation during the ownership await is
        detected before mutation. A wrapper that merely drops the keyword is caught

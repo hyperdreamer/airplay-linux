@@ -706,8 +706,8 @@ class PublishedDoubletakeControl:
         ``dispatch_fence`` is the caller's exact-target (or cleanup-ownership)
         freshness predicate. For connect, disconnect, mute, unmute, start_audio
         and restart_audio this adapter **requires** it: with no fence supplied the
-        call returns a typed failure and no child is spawned, so a wrapper that
-        accepts the keyword and drops it cannot cause a mutation. Mutating
+        call returns a typed failure *before any I/O at all*, so a wrapper that
+        accepts the keyword and drops it cannot even run the ownership probe. Mutating
         commands evaluate the supplied fence after this adapter's own awaited
         ownership revalidation and before spawning, so a mismatch is detected at
         the dispatch boundary rather than after the reply. Read-only commands never
@@ -732,27 +732,21 @@ class PublishedDoubletakeControl:
             return _err(ErrorCode.dependency_incompatible)
 
         if self._is_mutation(op):
+            # A required fence that is absent rejects before any I/O at all: an
+            # unfenced target-addressed state change must not even run the
+            # ownership probe, let alone spawn the mutation. This is the guard
+            # that holds when a wrapper accepts ``dispatch_fence`` and drops it,
+            # because the wrapper reaches this method with ``None``.
+            if requires_dispatch_fence(op) and dispatch_fence is None:
+                return _err(ErrorCode.dependency_incompatible)
             ownership = await self._revalidate_ownership()
             if isinstance(ownership, Err):
                 return ownership
             # Closing the dispatch window: no await may separate this
             # re-evaluation from the spawn below, so a replacement admitted
-            # during the ownership query can never receive this command.
-            #
-            # A target-addressed state change is never dispatched unfenced.
-            # Enforcing this here, in the adapter that owns the spawn, is what
-            # makes the guarantee hold even when a wrapper accepts
-            # ``dispatch_fence`` and drops it: the wrapper reaches this method
-            # with ``dispatch_fence=None`` and the command does not spawn.
-            if requires_dispatch_fence(op):
-                if dispatch_fence is None:
-                    return _err(ErrorCode.dependency_incompatible)
-                fenced = dispatch_fence()
-                if isinstance(fenced, Err):
-                    return fenced
-            elif dispatch_fence is not None:
-                # Other mutations (pairing/keyring) may still pass a fence; honour
-                # it consistently rather than silently ignoring the argument.
+            # during the ownership query can never receive this command. Pairing
+            # and keyring mutations may supply a fence too; honour it either way.
+            if dispatch_fence is not None:
                 fenced = dispatch_fence()
                 if isinstance(fenced, Err):
                     return fenced
