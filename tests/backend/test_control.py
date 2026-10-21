@@ -84,6 +84,12 @@ def output(payload, *, exit_code=0, stderr=b""):
     return Ok(value=CommandOutput(exit_code=exit_code, stdout=payload, stderr=stderr))
 
 
+def _open_fence():
+    """A fence that always passes, for tests not about dispatch freshness."""
+
+    return Ok(value=None)
+
+
 def secure_features():
     return BackendFeatures(
         profile="application-contract-v1",
@@ -214,7 +220,9 @@ def test_application_contract_fake_exercises_every_typed_operation():
             BackendOperation.devices,
             BackendOperation.shutdown,
         } else target()
-        result = asyncio.run(control.request(operation, operation_target, payload, context()))
+        result = asyncio.run(control.request(
+            operation, operation_target, payload, context(), dispatch_fence=_open_fence,
+        ))
         assert isinstance(result, Ok), operation
         if operation not in {
             BackendOperation.status,
@@ -335,7 +343,9 @@ def test_unknown_or_negated_contract_cannot_open_connect_io():
         ),
     )
 
-    result = asyncio.run(control.request(BackendOperation.connect, target(), EmptyPayload(), context()))
+    result = asyncio.run(control.request(
+        BackendOperation.connect, target(), EmptyPayload(), context(),
+    ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.dependency_incompatible
@@ -390,7 +400,9 @@ def test_mutation_requires_authenticated_owner_before_any_mutation_io():
     process = _Process([])
     control = PublishedDoubletakeControl(process, secure_profile())
 
-    result = asyncio.run(control.request(BackendOperation.disconnect, target(), EmptyPayload(), context()))
+    result = asyncio.run(control.request(BackendOperation.disconnect, target(), EmptyPayload(), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.dependency_incompatible
@@ -406,7 +418,9 @@ def test_mutation_rejects_a_stale_daemon_instance_before_sending_command():
 
     handshake = asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9))))
     assert isinstance(handshake, Ok)
-    result = asyncio.run(control.request(BackendOperation.disconnect, target(), EmptyPayload(), context()))
+    result = asyncio.run(control.request(BackendOperation.disconnect, target(), EmptyPayload(), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.ownership_mismatch
@@ -459,7 +473,9 @@ def test_unsupported_control_rejects_without_process_io():
     process = _Process([])
     control = UnsupportedControl()
 
-    result = asyncio.run(control.request(BackendOperation.connect, target(), EmptyPayload(), context()))
+    result = asyncio.run(control.request(
+        BackendOperation.connect, target(), EmptyPayload(), context(),
+    ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.unsupported_operation
@@ -473,7 +489,9 @@ def test_published_control_fails_closed_per_operation_before_process_io():
         PublishedDoubletakeProfile(socket_path="/run/user/1000/private.sock"),
     )
 
-    result = asyncio.run(control.request(BackendOperation.connect, target(), EmptyPayload(), context()))
+    result = asyncio.run(control.request(BackendOperation.connect, target(), EmptyPayload(), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.dependency_incompatible
@@ -634,7 +652,9 @@ def test_mute_confirmation_comes_from_the_exact_target_stream():
     control = PublishedDoubletakeControl(process, secure_profile())
 
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
-    result = asyncio.run(control.request(BackendOperation.mute, receiver_b, MutePayload(muted=True), context()))
+    result = asyncio.run(control.request(BackendOperation.mute, receiver_b, MutePayload(muted=True), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Ok)
     assert result.value.target == "192.0.2.11"
@@ -661,7 +681,9 @@ def test_unmute_confirmation_comes_from_the_exact_target_stream():
     control = PublishedDoubletakeControl(process, secure_profile())
 
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
-    result = asyncio.run(control.request(BackendOperation.unmute, receiver_b, MutePayload(muted=False), context()))
+    result = asyncio.run(control.request(BackendOperation.unmute, receiver_b, MutePayload(muted=False), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Ok)
     assert result.value.target == "192.0.2.11"
@@ -686,7 +708,9 @@ def test_mute_confirmation_rejects_missing_or_ambiguous_target_stream():
     control = PublishedDoubletakeControl(process, secure_profile())
 
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
-    result = asyncio.run(control.request(BackendOperation.mute, receiver_b, EmptyPayload(), context()))
+    result = asyncio.run(control.request(BackendOperation.mute, receiver_b, EmptyPayload(), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.audio_mute_failed
@@ -705,7 +729,9 @@ def test_valid_cli_mute_rejection_uses_fixed_audio_diagnostic():
     control = PublishedDoubletakeControl(process, secure_profile())
 
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
-    result = asyncio.run(control.request(BackendOperation.mute, target(address="192.0.2.11"), MutePayload(muted=True), context()))
+    result = asyncio.run(control.request(BackendOperation.mute, target(address="192.0.2.11"), MutePayload(muted=True), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.audio_mute_failed
@@ -725,7 +751,9 @@ def test_valid_cli_rejection_exit_is_not_reported_as_daemon_failure():
     control = PublishedDoubletakeControl(process, secure_profile())
 
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
-    result = asyncio.run(control.request(BackendOperation.disconnect, target(address="192.0.2.11"), EmptyPayload(), context()))
+    result = asyncio.run(control.request(BackendOperation.disconnect, target(address="192.0.2.11"), EmptyPayload(), context(),
+            dispatch_fence=_open_fence,
+        ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.receiver_rejected

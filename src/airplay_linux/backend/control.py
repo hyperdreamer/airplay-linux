@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import Final, Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from airplay_linux.backend.contract import (
@@ -147,6 +147,28 @@ BackendPayload: TypeAlias = (
 # spawned.  It returns the typed failure to report when the exact target or the
 # cleanup ownership is no longer valid.
 DispatchFence: TypeAlias = Callable[[], Result[None]]
+
+# Operations that address a receiver target and change its state.  These are the
+# commands whose dispatch must be fenced: a target can be replaced at the same
+# address while an adapter-owned await is in flight, so the check has to happen
+# at the spawn boundary rather than at entry.  Pairing/keyring operations are
+# fenced by the trust coordinator's own generation fences and are not listed.
+FENCE_REQUIRED_OPERATIONS: Final[frozenset[BackendOperation]] = frozenset(
+    {
+        BackendOperation.connect,
+        BackendOperation.disconnect,
+        BackendOperation.mute,
+        BackendOperation.unmute,
+        BackendOperation.start_audio,
+        BackendOperation.restart_audio,
+    }
+)
+
+
+def requires_dispatch_fence(operation: BackendOperation) -> bool:
+    """True when this operation must be fenced at the dispatch boundary."""
+
+    return operation in FENCE_REQUIRED_OPERATIONS
 
 
 class BackendNoticeKind(StrEnum):
@@ -705,7 +727,21 @@ class PublishedDoubletakeControl:
             # Closing the dispatch window: no await may separate this
             # re-evaluation from the spawn below, so a replacement admitted
             # during the ownership query can never receive this command.
-            if dispatch_fence is not None:
+            #
+            # A target-addressed state change is never dispatched unfenced.
+            # Enforcing this here, in the adapter that owns the spawn, is what
+            # makes the guarantee hold even when a wrapper accepts
+            # ``dispatch_fence`` and drops it: the wrapper reaches this method
+            # with ``dispatch_fence=None`` and the command does not spawn.
+            if requires_dispatch_fence(op):
+                if dispatch_fence is None:
+                    return _err(ErrorCode.dependency_incompatible)
+                fenced = dispatch_fence()
+                if isinstance(fenced, Err):
+                    return fenced
+            elif dispatch_fence is not None:
+                # Other mutations (pairing/keyring) may still pass a fence; honour
+                # it consistently rather than silently ignoring the argument.
                 fenced = dispatch_fence()
                 if isinstance(fenced, Err):
                     return fenced

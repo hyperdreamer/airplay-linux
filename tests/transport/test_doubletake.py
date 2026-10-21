@@ -138,7 +138,13 @@ class Control:
             owner_token=owner_token, daemon=self.record.daemon, protocol_version="v1",
         ))
 
-    async def request(self, operation, receiver, payload, ctx):
+    async def request(self, operation, receiver, payload, ctx, *, dispatch_fence=None):
+        # Mirror the published adapter: a target-addressed state change is never
+        # dispatched unfenced, and the fence is evaluated before any effect.
+        if dispatch_fence is not None:
+            fenced = dispatch_fence()
+            if isinstance(fenced, Err):
+                return fenced
         self.journal.record("request", operation=operation, target=receiver, payload=payload, context=ctx)
         key = (operation, receiver.receiver_id if receiver is not None else None)
         gate = self.gates.pop(key, None)
@@ -325,6 +331,122 @@ class ContractHarness(Harness):
                 protocol_version=record.protocol_version,
             ),
         )
+
+
+class _LegacyControl:
+    """A control whose ``request`` predates the dispatch fence.
+
+    It still satisfies the old four-parameter protocol shape, so nothing in the
+    type system rejects it. Transport must refuse to dispatch a target-addressed
+    state change through it rather than calling it unfenced.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = []
+
+    def subscribe(self, callback):
+        return self._inner.subscribe(callback)
+
+    async def handshake(self, owner_token, instance_uuid):
+        return await self._inner.handshake(owner_token, instance_uuid)
+
+    async def request(self, operation, target, payload, context):
+        self.calls.append(operation)
+        return await self._inner.request(operation, target, payload, context)
+
+
+class _FenceDroppingWrapper:
+    """Preserves the fenced signature but can discard the keyword.
+
+    Signature inspection cannot tell this apart from an honest adapter, so the
+    guarantee has to come from the inner adapter refusing to spawn unfenced.
+    ``forward`` is switched off only after a stream exists, so the test reaches
+    the dispatch fence instead of failing earlier at ownership revalidation.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.calls = 0
+        self.forward = True
+
+    def subscribe(self, callback):
+        return self._inner.subscribe(callback)
+
+    async def handshake(self, owner_token, instance_uuid):
+        return await self._inner.handshake(owner_token, instance_uuid)
+
+    async def request(self, operation, target, payload, context, *, dispatch_fence=None):
+        self.calls += 1
+        if self.forward:
+            return await self._inner.request(
+                operation, target, payload, context, dispatch_fence=dispatch_fence,
+            )
+        # Deliberately drop dispatch_fence to simulate a betraying decorator.
+        return await self._inner.request(operation, target, payload, context)
+
+
+class _WrappedHarness(ContractHarness):
+    def __init__(self, tmp_path, wrapper):
+        self.wrapper_factory = wrapper
+        super().__init__(tmp_path)
+
+    def factory(self, record):
+        self.process.record = record
+        key = record.instance_uuid
+        if key not in self.controls:
+            inner = PublishedDoubletakeControl(
+                self.process,
+                ApplicationContractProfile(
+                    socket_path=record.socket_path,
+                    owner_token=record.owner_token,
+                    instance_uuid=record.instance_uuid,
+                    protocol_version=record.protocol_version,
+                ),
+            )
+            self.controls[key] = self.wrapper_factory(inner)
+        return self.controls[key]
+
+
+@pytest.mark.asyncio
+async def test_legacy_control_without_a_fence_is_rejected_before_any_call(tmp_path):
+    """F-5: a control that cannot be fenced must not receive a mutation at all."""
+    h = _WrappedHarness(tmp_path, _LegacyControl)
+    before = h.process.mutations()
+
+    result = await h.start(h.a)
+
+    # The transport fails closed. The surfaced code is a mapped cleanup/staleness
+    # variant; the load-bearing evidence is that the control was never called and
+    # no mutating command ever reached the process port.
+    assert isinstance(result, Err), result
+    wrapper = h.control
+    assert isinstance(wrapper, _LegacyControl)
+    assert wrapper.calls == [], wrapper.calls
+    assert h.process.mutations() == before
+
+
+@pytest.mark.asyncio
+async def test_fence_dropping_wrapper_cannot_dispatch_a_mutation(tmp_path):
+    """F-5: a signature-preserving decorator that drops the keyword still spawns nothing."""
+    h = _WrappedHarness(tmp_path, _FenceDroppingWrapper)
+    # Establish a stream while the wrapper still forwards the fence, so the
+    # later mutation is evaluated at the dispatch boundary rather than failing
+    # earlier during admission.
+    handle = await h.handle()
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    wrapper = h.control
+    assert isinstance(wrapper, _FenceDroppingWrapper)
+    wrapper.forward = False
+    before = h.process.mutations()
+    calls_before = wrapper.calls
+
+    result = await h.transport.set_muted(handle, True, context())
+
+    assert isinstance(result, Err), result
+    assert wrapper.calls > calls_before, "the wrapper was expected to be reached"
+    # The inner adapter refused to spawn an unfenced state change.
+    assert h.process.mutations() == before
 
 
 def assert_error(result, code):

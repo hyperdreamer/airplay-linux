@@ -17,7 +17,7 @@ from functools import lru_cache
 from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
-    Handshake, ModesPayload, MutePayload,
+    Handshake, ModesPayload, MutePayload, requires_dispatch_fence,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
@@ -476,7 +476,14 @@ class DoubleTakeTransport:
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
         fence = self._dispatch_fence(target, context, cleanup=cleanup)
-        if _accepts_dispatch_fence(daemon.control):
+        fenced = _accepts_dispatch_fence(daemon.control)
+        if requires_dispatch_fence(operation) and not fenced:
+            # Fail closed. A control that cannot accept the dispatch fence would
+            # spawn this state change unchecked, so it must not be called at all:
+            # a replacement admitted during the adapter's awaited ownership
+            # revalidation would otherwise receive the command.
+            return _failure(ErrorCode.dependency_incompatible)
+        if fenced:
             result = await _safe(daemon.control.request(
                 operation, target, payload, context, dispatch_fence=fence,
             ))
