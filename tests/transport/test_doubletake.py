@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import defaultdict, deque
 from dataclasses import replace
 from uuid import UUID
@@ -12,11 +13,12 @@ import pytest
 from airplay_linux.backend.contract import AckReply, StatusReply
 from airplay_linux.backend.control import (
     ApplicationContractProfile, BackendNotice, BackendNoticeKind, BackendOperation,
-    PublishedDoubletakeProfile,
+    PublishedDoubletakeControl, PublishedDoubletakeProfile,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import MutePayload, TransportEventKind
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
+from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import AudioPolicy, AudioState, Err, ErrorCode, Ok
 from airplay_linux.storage import AtomicFiles, JsonReceiverStore
@@ -231,6 +233,98 @@ class Harness:
         result = await self.start(receiver, **kwargs)
         assert isinstance(result, Ok), result
         return result.value
+
+
+def contract_status(record, *, address="192.0.2.10", muted=False):
+    """Status envelope proving the exact daemon named by ``record``."""
+    stream = {
+        "device": "Living Room", "device_ip": address, "state": "streaming",
+        "has_audio": True, "audio_muted": muted,
+    }
+    return {
+        "ok": True, "state": "streaming", "device": "Living Room",
+        "device_ip": address, "has_audio": True, "audio_muted": muted,
+        "owner_token": record.owner_token,
+        "instance_uuid": str(record.instance_uuid),
+        "socket_path": record.socket_path,
+        "protocol_version": record.protocol_version,
+        "daemon_pid": record.daemon.pid,
+        "daemon_start_ticks": record.daemon.start_ticks,
+        "streams": [stream],
+    }
+
+
+class ContractProcess:
+    """Gateable process port that journals the real adapter's argv dispatch."""
+
+    def __init__(self, record):
+        self.record = record
+        self.journal = Journal()
+        self.status_calls = 0
+        self.gated_at = None
+        self.gate = None
+
+    def gate_next_status(self):
+        gate = Gate()
+        self.gate, self.gated_at = gate, self.status_calls + 1
+        return gate
+
+    def commands(self, operation):
+        return [
+            tuple(call["argv"]) for call in self.journal.calls("run")
+            if tuple(call["argv"])[3] == operation
+        ]
+
+    def mutations(self):
+        return [
+            tuple(call["argv"]) for call in self.journal.calls("run")
+            if tuple(call["argv"])[3] not in {"status", "discover", "devices"}
+        ]
+
+    async def run(self, spec, timeout, stdin=None):
+        argv = tuple(spec.argv)
+        self.journal.record("run", argv=argv)
+        operation = argv[3]
+        if operation == "status":
+            self.status_calls += 1
+            if self.gated_at == self.status_calls:
+                gate, self.gate, self.gated_at = self.gate, None, None
+                await gate.wait()
+            return self._output(contract_status(self.record))
+        target_text = argv[4] if len(argv) > 4 else None
+        if operation in {"mute", "unmute"}:
+            return self._output(contract_status(
+                self.record, address=target_text, muted=operation == "mute",
+            ))
+        if operation == "disconnect":
+            return self._output({"ok": True, "state": "idle"})
+        return self._output({"ok": True, "state": "streaming"})
+
+    @staticmethod
+    def _output(payload):
+        return Ok(value=CommandOutput(
+            exit_code=0, stdout=json.dumps(payload).encode(), stderr=b"",
+        ))
+
+
+class ContractHarness(Harness):
+    """The real control adapter composed with a gateable process port."""
+
+    def __init__(self, tmp_path):
+        self.process = ContractProcess(daemon())
+        super().__init__(tmp_path)
+
+    def factory(self, record):
+        self.process.record = record
+        return PublishedDoubletakeControl(
+            self.process,
+            ApplicationContractProfile(
+                socket_path=record.socket_path,
+                owner_token=record.owner_token,
+                instance_uuid=record.instance_uuid,
+                protocol_version=record.protocol_version,
+            ),
+        )
 
 
 def assert_error(result, code):
@@ -1054,3 +1148,82 @@ async def test_unaffirmed_pairing_capability_has_no_backend_side_effect(tmp_path
     assert_error(await h.transport.begin_pairing(h.a, context(lease=None)), ErrorCode.keyring_unavailable)
     assert h.control.journal.entries == []
     assert h.registry.ensure_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("connect", ErrorCode.cleanup_timeout),
+        ("disconnect", ErrorCode.cleanup_timeout),
+        ("mute", ErrorCode.stale_target),
+    ],
+)
+async def test_replacement_during_ownership_revalidation_never_dispatches_a_mutation(
+    tmp_path, operation, expected,
+):
+    """F-1: the process journal, not a post-reply check, must prove no dispatch."""
+    h = ContractHarness(tmp_path)
+    if operation == "connect":
+        # The shared daemon handshake completes before the gated revalidation.
+        await h.handle(h.b, ctx=context(lease=2))
+        before = h.process.mutations()
+        gate = h.process.gate_next_status()
+        pending = asyncio.create_task(h.start(h.a))
+    else:
+        handle = await h.handle()
+        if operation == "mute":
+            assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+        before = h.process.mutations()
+        gate = h.process.gate_next_status()
+        pending = asyncio.create_task(
+            h.transport.stop_stream(handle, context())
+            if operation == "disconnect"
+            else h.transport.set_muted(handle, True, context())
+        )
+    await gate.entered.wait()
+    replacement = target("replacement")
+    h.transport.update_target(replacement, replacement.receiver_id)
+    gate.release()
+    assert_error(await pending, expected)
+    # Nothing new reached the process, so the replacement cannot be touched.
+    assert h.process.mutations() == before
+    assert [
+        argv for argv in h.process.commands(operation)
+        if len(argv) > 4 and argv[4] == h.a.canonical_host
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_daemon_exit_before_admission_is_remembered_without_connect_io(tmp_path):
+    h = Harness(tmp_path)
+    gate = h.registry.gate = Gate()
+    pending = asyncio.create_task(h.start())
+    await gate.entered.wait()
+    h.registry.emit("exit")
+    gate.release()
+    assert_error(await pending, ErrorCode.daemon_failed)
+    assert h.control.calls(BackendOperation.connect) == []
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+
+
+@pytest.mark.asyncio
+async def test_unaffirmed_multi_target_capability_rejects_start_without_backend_io(tmp_path):
+    h = Harness(tmp_path, multi_target=False)
+    assert_error(await h.start(), ErrorCode.unsupported_operation)
+    assert h.control.journal.entries == []
+
+
+@pytest.mark.asyncio
+async def test_contradictory_mute_ack_cannot_promote_the_requested_state(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    h.control.results[BackendOperation.mute].append(Ok(value=AckReply(
+        operation="mute", target=h.a.canonical_host, muted=False,
+    )))
+    assert_error(await h.transport.set_muted(handle, True, context()), ErrorCode.audio_mute_failed)
+    assert h.events[-1].payload == MutePayload(muted=False, ok=False)
+    assert h.control.muted == {}
+    assert isinstance(await h.transport.set_muted(handle, True, context()), Ok)
+    assert h.events[-1].payload == MutePayload(muted=True, ok=True)

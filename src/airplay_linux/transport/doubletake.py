@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
+from inspect import Parameter, signature
+from functools import lru_cache
 
 from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply
 from airplay_linux.backend.control import (
@@ -48,6 +50,35 @@ SHUTDOWN_TIMEOUT = 15.0
 
 def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
+
+
+@lru_cache(maxsize=None)
+def _request_accepts_dispatch_fence(method: object) -> bool:
+    """True when this control's ``request`` declares a ``dispatch_fence`` parameter.
+
+    Duck-typed on the signature rather than on the concrete class: a decorator or
+    wrapper that preserves the parameter keeps the fence, and a future adapter that
+    adds it is fenced automatically. A control that does not declare the parameter
+    is a test double or an out-of-contract adapter; it cannot await-then-spawn, so
+    it cannot open the replacement window this fence closes.
+    """
+
+    try:
+        parameters = signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    if "dispatch_fence" in parameters:
+        return True
+    return any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
+
+def _accepts_dispatch_fence(control: object) -> bool:
+    method = getattr(control, "request", None)
+    if method is None:
+        return False
+    return _request_accepts_dispatch_fence(getattr(method, "__func__", method))
 
 
 async def _safe(operation: Awaitable, code: ErrorCode = ErrorCode.transport_failed):
@@ -420,6 +451,21 @@ class DoubleTakeTransport:
                 return _failure(ErrorCode.daemon_failed)
         return Ok(value=daemon)
 
+    def _dispatch_fence(
+        self, target: ReceiverTarget, context: OperationContext, *, cleanup: bool,
+    ) -> Callable[[], Result[None]]:
+        """Bind the exact target/cleanup ownership the adapter rechecks at dispatch.
+
+        The adapter evaluates this after its own awaited ownership query and
+        immediately before the mutating child is spawned.  A replacement admitted
+        during that window therefore cannot receive the old stream's command.
+        """
+
+        def check() -> Result[None]:
+            return self._targets.require_cleanup(target) if cleanup else self._current(target, context)
+
+        return check
+
     async def _request(
         self, daemon: _Daemon, operation: BackendOperation, target: ReceiverTarget,
         payload: BackendPayload, context: OperationContext, *, cleanup=False,
@@ -429,7 +475,13 @@ class DoubleTakeTransport:
             return checked
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
-        result = await _safe(daemon.control.request(operation, target, payload, context))
+        fence = self._dispatch_fence(target, context, cleanup=cleanup)
+        if _accepts_dispatch_fence(daemon.control):
+            result = await _safe(daemon.control.request(
+                operation, target, payload, context, dispatch_fence=fence,
+            ))
+        else:
+            result = await _safe(daemon.control.request(operation, target, payload, context))
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
         checked = self._targets.require_cleanup(target) if cleanup else self._current(target, context)

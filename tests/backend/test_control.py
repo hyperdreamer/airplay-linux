@@ -25,6 +25,7 @@ from airplay_linux.backend.control import (
     StatusReply,
     UnsupportedControl,
 )
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
@@ -482,6 +483,128 @@ def test_published_control_fails_closed_per_operation_before_process_io():
 class _SlowProcess:
     async def run(self, spec, timeout, stdin=None):
         await asyncio.sleep(1)
+
+
+class _GatedProcess:
+    """Process fake that can suspend one selected command before it completes."""
+
+    def __init__(self, outputs):
+        self.outputs = list(outputs)
+        self.calls = []
+        self.gate_operation = None
+        self.gated = False
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def run(self, spec, timeout, stdin=None):
+        self.calls.append((spec, timeout, stdin))
+        if (
+            self.gate_operation is not None
+            and spec.argv[3] == self.gate_operation
+            and not self.gated
+        ):
+            self.gated = True
+            self.entered.set()
+            await self.release.wait()
+        return self.outputs.pop(0)
+
+
+def test_dispatch_fence_runs_after_ownership_revalidation_and_blocks_spawn():
+    async def scenario():
+        process = _GatedProcess([
+            output(json.dumps(owned_status())),
+            output(json.dumps(owned_status())),
+            output(json.dumps({"ok": True, "state": "idle"})),
+        ])
+        control = PublishedDoubletakeControl(process, secure_profile())
+        assert isinstance(
+            await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok,
+        )
+        process.gate_operation = "status"
+        seen = []
+
+        def fence():
+            seen.append(len(process.calls))
+            return Err(error=diagnostic(ErrorCode.stale_target))
+
+        pending = asyncio.create_task(control.request(
+            BackendOperation.disconnect, target(), EmptyPayload(), context(),
+            dispatch_fence=fence,
+        ))
+        await asyncio.wait_for(process.entered.wait(), timeout=1)
+        assert seen == []
+        process.release.set()
+        result = await pending
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.stale_target
+        assert seen == [2]
+        assert [call[0].argv[3] for call in process.calls] == ["status", "status"]
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_fence_passing_allows_exactly_one_mutating_command():
+    process = _Process([
+        output(json.dumps(owned_status())),
+        output(json.dumps(owned_status())),
+        output(json.dumps({"ok": True, "state": "idle"})),
+    ])
+    control = PublishedDoubletakeControl(process, secure_profile())
+    assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
+    seen = []
+
+    def fence():
+        seen.append(len(process.calls))
+        return Ok(value=None)
+
+    result = asyncio.run(control.request(
+        BackendOperation.disconnect, target(), EmptyPayload(), context(),
+        dispatch_fence=fence,
+    ))
+
+    assert isinstance(result, Ok)
+    assert seen == [2]
+    assert [call[0].argv[3] for call in process.calls] == ["status", "status", "disconnect"]
+
+
+def test_failed_ownership_revalidation_never_consults_the_dispatch_fence():
+    process = _Process([
+        output(json.dumps(owned_status())),
+        output(json.dumps(owned_status(instance=10))),
+    ])
+    control = PublishedDoubletakeControl(process, secure_profile())
+    assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
+
+    def fence():
+        raise AssertionError("fence must not run when ownership revalidation failed")
+
+    result = asyncio.run(control.request(
+        BackendOperation.disconnect, target(), EmptyPayload(), context(),
+        dispatch_fence=fence,
+    ))
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert all(call[0].argv[3] != "disconnect" for call in process.calls)
+
+
+def test_dispatch_fence_does_not_gate_read_only_commands():
+    process = _Process([output(json.dumps({
+        "ok": True, "state": "idle", "has_audio": False, "audio_muted": False,
+    }))])
+    control = PublishedDoubletakeControl(
+        process, PublishedDoubletakeProfile(socket_path="/run/user/1000/private.sock"),
+    )
+
+    def fence():
+        raise AssertionError("read-only commands have no dispatch fence")
+
+    result = asyncio.run(control.request(
+        BackendOperation.status, None, EmptyPayload(), None, dispatch_fence=fence,
+    ))
+
+    assert isinstance(result, Ok)
+    assert [call[0].argv[3] for call in process.calls] == ["status"]
 
 
 def test_mute_confirmation_comes_from_the_exact_target_stream():

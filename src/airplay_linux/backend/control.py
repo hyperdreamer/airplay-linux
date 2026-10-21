@@ -142,6 +142,12 @@ BackendPayload: TypeAlias = (
     | ModesPayload
 )
 
+# A caller-owned predicate the adapter re-evaluates at the dispatch boundary:
+# after every adapter-owned await and immediately before the mutating child is
+# spawned.  It returns the typed failure to report when the exact target or the
+# cleanup ownership is no longer valid.
+DispatchFence: TypeAlias = Callable[[], Result[None]]
+
 
 class BackendNoticeKind(StrEnum):
     status = "status"
@@ -670,7 +676,17 @@ class PublishedDoubletakeControl:
         target: ReceiverTarget | None,
         payload: BackendPayload,
         context: OperationContext | None,
+        *,
+        dispatch_fence: DispatchFence | None = None,
     ) -> Result[BackendReply]:
+        """Dispatch one typed command against an already admitted target.
+
+        ``dispatch_fence`` is the caller's exact-target (or cleanup-ownership)
+        freshness predicate.  Mutating commands re-evaluate it after this
+        adapter's own awaited revalidation and before the mutating child is
+        spawned; a failing predicate returns its typed failure with no spawn.
+        Read-only commands never consult it.
+        """
         if self._closed:
             return _err(ErrorCode.daemon_failed)
         op = self._normalize_operation(operation)
@@ -686,6 +702,13 @@ class PublishedDoubletakeControl:
             ownership = await self._revalidate_ownership()
             if isinstance(ownership, Err):
                 return ownership
+            # Closing the dispatch window: no await may separate this
+            # re-evaluation from the spawn below, so a replacement admitted
+            # during the ownership query can never receive this command.
+            if dispatch_fence is not None:
+                fenced = dispatch_fence()
+                if isinstance(fenced, Err):
+                    return fenced
 
         process_result = await self._run(argv_result.value)
         if isinstance(process_result, Err):
@@ -867,6 +890,7 @@ __all__ = [
     "ConnectPayload",
     "CredentialPayload",
     "DevicesReply",
+    "DispatchFence",
     "EmptyPayload",
     "Handshake",
     "ModesPayload",
