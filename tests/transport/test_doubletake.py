@@ -1351,45 +1351,61 @@ async def test_contradictory_mute_ack_cannot_promote_the_requested_state(tmp_pat
     assert h.events[-1].payload == MutePayload(muted=True, ok=True)
 
 
-def test_fence_compatibility_requires_a_keyword_passing_parameter():
-    """F-7: sharing the name is not keyword compatibility."""
+def test_fence_compatibility_matches_actual_keyword_callability():
+    """F-7/F-8: the helper must agree with whether the call really works.
+
+    Enumerated rather than hand-listed: the previous two rounds each fixed one
+    parameter kind and broke another, so the domain is checked wholesale. Every
+    shape is built as a real method and probed with an actual
+    ``request(..., dispatch_fence=...)`` call, including the mixed cases where a
+    same-named positional-only or ``*args`` parameter coexists with ``**kwargs``.
+    """
     from airplay_linux.transport.doubletake import _accepts_dispatch_fence
 
-    class PositionalOnly:
-        def request(self, operation, target, payload, context, dispatch_fence=None, /):
-            ...
+    def build(params: str):
+        source = (
+            "class Probe:\n"
+            f"    def request(self, operation, target, payload, context{params}):\n"
+            "        return True\n"
+        )
+        namespace: dict = {}
+        exec(source, namespace)  # noqa: S102 - fixed source, no user input
+        return namespace["Probe"]()
 
-    class VarPositional:
-        def request(self, operation, target, payload, context, *dispatch_fence):
-            ...
+    def callable_with(instance) -> bool:
+        try:
+            instance.request(1, 2, 3, 4, dispatch_fence=lambda: None)
+        except TypeError:
+            return False
+        return True
 
-    class NamedKwargs:
-        def request(self, operation, target, payload, context, **dispatch_fence):
-            ...
+    fence_forms = [
+        "",
+        ", dispatch_fence=None",
+        ", *, dispatch_fence=None",
+        ", dispatch_fence=None, /",
+        ", **dispatch_fence",
+        ", *dispatch_fence",
+    ]
+    catchalls = ["", ", **kwargs"]
+    extras = ["", ", *extra"]
 
-    class KeywordOnly:
-        def request(self, operation, target, payload, context, *, dispatch_fence=None):
-            ...
-
-    class PositionalOrKeyword:
-        def request(self, operation, target, payload, context, dispatch_fence=None):
-            ...
-
-    class ForwardsKeywords:
-        def request(self, operation, target, payload, context, **kwargs):
-            ...
-
-    class NoFence:
-        def request(self, operation, target, payload, context):
-            ...
-
-    # Rejected: passing the keyword would raise TypeError at the call site.
-    assert _accepts_dispatch_fence(PositionalOnly()) is False
-    assert _accepts_dispatch_fence(VarPositional()) is False
-    assert _accepts_dispatch_fence(NoFence()) is False
-    # Accepted: a keyword really can be delivered, or **kwargs forwards it.
-    assert _accepts_dispatch_fence(KeywordOnly()) is True
-    assert _accepts_dispatch_fence(PositionalOrKeyword()) is True
-    assert _accepts_dispatch_fence(ForwardsKeywords()) is True
-    # F-8: a VAR_KEYWORD named dispatch_fence binds the keyword.
-    assert _accepts_dispatch_fence(NamedKwargs()) is True
+    checked = 0
+    for form in fence_forms:
+        for catchall in catchalls:
+            for extra in extras:
+                # a positional-only marker must precede *args; skip invalid orders
+                if "/" in form and extra:
+                    continue
+                params = form + extra + catchall
+                try:
+                    instance = build(params)
+                except SyntaxError:
+                    continue
+                expected = callable_with(instance)
+                actual = _accepts_dispatch_fence(instance)
+                assert actual is expected, (
+                    f"shape {params!r}: helper={actual} real call works={expected}"
+                )
+                checked += 1
+    assert checked >= 12, checked

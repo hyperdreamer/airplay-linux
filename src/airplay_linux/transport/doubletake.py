@@ -77,17 +77,16 @@ def _request_accepts_dispatch_fence(method: object) -> bool:
         parameters = signature(method).parameters
     except (TypeError, ValueError):
         return False
+    # The keyword can be delivered by a parameter that actually binds keywords.
+    # A same-named ``POSITIONAL_ONLY`` or ``VAR_POSITIONAL`` parameter cannot (F-7),
+    # so it must not short-circuit the catchall check: ``(..., dispatch_fence, /,
+    # **kwargs)`` still accepts the keyword through ``**kwargs`` (F-8).
     candidate = parameters.get("dispatch_fence")
-    if candidate is not None:
-        # A parameter that merely *shares the name* is not keyword-compatible.
-        # ``POSITIONAL_ONLY`` and ``VAR_POSITIONAL`` raise TypeError at the call
-        # site (F-7), while a ``VAR_KEYWORD`` *named* dispatch_fence does bind the
-        # keyword and must count (F-8). Accept exactly the kinds that can receive
-        # it: positional-or-keyword, keyword-only, and a named ``**kwargs``.
-        return candidate.kind in {
-            Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY,
-            Parameter.VAR_KEYWORD,
-        }
+    if candidate is not None and candidate.kind in {
+        Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY,
+        Parameter.VAR_KEYWORD,
+    }:
+        return True
     return any(
         parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
     )
