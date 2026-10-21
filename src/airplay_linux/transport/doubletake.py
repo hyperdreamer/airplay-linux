@@ -56,9 +56,12 @@ def _failure(code: ErrorCode) -> Err:
 def _request_accepts_dispatch_fence(method: object) -> bool:
     """True when this control's ``request`` accepts a ``dispatch_fence`` keyword.
 
-    This establishes **keyword compatibility only**. It does not show that a
-    control, decorator or wrapper forwards the keyword to the adapter that
-    spawns, and it does not authenticate the predicate's origin or meaning.
+    This establishes **keyword compatibility only**, and only for a parameter
+    that can genuinely be passed by keyword: a ``POSITIONAL_ONLY`` or
+    ``VAR_POSITIONAL`` parameter that merely shares the name does not qualify.
+    Beyond that it shows nothing — not that a control, decorator or wrapper
+    forwards the keyword to the adapter that spawns, and not the predicate's
+    origin or meaning.
 
     What the answer is used for: transport refuses to invoke a control that
     cannot accept a fence for a target-addressed state change (see ``_request``),
@@ -74,8 +77,15 @@ def _request_accepts_dispatch_fence(method: object) -> bool:
         parameters = signature(method).parameters
     except (TypeError, ValueError):
         return False
-    if "dispatch_fence" in parameters:
-        return True
+    candidate = parameters.get("dispatch_fence")
+    if candidate is not None:
+        # A parameter that merely *shares the name* is not keyword-compatible.
+        # ``POSITIONAL_ONLY`` and ``VAR_POSITIONAL`` would raise TypeError at the
+        # call site, so accept only the kinds that can actually be passed as a
+        # keyword. (F-7)
+        return candidate.kind in {
+            Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY,
+        }
     return any(
         parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
     )

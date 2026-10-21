@@ -1349,3 +1349,41 @@ async def test_contradictory_mute_ack_cannot_promote_the_requested_state(tmp_pat
     assert h.control.muted == {}
     assert isinstance(await h.transport.set_muted(handle, True, context()), Ok)
     assert h.events[-1].payload == MutePayload(muted=True, ok=True)
+
+
+def test_fence_compatibility_requires_a_keyword_passing_parameter():
+    """F-7: sharing the name is not keyword compatibility."""
+    from airplay_linux.transport.doubletake import _accepts_dispatch_fence
+
+    class PositionalOnly:
+        def request(self, operation, target, payload, context, dispatch_fence=None, /):
+            ...
+
+    class VarPositional:
+        def request(self, operation, target, payload, context, *dispatch_fence):
+            ...
+
+    class KeywordOnly:
+        def request(self, operation, target, payload, context, *, dispatch_fence=None):
+            ...
+
+    class PositionalOrKeyword:
+        def request(self, operation, target, payload, context, dispatch_fence=None):
+            ...
+
+    class ForwardsKeywords:
+        def request(self, operation, target, payload, context, **kwargs):
+            ...
+
+    class NoFence:
+        def request(self, operation, target, payload, context):
+            ...
+
+    # Rejected: passing the keyword would raise TypeError at the call site.
+    assert _accepts_dispatch_fence(PositionalOnly()) is False
+    assert _accepts_dispatch_fence(VarPositional()) is False
+    assert _accepts_dispatch_fence(NoFence()) is False
+    # Accepted: a keyword really can be delivered, or **kwargs forwards it.
+    assert _accepts_dispatch_fence(KeywordOnly()) is True
+    assert _accepts_dispatch_fence(PositionalOrKeyword()) is True
+    assert _accepts_dispatch_fence(ForwardsKeywords()) is True
