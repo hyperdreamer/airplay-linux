@@ -704,10 +704,21 @@ class PublishedDoubletakeControl:
         """Dispatch one typed command against an already admitted target.
 
         ``dispatch_fence`` is the caller's exact-target (or cleanup-ownership)
-        freshness predicate.  Mutating commands re-evaluate it after this
-        adapter's own awaited revalidation and before the mutating child is
-        spawned; a failing predicate returns its typed failure with no spawn.
-        Read-only commands never consult it.
+        freshness predicate. For connect, disconnect, mute, unmute, start_audio
+        and restart_audio this adapter **requires** it: with no fence supplied the
+        call returns a typed failure and no child is spawned, so a wrapper that
+        accepts the keyword and drops it cannot cause a mutation. Mutating
+        commands evaluate the supplied fence after this adapter's own awaited
+        ownership revalidation and before spawning, so a mismatch is detected at
+        the dispatch boundary rather than after the reply. Read-only commands never
+        consult it.
+
+        Trust boundary: the fence is trusted, not authenticated. This adapter
+        cannot tell whether the callable it was given is the caller's genuine
+        target check, and it cannot defend against same-process code that
+        substitutes a permissive predicate, changes the target, or bypasses this
+        method. Callers must forward the original predicate and the unchanged
+        target; see the composition note on ``DoubleTakeTransport``.
         """
         if self._closed:
             return _err(ErrorCode.daemon_failed)

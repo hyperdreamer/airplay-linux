@@ -54,13 +54,20 @@ def _failure(code: ErrorCode) -> Err:
 
 @lru_cache(maxsize=None)
 def _request_accepts_dispatch_fence(method: object) -> bool:
-    """True when this control's ``request`` declares a ``dispatch_fence`` parameter.
+    """True when this control's ``request`` accepts a ``dispatch_fence`` keyword.
 
-    Duck-typed on the signature rather than on the concrete class: a decorator or
-    wrapper that preserves the parameter keeps the fence, and a future adapter that
-    adds it is fenced automatically. A control that does not declare the parameter
-    is a test double or an out-of-contract adapter; it cannot await-then-spawn, so
-    it cannot open the replacement window this fence closes.
+    This establishes **keyword compatibility only**. It does not show that a
+    control, decorator or wrapper forwards the keyword to the adapter that
+    spawns, and it does not authenticate the predicate's origin or meaning.
+
+    What the answer is used for: transport refuses to invoke a control that
+    cannot accept a fence for a target-addressed state change (see ``_request``),
+    and the adapter independently refuses such a change when no fence arrives.
+    Between them, a missing or rejecting fence blocks the six fenced operations.
+    Neither this check nor the adapter's guard can stop same-privilege code that
+    substitutes a permissive predicate, changes the target, or bypasses
+    ``request`` entirely; see the trust-boundary note on
+    :class:`DoubleTakeTransport`.
     """
 
     try:
@@ -248,6 +255,31 @@ class DoubleTakeTransport:
     independent. A stream lock serializes controls and cleanup for that stream.
     Deadlines bound waiters, retaining in-flight acquisition ownership so late
     success is cleaned up or exposed with its exact handle as uncertain.
+
+    Replacement-safe dispatch guarantee (what this class does and does not do):
+
+    1. For connect, disconnect, mute, unmute, start_audio and restart_audio this
+       class binds its own exact-target predicate (or the retained
+       address-ownership predicate on the cleanup path) and supplies it to the
+       control. A control whose ``request`` cannot accept a fence is rejected
+       before invocation, so it receives no command at all.
+    2. ``PublishedDoubletakeControl.request`` refuses those six operations when no
+       fence is supplied, and otherwise evaluates the supplied fence after its own
+       daemon-ownership await and immediately before spawning the mutating child.
+       A typed ``Err`` prevents the mutation. Ownership-status children may already
+       have run: the guarantee is *no target mutation*, not *no subprocess*.
+    3. With trusted controls and wrappers that forward the original predicate and
+       the unchanged target, target invalidation during the ownership await is
+       detected before mutation. A wrapper that merely drops the keyword is caught
+       by (2).
+    4. **Trust boundary.** The adapter does not authenticate the provenance of the
+       predicate, and no signature establishes that another component's
+       implementation honours it. A same-process wrapper that substitutes or
+       caches a permissive predicate, alters the target, ignores this contract,
+       calls the adapter's ``_run`` directly, or launches a child itself is outside
+       the guarantee. Post-reply freshness checks still reject stale *results*;
+       they cannot undo effects such a component has already dispatched. Injected
+       controls and runners must honour the ordering contract above.
     """
 
     def __init__(
