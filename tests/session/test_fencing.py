@@ -95,6 +95,18 @@ def test_transport_ready_uses_stream_start_operation_not_latest_command() -> Non
     assert not accept_transport(state, latest_operation)
 
 
+def test_transport_start_operation_is_compared_with_owned_handle() -> None:
+    destination = target()
+    owned = stream()
+    state = replace(
+        SessionSnapshot.idle(destination.receiver_id, online=True), target=destination,
+        stream=owned, transport_lease_id=owned.lease_id, session_generation=1,
+    )
+    incoming = replace(owned, start_operation_id=OperationId(UUID(int=333)))
+    # Both the incoming handle and context agree with each other, but not ownership.
+    assert not accept_transport(state, transport_ready(state, incoming))
+
+
 def test_stopped_event_can_finish_an_old_exact_stream_after_generation_change() -> None:
     destination = target()
     handle = stream()

@@ -39,13 +39,16 @@ from airplay_linux.domain.messages import (
     SubmitPairing,
     TimerEvent,
     TransportEvent,
+    TransportEventKind,
 )
 from airplay_linux.domain.operations import (
     ChallengeView,
     DisplayHandle,
+    InstanceId,
     LeaseId,
     OperationContext,
     OperationId,
+    OwnerId,
     StreamHandle,
 )
 from airplay_linux.domain.ports import (
@@ -130,6 +133,10 @@ class _Effect:
     work: Callable[[], Awaitable[Result[object]]]
     resource: StreamHandle | DisplayHandle | PhysicalMonitorSource | None
     acquisition: bool
+    context: OperationContext
+    endpoint_fingerprint: str | None
+    ownership_uuid: OwnerId | None
+    daemon_instance_uuid: InstanceId | None
     task: asyncio.Task[object] | None = None
 
 
@@ -146,12 +153,25 @@ class SessionContext:
 
     def __init__(self, manager: "SessionManager", state: SessionSnapshot) -> None:
         self._manager = manager
-        self.state = state
+        self.__state = state
         self.deps = manager.deps
         self._timers: list[object] = []
         self._audio_operation_id: OperationId | None = state.audio_operation_id
 
+    @property
+    def state(self) -> SessionSnapshot:
+        return self.__state
+
+    def _require_dispatch(self) -> None:
+        receiver_id = self.state.receiver_id
+        if (
+            receiver_id not in self._manager._draining
+            or self._manager._contexts.get(receiver_id) is not self
+        ):
+            raise RuntimeError("session context mutation requires actor dispatch")
+
     def apply(self, **changes: object) -> SessionSnapshot:
+        self._require_dispatch()
         changes.pop("phase", None)
         if "audio_operation_id" in changes:
             self._audio_operation_id = cast(
@@ -160,7 +180,7 @@ class SessionContext:
             )
         next_state = replace(self.state, **changes)
         next_state = replace(next_state, phase=derive_phase(next_state))
-        self.state = next_state
+        self.__state = next_state
         self._manager._changed(self.state)
         return self.state
 
@@ -168,6 +188,7 @@ class SessionContext:
         return self._context(self._new_operation_id())
 
     def supersede(self, reason: Literal["start", "cancel", "stop", "switch", "reconfigure", "shutdown"]) -> OperationContext:
+        self._require_dispatch()
         del reason
         context = replace(
             self._context(self._new_operation_id(), generation=self.state.session_generation + 1),
@@ -183,15 +204,17 @@ class SessionContext:
         self.cancel_timers()
         self.invalidate_trust()
         self._manager._fence_receiver(self.state)
-        return context
+        return replace(context, trust_generation=self.state.trust_generation)
 
     def new_transport_lease(self, context: OperationContext) -> OperationContext:
+        self._require_dispatch()
         lease = LeaseId(self.deps.ids.new())
         updated = replace(context, transport_lease_id=lease)
         self.apply(transport_lease_id=lease)
         return updated
 
     def invalidate_trust(self) -> None:
+        self._require_dispatch()
         generation = self.state.trust_generation + 1
         target = self.state.target
         endpoint_fingerprint = target.endpoint_fingerprint if target else None
@@ -209,6 +232,7 @@ class SessionContext:
         self.apply(trust_generation=generation, challenge=None)
 
     def cancel_timers(self) -> None:
+        self._require_dispatch()
         for timer in self._timers:
             cancel = getattr(timer, "cancel", None)
             if cancel is not None:
@@ -216,6 +240,7 @@ class SessionContext:
         self._timers.clear()
 
     def cancel_audio(self) -> None:
+        self._require_dispatch()
         self._audio_operation_id = None
         self.apply(audio_operation_id=None)
 
@@ -228,6 +253,7 @@ class SessionContext:
         acquisition: bool = False,
         resource: StreamHandle | DisplayHandle | PhysicalMonitorSource | None = None,
     ) -> None:
+        self._require_dispatch()
         effect = _Effect(
             receiver_id=self.state.receiver_id,
             operation_id=context.operation_id,
@@ -237,6 +263,14 @@ class SessionContext:
             work=work,
             resource=resource,
             acquisition=acquisition,
+            context=context,
+            endpoint_fingerprint=self.state.target.endpoint_fingerprint if self.state.target else None,
+            ownership_uuid=self.state.ownership_uuid,
+            daemon_instance_uuid=(
+                self.state.stream.daemon_instance_uuid
+                if self.state.stream is not None and self.state.stream.lease_id == context.transport_lease_id
+                else None
+            ),
         )
         self._manager._launch(effect)
 
@@ -244,6 +278,8 @@ class SessionContext:
         self._manager.ingest(event)
 
     def schedule(self, kind: str, when: float, context: OperationContext) -> None:
+        self._require_dispatch()
+
         def fire() -> None:
             self.enqueue(
                 TimerEvent(
@@ -452,6 +488,12 @@ class SessionManager:
                 route = self._route(message)
                 if route is None:
                     continue
+                admitted = self._admit(context, message, route)
+                if admitted is None:
+                    if isinstance(message, EffectEvent):
+                        self._completed_effects.pop((receiver_id, message.operation_id, message.kind), None)
+                    continue
+                route, message = admitted
                 handler = self.handlers.get(route)
                 handled = False
                 if handler is not None:
@@ -460,6 +502,133 @@ class SessionManager:
                     self._finish_acquisition(message, context)
         finally:
             self._draining.remove(receiver_id)
+
+    def _admit(
+        self, context: SessionContext, message: Command | ResourceEvent, route: Route,
+    ) -> tuple[Route, Command | ResourceEvent] | None:
+        """Check current resource identities immediately before handler delivery."""
+        state = context.state
+        owned = tuple(self._pending.get(state.receiver_id, ())) + tuple(
+            resource for resource in (state.stream, state.display_handle, state.physical_source)
+            if resource is not None
+        )
+        if isinstance(message, TransportEvent):
+            if not accept_transport(state, message):
+                if message.kind is TransportEventKind.stopped and accept_cleanup(owned, message):
+                    return Route.cleanup, message
+                return None
+        elif isinstance(message, DisplayEvent):
+            if not accept_display(state, message):
+                if message.kind == "removed" and accept_cleanup(owned, message):
+                    return Route.cleanup, message
+                return None
+        elif isinstance(message, SubmitPairing):
+            challenge = state.challenge
+            if (
+                challenge is None or message.challenge_id != challenge.challenge_id
+                or not accept_challenge(state, challenge)
+            ):
+                return None
+        elif isinstance(message, TimerEvent):
+            if message.kind == "pairing_expiry":
+                challenge = state.challenge
+                if (
+                    challenge is None or not accept_challenge(state, challenge)
+                    or message.context.operation_id != challenge.operation_id
+                    or message.context.session_generation != challenge.session_generation
+                    or message.context.endpoint_generation != challenge.endpoint_generation
+                    or message.context.trust_generation != challenge.trust_generation
+                ):
+                    return None
+            elif not self._context_current(state, message.context):
+                return None
+        elif isinstance(message, EffectEvent):
+            key = (message.receiver_id, message.operation_id, message.kind)
+            effect = self._completed_effects.get(key)
+            # Trust results must reach the authority that owns compensation.
+            if route is Route.trust:
+                return route, message
+            if effect is not None and effect.acquisition:
+                if not self._acquisition_current(state, effect, message.resource):
+                    route = Route.cleanup
+                    message = replace(message, kind=f"{route.value}:{effect.name}")
+                    self._completed_effects.pop(key)
+                    self._completed_effects[(message.receiver_id, message.operation_id, message.kind)] = effect
+            elif route is Route.cleanup and message.resource is not None and message.resource in owned:
+                # Exact release acknowledgements survive intent/endpoint replacement.
+                return route, message
+            elif effect is not None:
+                if not self._effect_current(state, effect):
+                    return None
+            elif (
+                message.session_generation != state.session_generation
+                or state.operation_id not in (None, message.operation_id)
+            ):
+                return None
+        return route, message
+
+    @staticmethod
+    def _context_current(
+        state: SessionSnapshot, operation: OperationContext, *,
+        check_operation: bool = True, check_audio: bool = False,
+    ) -> bool:
+        target = state.target
+        return (
+            operation.session_generation == state.session_generation
+            and operation.endpoint_generation == (target.endpoint_generation if target else 0)
+            and operation.transport_lease_id == state.transport_lease_id
+            and (not check_audio or operation.audio_operation_id == state.audio_operation_id)
+            and (not check_operation or state.operation_id in (None, operation.operation_id))
+        )
+
+    def _effect_current(self, state: SessionSnapshot, effect: _Effect) -> bool:
+        target = state.target
+        current = state.stream
+        return (
+            self._context_current(
+                state, effect.context,
+                check_operation=effect.route is not Route.audio or effect.context.audio_operation_id is None,
+                check_audio=effect.route is Route.audio,
+            )
+            and effect.endpoint_fingerprint == (target.endpoint_fingerprint if target else None)
+            and (effect.daemon_instance_uuid is None or (
+                current is not None and current.daemon_instance_uuid == effect.daemon_instance_uuid
+            ))
+        )
+
+    def _acquisition_current(
+        self, state: SessionSnapshot, effect: _Effect,
+        resource: StreamHandle | DisplayHandle | PhysicalMonitorSource | None,
+    ) -> bool:
+        if effect.session_generation != state.session_generation:
+            return False
+        if isinstance(resource, DisplayHandle):
+            # Display ownership is independent of transport and endpoint churn.
+            return (
+                effect.ownership_uuid in (None, resource.owner_uuid)
+                and state.ownership_uuid in (None, resource.owner_uuid)
+                and state.display_handle in (None, resource)
+                and (state.ownership_uuid is not None or state.operation_id in (None, effect.operation_id))
+            )
+        target = state.target
+        if (
+            not self._context_current(state, effect.context, check_operation=False)
+            or effect.endpoint_fingerprint != (target.endpoint_fingerprint if target else None)
+        ):
+            return False
+        if isinstance(resource, StreamHandle):
+            current = state.stream
+            return (
+                resource.receiver_id == state.receiver_id
+                and resource.lease_id == effect.context.transport_lease_id
+                and resource.start_operation_id == effect.operation_id
+                and resource.endpoint_generation == effect.context.endpoint_generation
+                and resource.endpoint_fingerprint == effect.endpoint_fingerprint
+                and effect.daemon_instance_uuid in (None, resource.daemon_instance_uuid)
+                and (current is None or current.lease_id != resource.lease_id
+                     or current.daemon_instance_uuid == resource.daemon_instance_uuid)
+            )
+        return True
 
     def _apply_discovery(self, context: SessionContext, event: DiscoveryEvent) -> None:
         if event.receiver is None:
@@ -479,7 +648,7 @@ class SessionManager:
             effect is not None
             and effect.acquisition
             and event.kind.startswith(f"{Route.cleanup.value}:")
-            and effect.session_generation != context.state.session_generation
+            and not self._acquisition_current(context.state, effect, resource)
         ):
             return
         pending = self._pending.get(event.receiver_id, [])
@@ -519,14 +688,7 @@ class SessionManager:
             resource = result.value
         if effect.acquisition and resource is not None and isinstance(result, Ok):
             self._pending[effect.receiver_id].append(resource)
-        current = self._states.get(effect.receiver_id)
         route = effect.route
-        if (
-            effect.acquisition
-            and current is not None
-            and current.session_generation != effect.session_generation
-        ):
-            route = Route.cleanup
         kind = f"{route.value}:{effect.name}"
         self._completed_effects[(effect.receiver_id, effect.operation_id, kind)] = effect
         self.ingest(

@@ -4,7 +4,7 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.domain.messages import RetryRevocation, Start, Stop
+from airplay_linux.domain.messages import EffectEvent, RetryRevocation, Start, Stop
 from airplay_linux.domain.operations import OperationId
 from airplay_linux.domain.records import SessionSnapshot
 from airplay_linux.domain.resources import (
@@ -151,21 +151,24 @@ async def test_commands_for_two_receivers_are_independent() -> None:
     assert rig.manager.snapshot(second_target.receiver_id).intent_active
 
 
-def test_phase_is_derived_and_manual_phase_cannot_contradict_resources() -> None:
-    rig = SessionRig()
+@pytest.mark.asyncio
+async def test_phase_is_derived_and_manual_phase_cannot_contradict_resources() -> None:
+    def handlers(_deps):
+        def mirror(ctx, message):
+            if isinstance(message, Start):
+                ctx.apply(transport=TransportState.Connecting, phase=SessionPhase.Available)
+            return True
+        return {Route.mirror: mirror}
+
+    rig = SessionRig(handlers)
     destination = target()
     rig.discovery.add_target(destination)
-    state = rig.manager.snapshot(destination.receiver_id)
-    assert state.phase is SessionPhase.Available
-
-    context = rig.manager.context(destination.receiver_id)
-    state = context.apply(
-        transport=TransportState.Connecting,
-        phase=SessionPhase.Available,
-    )
-    assert state.phase is SessionPhase.Connecting
-
-
+    assert rig.manager.snapshot(destination.receiver_id).phase is SessionPhase.Available
+    await rig.manager.dispatch(Start(
+        receiver_id=destination.receiver_id,
+        request=StartRequest(mode=Mode.MIRROR, source=physical()),
+    ))
+    assert rig.manager.snapshot(destination.receiver_id).phase is SessionPhase.Connecting
 
 
 @pytest.mark.asyncio
@@ -225,19 +228,30 @@ def test_manager_bootstraps_an_existing_offline_discovery_view_as_offline() -> N
 @pytest.mark.asyncio
 async def test_completed_stale_acquisition_is_routed_to_cleanup_and_remains_pending() -> None:
     blocked: Deferred[object] = Deferred()
-    seen_routes: list[Route] = []
+    operations = []
+    live_completions = []
+    cleanup_completions = []
+    stopped = []
 
     def handlers(_deps):
         def mirror(ctx, message):
             if isinstance(message, Start):
-                ctx.launch(Route.mirror, "capture", ctx.operation(), blocked.wait, acquisition=True)
-                return True
-            return False
+                operation = ctx.operation()
+                operations.append(operation)
+                ctx.apply(intent_active=True)
+                ctx.launch(Route.mirror, "capture", operation, blocked.wait, acquisition=True)
+            elif isinstance(message, EffectEvent):
+                live_completions.append(message)
+                ctx.apply(intent_active=True, physical_source=message.resource)
+            return True
 
         def cleanup(ctx, message):
-            seen_routes.append(Route.cleanup)
             if isinstance(message, Stop):
+                stopped.append(message)
                 ctx.supersede("stop")
+                ctx.apply(intent_active=False)
+            elif isinstance(message, EffectEvent):
+                cleanup_completions.append(message)
             return True
 
         return {Route.mirror: mirror, Route.cleanup: cleanup}
@@ -256,7 +270,16 @@ async def test_completed_stale_acquisition_is_routed_to_cleanup_and_remains_pend
     blocked.resolve(Ok(value=acquired))
     await rig.settle()
 
-    assert seen_routes
+    assert len(stopped) == 1
+    assert live_completions == []
+    assert cleanup_completions == [EffectEvent(
+        receiver_id=destination.receiver_id,
+        operation_id=operations[0].operation_id,
+        session_generation=operations[0].session_generation,
+        kind="cleanup:capture", result=Ok(value=acquired), resource=acquired,
+    )]
+    assert not rig.manager.snapshot(destination.receiver_id).intent_active
+    assert rig.manager.snapshot(destination.receiver_id).physical_source is None
     assert rig.manager.pending_resources(destination.receiver_id) == (acquired,)
     assert rig.manager.context(destination.receiver_id).outstanding_acquisitions() == 0
 
@@ -303,26 +326,40 @@ async def test_non_acquisition_effects_do_not_count_as_outstanding_acquisitions(
     rig = SessionRig(handlers)
     destination = target()
     rig.discovery.add_target(destination)
+    await rig.manager.dispatch(Start(
+        receiver_id=destination.receiver_id,
+        request=StartRequest(mode=Mode.MIRROR, source=physical()),
+    ))
     context = rig.manager.context(destination.receiver_id)
-    context.launch(Route.mirror, "control", context.operation(), blocked.wait)
     assert context.outstanding_acquisitions() == 0
     blocked.resolve(Ok(value=None))
     await rig.settle()
 
 
-def test_context_audio_token_is_carried_until_cancel_or_supersede() -> None:
-    rig = SessionRig()
-    destination = target()
-    context = rig.manager.context(destination.receiver_id)
+@pytest.mark.asyncio
+async def test_context_audio_token_is_carried_until_cancel_or_supersede() -> None:
+    observed = []
     audio_id = OperationId(UUID(int=77))
-    context.apply(audio_operation_id=audio_id)
-    assert context.operation().audio_operation_id == audio_id
 
-    context.cancel_audio()
-    assert context.operation().audio_operation_id is None
-    context.apply(audio_operation_id=audio_id)
-    context.supersede("reconfigure")
-    assert context.operation().audio_operation_id is None
+    def handlers(_deps):
+        def mirror(ctx, message):
+            if isinstance(message, Start):
+                ctx.apply(audio_operation_id=audio_id)
+                observed.append(ctx.operation().audio_operation_id)
+                ctx.cancel_audio()
+                observed.append(ctx.operation().audio_operation_id)
+                ctx.apply(audio_operation_id=audio_id)
+                ctx.supersede("reconfigure")
+                observed.append(ctx.operation().audio_operation_id)
+            return True
+        return {Route.mirror: mirror}
+
+    rig = SessionRig(handlers)
+    await rig.manager.dispatch(Start(
+        receiver_id=rig.receiver_id,
+        request=StartRequest(mode=Mode.MIRROR, source=physical()),
+    ))
+    assert observed == [audio_id, None, None]
 
 
 @pytest.mark.asyncio
@@ -358,25 +395,35 @@ async def test_failed_acquisition_does_not_enter_pending_resource_ledger() -> No
     assert rig.manager.pending_resources(destination.receiver_id) == ()
 
 
-def test_context_allocates_operations_without_advancing_generation_until_supersede() -> None:
-    rig = SessionRig()
+@pytest.mark.asyncio
+async def test_context_allocates_operations_without_advancing_generation_until_supersede() -> None:
+    observed = []
+
+    def handlers(_deps):
+        def mirror(ctx, message):
+            if isinstance(message, Start):
+                first, second = ctx.operation(), ctx.operation()
+                leased = ctx.new_transport_lease(first)
+                superseding = ctx.supersede("reconfigure")
+                observed.extend((first, second, leased, superseding, ctx.operation()))
+            return True
+        return {Route.mirror: mirror}
+
+    rig = SessionRig(handlers)
     destination = target()
     rig.discovery.add_target(destination)
-    context = rig.manager.context(destination.receiver_id)
-    first = context.operation()
-    second = context.operation()
+    await rig.manager.dispatch(Start(
+        receiver_id=destination.receiver_id,
+        request=StartRequest(mode=Mode.MIRROR, source=physical()),
+    ))
+    first, second, leased, superseding, after = observed
     assert first.operation_id != second.operation_id
     assert first.session_generation == second.session_generation == 0
-
-    leased = context.new_transport_lease(first)
     assert leased.transport_lease_id is not None
-    superseding = context.supersede("reconfigure")
-    assert superseding.session_generation == 1
+    assert superseding.session_generation == after.session_generation == 1
     assert superseding.transport_lease_id is None
     assert superseding.audio_operation_id is None
-    assert context.state.session_generation == 1
-    assert context.state.transport_lease_id is None
-    assert context.operation().session_generation == 1
+    assert rig.manager.snapshot(destination.receiver_id).transport_lease_id is None
 
 
 @pytest.mark.parametrize(

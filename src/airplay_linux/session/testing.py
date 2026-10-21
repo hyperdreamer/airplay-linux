@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
 from airplay_linux.domain.identity import ReceiverId
+from airplay_linux.domain.operations import OpaqueCredentialRef
 from airplay_linux.domain.ports import (
     ActivitySink,
     AudioProbe,
@@ -81,6 +82,7 @@ class SessionRig:
         self.fences = TrustFenceRegistry()
         self.journal = Journal()
         self.receiver_id: ReceiverId = target().receiver_id
+        self.pairing.trusted[self.receiver_id] = OpaqueCredentialRef("fake-session-backend-ref")
         self.deps = ManagerDeps(
             transport=self.transport,
             pairing=self.pairing,

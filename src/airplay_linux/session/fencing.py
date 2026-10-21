@@ -30,6 +30,7 @@ def _same_stream(left: StreamHandle | None, right: StreamHandle | None) -> bool:
         and left.daemon_instance_uuid == right.daemon_instance_uuid
         and left.lease_id == right.lease_id
         and left.backend_stream_id == right.backend_stream_id
+        and left.start_operation_id == right.start_operation_id
     )
 
 
@@ -105,7 +106,7 @@ def accept_transport(state: SessionSnapshot, event: TransportEvent) -> bool:
             return False
         if event.context.audio_operation_id != state.audio_operation_id:
             return False
-    elif not stopped and event.context.operation_id != stream.start_operation_id:
+    elif not stopped and event.context.operation_id != state.stream.start_operation_id:
         return False
     if event.daemon_instance_uuid != stream.daemon_instance_uuid:
         return False
