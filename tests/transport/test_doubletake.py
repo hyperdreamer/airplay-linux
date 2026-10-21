@@ -1363,6 +1363,10 @@ def test_fence_compatibility_requires_a_keyword_passing_parameter():
         def request(self, operation, target, payload, context, *dispatch_fence):
             ...
 
+    class NamedKwargs:
+        def request(self, operation, target, payload, context, **dispatch_fence):
+            ...
+
     class KeywordOnly:
         def request(self, operation, target, payload, context, *, dispatch_fence=None):
             ...
@@ -1387,3 +1391,5 @@ def test_fence_compatibility_requires_a_keyword_passing_parameter():
     assert _accepts_dispatch_fence(KeywordOnly()) is True
     assert _accepts_dispatch_fence(PositionalOrKeyword()) is True
     assert _accepts_dispatch_fence(ForwardsKeywords()) is True
+    # F-8: a VAR_KEYWORD named dispatch_fence binds the keyword.
+    assert _accepts_dispatch_fence(NamedKwargs()) is True
