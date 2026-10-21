@@ -7,7 +7,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Protocol, TypeAlias, runtime_checkable
+from typing import Final, Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from airplay_linux.backend.contract import (
@@ -141,6 +141,34 @@ BackendPayload: TypeAlias = (
     | PairingPayload
     | ModesPayload
 )
+
+# A caller-owned predicate the adapter re-evaluates at the dispatch boundary:
+# after every adapter-owned await and immediately before the mutating child is
+# spawned.  It returns the typed failure to report when the exact target or the
+# cleanup ownership is no longer valid.
+DispatchFence: TypeAlias = Callable[[], Result[None]]
+
+# Operations that address a receiver target and change its state.  These are the
+# commands whose dispatch must be fenced: a target can be replaced at the same
+# address while an adapter-owned await is in flight, so the check has to happen
+# at the spawn boundary rather than at entry.  Pairing/keyring operations are
+# fenced by the trust coordinator's own generation fences and are not listed.
+FENCE_REQUIRED_OPERATIONS: Final[frozenset[BackendOperation]] = frozenset(
+    {
+        BackendOperation.connect,
+        BackendOperation.disconnect,
+        BackendOperation.mute,
+        BackendOperation.unmute,
+        BackendOperation.start_audio,
+        BackendOperation.restart_audio,
+    }
+)
+
+
+def requires_dispatch_fence(operation: BackendOperation) -> bool:
+    """True when this operation must be fenced at the dispatch boundary."""
+
+    return operation in FENCE_REQUIRED_OPERATIONS
 
 
 class BackendNoticeKind(StrEnum):
@@ -670,7 +698,28 @@ class PublishedDoubletakeControl:
         target: ReceiverTarget | None,
         payload: BackendPayload,
         context: OperationContext | None,
+        *,
+        dispatch_fence: DispatchFence | None = None,
     ) -> Result[BackendReply]:
+        """Dispatch one typed command against an already admitted target.
+
+        ``dispatch_fence`` is the caller's exact-target (or cleanup-ownership)
+        freshness predicate. For connect, disconnect, mute, unmute, start_audio
+        and restart_audio this adapter **requires** it: with no fence supplied the
+        call returns a typed failure *before any I/O at all*, so a wrapper that
+        accepts the keyword and drops it cannot even run the ownership probe. Mutating
+        commands evaluate the supplied fence after this adapter's own awaited
+        ownership revalidation and before spawning, so a mismatch is detected at
+        the dispatch boundary rather than after the reply. Read-only commands never
+        consult it.
+
+        Trust boundary: the fence is trusted, not authenticated. This adapter
+        cannot tell whether the callable it was given is the caller's genuine
+        target check, and it cannot defend against same-process code that
+        substitutes a permissive predicate, changes the target, or bypasses this
+        method. Callers must forward the original predicate and the unchanged
+        target; see the composition note on ``DoubleTakeTransport``.
+        """
         if self._closed:
             return _err(ErrorCode.daemon_failed)
         op = self._normalize_operation(operation)
@@ -683,9 +732,24 @@ class PublishedDoubletakeControl:
             return _err(ErrorCode.dependency_incompatible)
 
         if self._is_mutation(op):
+            # A required fence that is absent rejects before any I/O at all: an
+            # unfenced target-addressed state change must not even run the
+            # ownership probe, let alone spawn the mutation. This is the guard
+            # that holds when a wrapper accepts ``dispatch_fence`` and drops it,
+            # because the wrapper reaches this method with ``None``.
+            if requires_dispatch_fence(op) and dispatch_fence is None:
+                return _err(ErrorCode.dependency_incompatible)
             ownership = await self._revalidate_ownership()
             if isinstance(ownership, Err):
                 return ownership
+            # Closing the dispatch window: no await may separate this
+            # re-evaluation from the spawn below, so a replacement admitted
+            # during the ownership query can never receive this command. Pairing
+            # and keyring mutations may supply a fence too; honour it either way.
+            if dispatch_fence is not None:
+                fenced = dispatch_fence()
+                if isinstance(fenced, Err):
+                    return fenced
 
         process_result = await self._run(argv_result.value)
         if isinstance(process_result, Err):
@@ -867,6 +931,7 @@ __all__ = [
     "ConnectPayload",
     "CredentialPayload",
     "DevicesReply",
+    "DispatchFence",
     "EmptyPayload",
     "Handshake",
     "ModesPayload",
