@@ -28,8 +28,11 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok, Size
 from airplay_linux.process import (
     OWNER_TOKEN_ENV,
     RUNTIME_DIRECTORY_ENV,
+    IdentityState,
     LinuxProcessRunner,
     owner_evidence,
+    owned_processes,
+    read_environment_evidence,
     read_identity,
 )
 from airplay_linux.testing.adapters import FakeProcess
@@ -581,6 +584,121 @@ async def test_owned_scan_reports_an_uninspectable_entry_as_incomplete(tmp_path:
     assert scan.complete is False
     assert helper.find_owned(OWNER, RUNTIME) == scan.matches
     assert helper.owned_scan("bad", RUNTIME).complete is False  # type: ignore[arg-type]
+
+
+class CorruptingRecheckProcess(ProcfsOnlyProcess):
+    """Procfs evidence that becomes unreadable during the final ownership recheck.
+
+    The complete scan proves the exact match first; the very next boolean recheck
+    cannot read the owner environment. That is precisely the uncertainty the scan
+    must not convert into "nothing here".
+    """
+
+    def __init__(self, proc_root: Path, pid: int) -> None:
+        super().__init__(proc_root)
+        self._entry = proc_root / str(pid)
+        self._corrupted = False
+
+    def owned(
+        self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
+    ) -> bool:
+        if not self._corrupted:
+            self._corrupted = True
+            with (self._entry / "environ").open("ab") as handle:
+                handle.write(f"{OWNER_TOKEN_ENV}=duplicate\0".encode())
+        return super().owned(identity, owner_uuid, runtime_directory)
+
+
+async def test_owned_scan_keeps_an_unreadable_final_recheck_incomplete(tmp_path: Path):
+    """A recheck that cannot read ownership is uncertainty, not an empty scan.
+
+    The initial complete scan proves the exact instance is owned; a duplicate
+    environment key makes the procfs parser classify that same instance as
+    unreadable. The boolean port collapses that into "not owned", so the scan has
+    to keep the incompleteness instead of reporting a complete empty result.
+    """
+    entry(tmp_path, 4321, start_ticks=777, environment={
+        OWNER_TOKEN_ENV: str(OWNER), RUNTIME_DIRECTORY_ENV: RUNTIME,
+    })
+    identity = ProcessIdentity(pid=4321, start_ticks=777)
+    initial = owned_processes(OWNER, RUNTIME, tmp_path)
+    assert initial.matches == (identity,)
+    assert initial.complete is True
+    process = CorruptingRecheckProcess(tmp_path, 4321)
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    scan = helper.owned_scan(OWNER, RUNTIME)
+    assert read_environment_evidence(4321, tmp_path).state is IdentityState.unreadable
+    assert scan.matches == ()
+    assert scan.complete is False
+    assert helper.find_owned(OWNER, RUNTIME) == ()
+    assert process.terminated == []
+
+
+async def test_owned_scan_keeps_a_complete_exact_match(tmp_path: Path):
+    """The control: readable evidence still yields a complete exact match."""
+    entry(tmp_path, 4321, start_ticks=777, environment={
+        OWNER_TOKEN_ENV: str(OWNER), RUNTIME_DIRECTORY_ENV: RUNTIME,
+    })
+    process = ProcfsOnlyProcess(tmp_path)
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    scan = helper.owned_scan(OWNER, RUNTIME)
+    assert scan.matches == (ProcessIdentity(pid=4321, start_ticks=777),)
+    assert scan.complete is True
+
+
+class UncertainLaunchProcess(CorruptingRecheckProcess):
+    """The corrupting recheck plus a spawn boundary that records the request."""
+
+    def __init__(self, proc_root: Path, pid: int) -> None:
+        super().__init__(proc_root, pid)
+        self.spawned: list[Any] = []
+        self._scripted = FakeProcess()
+
+    def script_profile(self) -> None:
+        self._scripted.queue_result("run", help_result())
+        self._scripted.queue_result("run", version_result())
+
+    async def run(self, spec: Any, timeout: float, stdin: bytes | None = None) -> Any:
+        return await self._scripted.run(spec, timeout, stdin)
+
+    async def spawn(self, spec: Any) -> Any:
+        self.spawned.append(spec)
+        return Err(
+            error=diagnostic(ErrorCode.dependency_missing, command="krfb-virtualmonitor"),
+        )
+
+
+async def test_launch_refuses_unreadable_evidence_in_the_final_owner_recheck(
+    tmp_path: Path,
+):
+    """Unreadable ownership during revalidation must never authorise a spawn."""
+    entry(tmp_path, 4321, start_ticks=777, environment={
+        OWNER_TOKEN_ENV: str(OWNER), RUNTIME_DIRECTORY_ENV: RUNTIME,
+    })
+    process = UncertainLaunchProcess(tmp_path, 4321)
+    process.script_profile()
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.helper_failed
+    assert process.spawned == []
+    assert read_environment_evidence(4321, tmp_path).state is IdentityState.unreadable
+    assert process.terminated == []
+
+
+async def test_stop_refuses_an_unreadable_ownership_recheck(tmp_path: Path):
+    """The stop control still refuses without signalling anything."""
+    entry(tmp_path, 4321, start_ticks=777, environment={
+        OWNER_TOKEN_ENV: str(OWNER), RUNTIME_DIRECTORY_ENV: RUNTIME,
+    })
+    process = CorruptingRecheckProcess(tmp_path, 4321)
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    result = await helper.stop(
+        ProcessIdentity(pid=4321, start_ticks=777), OWNER, RUNTIME, 5.0,
+    )
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.ownership_mismatch
+    assert process.terminated == []
 
 
 async def test_stop_never_reports_an_unreadable_procfs_entry_as_released(tmp_path: Path):

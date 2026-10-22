@@ -22,9 +22,11 @@ shape this module:
 
 Polling is asynchronous and deadline-based through the injected
 :class:`~airplay_linux.domain.ports.Scheduler`; nothing here sleeps on the actor
-thread. The deadline bounds one operation: no read starts at or after it, each
-read is bounded by the budget that remains, and evidence that arrives after it is
-never accepted. Subscribers observe changes that a poll actually discovered,
+thread. The deadline bounds one operation from the moment it is invoked: one real
+expiration is established *before* the first command starts, it is never re-armed
+when a fallback is installed, no read starts at or after the deadline, each read
+is bounded by the budget that remains, and evidence that arrives after the deadline
+is never accepted. Subscribers observe changes that a poll actually discovered,
 because the KScreen CLI has no push channel of its own.
 """
 
@@ -35,9 +37,9 @@ import hashlib
 import json
 import math
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, TypeVar
 
 from airplay_linux.diagnostics import ALLOWED_COMMANDS, diagnostic
 from airplay_linux.domain.ports import Clock, CommandSpec, ProcessPort, Scheduler, Subscription
@@ -83,6 +85,20 @@ _PHYSICAL_TYPES: Final[frozenset[int]] = frozenset(range(1, 15))
 
 _MAX_SCALE: Final[float] = 64.0
 _MAX_COORDINATE: Final[int] = 2**31 - 1
+
+T = TypeVar("T")
+
+
+class _Expired:
+    """Sentinel: an operation's own expiration ended an await before it answered."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "EXPIRED"
+
+
+_EXPIRED: Final[_Expired] = _Expired()
 
 
 class KScreenParseError(ValueError):
@@ -676,19 +692,103 @@ class KScreenObserver:
         self._observed: tuple[OutputInfo, ...] | None = None
         self._configure_lock = asyncio.Lock()
 
+    # -- bounded awaits -----------------------------------------------------
+
+    def _real_expiration(
+        self, delay: float, callback: Callable[[], None],
+    ) -> asyncio.TimerHandle:
+        """Install one real-time expiration *before* the wait it bounds starts.
+
+        The injected clock is the deadline *domain*: it decides whether a caller's
+        absolute deadline has passed and how much budget each read may use. It is
+        not a source of elapsed real time, and the process port starts its own
+        command timeout only after a command has actually started, so an operation
+        that relied on either alone could outlive the interval it promised. Each
+        operation installs exactly one of these for its whole duration and never
+        replaces it. This is a method (rather than an inline ``call_later``) so a
+        test can own the expiration and drive it without sleeping.
+        """
+        return asyncio.get_running_loop().call_later(max(0.0, float(delay)), callback)
+
+    @staticmethod
+    async def _settle(
+        expiration: asyncio.Future[None], operation: Awaitable[T],
+    ) -> T | _Expired:
+        """Await ``operation``, unless the operation's expiration ends it first.
+
+        The expiration is not a second timeout handed to the backend: it bounds
+        the *whole* await, including a command that has not started yet. When it
+        wins, the operation is cancelled and its own cancellation cleanup is
+        awaited before expiry is reported, so a process port still performs its
+        kill/reap obligation.
+        """
+        pending = asyncio.ensure_future(operation)
+        if expiration.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            return _EXPIRED
+        try:
+            await asyncio.wait(
+                {pending, expiration}, return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            raise
+        if expiration.done():
+            # The expiration is terminal: a result delivered in the same loop
+            # iteration is no longer evidence that arrived within the interval.
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            return _EXPIRED
+        return pending.result()
+
+    async def _bounded(self, operation: Awaitable[T], timeout: float) -> T | _Expired:
+        """Await one command under an expiration installed before it can start."""
+        loop = asyncio.get_running_loop()
+        expiration: asyncio.Future[None] = loop.create_future()
+
+        def expire() -> None:
+            if not expiration.done():
+                expiration.set_result(None)
+
+        timer = self._real_expiration(max(0.0, float(timeout)), expire)
+        try:
+            return await self._settle(expiration, operation)
+        finally:
+            timer.cancel()
+            if not expiration.done():
+                expiration.cancel()
+
     # -- observation --------------------------------------------------------
 
-    async def _records(self, timeout: float | None = None) -> Result[tuple[_Record, ...]]:
+    async def _records(
+        self, timeout: float | None = None, *,
+        expiration: asyncio.Future[None] | None = None,
+    ) -> Result[tuple[_Record, ...]]:
         """Run ``kscreen-doctor -j`` once and parse it, or return a typed failure.
 
-        ``timeout`` bounds this one command; a caller with an operation deadline
-        passes its *remaining* budget so a read can never outlive the operation it
-        is evidence for. ``None`` uses the adapter's own control-call bound.
+        ``timeout`` bounds this one command *from before it starts*: the
+        expiration is installed here instead of relying on the process port, whose
+        own timeout begins only after a command has been launched. A caller with
+        an operation deadline passes its *remaining* budget and its own
+        ``expiration``, so the read is bounded by the one deadline of the whole
+        operation instead of a second timer that could restart it. ``None`` uses
+        the adapter's own control-call bound.
         """
         budget = self._timeout if timeout is None else max(0.0, float(timeout))
-        result = await self._process.run(
-            CommandSpec(argv=(self._command, "-j"), env={}), min(self._timeout, budget),
+        bounded = min(self._timeout, budget)
+        command = self._process.run(
+            CommandSpec(argv=(self._command, "-j"), env={}), bounded,
         )
+        if expiration is None:
+            result = await self._bounded(command, bounded)
+        else:
+            result = await self._settle(expiration, command)
+        if result is _EXPIRED:
+            # The command did not answer inside this read's budget, so there is no
+            # layout: a timeout is a failed read, never an empty one.
+            return _failure(ErrorCode.cleanup_timeout)
         if isinstance(result, Err):
             return result
         output = result.value
@@ -752,10 +852,13 @@ class KScreenObserver:
         """Poll until ``predicate`` holds, or report that it never was confirmed.
 
         ``deadline`` is an absolute value of the injected clock, and it is one
-        operation deadline rather than a per-iteration one: a read may not begin
-        at or after it, each read is bounded by the budget that remains, and a
-        read that finishes at or after it is not evidence any more. Expiry is
-        terminal. A read error is never mistaken for a match: missing
+        operation deadline rather than a per-iteration one: a single real
+        expiration is installed before the first read, so the whole wait -- command
+        startup, every read, and every poll -- is bounded from invocation, and the
+        expiration is never re-armed when a fallback is installed. A read may not
+        begin at or after the deadline, each read is bounded by the budget that
+        remains, and a read that finishes at or after it is not evidence any more.
+        Expiry is terminal. A read error is never mistaken for a match: missing
         dependencies are reported at once, while a transient layout failure is
         retried until the deadline and then reported instead of a false timeout.
         A timeout is :attr:`~airplay_linux.domain.resources.ErrorCode.cleanup_timeout`,
@@ -766,79 +869,89 @@ class KScreenObserver:
         if not (type(deadline) in (int, float) and math.isfinite(float(deadline))):
             return _failure(ErrorCode.invalid_input)
         expires_at = float(deadline)
+        loop = asyncio.get_running_loop()
+        expiration: asyncio.Future[None] = loop.create_future()
+
+        def expire() -> None:
+            if not expiration.done():
+                expiration.set_result(None)
+
+        # One real expiration, established before the first read, bounds the whole
+        # operation. Its duration is the caller's deadline distance measured once:
+        # a read that consumes part of the budget, a stalled scheduler, or a frozen
+        # injected clock must not restart a fresh interval afterwards.
+        timer = self._real_expiration(max(0.0, expires_at - self._clock.now()), expire)
         last_error: Err | None = None
-        while True:
-            now = self._clock.now()
-            if now >= expires_at:
-                return self._expired(last_error)
-            result = await self._records(expires_at - now)
-            if isinstance(result, Ok):
-                if self._clock.now() >= expires_at:
-                    # The read answered, but not within the interval we promised
-                    # to observe; a late layout is not evidence about the deadline.
-                    return _failure(ErrorCode.cleanup_timeout)
-                outputs = _outputs(result.value)
-                self._publish(outputs)
-                last_error = None
-                if predicate(outputs):
-                    return Ok(value=outputs)
-            else:
-                last_error = result
-                if result.error.code in (
-                    ErrorCode.dependency_missing, ErrorCode.dependency_incompatible,
+        try:
+            while True:
+                now = self._clock.now()
+                if now >= expires_at or expiration.done():
+                    return self._expired(last_error)
+                result = await self._records(expires_at - now, expiration=expiration)
+                if isinstance(result, Ok):
+                    if self._clock.now() >= expires_at:
+                        # The read answered, but not within the interval we promised
+                        # to observe; a late layout is not evidence about the deadline.
+                        return _failure(ErrorCode.cleanup_timeout)
+                    outputs = _outputs(result.value)
+                    self._publish(outputs)
+                    last_error = None
+                    if predicate(outputs):
+                        return Ok(value=outputs)
+                else:
+                    last_error = result
+                    if result.error.code in (
+                        ErrorCode.dependency_missing, ErrorCode.dependency_incompatible,
+                    ):
+                        return result
+                now = self._clock.now()
+                if now >= expires_at or expiration.done():
+                    return self._expired(last_error)
+                if await self._sleep_until(
+                    min(now + self._poll_interval, expires_at), expiration,
                 ):
-                    return result
-            now = self._clock.now()
-            if now >= expires_at:
-                return self._expired(last_error)
-            expired = await self._sleep_until(
-                min(now + self._poll_interval, expires_at), expires_at,
-            )
-            if expired:
-                # The real-time fallback fired, which means no poll tick arrived
-                # before the deadline; the injected clock may never advance, so
-                # this is a terminal timeout rather than another iteration.
-                return self._expired(last_error)
+                    # The real expiration ended the wait. The injected clock may
+                    # never advance, so it is a terminal timeout, not another poll.
+                    return self._expired(last_error)
+        finally:
+            timer.cancel()
+            if not expiration.done():
+                expiration.cancel()
 
     @staticmethod
     def _expired(last_error: Err | None) -> Err:
         """The outcome of an expired wait: the last read failure, else a timeout."""
         return last_error if last_error is not None else _failure(ErrorCode.cleanup_timeout)
 
-    async def _sleep_until(self, when: float, deadline: float) -> bool:
-        """Wait for a scheduler wake; only the deadline has a real-time fallback.
+    async def _sleep_until(self, when: float, expiration: asyncio.Future[None]) -> bool:
+        """Wait for a scheduler wake; the operation's one expiration also ends it.
 
         Poll ticks must come from the injected scheduler so a test can drive them
-        deterministically. The overall deadline additionally uses a real timer so
-        a scheduler that never fires ends the wait instead of hanging; its
-        duration is the deadline distance, not a poll interval. Returns whether
-        that real-time fallback ended the wait, which is a terminal timeout: it
-        must not be treated as a poll tick, or a frozen clock would install one
-        fallback after another forever.
+        deterministically. The single real expiration established by the caller
+        before the first read bounds this wait too and is never re-armed here: a
+        new timer computed from a possibly frozen injected clock would restart the
+        operation budget after time already spent reading. Returns whether that
+        expiration (rather than a poll tick) ended the wait, which is terminal.
         """
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
-        expired = False
 
         def wake() -> None:
             if not future.done():
                 future.set_result(None)
 
-        def expire() -> None:
-            nonlocal expired
-            expired = True
-            wake()
-
         scheduled = self._scheduler.call_at(when, wake)
-        fallback = loop.call_later(max(0.0, deadline - self._clock.now()), expire)
         try:
-            await future
+            if expiration.done():
+                return True
+            await asyncio.wait(
+                {future, expiration}, return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
             scheduled.cancel()
-            fallback.cancel()
             if not future.done():
                 future.cancel()
-        return expired
+        return expiration.done()
 
     # -- configuration ------------------------------------------------------
 
@@ -879,9 +992,14 @@ class KScreenObserver:
         tokens = _tokens(output_id, request, mode)
         if not tokens:
             return _failure(ErrorCode.invalid_input), None
-        applied = await self._process.run(
-            CommandSpec(argv=(self._command, *tokens), env={}), self._timeout,
+        applied = await self._bounded(
+            self._process.run(
+                CommandSpec(argv=(self._command, *tokens), env={}), self._timeout,
+            ),
+            self._timeout,
         )
+        if applied is _EXPIRED:
+            return _failure(ErrorCode.cleanup_timeout), None
         if isinstance(applied, Err):
             return applied, None
         if applied.value.exit_code != 0:

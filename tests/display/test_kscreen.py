@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from airplay_linux.display.kscreen import (
 )
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Size
+from airplay_linux.process import LinuxProcessRunner
 from airplay_linux.testing.adapters import FakeProcess
 from airplay_linux.testing.time import FakeClock, FakeScheduler
 
@@ -864,6 +866,262 @@ async def test_wait_for_bounds_each_read_by_the_remaining_budget():
     assert isinstance(result, Ok)
     # The default 5 s control bound never outlives the operation deadline.
     assert [timeout for _spec, timeout in process.runs] == [1.0, 0.75]
+
+
+class DeterministicExpiration:
+    """One real expiration that only the test can fire; no wall clock involved."""
+
+    def __init__(self, delay: float, callback: Any) -> None:
+        self.delay = delay
+        self._callback = callback
+        self.cancelled = False
+
+    def fire(self) -> None:
+        if not self.cancelled:
+            self._callback()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+
+
+class ExpirationDrivenObserver(KScreenObserver):
+    """An observer whose one real expiration is driven by the test, not by time."""
+
+    def __init__(self, *args: Any, **options: Any) -> None:
+        super().__init__(*args, **options)
+        self.expirations: list[DeterministicExpiration] = []
+
+    def _real_expiration(self, delay: float, callback: Any) -> DeterministicExpiration:
+        expiration = DeterministicExpiration(delay, callback)
+        self.expirations.append(expiration)
+        return expiration
+
+
+async def test_wait_for_installs_one_expiration_before_a_held_command():
+    """The operation deadline covers command startup, not only the answer.
+
+    The injected clock never advances on its own and the command is held before
+    it answers, so only the expiration installed at invocation can end the wait.
+    A deadline enforced after a read -- or restarted when a fallback is installed
+    -- would leave a command that never starts pending forever.
+    """
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldRead(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.answered = False
+            self.interrupted = False
+
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            self.runs.append((spec, timeout))
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                self.interrupted = True
+            self.answered = True
+            return command_output(fixture(BASELINE))
+
+    process = HeldRead()
+    observed = ExpirationDrivenObserver(process, clock, scheduler)
+    task = asyncio.create_task(
+        observed.wait_for(lambda outputs: False, clock.now() + 0.20),
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    assert len(process.runs) == 1
+    # One expiration, for the whole operation budget, installed before the read.
+    assert len(observed.expirations) == 1
+    assert observed.expirations[0].delay == 0.20
+    assert process.answered is False
+    observed.expirations[0].fire()
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    # Startup was cancelled (its cleanup ran) and the budget was never re-armed.
+    assert process.interrupted is True
+    assert process.answered is False
+    assert len(observed.expirations) == 1
+    release.set()
+
+
+async def test_wait_for_propagates_cancellation_and_cancels_its_expiration():
+    """A caller's cancellation is neither a timeout nor a match."""
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class HeldRead(FakeProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.interrupted = False
+
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            self.runs.append((spec, timeout))
+            entered.set()
+            try:
+                await release.wait()
+            finally:
+                self.interrupted = True
+            return command_output(fixture(BASELINE))
+
+    process = HeldRead()
+    observed = ExpirationDrivenObserver(process, clock, scheduler)
+    task = asyncio.create_task(
+        observed.wait_for(lambda outputs: True, clock.now() + 5.0),
+    )
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The in-flight command's cleanup ran and the one expiration was disarmed.
+    assert process.interrupted is True
+    (expiration,) = observed.expirations
+    assert expiration.cancelled is True
+    release.set()
+
+
+async def test_wait_for_never_restarts_the_expiration_after_a_slow_read():
+    """Time advances only while the command waits, and the anchor does not move.
+
+    The command consumes 180 ms of the 200 ms operation budget, and the injected
+    clock moves only inside that wait. Installing a fresh interval afterwards (or
+    rounding the next wait up to a full poll interval) would end the operation
+    late; the single expiration fixed at invocation must still govern it.
+    """
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+
+    class SlowRead(FakeProcess):
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            self.runs.append((spec, timeout))
+            clock.advance(0.18)
+            return command_output(fixture(BASELINE))
+
+    process = SlowRead()
+    observed = ExpirationDrivenObserver(process, clock, scheduler)
+    task = asyncio.create_task(observed.wait_for(lambda outputs: False, 0.20))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert clock.now() == 0.18
+    assert len(process.runs) == 1
+    (expiration,) = observed.expirations
+    assert expiration.delay == 0.20
+    assert scheduler.pending() == (0.20,)
+    expiration.fire()
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    # The read's 180 ms was charged to the same budget, not added to a new one.
+    assert clock.now() == 0.18
+    assert len(observed.expirations) == 1
+    assert len(process.runs) == 1
+
+
+class RealClock:
+    """A monotonic clock that advances only when the code actually waits."""
+
+    def now(self) -> float:
+        return time.monotonic()
+
+
+class HeldStartupRunner(LinuxProcessRunner):
+    """The production runner with only command startup held open.
+
+    No process is created: ``_exec`` never returns, exactly like a command launch
+    that is stalled before the child exists. ``LinuxProcessRunner.run`` starts its
+    own timeout only after ``_exec`` returns, so this is the case the adapter's
+    real expiration has to cover.
+    """
+
+    def __init__(self, proc_root: Path) -> None:
+        super().__init__(proc_root)
+        self.entered = asyncio.Event()
+        self.interrupted = False
+
+    async def _exec(self, argv: Any, spec: Any, *, stdin: Any, stdout: Any, stderr: Any) -> Any:
+        self.entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            self.interrupted = True
+
+
+async def test_wait_for_bounds_a_held_command_startup(tmp_path: Path):
+    """A startup that never completes cannot outlive the operation deadline."""
+    runner = HeldStartupRunner(tmp_path)
+    clock = RealClock()
+    observed = KScreenObserver(runner, clock, FakeScheduler(FakeClock()))
+    task = asyncio.create_task(
+        observed.wait_for(lambda outputs: False, clock.now() + 0.02),
+    )
+    await asyncio.wait_for(runner.entered.wait(), timeout=1.0)
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert runner.interrupted is True
+
+
+async def test_wait_for_does_not_extend_its_deadline_after_a_slow_read():
+    """A read that obeys its own budget must not add a second full interval."""
+
+    class SlowRead(FakeProcess):
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            self.runs.append((spec, timeout))
+            assert timeout >= 0.18
+            await asyncio.sleep(0.18)
+            return command_output(fixture(BASELINE))
+
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    observed = KScreenObserver(SlowRead(), clock, scheduler)
+    started = time.monotonic()
+    result = await asyncio.wait_for(
+        observed.wait_for(lambda outputs: False, 0.20), timeout=1.0,
+    )
+    elapsed = time.monotonic() - started
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert elapsed < 0.30, f"a 200 ms deadline took {elapsed:.3f}s"
+    assert scheduler.pending() == ()
+
+
+async def test_snapshot_bounds_a_held_command_startup(tmp_path: Path):
+    """Every read is bounded from before its command starts, not afterwards."""
+    runner = HeldStartupRunner(tmp_path)
+    observed = KScreenObserver(
+        runner, RealClock(), FakeScheduler(FakeClock()), timeout=0.02,
+    )
+    result = await asyncio.wait_for(observed.snapshot(), timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert runner.interrupted is True
+
+
+async def test_configure_bounds_a_held_apply_command():
+    """The configuration command is bounded from before its startup too."""
+    entered = asyncio.Event()
+
+    class HeldApply(FakeProcess):
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            self.runs.append((spec, timeout))
+            if spec.argv[1:] == ("-j",):
+                return command_output(fixture(BASELINE))
+            entered.set()
+            await asyncio.Event().wait()
+
+    process = HeldApply()
+    observed, _fake, _clock, _scheduler = observer(process, timeout=0.02)
+    task = asyncio.create_task(observed.configure("1", {"scale": 2}))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert [spec.argv[1:] for spec, _timeout in process.runs] == [("-j",), ("output.1.scale.2",)]
 
 
 # --------------------------------------------------------------------------- subscriptions

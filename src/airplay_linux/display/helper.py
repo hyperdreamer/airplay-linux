@@ -334,7 +334,8 @@ class VirtualHelper:
         In production the scan reads procfs; a test double that exposes an
         environment table (the deterministic stand-in for procfs) is read through
         it. Each candidate is re-checked through ``identity`` and ``owned`` so a
-        recycled PID or a different runtime directory is never reported. A
+        recycled PID or a different runtime directory is never reported, and a
+        re-check that cannot prove ownership makes the whole scan incomplete. A
         ``complete=False`` result is cleanup uncertainty, never "nothing there".
         """
         if not _valid_owner(owner_uuid) or not _valid_runtime_directory(runtime_directory):
@@ -392,6 +393,16 @@ class VirtualHelper:
                 continue
             if self._process.owned(identity, owner_uuid, runtime_directory):
                 matches.append(identity)
+            else:
+                # ``ProcessPort.owned`` is a boolean, so it collapses an
+                # unreadable ownership recheck into "not owned". This identity
+                # was an exact match for the complete scan a moment ago, and a
+                # running process cannot lose its owner environment, so a failed
+                # recheck cannot prove non-ownership: it is uncertainty. Reporting
+                # a complete empty scan here would authorise a second helper for
+                # the same reservation, so the scan stays incomplete and the
+                # caller keeps the retry remedy.
+                complete = False
         return OwnedProcessScan(
             matches=tuple(sorted(set(matches), key=lambda item: (item.pid, item.start_ticks))),
             complete=complete,
