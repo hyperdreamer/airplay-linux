@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +35,7 @@ from airplay_linux.domain.resources import (
     Size,
     VirtualOutputSource,
 )
+from airplay_linux.process import OwnedProcessScan
 
 from .locking import CreationLock
 
@@ -73,6 +74,8 @@ class _Creation:
     record: OwnershipRecord | None = None
     helper: ProcessIdentity | None = None
     output: OutputInfo | None = None
+    launch_attempted: bool = False
+    cleanup_complete: bool = False
     fenced: bool = False
 
 
@@ -166,9 +169,16 @@ class DisplayCreator:
         lock: CreationLock | None = None,
         ids: IdFactory | None = None,
         activity: ActivitySink | None = None,
+        output_verifier: Callable[
+            [OwnerId, str, ProcessIdentity, OutputInfo], Awaitable[Result[None]]
+        ] | None = None,
     ) -> None:
         self._helper = helper
         self._observer = observer
+        # The documented helper/observer contract has no process-to-output
+        # evidence. A provider must supply a supported association authority;
+        # without one, even a new same-size output cannot be published.
+        self._output_verifier = output_verifier
         self._ownership = ownership_store if ownership_store is not None else ownership
         self._creation_lock = creation_lock if creation_lock is not None else lock
         self._runtime_directory = str(runtime_directory) if runtime_directory is not None else ""
@@ -239,10 +249,21 @@ class DisplayCreator:
             return await asyncio.shield(transaction)
         except asyncio.CancelledError:
             state.fenced = True
-            # The shielded transaction observes this fence at its next boundary
-            # and completes removal independently of the cancelled caller.
+            # Admission runs independently of a held launch/observation and of
+            # the provider lock. Repeated cancellation cannot bypass durability.
+            admission = asyncio.create_task(self._mark_removing(state))
+            self._background.add(admission)
+            admission.add_done_callback(self._discard_background)
+            while True:
+                try:
+                    admitted = await asyncio.shield(admission)
+                    break
+                except asyncio.CancelledError:
+                    continue
             if transaction.done():
                 self._schedule_cancelled_result_cleanup(state, transaction)
+            if isinstance(admitted, Err):
+                return admitted
             raise
 
     def _discard_background(self, task: asyncio.Task) -> None:
@@ -352,6 +373,7 @@ class DisplayCreator:
                 if self._is_fenced(state):
                     return await self._finish_failure(state, _failure(ErrorCode.stale_event, state.receiver_id))
 
+                state.launch_attempted = True
                 launch_result = await self._helper.launch(
                     state.owner_uuid, self._runtime_directory, state.size,
                 )
@@ -378,11 +400,14 @@ class DisplayCreator:
                     return await self._finish_failure(state, _failure(ErrorCode.stale_event, state.receiver_id))
 
                 observed_result = await self._observe_new_output(
-                    baseline_outputs, state.size,
+                    baseline_outputs, state.size, baseline,
                 )
                 if isinstance(observed_result, Err):
                     return await self._finish_failure(state, observed_result)
                 selected = observed_result.value
+                verified = await self._verify_output(state, selected)
+                if isinstance(verified, Err):
+                    return await self._finish_failure(state, verified)
                 state.output = selected
                 observed_record = replace(
                     record,
@@ -416,6 +441,13 @@ class DisplayCreator:
                     ("position", {"position": "0,0"}, {"x": 0, "y": 0, "position": "0,0"}),
                 )
                 for step, values, applied_values in configuration_steps:
+                    if self._is_fenced(state):
+                        return await self._finish_failure(
+                            state, _failure(ErrorCode.stale_event, state.receiver_id),
+                        )
+                    verified = await self._verify_output(state, selected)
+                    if isinstance(verified, Err):
+                        return await self._finish_failure(state, verified)
                     if self._is_fenced(state):
                         return await self._finish_failure(
                             state, _failure(ErrorCode.stale_event, state.receiver_id),
@@ -457,6 +489,9 @@ class DisplayCreator:
                         state, _failure(ErrorCode.stale_event, state.receiver_id),
                     )
 
+                verified = await self._verify_output(state, selected)
+                if isinstance(verified, Err):
+                    return await self._finish_failure(state, verified)
                 published = await self._publish(state, record)
                 if isinstance(published, Err):
                     return await self._finish_failure(state, published)
@@ -530,6 +565,8 @@ class DisplayCreator:
         try:
             async with self._journal(record.owner_uuid):
                 if not allow_removing and record.desired_state == "active":
+                    if self._is_fenced(state):
+                        return _failure(ErrorCode.stale_event, state.receiver_id)
                     current_result = await self._ownership.all()
                     if isinstance(current_result, Err):
                         return current_result
@@ -545,6 +582,8 @@ class DisplayCreator:
                     ):
                         state.fenced = True
                         self._removing_owners.add(record.owner_uuid)
+                        return _failure(ErrorCode.stale_event, state.receiver_id)
+                    if self._is_fenced(state):
                         return _failure(ErrorCode.stale_event, state.receiver_id)
                 result = await self._ownership.write(record)
         except Exception:
@@ -575,6 +614,11 @@ class DisplayCreator:
                 return _failure(ErrorCode.stale_event, state.receiver_id)
             if self._is_fenced(state):
                 return _failure(ErrorCode.stale_event, state.receiver_id)
+            if state.output is None:
+                return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+            verified = await self._verify_output(state, state.output)
+            if isinstance(verified, Err):
+                return verified
             published = replace(
                 current or record,
                 desired_state="active",
@@ -587,10 +631,57 @@ class DisplayCreator:
             state.record = published
             if self._is_fenced(state):
                 return _failure(ErrorCode.stale_event, state.receiver_id)
+            verified = await self._verify_output(state, state.output)
+            if isinstance(verified, Err):
+                return verified
             return Ok(value=published)
 
+    @staticmethod
+    def _absent_from_baseline(candidate: OutputInfo, baseline: LayoutSnapshot) -> bool:
+        return candidate.connector not in baseline.outputs and all(
+            properties.get("id") != candidate.output_id
+            for properties in baseline.outputs.values()
+        )
+
+    def _owned_scan(self, state: _Creation) -> OwnedProcessScan:
+        scan = getattr(self._helper, "owned_scan", None)
+        if not callable(scan) or state.owner_uuid is None:
+            return OwnedProcessScan(matches=(), complete=False)
+        try:
+            result = scan(state.owner_uuid, self._runtime_directory)
+        except Exception:
+            return OwnedProcessScan(matches=(), complete=False)
+        if type(result) is not OwnedProcessScan:
+            return OwnedProcessScan(matches=(), complete=False)
+        return result
+
+    async def _verify_output(self, state: _Creation, candidate: OutputInfo) -> Result[None]:
+        if self._is_fenced(state):
+            return _failure(ErrorCode.stale_event, state.receiver_id)
+        if state.record is None or not self._absent_from_baseline(candidate, state.record.baseline):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        scan = self._owned_scan(state)
+        if state.helper is None or not scan.complete or scan.matches != (state.helper,):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if self._output_verifier is None:
+            return _failure(ErrorCode.unsupported_operation, state.receiver_id)
+        try:
+            result = await self._output_verifier(
+                state.owner_uuid, self._runtime_directory, state.helper, candidate,
+            )
+        except Exception:
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        # Recheck after the authority's await: PID reuse or removal admission
+        # during verification cannot authorise a configuration/publication.
+        scan = self._owned_scan(state)
+        if self._is_fenced(state) or not scan.complete or scan.matches != (state.helper,):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if type(result) is not Ok or result.value is not None:
+            return result if isinstance(result, Err) else _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        return Ok(value=None)
+
     async def _observe_new_output(
-        self, baseline: tuple[OutputInfo, ...], size: Size,
+        self, baseline: tuple[OutputInfo, ...], size: Size, complete_baseline: LayoutSnapshot,
     ) -> Result[OutputInfo]:
         deadline = self._clock.now() + CREATION_TIMEOUT
         try:
@@ -609,6 +700,8 @@ class DisplayCreator:
         selected = select_new_output(baseline, current_result.value, size)
         if isinstance(selected, Err):
             return selected
+        if not self._absent_from_baseline(selected.value, complete_baseline):
+            return _failure(ErrorCode.ownership_mismatch)
         return selected
 
     @staticmethod
@@ -637,66 +730,138 @@ class DisplayCreator:
             return cleanup
         return failure
 
-    async def _cleanup(self, state: _Creation) -> Result[None]:
+    async def _mark_removing(self, state: _Creation) -> Result[None]:
         owner_uuid = state.owner_uuid
-        record = state.record
-        if owner_uuid is None or record is None:
+        state.fenced = True
+        if owner_uuid is None:
+            # No reservation exists; the transaction checks the fence before
+            # reserving or crossing the launch boundary.
             return Ok(value=None)
         self._removing_owners.add(owner_uuid)
-        state.fenced = True
-        removing = replace(
-            record,
-            desired_state="removing",
-            stage="removing",
-            helper=record.helper or state.helper,
-            connector=record.connector or (state.output.connector if state.output is not None else None),
-            output_id=record.output_id or (state.output.output_id if state.output is not None else None),
-            observed_size=record.observed_size or (state.output.size if state.output is not None else None),
-            last_configuration_step="removing",
-        )
-        written = await self._persist(state, removing, allow_removing=True)
+        try:
+            async with self._journal(owner_uuid):
+                if state.cleanup_complete:
+                    return Ok(value=None)
+                records = await self._ownership.all()
+                if isinstance(records, Err):
+                    return records
+                current = next((r for r in records.value if r.owner_uuid == owner_uuid), None)
+                record = current or state.record
+                if record is None:
+                    return _failure(ErrorCode.persistence_failed, state.receiver_id)
+                removing = replace(
+                    record,
+                    desired_state="removing",
+                    stage="removing",
+                    helper=state.helper or record.helper,
+                    connector=state.output.connector if state.output is not None else record.connector,
+                    output_id=state.output.output_id if state.output is not None else record.output_id,
+                    observed_size=state.output.size if state.output is not None else record.observed_size,
+                    last_configuration_step="removing",
+                )
+                written = await self._ownership.write(removing)
+                if isinstance(written, Err):
+                    return written
+                state.record = removing
+        except Exception:
+            return _failure(ErrorCode.persistence_failed, state.receiver_id)
+        self._emit_progress(state, removing)
+        return Ok(value=None)
+
+    async def _cleanup(self, state: _Creation) -> Result[None]:
+        owner_uuid = state.owner_uuid
+        if owner_uuid is None or state.record is None:
+            return Ok(value=None)
+        written = await self._mark_removing(state)
         if isinstance(written, Err):
             return written
-        self._emit_progress(state, removing)
+        if state.cleanup_complete:
+            return Ok(value=None)
 
-        if state.helper is not None:
+        if state.launch_attempted:
+            scan = self._owned_scan(state)
+            identities = (state.helper,) if state.helper is not None else scan.matches
+            if not identities:
+                # A failed launch may have spawned an unprovable child. Even a
+                # scan with no owned matches cannot certify that child absent.
+                return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
+            if state.helper is None:
+                if not scan.complete or len(identities) != 1:
+                    return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
+                state.helper = identities[0]
+                written = await self._mark_removing(state)
+                if isinstance(written, Err):
+                    return written
             stop = getattr(self._helper, "stop", None)
             if not callable(stop):
                 return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
-            try:
-                stopped = await stop(
-                    state.helper,
-                    owner_uuid,
-                    self._runtime_directory,
-                    HELPER_STOP_TIMEOUT,
-                )
-            except Exception:
-                return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
-            if isinstance(stopped, Err):
-                return stopped
+            for identity in identities:
+                try:
+                    stopped = await stop(
+                        identity, owner_uuid, self._runtime_directory, HELPER_STOP_TIMEOUT,
+                    )
+                except Exception:
+                    return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
+                if isinstance(stopped, Err):
+                    return stopped
+            scan = self._owned_scan(state)
+            if not scan.complete or scan.matches:
+                return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
 
-        if state.output is not None:
+            # Stop is process evidence only. Wait even if observation or the
+            # helper_started journal failed before an output identity was saved.
+            baseline = state.record.baseline
+            if state.output is not None:
+                predicate = lambda outputs: not self._contains_output(outputs, state.output)
+            else:
+                predicate = lambda outputs: type(outputs) is tuple and all(
+                    type(item) is OutputInfo
+                    and item.connector in baseline.outputs
+                    and baseline.outputs[item.connector].get("id") == item.output_id
+                    for item in outputs
+                )
             try:
                 disappeared = await self._observer.wait_for(
-                    lambda outputs: not self._contains_output(outputs, state.output),
-                    self._clock.now() + HELPER_STOP_TIMEOUT,
+                    predicate, self._clock.now() + HELPER_STOP_TIMEOUT,
                 )
             except Exception:
                 return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
             if isinstance(disappeared, Err):
                 return disappeared
-            if type(disappeared.value) is not tuple:
+            # outputs() omits unknown geometry; only the complete snapshot can
+            # prove no unobserved output or reused identity remains.
+            current = await self._observer.snapshot()
+            if isinstance(current, Err) or type(current.value) is not LayoutSnapshot:
                 return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
-            for item in disappeared.value:
-                if type(item) is not OutputInfo:
-                    return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
-                if item.output_id == state.output.output_id or item.connector == state.output.connector:
+            if state.output is not None:
+                if state.output.connector in current.value.outputs or any(
+                    p.get("id") == state.output.output_id for p in current.value.outputs.values()
+                ):
                     return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+            elif not self._only_baseline_identities(current.value, baseline):
+                return _failure(ErrorCode.cleanup_timeout, state.receiver_id)
         try:
-            deleted = await self._ownership.delete(owner_uuid)
+            async with self._journal(owner_uuid):
+                # Observation and journal admission can suspend. Process
+                # absence must still hold at the evidence deletion boundary.
+                if state.launch_attempted:
+                    scan = self._owned_scan(state)
+                    if not scan.complete or scan.matches:
+                        return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+                deleted = await self._ownership.delete(owner_uuid)
+                if isinstance(deleted, Ok):
+                    state.cleanup_complete = True
+                return deleted
         except Exception:
             return _failure(ErrorCode.persistence_failed, state.receiver_id)
-        return deleted
+
+    @staticmethod
+    def _only_baseline_identities(current: LayoutSnapshot, baseline: LayoutSnapshot) -> bool:
+        return all(
+            connector in baseline.outputs
+            and properties.get("id") == baseline.outputs[connector].get("id")
+            for connector, properties in current.outputs.items()
+        )
 
     @staticmethod
     def _contains_output(outputs: object, expected: OutputInfo) -> bool:

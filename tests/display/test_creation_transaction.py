@@ -20,6 +20,7 @@ from airplay_linux.domain.operations import (
 )
 from airplay_linux.domain.records import LayoutSnapshot
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Size
+from airplay_linux.process import OwnedProcessScan
 from airplay_linux.testing.adapters import MemoryActivity, MemoryOwnershipStore
 from airplay_linux.testing.time import FakeClock, FakeScheduler
 
@@ -77,6 +78,22 @@ class ImmediateHelper:
         self.stopped: list[ProcessIdentity] = []
         self.create_output = True
         self._next_pid = 7000
+        self.resources = {}
+
+    def owned_scan(self, owner_uuid, runtime_directory):
+        return OwnedProcessScan(
+            matches=tuple(identity for identity, (owner, runtime, _) in self.resources.items()
+                          if owner == owner_uuid and runtime == runtime_directory),
+            complete=True,
+        )
+
+    async def verify_output(self, owner_uuid, runtime_directory, identity, candidate):
+        resource = self.resources.get(identity)
+        if resource is None or resource[:2] != (owner_uuid, runtime_directory) or resource[2] != (
+            candidate.output_id, candidate.connector,
+        ):
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        return Ok(value=None)
 
     async def probe(self):
         from airplay_linux.display.helper import HelperFeatures
@@ -93,13 +110,20 @@ class ImmediateHelper:
         self._next_pid += 1
         identity = ProcessIdentity(pid=self._next_pid, start_ticks=identity_ticks(self._next_pid))
         self.launched.append((owner_uuid, runtime_directory, size))
+        connector = f"Virtual-{self._next_pid % 1000}"
+        resource = (str(identity.pid), connector) if self.create_output else None
+        self.resources[identity] = (owner_uuid, runtime_directory, resource)
         if self.create_output:
             self.observer.current = self.observer.current + (
-                output(str(self._next_pid), f"Virtual-{self._next_pid % 1000}"),
+                output(str(self._next_pid), connector),
             )
         return Ok(value=identity)
 
     async def stop(self, identity, owner_uuid, runtime_directory: str, deadline: float):
+        resource = self.resources.get(identity)
+        if resource is None or resource[:2] != (owner_uuid, runtime_directory):
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        self.resources.pop(identity)
         self.stopped.append(identity)
         self.observer.current = tuple(
             item for item in self.observer.current if item.output_id != str(identity.pid)
@@ -123,6 +147,9 @@ class LateHelper(ImmediateHelper):
         self.launched.append((owner_uuid, runtime_directory, size))
         self.started.set()
         await asyncio.shield(self.completion)
+        self.resources[identity] = (
+            owner_uuid, runtime_directory, (str(identity.pid), f"Virtual-{self._next_pid % 1000}"),
+        )
         self.observer.current = self.observer.current + (
             output(str(self._next_pid), f"Virtual-{self._next_pid % 1000}"),
         )
@@ -164,7 +191,7 @@ class Observer:
 
     async def snapshot(self):
         self.snapshot_calls += 1
-        return Ok(value=snapshot(self.baseline))
+        return Ok(value=snapshot(self.current))
 
     async def outputs(self):
         return Ok(value=self.current)
@@ -255,6 +282,7 @@ def make_creator(tmp_path: Path, observer, helper, store=None, activity=None) ->
         scheduler=scheduler,
         id_factory=__import__("airplay_linux.testing.adapters", fromlist=["SequenceIds"]).SequenceIds(500),
         activity_sink=activity or MemoryActivity(),
+        output_verifier=getattr(helper, "verify_output", None),
     )
 
 
