@@ -9,12 +9,14 @@ here starts a real helper or reads a real process environment.
 from __future__ import annotations
 
 import os
+import signal
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 import pytest
 
+import airplay_linux.process.linux as linux
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.display.helper import (
     HelperFeatures,
@@ -23,9 +25,10 @@ from airplay_linux.display.helper import (
 from airplay_linux.domain.operations import ProcessIdentity
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Size
-from airplay_linux.process.procfs import (
+from airplay_linux.process import (
     OWNER_TOKEN_ENV,
     RUNTIME_DIRECTORY_ENV,
+    LinuxProcessRunner,
     owner_evidence,
     read_identity,
 )
@@ -268,6 +271,82 @@ async def test_launch_refuses_an_identity_it_cannot_prove_is_owned():
     # Cleanup was attempted through the ownership-checked terminate boundary, which
     # refused to signal anything it could not prove.
     assert process.terminated == []
+
+
+async def test_launch_cleanup_passes_a_relative_duration_not_a_clock_reading():
+    class UntrustingProcess(FakeProcess):
+        def owned(
+            self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
+        ) -> bool:
+            return False
+
+    process = UntrustingProcess()
+    helper = await probed(process, FakeClock(start=1000))
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err)
+    (terminated,) = process.journal.calls("process.terminate")
+    # The port's contract is "seconds to wait", so a machine whose clock reads
+    # 1000 still asks for the five-second helper bound, never 1005.
+    assert terminated["deadline"] == 5.0
+
+
+async def test_launch_cleanup_hands_the_production_runner_a_relative_duration(
+    tmp_path: Path,
+):
+    process = RecordingRunner(tmp_path)
+    helper = VirtualHelper(process, FakeClock(start=1000), proc_root=tmp_path)
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.ownership_mismatch
+    assert process.signals == [signal.SIGTERM]
+    # The real runner's exit wait is bounded by the duration the display adapter
+    # computed, not by the absolute value of the injected clock.
+    assert process.waits == [5.0]
+
+
+async def test_launch_refuses_an_incomplete_procfs_scan(tmp_path: Path):
+    broken = tmp_path / "6000"
+    broken.mkdir()
+    (broken / "stat").write_text("this is not a procfs stat line\n")
+    (broken / "environ").write_bytes(b"")
+    process = SyntheticProcfsProcess(tmp_path)
+    process.script_profile()
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    assert helper.owned_scan(OWNER, RUNTIME).complete is False
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.helper_failed
+    assert process.spawned == []
+
+
+async def test_launch_proceeds_when_the_procfs_scan_is_complete(tmp_path: Path):
+    process = SyntheticProcfsProcess(tmp_path)
+    process.script_profile()
+    helper = VirtualHelper(process, FakeClock(), proc_root=tmp_path)
+    assert helper.owned_scan(OWNER, RUNTIME).complete is True
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Ok)
+    assert len(process.spawned) == 1
+
+
+async def test_launch_refuses_an_incomplete_simulated_environment_scan():
+    class UnreadableIdentityProcess(FakeProcess):
+        """One listed process whose exact identity cannot be read."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.register(ProcessIdentity(pid=6000, start_ticks=1), {})
+
+        def identity(self, pid: int) -> ProcessIdentity | None:
+            return None
+
+    process = UnreadableIdentityProcess()
+    helper = await probed(process)
+    assert helper.owned_scan(OWNER, RUNTIME).complete is False
+    result = await helper.launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.helper_failed
+    assert process.spawned == []
 
 
 # --------------------------------------------------------------------------- find_owned
@@ -514,3 +593,94 @@ async def test_stop_never_reports_an_unreadable_procfs_entry_as_released(tmp_pat
     result = await helper.stop(ProcessIdentity(pid=6000, start_ticks=10), OWNER, RUNTIME, 5.0)
     assert isinstance(result, Err)
     assert result.error.code == ErrorCode.ownership_mismatch
+
+
+class SyntheticProcfsProcess:
+    """Scripted commands plus the production procfs ownership evidence.
+
+    ``run`` is served by a nested scripted double so the helper profile can be
+    scripted, and ``spawn`` records the request and materialises the new helper
+    under the synthetic ``/proc``, so the production identity and owner checks
+    decide whether the launch is confirmed. Nothing is executed or signalled.
+    """
+
+    def __init__(self, proc_root: Path) -> None:
+        self._proc_root = proc_root
+        self._scripted = FakeProcess()
+        self.spawned: list[Any] = []
+
+    def script_profile(self) -> None:
+        """Queue the documented help output and version banner for ``probe``."""
+        self._scripted.queue_result("run", help_result())
+        self._scripted.queue_result("run", version_result())
+
+    async def run(self, spec: Any, timeout: float, stdin: bytes | None = None) -> Any:
+        return await self._scripted.run(spec, timeout, stdin)
+
+    async def spawn(self, spec: Any) -> Any:
+        self.spawned.append(spec)
+        pid = 7000 + len(self.spawned)
+        identity = ProcessIdentity(pid=pid, start_ticks=500 + pid)
+        entry(
+            self._proc_root,
+            pid,
+            start_ticks=identity.start_ticks,
+            environment=dict(spec.env),
+        )
+        return Ok(value=identity)
+
+    def identity(self, pid: int) -> ProcessIdentity | None:
+        return read_identity(pid, self._proc_root)
+
+    def owned(self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str) -> bool:
+        return owner_evidence(
+            identity, owner_uuid, runtime_directory, self._proc_root, os.getuid(),
+        )
+
+    async def terminate(self, *args: Any) -> Any:
+        raise AssertionError("a launch refused for uncertain ownership signals nothing")
+
+
+class RecordingRunner(LinuxProcessRunner):
+    """The production runner with spawn, classification, and exit-wait instrumented.
+
+    No process is created and no signal is delivered: ``spawn`` is scripted,
+    ``_deliver`` records the signal instead of sending it, and ``_await_exit``
+    records the duration it was given and reports the exit. Everything around
+    those seams -- including the units of the termination budget -- is the
+    production code path.
+    """
+
+    IDENTITY = ProcessIdentity(pid=7000, start_ticks=700)
+
+    def __init__(self, proc_root: Path) -> None:
+        super().__init__(proc_root)
+        self.signals: list[int] = []
+        self.waits: list[float] = []
+
+    async def run(self, spec: Any, timeout: float, stdin: bytes | None = None) -> Any:
+        stdout = HELP if spec.argv[1] == "--help" else VERSION
+        return output(stdout=stdout.encode("utf-8"))
+
+    async def spawn(self, spec: Any) -> Any:
+        return Ok(value=self.IDENTITY)
+
+    def _classify(
+        self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
+    ) -> str:
+        return linux._OWNED
+
+    @staticmethod
+    def _open_pidfd(pid: int) -> None:
+        return None
+
+    def _deliver(
+        self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
+        pidfd: int | None, signum: int,
+    ) -> str:
+        self.signals.append(signum)
+        return linux._OWNED
+
+    async def _await_exit(self, identity: Any, pidfd: Any, child: Any, timeout: float) -> bool:
+        self.waits.append(timeout)
+        return True

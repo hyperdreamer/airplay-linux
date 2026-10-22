@@ -237,6 +237,9 @@ class VirtualHelper:
 
         The helper is refused unless its documented profile probed successfully
         and this reservation does not already have a live owned helper. The
+        ownership scan is consulted inside the launch lock together with its
+        completeness: a scan that could not inspect every candidate is
+        uncertainty, and uncertainty never authorises a second helper. The
         post-spawn identity is verified again before it is handed out; a child
         that cannot be proven is failed and cleanup is attempted through the
         ownership-checked termination boundary.
@@ -251,7 +254,15 @@ class VirtualHelper:
         if isinstance(probed, Err):
             return probed
         async with self._launch_lock:
-            if self.find_owned(owner_uuid, runtime_directory):
+            scan = self.owned_scan(owner_uuid, runtime_directory)
+            if scan.matches:
+                return _failure(ErrorCode.helper_failed)
+            if not scan.complete:
+                # An unreadable procfs entry can hide an earlier helper for this
+                # reservation, so an empty match list is not proof that nothing
+                # remains. Creating another helper now would break
+                # one-helper-per-reservation while ownership is unknown; retrying
+                # the scan is the remedy the caller is offered.
                 return _failure(ErrorCode.helper_failed)
             spec = CommandSpec(
                 argv=(self._command, "--resolution", f"{size.width}x{size.height}"),
@@ -273,6 +284,18 @@ class VirtualHelper:
                 return _failure(ErrorCode.ownership_mismatch)
             return Ok(value=identity)
 
+    def _remaining(self, deadline: float) -> float:
+        """The duration left before ``deadline``, in the port's relative units.
+
+        :meth:`~airplay_linux.domain.ports.ProcessPort.terminate` takes a
+        *relative* duration (how long to wait for the exit), never an absolute
+        clock reading, so an absolute deadline has to be converted at this
+        boundary. Passing the reading itself would ask the runner to wait until
+        that clock value -- on a machine whose uptime exceeds the bound, longer
+        than any operation should run.
+        """
+        return max(0.0, float(deadline) - self._clock.now())
+
     async def _terminate_quietly(
         self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
     ) -> None:
@@ -282,8 +305,9 @@ class VirtualHelper:
         stays the caller's durable ``CleanupRequired`` evidence, not a success.
         """
         deadline = self._clock.now() + self._timeout
+        budget = self._remaining(deadline)
         try:
-            await self._process.terminate(identity, owner_uuid, runtime_directory, deadline)
+            await self._process.terminate(identity, owner_uuid, runtime_directory, budget)
         except Exception:  # noqa: BLE001 - the caller already reports the launch failure
             return
 
@@ -397,7 +421,9 @@ class VirtualHelper:
         A wrong owner, runtime directory, PID, or start time is
         ``ownership_mismatch`` and no signal is sent. An identity whose PID no
         longer exists cannot be the recorded instance any more, so its release is
-        already confirmed. The actual signal is delegated to the process port's
+        already confirmed. ``deadline`` is a relative duration of seconds, which
+        is what :meth:`~airplay_linux.domain.ports.ProcessPort.terminate`
+        contracts for. The actual signal is delegated to the process port's
         ownership-checked termination, which re-reads evidence before each signal.
         """
         if (

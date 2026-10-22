@@ -228,6 +228,71 @@ def test_preexisting_virtual_output_keeps_its_identity_in_the_baseline():
     assert set(snapshot.value.outputs) == {"DP-1", "Virtual-1", "Virtual-2"}
 
 
+@pytest.mark.parametrize("current_mode", [None, "bad-mode", "999"])
+def test_unknown_current_geometry_is_not_taken_from_advertised_modes(current_mode):
+    """An advertised or preferred mode is never evidence of the current size."""
+    raw = with_output(
+        fixture(BASELINE), "1", size={"width": 0, "height": 0}, currentModeId=current_mode,
+    )
+    assert parse_outputs(raw) == ()
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    result = asyncio.run(observed.outputs())
+    assert isinstance(result, Ok) and result.value == ()
+
+
+def test_current_geometry_comes_from_the_exact_current_mode_id():
+    raw = with_output(fixture(BASELINE), "1", size={"width": 0, "height": 0})
+    (monitor,) = parse_outputs(raw)
+    assert monitor.size == Size(width=1920, height=1080)
+
+
+def test_snapshot_keeps_identity_when_current_geometry_is_unknown():
+    raw = with_output(
+        fixture(BASELINE), "1", size={"width": 0, "height": 0}, currentModeId="999",
+    )
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    snapshot = asyncio.run(observed.snapshot())
+    assert isinstance(snapshot, Ok)
+    properties = snapshot.value.outputs["DP-1"]
+    assert properties["id"] == "1"
+    assert properties["enabled"] is True
+    assert properties["position"] == "0,0"
+    assert properties["scale"] == 1
+    assert "width" not in properties and "height" not in properties
+    assert "size" not in properties
+
+
+def test_duplicate_mode_ids_reject_the_whole_document():
+    raw = fixture(BASELINE)
+    duplicate = json.loads(json.dumps(raw["outputs"][0]["modes"][0]))
+    duplicate["size"] = {"width": 1280, "height": 720}
+    raw["outputs"][0]["modes"].append(duplicate)
+    with pytest.raises(KScreenParseError):
+        parse_outputs(raw)
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    result = asyncio.run(observed.outputs())
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
+@pytest.mark.parametrize("field", ["scale", "refreshRate"])
+def test_malformed_numeric_backend_fields_return_a_typed_failure(field):
+    """A JSON number the runtime cannot convert never escapes as an exception."""
+    raw = fixture(BASELINE)
+    if field == "scale":
+        raw["outputs"][0]["scale"] = 10**400
+    else:
+        raw["outputs"][0]["modes"][0]["refreshRate"] = 10**400
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    result = asyncio.run(observed.outputs())
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
 # --------------------------------------------------------------------------- snapshot
 
 
@@ -425,6 +490,7 @@ def test_configure_rejects_argv_injection_and_malformed_values():
         {"position": "1,2,3"},
         {"scale": float("nan")},
         {"scale": "not-a-scale"},
+        {"scale": 10**400},
     ):
         result = asyncio.run(observed.configure("1", values))
         assert isinstance(result, Err), values
@@ -487,14 +553,123 @@ def test_configure_rejects_conflicting_mode_and_size():
     assert result.error.code == ErrorCode.invalid_input
 
 
+def test_configure_cannot_select_a_mode_with_an_invalid_id():
+    """A mode entry KScreen cannot name is dropped, never given an invented id."""
+    raw = fixture(BASELINE)
+    raw["outputs"][0]["modes"].append(
+        {"id": None, "size": {"width": 2560, "height": 1440}, "refreshRate": 60},
+    )
+    for values in ({"size": "2560x1440"}, {"mode": "999"}):
+        observed, fake, _clock, _scheduler = observer()
+        fake.queue_result("run", command_output(raw))
+        result = asyncio.run(observed.configure("1", values))
+        assert isinstance(result, Err), values
+        assert result.error.code == ErrorCode.unsupported_mode, values
+        assert len(fake.runs) == 1, values
+
+
+def test_configure_cannot_select_a_mode_with_an_invalid_size():
+    """A mode whose size is unusable is not repaired into a selectable mode."""
+    raw = {
+        "outputs": [
+            {
+                "id": 2,
+                "name": "Virtual-9",
+                "enabled": True,
+                "pos": {"x": 0, "y": 0},
+                "scale": 1,
+                "size": {"width": 1280, "height": 720},
+                "currentModeId": "71",
+                "modes": [
+                    {"id": "71", "size": {"width": 1280, "height": 720}, "refreshRate": 60},
+                    {"id": "72", "size": {"width": 0, "height": 1080}, "refreshRate": 60},
+                ],
+            },
+        ],
+    }
+    for values in ({"size": "1920x1080"}, {"mode": "72"}):
+        observed, fake, _clock, _scheduler = observer()
+        fake.queue_result("run", command_output(raw))
+        result = asyncio.run(observed.configure("2", values))
+        assert isinstance(result, Err), values
+        assert result.error.code == ErrorCode.unsupported_mode, values
+        assert len(fake.runs) == 1, values
+
+
+def test_configure_readback_rejects_a_reused_id_with_a_different_connector():
+    raw = fixture(BASELINE)
+    replaced = with_output(raw, "1", name="Virtual-unrelated", pos={"x": 1920, "y": 0})
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    fake.queue_result("run", Ok(value=CommandOutput(exit_code=0, stdout=b"", stderr=b"")))
+    fake.queue_result("run", command_output(replaced))
+    result = asyncio.run(observed.configure("1", {"position": "1920,0"}))
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
+def test_configure_readback_rejects_wrong_dimensions_despite_the_same_mode_id():
+    raw = fixture(BASELINE)
+    resized = fixture(BASELINE)
+    resized["outputs"][0]["size"] = {"width": 1280, "height": 720}
+    resized["outputs"][0]["modes"][0]["size"] = {"width": 1280, "height": 720}
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(raw))
+    fake.queue_result("run", Ok(value=CommandOutput(exit_code=0, stdout=b"", stderr=b"")))
+    fake.queue_result("run", command_output(resized))
+    result = asyncio.run(observed.configure("1", {"size": "1920x1080"}))
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
+def test_readback_must_report_the_requested_mode():
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    fake.queue_result("run", Ok(value=CommandOutput(exit_code=0, stdout=b"", stderr=b"")))
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    result = asyncio.run(observed.configure("1", {"mode": "35"}))
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
+def test_readback_must_report_the_requested_enabled_state():
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    fake.queue_result("run", Ok(value=CommandOutput(exit_code=0, stdout=b"", stderr=b"")))
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    result = asyncio.run(observed.configure("1", {"enabled": False}))
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
+def test_readback_must_report_the_requested_scale():
+    observed, fake, _clock, _scheduler = observer()
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    fake.queue_result("run", Ok(value=CommandOutput(exit_code=0, stdout=b"", stderr=b"")))
+    fake.queue_result("run", command_output(fixture(BASELINE)))
+    result = asyncio.run(observed.configure("1", {"scale": 2}))
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.configuration_failed
+
+
 # --------------------------------------------------------------------------- waiting
 
 
 async def test_wait_for_returns_immediately_when_the_predicate_already_matches():
     observed, fake, clock, _scheduler = observer()
     fake.queue_result("run", command_output(fixture(TWO_VIRTUAL)))
-    result = await observed.wait_for(lambda outputs: len(outputs) == 3, clock.now() + 5)
+    seen: list[tuple[OutputInfo, ...]] = []
+
+    def predicate(outputs: tuple[OutputInfo, ...]) -> bool:
+        seen.append(outputs)
+        return len(outputs) == 3
+
+    result = await observed.wait_for(predicate, clock.now() + 5)
     assert isinstance(result, Ok) and len(result.value) == 3
+    assert all(isinstance(output, OutputInfo) for output in result.value)
+    # The predicate and the caller see projected outputs, never raw records.
+    assert seen[0] == result.value
+    assert {output.connector for output in result.value} == {"DP-1", "Virtual-1", "Virtual-2"}
     assert len(fake.runs) == 1
 
 
@@ -515,6 +690,30 @@ async def test_wait_for_polls_through_the_injected_scheduler():
     result = await asyncio.wait_for(task, timeout=2.0)
     assert isinstance(result, Ok) and len(result.value) == 3
     assert len(process.runs) == 2
+
+
+async def test_wait_for_publishes_a_change_it_discovers():
+    process = FakeProcess()
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    observed = KScreenObserver(process, clock, scheduler, poll_interval=0.25)
+    seen: list[tuple[OutputInfo, ...]] = []
+    subscription = observed.subscribe(seen.append)
+    process.queue_result("run", command_output(fixture(BASELINE)))
+    process.queue_result("run", command_output(fixture(TWO_VIRTUAL)))
+    task = asyncio.create_task(
+        observed.wait_for(lambda outputs: len(outputs) == 3, clock.now() + 5),
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert seen == []  # the first poll establishes the baseline silently
+    scheduler.advance(0.25)
+    result = await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(result, Ok)
+    assert [sorted(output.connector for output in event) for event in seen] == [
+        ["DP-1", "Virtual-1", "Virtual-2"],
+    ]
+    subscription.close()
 
 
 async def test_wait_for_times_out_without_claiming_an_output():
@@ -565,6 +764,106 @@ async def test_wait_for_survives_a_transient_read_error_until_the_output_appears
     scheduler.advance(0.25)
     result = await asyncio.wait_for(task, timeout=2.0)
     assert isinstance(result, Ok) and len(result.value) == 3
+
+
+class PollSignallingScheduler(FakeScheduler):
+    """A scheduler that reports when a poll tick was scheduled.
+
+    The wait never fires these ticks by itself, so a test controls whether the
+    injected clock and the scheduler advance at all.
+    """
+
+    def __init__(self, clock: FakeClock) -> None:
+        super().__init__(clock)
+        self.scheduled = asyncio.Event()
+
+    def call_at(self, when, callback):
+        handle = super().call_at(when, callback)
+        self.scheduled.set()
+        return handle
+
+
+async def test_wait_for_obeys_a_real_deadline_when_the_scheduler_never_fires():
+    """A frozen clock plus a scheduler that never fires still ends in a timeout.
+
+    The real-time fallback must be terminal. If it only wakes the loop, every
+    iteration installs another fallback and a 20 ms deadline can hang.
+    """
+    clock = FakeClock()
+    scheduler = PollSignallingScheduler(clock)
+    process = FakeProcess()
+    observed = KScreenObserver(process, clock, scheduler)
+    for _ in range(30):
+        process.queue_result("run", command_output(fixture(BASELINE)))
+    task = asyncio.create_task(observed.wait_for(lambda outputs: False, 0.02))
+    await asyncio.wait_for(scheduler.scheduled.wait(), timeout=1.0)
+    done, _pending = await asyncio.wait({task}, timeout=1.0)
+    if task not in done:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task in done, f"a 20 ms deadline was still pending; {len(process.runs)} reads"
+    result = task.result()
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert len(process.runs) == 1
+
+
+async def test_wait_for_rejects_a_match_observed_after_the_deadline():
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    clock = FakeClock()
+
+    class HeldRead(FakeProcess):
+        async def run(self, spec, timeout, stdin=None):
+            self.runs.append((spec, timeout))
+            entered.set()
+            await release.wait()
+            return command_output(fixture(BASELINE))
+
+    process = HeldRead()
+    observed = KScreenObserver(process, clock, FakeScheduler(clock))
+    task = asyncio.create_task(observed.wait_for(lambda outputs: True, 1.0))
+    await asyncio.wait_for(entered.wait(), timeout=1.0)
+    clock.advance(2)
+    release.set()
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+
+
+async def test_wait_for_does_not_start_a_read_at_the_deadline():
+    clock = FakeClock()
+    scheduler = PollSignallingScheduler(clock)
+    process = FakeProcess()
+    observed = KScreenObserver(process, clock, scheduler)
+    process.queue_result("run", command_output(fixture(BASELINE)))
+    process.queue_result("run", command_output(fixture(BASELINE)))
+    task = asyncio.create_task(observed.wait_for(lambda outputs: False, 1.0))
+    await asyncio.wait_for(scheduler.scheduled.wait(), timeout=1.0)
+    scheduler.advance(1)
+    result = await asyncio.wait_for(task, timeout=1.0)
+    assert isinstance(result, Err)
+    assert result.error.code == ErrorCode.cleanup_timeout
+    assert len(process.runs) == 1
+
+
+async def test_wait_for_bounds_each_read_by_the_remaining_budget():
+    process = FakeProcess()
+    clock = FakeClock()
+    scheduler = FakeScheduler(clock)
+    observed = KScreenObserver(process, clock, scheduler, poll_interval=0.25)
+    process.queue_result("run", command_output(fixture(BASELINE)))
+    process.queue_result("run", command_output(fixture(TWO_VIRTUAL)))
+    task = asyncio.create_task(
+        observed.wait_for(lambda outputs: len(outputs) == 3, clock.now() + 1.0),
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    scheduler.advance(0.25)
+    result = await asyncio.wait_for(task, timeout=2.0)
+    assert isinstance(result, Ok)
+    # The default 5 s control bound never outlives the operation deadline.
+    assert [timeout for _spec, timeout in process.runs] == [1.0, 0.75]
 
 
 # --------------------------------------------------------------------------- subscriptions

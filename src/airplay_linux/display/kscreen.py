@@ -7,19 +7,25 @@ shape this module:
 * A layout is *evidence*. It is parsed strictly: an output this adapter cannot
   address (no numeric KScreen id or no connector name) is never assigned an
   invented identity, a duplicate id or connector is refused as ambiguous, and a
-  reported size is the only geometry trusted. Missing geometry is not guessed;
-  such an output is simply not offered as a candidate, while the baseline still
-  records its existence by connector so a preexisting output can never look new.
+  reported size is the only geometry trusted. Current geometry comes from a
+  reported current size or the exact current mode id, never from a preferred or
+  merely advertised mode. Missing geometry is not guessed; such an output is
+  simply not offered as a candidate, while the baseline still records its
+  existence by connector so a preexisting output can never look new.
 * Configuration is an *atomic command followed by a readback*. The installed
   contract takes ``output.<id>.<setting>`` tokens, where the mode value is the
   numeric mode id KScreen reports, never a ``WIDTHxHEIGHT`` string. Every
-  requested value must be visible in the layout read afterwards; a command that
-  exits zero but changes nothing is a failure, not a success.
+  requested value must be visible in the layout read afterwards, for the same
+  connector and at the same resolution that was requested; a command that exits
+  zero but changes nothing -- or changes another output -- is a failure, not a
+  success.
 
 Polling is asynchronous and deadline-based through the injected
 :class:`~airplay_linux.domain.ports.Scheduler`; nothing here sleeps on the actor
-thread. Subscribers observe changes that a poll actually discovered, because the
-KScreen CLI has no push channel of its own.
+thread. The deadline bounds one operation: no read starts at or after it, each
+read is bounded by the budget that remains, and evidence that arrives after it is
+never accepted. Subscribers observe changes that a poll actually discovered,
+because the KScreen CLI has no push channel of its own.
 """
 
 from __future__ import annotations
@@ -181,11 +187,38 @@ def _position_value(value: object) -> tuple[int, int] | None:
     return (x, y)
 
 
-def _scale_value(value: object) -> float | None:
+def _finite_float(value: object) -> float | None:
+    """``value`` as a finite float, or ``None``; conversion never raises.
+
+    ``10**400`` is a syntactically valid JSON integer that the runtime cannot
+    represent, so conversion failure is treated as an unusable value rather than
+    allowed to escape the adapter as an ``OverflowError``.
+    """
     if type(value) is bool or type(value) not in (int, float):
         return None
-    number = float(value)
-    if not math.isfinite(number) or not 0.0 < number <= _MAX_SCALE:
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _document_number(value: object) -> float | None:
+    """A finite number from backend evidence, or ``None`` for a non-number.
+
+    A JSON *number* that is not a finite, representable value makes the document
+    unusable rather than merely one unreadable property: it is refused as a
+    typed parse error so the caller sees a failed read, not an exception.
+    """
+    number = _finite_float(value)
+    if number is None and type(value) in (int, float) and type(value) is not bool:
+        raise KScreenParseError("KScreen numeric value is not a finite number")
+    return number
+
+
+def _scale_value(value: object) -> float | None:
+    number = _document_number(value)
+    if number is None or not 0.0 < number <= _MAX_SCALE:
         return None
     return number
 
@@ -203,7 +236,8 @@ def _parse_modes(value: object) -> tuple[_Mode, ...]:
     A mode without a numeric id or with an invalid size cannot be named to the
     CLI, so it is dropped rather than repaired. A duplicate id is ambiguous and
     refuses the whole read: selecting either entry could configure a mode the
-    caller did not ask for.
+    caller did not ask for. A numeric field the runtime cannot represent refuses
+    the read for the same reason -- the document is not usable evidence.
     """
     if not isinstance(value, list):
         return ()
@@ -219,9 +253,14 @@ def _parse_modes(value: object) -> tuple[_Mode, ...]:
         if mode_id in seen:
             raise KScreenParseError("duplicate KScreen mode id")
         seen.add(mode_id)
-        refresh = entry.get("refreshRate")
-        refresh_rate = float(refresh) if type(refresh) in (int, float) else 0.0
-        modes.append(_Mode(mode_id=mode_id, size=size, refresh_rate=refresh_rate))
+        refresh_rate = _document_number(entry.get("refreshRate"))
+        modes.append(
+            _Mode(
+                mode_id=mode_id,
+                size=size,
+                refresh_rate=refresh_rate if refresh_rate is not None else 0.0,
+            ),
+        )
     return tuple(modes)
 
 
@@ -244,18 +283,22 @@ def _preferred_modes(value: object) -> tuple[str, ...]:
     return tuple(preferred)
 
 
-def _size_from_modes(
-    current_mode_id: str | None, preferred: tuple[str, ...], modes: tuple[_Mode, ...],
+def _current_mode_size(
+    current_mode_id: str | None, modes: tuple[_Mode, ...],
 ) -> Size | None:
-    if current_mode_id is not None:
-        for mode in modes:
-            if mode.mode_id == current_mode_id:
-                return mode.size
-    for mode_id in preferred:
-        for mode in modes:
-            if mode.mode_id == mode_id:
-                return mode.size
-    return modes[0].size if modes else None
+    """The size of the mode KScreen reports as *current*, or ``None``.
+
+    Only an exact current-mode identity proves current geometry. An advertised
+    mode is a supported candidate, never evidence about what is displayed now, so
+    preferred or first-listed modes are deliberately not consulted here; they
+    belong to :func:`select_mode`, which chooses a requested configuration.
+    """
+    if current_mode_id is None:
+        return None
+    for mode in modes:
+        if mode.mode_id == current_mode_id:
+            return mode.size
+    return None
 
 
 def _virtual_value(connector: str, output_type: object) -> bool | None:
@@ -313,7 +356,7 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
                 position=_position_value(entry.get("pos")),
                 scale=_scale_value(entry.get("scale")),
                 size=_size_value(entry.get("size"))
-                or _size_from_modes(current_mode_id, preferred, modes),
+                or _current_mode_size(current_mode_id, modes),
                 current_mode_id=current_mode_id,
                 modes=modes,
                 preferred_modes=preferred,
@@ -469,12 +512,13 @@ def _scale_request(value: object) -> float | None:
         matched = _SCALE_TEXT.fullmatch(value)
         if matched is None:
             return None
-        number = float(matched.group(1))
-    elif type(value) in (int, float) and type(value) is not bool:
-        number = float(value)
+        try:
+            number = float(matched.group(1))
+        except (OverflowError, ValueError):
+            return None
     else:
-        return None
-    if not math.isfinite(number) or not 0.0 < number <= _MAX_SCALE:
+        number = _finite_float(value)
+    if number is None or not 0.0 < number <= _MAX_SCALE:
         return None
     return number
 
@@ -552,13 +596,31 @@ def _tokens(output_id: str, request: _Request, mode: KScreenMode | None) -> tupl
 
 
 def _verified(
-    updated: _Record, request: _Request, mode: KScreenMode | None,
+    updated: _Record, original: _Record, request: _Request, mode: KScreenMode | None,
 ) -> bool:
-    """Whether the readback proves every requested setting took effect."""
+    """Whether the readback proves every requested setting took effect.
+
+    Readback is evidence about *this connector's current instance*, so it is
+    fenced before any property is compared: a numeric output id can be reused by
+    another connector, and a mode table can change between the command and the
+    read. A requested mode must therefore still be current *and* still have the
+    dimensions it had when it was selected, so an exit-zero command cannot be
+    read as success for a different output or a different resolution.
+    """
+    if updated.connector != original.connector:
+        return False
     if request.enabled is not None and updated.enabled != request.enabled:
         return False
-    if mode is not None and updated.current_mode_id != mode.mode_id:
-        return False
+    if mode is not None:
+        if updated.current_mode_id != mode.mode_id:
+            return False
+        selected = next(
+            (entry for entry in updated.modes if entry.mode_id == mode.mode_id), None,
+        )
+        if selected is None or selected.size != mode.size:
+            return False
+        if updated.size is not None and updated.size != mode.size:
+            return False
     if request.position is not None and updated.position != request.position:
         return False
     if request.scale is not None:
@@ -616,10 +678,16 @@ class KScreenObserver:
 
     # -- observation --------------------------------------------------------
 
-    async def _records(self) -> Result[tuple[_Record, ...]]:
-        """Run ``kscreen-doctor -j`` once and parse it, or return a typed failure."""
+    async def _records(self, timeout: float | None = None) -> Result[tuple[_Record, ...]]:
+        """Run ``kscreen-doctor -j`` once and parse it, or return a typed failure.
+
+        ``timeout`` bounds this one command; a caller with an operation deadline
+        passes its *remaining* budget so a read can never outlive the operation it
+        is evidence for. ``None`` uses the adapter's own control-call bound.
+        """
+        budget = self._timeout if timeout is None else max(0.0, float(timeout))
         result = await self._process.run(
-            CommandSpec(argv=(self._command, "-j"), env={}), self._timeout,
+            CommandSpec(argv=(self._command, "-j"), env={}), min(self._timeout, budget),
         )
         if isinstance(result, Err):
             return result
@@ -636,7 +704,10 @@ class KScreenObserver:
             return _failure(ErrorCode.configuration_failed)
         try:
             return Ok(value=_parse_records(raw))
-        except KScreenParseError:
+        except (KScreenParseError, OverflowError):
+            # A malformed number must leave as a failed read. Parsing already
+            # refuses what it cannot represent; ``OverflowError`` stays caught as
+            # a net so no conversion can escape the adapter's error contract.
             return _failure(ErrorCode.configuration_failed)
 
     def _publish(self, outputs: tuple[OutputInfo, ...]) -> None:
@@ -680,24 +751,37 @@ class KScreenObserver:
     ) -> Result[tuple[OutputInfo, ...]]:
         """Poll until ``predicate`` holds, or report that it never was confirmed.
 
-        ``deadline`` is an absolute value of the injected clock. A read error is
-        never mistaken for a match: missing dependencies are reported at once,
-        while a transient layout failure is retried until the deadline and then
-        reported instead of a false timeout. A timeout is
-        :attr:`~airplay_linux.domain.resources.ErrorCode.cleanup_timeout`, so the
-        caller can offer cleanup rather than claim success.
+        ``deadline`` is an absolute value of the injected clock, and it is one
+        operation deadline rather than a per-iteration one: a read may not begin
+        at or after it, each read is bounded by the budget that remains, and a
+        read that finishes at or after it is not evidence any more. Expiry is
+        terminal. A read error is never mistaken for a match: missing
+        dependencies are reported at once, while a transient layout failure is
+        retried until the deadline and then reported instead of a false timeout.
+        A timeout is :attr:`~airplay_linux.domain.resources.ErrorCode.cleanup_timeout`,
+        so the caller can offer cleanup rather than claim success.
         """
         if not callable(predicate):
             return _failure(ErrorCode.invalid_input)
         if not (type(deadline) in (int, float) and math.isfinite(float(deadline))):
             return _failure(ErrorCode.invalid_input)
+        expires_at = float(deadline)
         last_error: Err | None = None
         while True:
-            result = await self.outputs()
+            now = self._clock.now()
+            if now >= expires_at:
+                return self._expired(last_error)
+            result = await self._records(expires_at - now)
             if isinstance(result, Ok):
+                if self._clock.now() >= expires_at:
+                    # The read answered, but not within the interval we promised
+                    # to observe; a late layout is not evidence about the deadline.
+                    return _failure(ErrorCode.cleanup_timeout)
+                outputs = _outputs(result.value)
+                self._publish(outputs)
                 last_error = None
-                if predicate(result.value):
-                    return result
+                if predicate(outputs):
+                    return Ok(value=outputs)
             else:
                 last_error = result
                 if result.error.code in (
@@ -705,29 +789,48 @@ class KScreenObserver:
                 ):
                     return result
             now = self._clock.now()
-            if now >= float(deadline):
-                return last_error if last_error is not None else _failure(ErrorCode.cleanup_timeout)
-            await self._sleep_until(
-                min(now + self._poll_interval, float(deadline)), float(deadline),
+            if now >= expires_at:
+                return self._expired(last_error)
+            expired = await self._sleep_until(
+                min(now + self._poll_interval, expires_at), expires_at,
             )
+            if expired:
+                # The real-time fallback fired, which means no poll tick arrived
+                # before the deadline; the injected clock may never advance, so
+                # this is a terminal timeout rather than another iteration.
+                return self._expired(last_error)
 
-    async def _sleep_until(self, when: float, deadline: float) -> None:
+    @staticmethod
+    def _expired(last_error: Err | None) -> Err:
+        """The outcome of an expired wait: the last read failure, else a timeout."""
+        return last_error if last_error is not None else _failure(ErrorCode.cleanup_timeout)
+
+    async def _sleep_until(self, when: float, deadline: float) -> bool:
         """Wait for a scheduler wake; only the deadline has a real-time fallback.
 
         Poll ticks must come from the injected scheduler so a test can drive them
         deterministically. The overall deadline additionally uses a real timer so
-        a scheduler that never fires ends the wait with a timeout instead of a
-        hang; its duration is the deadline distance, not a poll interval.
+        a scheduler that never fires ends the wait instead of hanging; its
+        duration is the deadline distance, not a poll interval. Returns whether
+        that real-time fallback ended the wait, which is a terminal timeout: it
+        must not be treated as a poll tick, or a frozen clock would install one
+        fallback after another forever.
         """
         loop = asyncio.get_running_loop()
         future: asyncio.Future[None] = loop.create_future()
+        expired = False
 
         def wake() -> None:
             if not future.done():
                 future.set_result(None)
 
+        def expire() -> None:
+            nonlocal expired
+            expired = True
+            wake()
+
         scheduled = self._scheduler.call_at(when, wake)
-        fallback = loop.call_later(max(0.0, deadline - self._clock.now()), wake)
+        fallback = loop.call_later(max(0.0, deadline - self._clock.now()), expire)
         try:
             await future
         finally:
@@ -735,6 +838,7 @@ class KScreenObserver:
             fallback.cancel()
             if not future.done():
                 future.cancel()
+        return expired
 
     # -- configuration ------------------------------------------------------
 
@@ -788,7 +892,7 @@ class KScreenObserver:
         updated = next(
             (item for item in readback.value if item.output_id == output_id), None,
         )
-        if updated is None or not _verified(updated, request, mode):
+        if updated is None or not _verified(updated, record, request, mode):
             return _failure(ErrorCode.configuration_failed), None
         return Ok(value=None), _outputs(readback.value)
 
