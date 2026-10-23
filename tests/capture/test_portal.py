@@ -52,6 +52,7 @@ class FakePortalPeer:
         self.error_replies: dict[str, str] = {}
         self.handle_override: dict[str, str] = {}
         self.held: dict[str, asyncio.Event] = {}
+        self.session_close_error: str | None = None
         self.disconnected = False
         self._next_serial = 0
         self._condition = asyncio.Condition()
@@ -113,6 +114,9 @@ class FakePortalPeer:
             return Message.new_method_return(message)
         if message.interface == SESSION_INTERFACE and message.member == "Close":
             self.closed_sessions.append(message.path)
+            if self.session_close_error is not None:
+                # A refused close leaves the portal session live.
+                return Message.new_error(message, self.session_close_error, "close refused")
             self.open_sessions.discard(message.path)
             return Message.new_method_return(message)
 
@@ -649,6 +653,54 @@ async def test_client_owns_and_disconnects_the_connection_it_opens() -> None:
     await client.close()
     assert peer.disconnected is True
     assert peer.closed_sessions == [peer.session_path("s1")]
+
+
+async def test_close_reports_unconfirmed_cleanup_and_retries_the_same_sessions() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    await complete_selection(client, peer)
+    peer.session_close_error = "org.freedesktop.DBus.Error.Failed"
+
+    first = await client.close()
+
+    assert isinstance(first, Err)
+    assert first.error.code is ErrorCode.cleanup_timeout
+    assert peer.open_sessions == {peer.session_path("s1")}
+    # The handler stays installed so a late completion is still observable.
+    assert peer.handlers != []
+
+    peer.session_close_error = None
+    second = await client.close()
+
+    assert isinstance(second, Ok)
+    assert peer.open_sessions == set()
+    assert peer.handlers == []
+
+
+async def test_close_keeps_ownership_of_a_completion_that_arrives_after_close() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    await settle()
+
+    closing = await client.close()
+
+    assert isinstance(closing, Err)
+    assert closing.error.code is ErrorCode.cleanup_timeout
+    assert peer.handlers != []
+    abandoned = await task
+    assert isinstance(abandoned, Err)
+    assert abandoned.error.code is ErrorCode.portal_cancelled
+
+    # The portal had already created the session; its Response arrives late.
+    peer.respond_create(session_token="late")
+    await client.drain()
+
+    assert peer.session_path("late") in peer.closed_sessions
+    assert peer.open_sessions == set()
+    assert isinstance(await client.close(), Ok)
+    assert peer.handlers == []
 
 
 async def test_close_is_idempotent() -> None:

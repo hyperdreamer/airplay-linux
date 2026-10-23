@@ -351,21 +351,31 @@ class PortalClient:
             # on the next loop pass.  Yield so draining cannot spin the loop.
             await asyncio.sleep(0)
 
-    async def close(self) -> None:
-        """Close every session this client still owns and detach the peer."""
+    async def close(self) -> Result[None]:
+        """Refuse new selections and confirm every resource this client owns.
+
+        ``Ok`` means every exact session was confirmed closed and no abandoned
+        request can still produce a new one.  Otherwise the uncertain records are
+        retained and the handler stays installed, so the portal can still report
+        a late completion and calling ``close()`` again retries the same cleanup
+        instead of finalising over an unconfirmed resource.
+        """
         async with self._close_lock:
-            if self._closed:
-                return
             self._closed = True
-            for pending in tuple(self._pending.values()):
-                for path in tuple(pending.paths):
-                    self._track_cleanup(self._close_request(path))
             for job in tuple(self._jobs):
-                job.cancel()
+                acquisition = self._acquisitions.get(job)
+                if acquisition is not None:
+                    # Reconcile in flight work instead of dropping its handler.
+                    self._abandon(acquisition, job)
+                elif not job.done():
+                    job.cancel()
             await self.drain()
+            unconfirmed = False
             for session in tuple(self._sessions):
-                await self._close_session(session)
-            self._pending.clear()
+                if isinstance(await self._close_session(session), Err):
+                    unconfirmed = True
+            if unconfirmed or self._jobs or self._cleanup or self._orphaned:
+                return _failure(ErrorCode.cleanup_timeout)
             peer = self._peer
             if peer is not None and self._handler_installed:
                 peer.remove_message_handler(self._on_message)
@@ -376,6 +386,7 @@ class PortalClient:
                 except Exception:
                     pass
                 self._peer = None
+            return Ok(value=None)
 
     # -- acquisition --------------------------------------------------------
 
