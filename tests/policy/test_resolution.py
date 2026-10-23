@@ -1,11 +1,12 @@
 """Resolution policy never guesses a receiver mode.
 
-A remembered choice is reused only through the storage layer's continuity filter
-and wins for the same stable identity, as the design orders it. Otherwise a single
-reliable advertised or queried mode may be used; anything else becomes an
-explicit typed decision for the user. The tests pin precedence, identity
-replacement in both discovery arrival orders, and the rule that a preference is
-written only after a confirmed setup.
+A remembered choice is reused only through the storage layer's continuity filter,
+only while its own evidence is trustworthy, and only while current reliable
+reports do not exclude it. Otherwise a single reliable advertised or queried mode
+may be used; anything else becomes an explicit typed decision for the user. The
+tests pin precedence, contradiction of a remembered size, identity replacement in
+both discovery arrival orders, and the rule that a preference is written only
+after a confirmed setup.
 """
 
 from __future__ import annotations
@@ -159,9 +160,12 @@ def test_a_remembered_mode_wins_over_reliable_current_reports():
     result = resolve_resolution(
         candidate,
         saved(),
-        reported(UHD, evidence="advertised-modes"),
+        reported(UHD, FHD, evidence="advertised-modes"),
         reported(HD, evidence="query_modes"),
     )
+    # Both reports are reliable, and the remembered FHD is still among the
+    # advertised modes, so continuity and current compatibility agree. Memory
+    # outranks the multi-mode picker and the newer query.
     assert result == ResolutionDecision(
         size=FHD,
         source="stored",
@@ -217,14 +221,18 @@ def test_a_saved_record_without_a_remembered_resolution_still_uses_reliable_evid
     assert result.size == HD and result.source == "discovery"
 
 
-def test_a_reliable_report_that_differs_from_the_remembered_size_does_not_replace_it():
-    # Precedence is by continuity, not by whichever report is newest. A receiver
-    # that does not accept the remembered mode after setup is handled by the
-    # accepted-mode mismatch path, which stops the stream instead of silently
-    # re-resolving to a different size.
+def test_a_reliable_report_that_excludes_the_remembered_size_requires_a_decision():
+    # Current reliable evidence is the authority on compatibility. A receiver
+    # that no longer reports the remembered mode must not be sent a reservation
+    # at that size; the contradiction is a pre-output decision, and the
+    # post-setup accepted-mode path is not a substitute for it.
     result = resolve_resolution(record_set(), saved(), reported(HD), None)
-    assert isinstance(result, ResolutionDecision)
-    assert result.size == FHD and result.source == "stored"
+    assert result == ResolutionRequired(choices=(HD,), remembered_rejected=True)
+
+
+def test_a_remembered_size_excluded_by_several_reliable_modes_is_a_decision():
+    result = resolve_resolution(record_set(), saved(), reported(UHD, HD), None)
+    assert result == ResolutionRequired(choices=(UHD, HD), remembered_rejected=True)
 
 
 def test_a_remembered_size_that_reliable_evidence_still_supports_is_reused():
@@ -337,6 +345,27 @@ def test_an_unreliable_report_never_becomes_a_picker_choice_or_a_generic_default
     assert FHD not in result.choices
 
 
+@pytest.mark.parametrize(
+    ("discovered", "queried"),
+    [
+        (
+            reported(UHD, FHD, evidence="advertised-modes"),
+            reported(HD, reliable=False, evidence="query_modes"),
+        ),
+        (
+            reported(HD, reliable=False, evidence="advertised-modes"),
+            reported(UHD, FHD, evidence="query_modes"),
+        ),
+    ],
+)
+def test_unreliable_secondary_modes_never_join_a_reliable_picker(discovered, queried):
+    # A reliable multi-mode source and an unreliable secondary source can coexist.
+    # Only the trustworthy source's modes may be offered, in either arrival order;
+    # the untrusted HD must not become a user-confirmable picker option.
+    result = resolve_resolution(record_set(), None, discovered, queried)
+    assert result == ResolutionRequired(choices=(UHD, FHD), remembered_rejected=False)
+
+
 def test_nonpositive_dimensions_cannot_become_a_decision_at_all():
     with pytest.raises(ValueError):
         Size(width=0, height=1080)
@@ -391,14 +420,52 @@ def test_receiver_names_and_models_never_produce_a_resolution():
     assert result == ResolutionRequired(choices=(), remembered_rejected=False)
 
 
-def test_a_reliable_query_that_differs_from_the_remembered_size_does_not_replace_it():
+def test_a_reliable_query_that_excludes_the_remembered_size_requires_a_decision():
     candidate = record_set()
     stored = saved(remembered=decision(candidate, size=FHD, source="discovery", origin="discovery"))
     result = resolve_resolution(
         candidate, stored, reported(FHD, reliable=False), reported(HD),
     )
+    # The unreliable discovery report cannot support the memory, and the
+    # reliable query names a different mode: the user decides, the memory is
+    # reported as rejected, and no silent substitution happens.
+    assert result == ResolutionRequired(choices=(HD,), remembered_rejected=True)
+
+
+def test_a_remembered_decision_with_unreliable_evidence_is_not_reused():
+    candidate = record_set()
+    untrusted = ResolutionDecision(
+        size=FHD,
+        source="discovery",
+        evidence=ResolutionEvidence(
+            origin="discovery",
+            reliable=False,
+            receiver_id=candidate.receiver_id,
+            endpoint_fingerprint=candidate.endpoint_fingerprint,
+        ),
+    )
+    result = resolve_resolution(candidate, saved(remembered=untrusted), None, None)
+    # Read-side trust is re-checked: an unreliable stored record is treated as
+    # absent instead of being re-stamped reliable=True.
+    assert result == ResolutionRequired(choices=(), remembered_rejected=True)
+
+
+def test_an_unreliable_remembered_decision_is_ignored_not_laundered():
+    candidate = record_set()
+    untrusted = ResolutionDecision(
+        size=UHD,
+        source="user",
+        evidence=ResolutionEvidence(
+            origin="picker",
+            reliable=False,
+            receiver_id=candidate.receiver_id,
+            endpoint_fingerprint=candidate.endpoint_fingerprint,
+        ),
+    )
+    result = resolve_resolution(candidate, saved(remembered=untrusted), reported(FHD), None)
     assert isinstance(result, ResolutionDecision)
-    assert result.size == FHD and result.source == "stored"
+    assert result.size == FHD and result.source == "discovery"
+    assert result.evidence.origin == "discovery"
 
 
 # ----------------------------------------------------------- identity continuity

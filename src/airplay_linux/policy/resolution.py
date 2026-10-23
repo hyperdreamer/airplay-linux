@@ -12,9 +12,12 @@ television default. A decision comes from exactly one of three places:
 
 Multiple equally reliable modes and every unreliable/absent report produce a
 :class:`ResolutionRequired` instead of a guess. A remembered mode wins over
-current reports only because continuity was verified; a remembered value for an
-identity whose continuity is not current is not reused at all, and the picker
-reports that rejection rather than silently substituting it.
+current reports only because continuity was verified, and only while those
+reports do not contradict it: a reliable report that excludes the remembered
+size is a decision, never a silent reuse. A remembered value for an identity
+whose continuity is not current, or whose stored evidence is not trustworthy, is
+not reused at all, and the picker reports that rejection rather than silently
+substituting it.
 
 The module is pure policy: it reads DTOs and returns a typed decision. It never
 creates, resizes, or removes an output and never writes a preference itself.
@@ -55,7 +58,8 @@ class ResolutionRequired:
     those modes. It is empty when nothing trustworthy was reported, so a caller
     cannot mistake a generic default for receiver support. ``remembered_rejected``
     tells the UI that a remembered choice exists for this identity but could not
-    be used because continuity with the saved record is not justified.
+    be used: continuity with the saved record is not justified, its stored evidence
+    is not trustworthy, or current reliable evidence excludes its size.
     """
 
     choices: tuple[Size, ...] = ()
@@ -124,7 +128,9 @@ def _remembered(
     ambiguous, non-persistable, replaced, or unverified-fallback record even when
     the receiver ID hash is unchanged. The remembered decision must also name the
     identity it is stored for; a record whose evidence points at another receiver
-    is malformed and cannot authorize a size.
+    is malformed and cannot authorize a size. Read-side trust is re-checked too: a
+    stored record whose evidence was never reliable is treated as absent, so it can
+    never be laundered into a trustworthy decision by re-stamping it.
     """
     if saved is None:
         return None
@@ -135,6 +141,8 @@ def _remembered(
     if remembered is None:
         return None
     if remembered.evidence.receiver_id != record_set.receiver_id:
+        return None
+    if not remembered.evidence.reliable:
         return None
     return remembered
 
@@ -149,9 +157,11 @@ def resolve_resolution(
     """Resolve the virtual-output mode, or require an explicit decision.
 
     An explicit user choice is the current decision and outranks memory and
-    reports. Otherwise a mode remembered for the same continuous identity wins;
-    one reliable advertised/queried mode is used with its exact evidence; every
-    other case returns :class:`ResolutionRequired`.
+    reports. Otherwise a mode remembered for the same continuous identity wins
+    while no reliable report excludes it; one reliable advertised/queried mode is
+    used with its exact evidence when there is no memory to reconcile; every other
+    case returns :class:`ResolutionRequired`, including a remembered size that a
+    reliable report no longer supports.
     """
     if user is not None:
         if not isinstance(user, Size):
@@ -162,26 +172,32 @@ def resolve_resolution(
 
     had_remembered = saved is not None and saved.remembered_resolution is not None
     remembered = _remembered(record_set, saved)
-    rejected = had_remembered and remembered is None
     reliable = _reliable_modes(discovered, queried)
+    supported = () if reliable is None else reliable[1]
 
-    if remembered is not None:
-        # The design's precedence is explicit: a mode remembered for this same
-        # stable identity wins over reports, because it was confirmed by an
-        # earlier successful setup. A receiver that now accepts a different mode
-        # is handled after setup by ``accepted_mode_mismatch`` -- never by
-        # silently changing the remembered choice here.
+    if remembered is not None and (reliable is None or remembered.size in supported):
+        # A mode remembered for this same stable identity wins over reports that
+        # do not contradict it, because it was confirmed by an earlier successful
+        # setup. Current reliable evidence that *excludes* it is a different case:
+        # the choice is no longer supported, so it must not be applied silently.
         return ResolutionDecision(
             size=remembered.size,
             source="stored",
             evidence=_evidence(_REMEMBERED_ORIGIN, record_set),
         )
 
+    # Any usable-looking memory that reached this point was withheld (continuity,
+    # identity, trust) or contradicted by reliable evidence; the caller is told.
+    rejected = had_remembered
+
     if reliable is None:
         return ResolutionRequired(choices=(), remembered_rejected=rejected)
 
     origin, modes = reliable
-    if len(modes) == 1:
+    if remembered is None and len(modes) == 1:
+        # No usable memory needed reconciling, so one reliable mode is enough.
+        # A contradicted memory is handled below: it owns an explicit decision
+        # even when the replacement evidence names exactly one mode.
         return ResolutionDecision(
             size=modes[0],
             source="discovery",
