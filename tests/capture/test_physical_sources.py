@@ -70,6 +70,9 @@ class FakePortal:
         self.release_calls: list[str] = []
         self.open: dict[str, PortalMonitor] = {}
         self.started = asyncio.Event()
+        self.release_started = asyncio.Event()
+        self.release_script: deque[Any] = deque()
+        self.release_gate: Deferred[Any] | None = None
         self._scripted: deque[Any] = deque()
         self._counter = 0
 
@@ -106,6 +109,15 @@ class FakePortal:
 
     async def release_monitor(self, monitor: PortalMonitor) -> Any:
         self.release_calls.append(monitor.portal_session_id)
+        self.release_started.set()
+        gate, self.release_gate = self.release_gate, None
+        if gate is not None:
+            await gate.wait()
+        if self.release_script:
+            item = self.release_script.popleft()
+            if isinstance(item, BaseException):
+                raise item
+            return item
         self.open.pop(monitor.portal_session_id, None)
         return Ok(value=None)
 
@@ -370,6 +382,80 @@ async def test_portal_binding_a_different_connector_is_released_and_refused() ->
     assert result.error.code is ErrorCode.unsupported_source
     assert portal.release_calls == ["session-x"]
     assert "bad-token" not in repr(result)
+
+
+async def test_mismatched_acquisition_cleanup_failure_is_retained_and_retried() -> None:
+    portal = FakePortal()
+    monitor = PortalMonitor(
+        connector="HDMI-A-1",
+        source_type="physical_monitor",
+        restore_token="bad-token",
+        portal_session_id="session-x",
+    )
+    portal.queue(Ok(value=monitor))
+    portal.release_script.append(Err(error=diagnostic(ErrorCode.cleanup_timeout)))
+    provider, _, _ = make_provider(portal=portal)
+
+    refused = await provider.select("DP-1")
+
+    assert isinstance(refused, Err)
+    # The refused source still owns a live session; that is not a plain refusal.
+    assert refused.error.code is ErrorCode.cleanup_timeout
+    assert "session-x" in portal.open
+    assert "bad-token" not in repr(refused)
+
+    # The next selection retries the exact retained session and confirms it.
+    recovered = await provider.select("DP-1")
+
+    assert isinstance(recovered, Ok)
+    assert "session-x" not in portal.open
+    assert portal.release_calls == ["session-x", "session-x"]
+
+
+async def test_mismatched_acquisition_cleanup_exception_is_retained() -> None:
+    portal = FakePortal()
+    monitor = PortalMonitor(
+        connector="HDMI-A-1",
+        source_type="physical_monitor",
+        restore_token="bad-token",
+        portal_session_id="session-x",
+    )
+    portal.queue(Ok(value=monitor))
+    portal.release_script.append(RuntimeError("the bus went away"))
+    provider, _, _ = make_provider(portal=portal)
+
+    refused = await provider.select("DP-1")
+
+    assert isinstance(refused, Err)
+    assert refused.error.code is ErrorCode.cleanup_timeout
+    assert "session-x" in portal.open
+    assert "the bus went away" not in repr(refused)
+
+
+async def test_cancelled_mismatch_cleanup_keeps_the_exact_session() -> None:
+    portal = FakePortal()
+    monitor = PortalMonitor(
+        connector="HDMI-A-1",
+        source_type="physical_monitor",
+        restore_token="bad-token",
+        portal_session_id="session-x",
+    )
+    portal.queue(Ok(value=monitor))
+    portal.release_gate = Deferred()
+    provider, _, _ = make_provider(portal=portal)
+
+    task = asyncio.create_task(provider.select("DP-1"))
+    await portal.release_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "session-x" in portal.open
+
+    portal.release_gate = None
+    recovered = await provider.select("DP-1")
+    assert isinstance(recovered, Ok)
+    assert "session-x" not in portal.open
 
 
 async def test_portal_must_return_an_adapter_monitor() -> None:

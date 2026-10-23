@@ -200,6 +200,10 @@ class PhysicalCaptureProvider:
         self._features = features
         self._ids = ids or _UuidFactory()
         self._leases: dict[LeaseId, PortalMonitor] = {}
+        #: Exact acquired sessions whose release was never confirmed.  A refused
+        #: source still owns a live portal session, so it is retained here until a
+        #: later retry proves it closed instead of being discarded with its lease.
+        self._unconfirmed: dict[str, PortalMonitor] = {}
         self._restore_tokens: dict[str, str] = {}
         self._select_lock = asyncio.Lock()
 
@@ -254,6 +258,9 @@ class PhysicalCaptureProvider:
             return _failure(ErrorCode.unsupported_source)
 
         async with self._select_lock:
+            for session, monitor in tuple(self._unconfirmed.items()):
+                if isinstance(await self._release_exact(monitor), Ok):
+                    self._unconfirmed.pop(session, None)
             inventory = await self._inventory()
             if isinstance(inventory, Err):
                 return inventory
@@ -284,9 +291,13 @@ class PhysicalCaptureProvider:
                 or monitor.connector != connector
                 or monitor.source_type != "physical_monitor"
             ):
-                if type(monitor) is PortalMonitor:
-                    await self._safe_release(monitor)
                 self._restore_tokens.pop(connector, None)
+                if type(monitor) is PortalMonitor:
+                    released = await self._release_exact(monitor)
+                    if isinstance(released, Err):
+                        # The refused source still owns a live session: report the
+                        # unconfirmed cleanup rather than a plain refusal.
+                        return _failure(ErrorCode.cleanup_timeout)
                 return _failure(ErrorCode.unsupported_source)
 
             lease = LeaseId(self._ids.new())
@@ -359,13 +370,23 @@ class PhysicalCaptureProvider:
         self._leases.pop(lease, None)
         return Ok(value=None)
 
-    async def _safe_release(self, monitor: PortalMonitor) -> None:
+    async def _release_exact(self, monitor: PortalMonitor) -> Result[None]:
+        """Release one exact monitor, retaining it until the release is confirmed."""
+        session = monitor.portal_session_id
         try:
-            await self._portal.release_monitor(monitor)
+            released = await self._portal.release_monitor(monitor)
         except asyncio.CancelledError:
+            # The caller gave up; the session is still owned by this provider.
+            self._unconfirmed[session] = monitor
             raise
         except Exception:
-            return
+            self._unconfirmed[session] = monitor
+            return _failure(ErrorCode.cleanup_timeout)
+        if isinstance(released, Err):
+            self._unconfirmed[session] = monitor
+            return released
+        self._unconfirmed.pop(session, None)
+        return Ok(value=None)
 
 
 __all__ = [
