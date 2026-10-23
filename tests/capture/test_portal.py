@@ -278,6 +278,15 @@ class FakePortalPeer:
         return self.respond("Start", 0, results)
 
 
+async def bounded(awaitable: Any, timeout: float = 2.0) -> Any:
+    """Await one client operation but fail fast instead of hanging the suite.
+
+    A regression that reintroduces an unbounded wait must show up as a failing
+    assertion, never as a pytest run that never returns.
+    """
+    return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
 async def settle(cycles: int = 12) -> None:
     """Let the client reach the point where it waits for the Response signal.
 
@@ -620,7 +629,7 @@ async def test_late_response_after_cancel_closes_the_new_session() -> None:
 
     # The portal answers anyway, long after the caller gave up.
     peer.respond_create(session_token="late")
-    await client.drain()
+    await bounded(client.drain())
 
     assert peer.session_path("late") in peer.closed_sessions
     assert peer.session_path("late") not in peer.open_sessions
@@ -636,7 +645,7 @@ async def test_a_stalled_control_reply_is_a_bounded_typed_failure() -> None:
     client = PortalClient(peer=peer, deadline=0.05)
     peer.hold("CreateSession")
 
-    result = await asyncio.wait_for(client.select_monitor("DP-1", None), timeout=2.0)
+    result = await bounded(client.select_monitor("DP-1", None))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.cleanup_timeout
@@ -651,21 +660,21 @@ async def test_a_stalled_session_close_is_a_bounded_cleanup_failure() -> None:
     await complete_selection(client, peer)
     peer.hold("Close", SESSION_INTERFACE)
 
-    released = await asyncio.wait_for(client.release_monitor(
+    released = await bounded(client.release_monitor(
         PortalMonitor(
             connector="DP-1",
             source_type="physical_monitor",
             restore_token="new-token",
             portal_session_id=peer.session_path("s1"),
         )
-    ), timeout=2.0)
+    ))
 
     assert isinstance(released, Err)
     assert released.error.code is ErrorCode.cleanup_timeout
     # Uncertain ownership is retained for a later confirmed retry.
     assert peer.open_sessions == {peer.session_path("s1")}
     peer.release_hold("Close", SESSION_INTERFACE)
-    assert isinstance(await client.close(), Ok)
+    assert isinstance(await bounded(client.close()), Ok)
     assert peer.open_sessions == set()
 
 
@@ -680,7 +689,7 @@ async def test_a_stalled_request_close_never_blocks_cancellation_cleanup() -> No
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.wait_for(client.drain(), timeout=2.0)
+    await bounded(client.drain())
 
     assert client._cleanup == set()
     peer.release_hold("Close", REQUEST_INTERFACE)
@@ -701,7 +710,7 @@ async def test_cancelled_selection_finishes_without_waiting_for_a_suppressed_res
     # ``Request.Close`` succeeded, so the portal contract says no ``Response``
     # will ever be emitted for this request.  Nothing may still be waiting on it.
     assert peer.request_path(peer.last("CreateSession").handle_token) in peer.closed_requests
-    await asyncio.wait_for(client.drain(), timeout=2.0)
+    await bounded(client.drain())
 
     assert client._jobs == set()
     assert client._cleanup == set()
@@ -724,7 +733,7 @@ async def test_cancelled_selection_closes_the_session_it_already_created() -> No
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await asyncio.wait_for(client.drain(), timeout=2.0)
+    await bounded(client.drain())
 
     assert peer.session_path("s1") in peer.closed_sessions
     assert peer.open_sessions == set()
@@ -742,7 +751,7 @@ async def test_abandonment_does_not_wait_for_a_stalled_control_call() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     # The method reply is still outstanding; the job must not wait for it.
-    await asyncio.wait_for(client.drain(), timeout=2.0)
+    await bounded(client.drain())
     assert client._jobs == set()
 
     peer.release_hold("CreateSession")
@@ -759,7 +768,7 @@ async def test_close_confirms_every_session_and_detaches_the_handler() -> None:
     await complete_selection(client, peer, session_token="s1")
     await complete_selection(client, peer, session_token="s2")
 
-    await client.close()
+    await bounded(client.close())
 
     assert peer.closed_sessions == [peer.session_path("s1"), peer.session_path("s2")]
     assert peer.open_sessions == set()
@@ -777,7 +786,7 @@ async def test_client_owns_and_disconnects_the_connection_it_opens() -> None:
     result = await complete_selection(client, peer)
 
     assert isinstance(result, Ok)
-    await client.close()
+    await bounded(client.close())
     assert peer.disconnected is True
     assert peer.closed_sessions == [peer.session_path("s1")]
 
@@ -822,7 +831,7 @@ async def test_close_reports_unconfirmed_cleanup_and_retries_the_same_sessions()
     await complete_selection(client, peer)
     peer.session_close_error = "org.freedesktop.DBus.Error.Failed"
 
-    first = await client.close()
+    first = await bounded(client.close())
 
     assert isinstance(first, Err)
     assert first.error.code is ErrorCode.cleanup_timeout
@@ -831,7 +840,7 @@ async def test_close_reports_unconfirmed_cleanup_and_retries_the_same_sessions()
     assert peer.handlers != []
 
     peer.session_close_error = None
-    second = await client.close()
+    second = await bounded(client.close())
 
     assert isinstance(second, Ok)
     assert peer.open_sessions == set()
@@ -845,7 +854,7 @@ async def test_close_keeps_ownership_of_a_completion_that_arrives_after_close() 
     await peer.wait_for("CreateSession")
     await settle()
 
-    closing = await client.close()
+    closing = await bounded(client.close())
 
     assert isinstance(closing, Err)
     assert closing.error.code is ErrorCode.cleanup_timeout
@@ -856,11 +865,11 @@ async def test_close_keeps_ownership_of_a_completion_that_arrives_after_close() 
 
     # The portal had already created the session; its Response arrives late.
     peer.respond_create(session_token="late")
-    await client.drain()
+    await bounded(client.drain())
 
     assert peer.session_path("late") in peer.closed_sessions
     assert peer.open_sessions == set()
-    assert isinstance(await client.close(), Ok)
+    assert isinstance(await bounded(client.close()), Ok)
     assert peer.handlers == []
 
 
@@ -869,8 +878,8 @@ async def test_close_is_idempotent() -> None:
     client = PortalClient(peer=peer)
     await complete_selection(client, peer)
 
-    await client.close()
-    await client.close()
+    await bounded(client.close())
+    await bounded(client.close())
 
     assert peer.closed_sessions == [peer.session_path("s1")]
 
