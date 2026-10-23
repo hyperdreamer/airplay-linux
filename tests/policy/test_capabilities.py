@@ -347,6 +347,35 @@ async def test_a_second_virtual_output_limitation_blocks_only_additional_outputs
 
 
 @pytest.mark.parametrize(
+    "plausible",
+    ["unverified", "true", 1, [True], object()],
+    ids=["string", "true-text", "integer", "list", "object"],
+)
+async def test_a_non_boolean_output_claim_never_enables_an_extra_output(plausible):
+    """``HelperFeatures`` has no runtime validation, so a malformed provider can
+    hand policy a truthy non-boolean. Only the exact ``True`` proves distinct
+    concurrent outputs; anything else withholds the *additional* output while
+    the first Virtual output stays available."""
+    malformed = Ok(value=HelperFeatures(
+        version="24.08.2", distinct_outputs=plausible,  # type: ignore[arg-type]
+        capability_fingerprint=FINGERPRINT,
+    ))
+    report = await probe(helper_probe=helper(malformed)).check()
+
+    assert report.additional_virtual_outputs is False
+    assert report.virtual_display is True
+    assert report.mirror is True
+
+
+async def test_an_exact_boolean_True_enables_additional_outputs():
+    report = await probe(helper_probe=helper(Ok(value=HelperFeatures(
+        version="24.08.2", distinct_outputs=True, capability_fingerprint=FINGERPRINT,
+    )))).check()
+
+    assert report.additional_virtual_outputs is True
+
+
+@pytest.mark.parametrize(
     ("environment", "token"),
     [
         ({**PLASMA, "XDG_SESSION_TYPE": "x11"}, "x11"),
@@ -448,9 +477,72 @@ async def test_a_backend_without_ownership_evidence_never_enables_a_mode():
     assert report.mirror is False
     assert report.virtual_display is False
     assert report.remembered_pairing is False
+    # Each missing admission prerequisite is named exactly, so a user knows
+    # which backend operation to fix rather than seeing a generic failure.
+    unavailable = {
+        item.detail for item in report.diagnostics
+        if item.code is ErrorCode.dependency_incompatible
+    }
+    assert {"foreground_control", "owner_handshake"} <= unavailable
+    assert "keyring" not in unavailable
+    assert "multi_target" not in unavailable
+
+
+async def test_a_backend_without_its_keyring_operation_never_admits_a_mode():
+    """The transport's ``_admit`` refuses every start without this operation.
+
+    This backend keyring *operation* flag is not the desktop Secret Service
+    probe: pairing additionally needs the service, while the mode gate only
+    needs the transport's proven operation.
+    """
+    report = await probe(
+        backend_probe=backend(Ok(value=features(keyring=False))),
+    ).check()
+
+    assert report.mirror is False
+    assert report.virtual_display is False
+    assert report.additional_virtual_outputs is False
+    assert report.remembered_pairing is False
+    assert report.discovery is True
+    assert any(
+        item.code is ErrorCode.dependency_incompatible and item.detail == "keyring"
+        for item in report.diagnostics
+    )
+
+
+async def test_a_backend_without_multi_target_loses_streaming_but_keeps_pairing():
+    """``start_stream`` refuses without multi-target; pairing never needs it."""
+    report = await probe(
+        backend_probe=backend(Ok(value=features(multi_target=False))),
+    ).check()
+
+    assert report.mirror is False
+    assert report.virtual_display is False
+    assert report.additional_virtual_outputs is False
+    assert report.remembered_pairing is True
+    assert report.discovery is True
     assert any(
         item.code is ErrorCode.dependency_incompatible
-        and item.detail == "doubletake transport"
+        and item.detail == "multi_target"
+        for item in report.diagnostics
+    )
+    assert isinstance(can_start(report, Mode.MIRROR, TrustState.Trusted), Err)
+    assert isinstance(can_start(report, Mode.VIRTUAL, TrustState.Trusted), Err)
+
+
+async def test_unproven_backend_trust_transactions_disable_remembered_pairing_alone():
+    # ``provisional_commit`` is a pairing-only operation: the real transport's
+    # admission and start gates never consult it, so it must not affect a mode.
+    report = await probe(
+        backend_probe=backend(Ok(value=features(provisional_commit=False))),
+    ).check()
+
+    assert report.remembered_pairing is False
+    assert report.mirror is True
+    assert report.virtual_display is True
+    assert any(
+        item.code is ErrorCode.dependency_incompatible
+        and item.detail == "target_bound_pairing"
         for item in report.diagnostics
     )
 
@@ -470,8 +562,10 @@ async def test_a_backend_without_an_audio_surface_disables_audio_alone():
 
 
 async def test_unproven_backend_trust_transactions_disable_remembered_pairing_alone():
+    # ``provisional_commit`` is a pairing-only operation: the real transport's
+    # admission and start gates never consult it, so it must not affect a mode.
     report = await probe(
-        backend_probe=backend(Ok(value=features(keyring=False))),
+        backend_probe=backend(Ok(value=features(provisional_commit=False))),
     ).check()
 
     assert report.remembered_pairing is False
@@ -482,6 +576,7 @@ async def test_unproven_backend_trust_transactions_disable_remembered_pairing_al
         and item.detail == "target_bound_pairing"
         for item in report.diagnostics
     )
+
 
 
 async def test_a_backend_that_cannot_accept_typed_sources_never_enables_a_mode():
@@ -659,6 +754,62 @@ async def test_a_failed_probe_is_not_cached_in_a_way_that_hides_a_retry():
     assert (await builder.check()).audio is False
     assert (await builder.refresh()).audio is False
     assert audio_probe.calls == 2
+
+
+async def test_an_audio_permission_update_never_releases_an_existing_video_capture():
+    """Recording an audio outcome is not a video teardown.
+
+    The startup probe only ever enumerates; an acquired physical capture belongs
+    to a running video path and must survive an audio denial, a later retry, and
+    the re-probe that each update forces. The assertion is on the exact resource
+    identity, not on the capability booleans alone.
+    """
+    capture_port = capture()
+    acquired = await capture_port.select("DP-1")
+    assert isinstance(acquired, Ok)
+    assert acquired.value == MONITOR
+    builder = probe(capture_port=capture_port)
+
+    first = await builder.check()
+    assert first.mirror is True
+
+    builder.register_audio_probe_capability(
+        False, "org.freedesktop.portal.ScreenCast permission",
+    )
+    denied = await builder.check()
+    assert denied.audio is False
+    assert capture_port.released == []
+    assert "capture.release" not in capture_port.journal.names()
+
+    # The user's Retry action re-probes and records the new outcome.
+    builder.register_audio_probe_capability(True)
+    retried = await builder.refresh()
+
+    assert retried.audio is True
+    for report in (first, denied, retried):
+        assert report.mirror is True
+        assert report.virtual_display is True
+    assert capture_port.selections == ["DP-1"]
+    assert capture_port.released == []
+    assert "capture.release" not in capture_port.journal.names()
+    assert capture_port.monitors == {"DP-1": MONITOR}
+
+
+async def test_an_audio_permission_update_never_verifies_or_restarts_the_capture():
+    """A permission update adds no capture interaction beyond re-enumeration."""
+    capture_port = capture()
+    builder = probe(capture_port=capture_port)
+    await builder.check()
+    capture_port.journal.clear()
+
+    builder.register_audio_probe_capability(False)
+    await builder.check()
+    builder.register_audio_probe_capability(True)
+    await builder.refresh()
+
+    assert capture_port.journal.names() == ["capture.list_physical", "capture.list_physical"]
+    assert capture_port.selections == []
+    assert capture_port.released == []
 
 
 # ------------------------------------------------------------------- can_start

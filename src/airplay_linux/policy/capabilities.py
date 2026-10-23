@@ -6,8 +6,16 @@ that positively proved the operation, and every failure is isolated to the
 capability it belongs to:
 
 * discovery only depends on the selected mDNS implementation;
-* both modes first need the backend's proven foreground-owner handshake: a
-  transport the app cannot own is not a capability the app may use;
+* both modes first need the backend operations the real transport proves before
+  it dispatches anything: an owned foreground daemon with a proven owner
+  handshake *and* a working backend keyring operation, because
+  ``DoubleTakeTransport._admit`` refuses a start without all three. A mode gate
+  that omits one of them would advertise a start the transport rejects;
+* a start then needs the transport's proven multi-target operation, which
+  ``DoubleTakeTransport.start_stream`` checks after admission. This requirement
+  is distinct from pairing: remembered pairing still only needs admission plus
+  its trust transactions, so a backend without multi-target loses streaming but
+  keeps its pairing capability;
 * mirror needs the proven physical-source backend capability, a physical capture
   provider, and a physical monitor inventory;
 * virtual display needs the KDE Plasma 6 Wayland provider, a proven
@@ -17,7 +25,8 @@ capability it belongs to:
 * remembered pairing needs both an available keyring and the backend's proven
   trust transactions;
 * a second virtual output additionally needs the helper profile to prove
-  distinct outputs.
+  distinct outputs with an exact ``True``; a truthy non-boolean is not proof and
+  never blocks the first output.
 
 The guaranteed v1 environment is KDE Plasma 6 Wayland. Another desktop is
 reported by name but never enables a mode from command presence alone: no
@@ -80,6 +89,22 @@ class DesktopEnvironment(StrEnum):
 
 #: The only environment with a concrete v1 capture/display provider path.
 KDE_PLASMA_6_WAYLAND: Final[str] = DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value
+
+#: Backend operations every stream start needs before any backend I/O.
+#: ``DoubleTakeTransport._admit`` refuses with ``dependency_incompatible``
+#: unless all three are proven, so these are admission prerequisites, not
+#: optional niceties. ``keyring`` here is the backend's keyring *operation*; it
+#: is not the desktop Secret Service probe used for remembered pairing.
+ADMISSION_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = (
+    "foreground_control",
+    "owner_handshake",
+    "keyring",
+)
+
+#: The additional backend operation a start needs once the daemon is admitted.
+#: ``DoubleTakeTransport.start_stream`` refuses with ``unsupported_operation``
+#: without it. Pairing does not need it, so it must not gate trust operations.
+START_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = ("multi_target",)
 
 #: Backend operations remembered pairing depends on, all of which must be proven.
 PAIRING_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = (
@@ -378,9 +403,11 @@ class EnvironmentProbe:
             else:
                 note(_incompatible("doubletake backend contract"))
 
-        transport_ready = backend is not None and all(
-            backend.supports(name)
-            for name in ("foreground_control", "owner_handshake")
+        admitted = backend is not None and all(
+            backend.supports(name) for name in ADMISSION_BACKEND_CAPABILITIES
+        )
+        mode_ready = admitted and all(
+            backend.supports(name) for name in START_BACKEND_CAPABILITIES
         )
         physical_source = backend is not None and backend.supports("physical_source")
         virtual_source = backend is not None and backend.supports("virtual_source")
@@ -389,8 +416,11 @@ class EnvironmentProbe:
             backend.supports(name) for name in PAIRING_BACKEND_CAPABILITIES
         )
         if backend is not None:
-            if not transport_ready:
-                note(_incompatible("doubletake transport"))
+            # Name every missing prerequisite exactly, so a user sees which
+            # backend operation to fix instead of a generic transport failure.
+            for name in ADMISSION_BACKEND_CAPABILITIES + START_BACKEND_CAPABILITIES:
+                if not backend.supports(name):
+                    note(_incompatible(name))
             if not physical_source:
                 note(_incompatible("physical_source"))
             if not virtual_source:
@@ -456,20 +486,25 @@ class EnvironmentProbe:
         keyring = await self._keyring()
         if not keyring:
             note(_keyring_failure("Secret Service"))
-        remembered_pairing = keyring and backend_pairing and transport_ready
+        # Pairing is admitted without the multi-target start operation: losing
+        # streaming must not silently disable the saved-device trust path.
+        remembered_pairing = keyring and backend_pairing and admitted
 
         mirror = bool(
-            environment_supported and transport_ready and inventory and physical_source
+            environment_supported and mode_ready and inventory and physical_source
         )
         virtual_display = bool(
             environment_supported
-            and transport_ready
+            and mode_ready
             and kscreen
             and helper is not None
             and virtual_source
         )
+        # An exact boolean is the only proof of distinct concurrent outputs. A
+        # truthy string or integer is malformed evidence, and it only withholds
+        # the *additional* output, never the first one.
         additional_outputs = bool(
-            virtual_display and helper is not None and helper.distinct_outputs,
+            virtual_display and helper is not None and helper.distinct_outputs is True,
         )
 
         return CapabilityReport(
@@ -487,7 +522,10 @@ class EnvironmentProbe:
 def can_start(report: CapabilityReport, mode: Mode, trust: TrustState) -> Result[None]:
     """Gate one attempted mode, and no unrelated capability.
 
-    The report's mode booleans decide support; a mode blocked by a missing
+    The report's mode booleans decide support, and each one already includes the
+    transport's own admission prerequisites (owned foreground daemon, backend
+    keyring operation, multi-target operation); permission here therefore never
+    exceeds what the real transport will admit. A mode blocked by a missing
     dependency does not block the other mode. Unconfirmed trust cleanup is a
     separate safety lockout for every new start. Audio is intentionally not
     consulted here: a pre-ready audio failure is an explicit
@@ -509,10 +547,12 @@ def can_start(report: CapabilityReport, mode: Mode, trust: TrustState) -> Result
 
 
 __all__ = [
+    "ADMISSION_BACKEND_CAPABILITIES",
     "DesktopEnvironment",
     "EnvironmentProbe",
     "KDE_PLASMA_6_WAYLAND",
     "PAIRING_BACKEND_CAPABILITIES",
+    "START_BACKEND_CAPABILITIES",
     "can_start",
     "classify_environment",
 ]

@@ -4,9 +4,11 @@ Audio is enabled by default, so a start with audio may not silently continue whe
 the audio path is unproven. This module keeps the two questions separate:
 
 * :class:`PipeWirePortalAudioProbe` proves *capability* by introspection only: a
-  PipeWire socket is published and the desktop portal exposes the ScreenCast
-  interface the capture path uses. That is not a permission grant. A normal start
-  still asks the portal, and that request can be denied or cancelled later.
+  PipeWire socket **accepts a connection** and the desktop portal exposes the
+  ScreenCast interface the capture path uses. Existence of the socket path is not
+  proof; a stale socket from a stopped daemon is reported unavailable. That is
+  still not a permission grant: a normal start still asks the portal, and that
+  request can be denied or cancelled later.
 * :func:`audio_start_policy` turns the probe result into one of exactly three
   outcomes. While audio is enabled, an absent or failed probe is
   ``decision_required``; only the user's explicit video-only choice produces
@@ -22,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import socket
 import stat
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -51,6 +54,9 @@ REQUIRED_PORTAL_INTERFACES: Final[frozenset[str]] = frozenset({SCREENCAST_INTERF
 #: The PipeWire daemon socket inside ``XDG_RUNTIME_DIR``.
 PIPEWIRE_SOCKET_NAME: Final[str] = "pipewire-0"
 
+#: Bound on the read-only connection probe; a live local daemon answers at once.
+PIPEWIRE_PROBE_TIMEOUT: Final[float] = 0.25
+
 #: The Secret Service interface a usable remembered-pairing keyring exposes.
 SECRET_SERVICE: Final[str] = "org.freedesktop.secrets"
 SECRET_SERVICE_PATH: Final[str] = "/org/freedesktop/secrets"
@@ -74,20 +80,24 @@ class InterfaceCapabilityClient(Protocol):
 
 
 class PipeWireSocket:
-    """Affirmative PipeWire evidence: the daemon's socket exists right now.
+    """Affirmative PipeWire evidence: the daemon's socket accepts a connection.
 
-    A socket is stronger evidence than a bare path, but it is still only
-    availability: it does not claim that the portal will grant audio to a
-    particular request.
+    A socket file's presence is *not* availability: a crashed or stopped daemon
+    leaves the path behind, so a stale socket looks exactly like a live one to
+    every metadata check. The probe therefore connects to the endpoint and
+    closes it again, which only succeeds while a process is accepting on that
+    path. It never speaks the protocol, creates a stream, or asks permission;
+    a successful connect claims availability only, not that the portal will
+    grant audio to a particular request.
     """
 
     def __init__(
         self,
         environment: Mapping[str, str] | None = None,
-        path_exists: Callable[[str], bool] | None = None,
+        reachable: Callable[[str], bool] | None = None,
     ) -> None:
         self._environment = os.environ if environment is None else environment
-        self._path_exists = _socket_exists if path_exists is None else path_exists
+        self._reachable = _socket_reachable if reachable is None else reachable
 
     def __call__(self) -> bool:
         runtime = self._environment.get("XDG_RUNTIME_DIR")
@@ -100,16 +110,33 @@ class PipeWireSocket:
             return False
         path = os.path.join(runtime, PIPEWIRE_SOCKET_NAME)
         try:
-            return bool(self._path_exists(path))
-        except Exception:  # noqa: BLE001 - an unreadable socket proves nothing
+            return bool(self._reachable(path))
+        except Exception:  # noqa: BLE001 - an unreachable socket proves nothing
             return False
 
 
-def _socket_exists(path: str) -> bool:
+def _socket_reachable(path: str) -> bool:
+    """Whether some process is accepting connections on this Unix socket.
+
+    ``connect`` is bounded: a local PipeWire daemon answers immediately, and the
+    timeout only stops a wedged listener from stalling startup. Every failure
+    mode (missing path, ordinary file, stale socket, refused or timed-out
+    connect) returns ``False`` so the audio capability is reported unavailable.
+    """
     try:
-        return stat.S_ISSOCK(os.stat(path).st_mode)
+        if not stat.S_ISSOCK(os.stat(path).st_mode):
+            return False
     except OSError:
         return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.settimeout(PIPEWIRE_PROBE_TIMEOUT)
+        sock.connect(path)
+    except OSError:
+        return False
+    finally:
+        sock.close()
+    return True
 
 
 class DBusCapabilityClient:
@@ -194,7 +221,8 @@ class PipeWirePortalAudioProbe:
 
     Both evidence sources are injected so tests never touch a real socket or the
     session bus. The default client is read-only introspection, and the default
-    PipeWire check inspects the runtime socket; neither starts a process.
+    PipeWire check proves reachability with a bounded connect and close; neither
+    starts a process or creates a stream.
     """
 
     def __init__(
@@ -291,6 +319,7 @@ __all__ = [
     "DBusCapabilityClient",
     "INTROSPECTION_TIMEOUT",
     "InterfaceCapabilityClient",
+    "PIPEWIRE_PROBE_TIMEOUT",
     "PIPEWIRE_SOCKET_NAME",
     "PORTAL_OBJECT_PATH",
     "PORTAL_SERVICE",

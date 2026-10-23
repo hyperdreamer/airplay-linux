@@ -13,6 +13,9 @@ an explicitly disabled policy) produces ``video_only``.
 
 from __future__ import annotations
 
+import os
+import socket
+import stat
 from collections import deque
 
 import pytest
@@ -203,6 +206,52 @@ async def test_probe_is_repeatable_and_never_caches_a_failure():
     assert len(portal.calls) == 2
 
 
+async def test_a_successful_probe_is_repeated_when_pipewire_disappears():
+    """A cached success must not outlive the daemon that produced it."""
+    portal = FakePortal()
+    pipewire = FakePipeWire(True, False)
+    probe = audio_probe(portal=portal, pipewire=pipewire)
+
+    assert await probe.check() == Ok(value=None)
+    second = await probe.check()
+
+    assert isinstance(second, Err)
+    assert second.error.code is ErrorCode.audio_unavailable
+    assert "pipewire-0" in (second.error.detail or "")
+    assert pipewire.calls == 2
+    # The second check re-observes PipeWire itself, so the portal is not asked.
+    assert len(portal.calls) == 1
+    assert audio_start_policy(AudioPolicy(), second, False) == "decision_required"
+
+
+async def test_a_successful_probe_is_repeated_when_the_portal_disappears():
+    portal = FakePortal(REQUIRED_PORTAL_INTERFACES, None)
+    pipewire = FakePipeWire(True)
+    probe = audio_probe(portal=portal, pipewire=pipewire)
+
+    assert await probe.check() == Ok(value=None)
+    second = await probe.check()
+
+    assert isinstance(second, Err)
+    assert second.error.code is ErrorCode.audio_unavailable
+    assert PORTAL_SERVICE in (second.error.detail or "")
+    assert pipewire.calls == 2
+    assert len(portal.calls) == 2
+    assert audio_start_policy(AudioPolicy(), second, False) == "decision_required"
+
+
+async def test_repeated_successes_are_probed_each_time_instead_of_replayed():
+    portal = FakePortal()
+    pipewire = FakePipeWire(True)
+    probe = audio_probe(portal=portal, pipewire=pipewire)
+
+    assert await probe.check() == Ok(value=None)
+    assert await probe.check() == Ok(value=None)
+
+    assert pipewire.calls == 2
+    assert len(portal.calls) == 2
+
+
 async def test_missing_pipewire_is_audio_unavailable_and_skips_the_portal():
     portal = FakePortal()
     pipewire = FakePipeWire(False)
@@ -244,17 +293,84 @@ async def test_probe_audio_does_not_accept_a_malformed_success():
 def test_the_pipewire_socket_check_requires_an_absolute_runtime_and_socket_name():
     seen: list[str] = []
 
-    def exists(path: str) -> bool:
+    def reachable(path: str) -> bool:
         seen.append(path)
         return True
 
-    assert PipeWireSocket({"XDG_RUNTIME_DIR": "/run/user/1000"}, exists)() is True
+    assert PipeWireSocket({"XDG_RUNTIME_DIR": "/run/user/1000"}, reachable)() is True
     assert seen == ["/run/user/1000/pipewire-0"]
 
     seen.clear()
-    assert PipeWireSocket({"XDG_RUNTIME_DIR": "relative"}, exists)() is False
-    assert PipeWireSocket({}, exists)() is False
+    assert PipeWireSocket({"XDG_RUNTIME_DIR": "relative"}, reachable)() is False
+    assert PipeWireSocket({}, reachable)() is False
     assert seen == []
+
+
+def test_the_default_pipewire_probe_rejects_a_missing_socket(tmp_path):
+    assert PipeWireSocket({"XDG_RUNTIME_DIR": str(tmp_path)})() is False
+
+
+def test_the_default_pipewire_probe_rejects_an_ordinary_file(tmp_path):
+    """Socket identity alone is not reachability, and a file is not a socket."""
+    (tmp_path / "pipewire-0").write_text("stale placeholder")
+
+    assert PipeWireSocket({"XDG_RUNTIME_DIR": str(tmp_path)})() is False
+
+
+def test_the_default_pipewire_probe_rejects_a_stale_socket(tmp_path):
+    """A bound-then-closed socket still looks like a socket to metadata checks.
+
+    The endpoint no longer answers, so the probe must report unavailable rather
+    than inferring a live PipeWire daemon from the leftover path.
+    """
+    path = tmp_path / "pipewire-0"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        stale.bind(str(path))
+    finally:
+        stale.close()
+
+    assert stat.S_ISSOCK(os.stat(path).st_mode)
+    unreachable = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        assert unreachable.connect_ex(str(path)) != 0
+    finally:
+        unreachable.close()
+
+    assert PipeWireSocket({"XDG_RUNTIME_DIR": str(tmp_path)})() is False
+
+
+def test_the_default_pipewire_probe_accepts_a_listening_socket(tmp_path):
+    path = tmp_path / "pipewire-0"
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listener.bind(str(path))
+        listener.listen(1)
+        assert PipeWireSocket({"XDG_RUNTIME_DIR": str(tmp_path)})() is True
+    finally:
+        listener.close()
+
+
+async def test_the_default_probe_reports_a_stale_socket_as_audio_unavailable(tmp_path):
+    """The review's counterexample: portal present, PipeWire path stale."""
+    path = tmp_path / "pipewire-0"
+    stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        stale.bind(str(path))
+    finally:
+        stale.close()
+
+    portal = FakePortal()
+    probe = PipeWirePortalAudioProbe(
+        portal=portal, environment={"XDG_RUNTIME_DIR": str(tmp_path)},
+    )
+    result = await probe.check()
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.audio_unavailable
+    assert "pipewire-0" in (result.error.detail or "")
+    assert portal.calls == []
+    assert audio_start_policy(AudioPolicy(), result, False) == "decision_required"
 
 
 async def test_probe_never_requests_permission_or_opens_a_stream():
