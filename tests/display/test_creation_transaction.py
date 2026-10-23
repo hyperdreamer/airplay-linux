@@ -202,7 +202,8 @@ class Observer:
             return Ok(value=self.current)
         return Err(error=diagnostic(ErrorCode.cleanup_timeout))
 
-    async def configure(self, output_id: str, values):
+    async def configure(self, target, values):
+        output_id = target.output_id if isinstance(target, OutputInfo) else target
         self.configure_calls.append((output_id, dict(values)))
         changed = []
         for item in self.current:

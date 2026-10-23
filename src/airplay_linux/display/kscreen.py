@@ -110,6 +110,16 @@ class KScreenParseError(ValueError):
 
 
 @dataclass(frozen=True, kw_only=True)
+class OutputIdentity:
+    """The captured KScreen identity required before a configuration command."""
+
+    output_id: str
+    connector: str
+    size: Size
+    position: tuple[int, int]
+
+
+@dataclass(frozen=True, kw_only=True)
 class OutputInfo:
     """One KScreen output, projected onto the facts this application acts on."""
 
@@ -120,6 +130,15 @@ class OutputInfo:
     position: tuple[int, int]
     scale: float
     virtual: bool | None
+
+    @property
+    def identity(self) -> OutputIdentity:
+        return OutputIdentity(
+            output_id=self.output_id,
+            connector=self.connector,
+            size=self.size,
+            position=self.position,
+        )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -612,7 +631,8 @@ def _tokens(output_id: str, request: _Request, mode: KScreenMode | None) -> tupl
 
 
 def _verified(
-    updated: _Record, original: _Record, request: _Request, mode: KScreenMode | None,
+    updated: _Record, target: OutputIdentity, request: _Request,
+    mode: KScreenMode | None,
 ) -> bool:
     """Whether the readback proves every requested setting took effect.
 
@@ -623,7 +643,17 @@ def _verified(
     dimensions it had when it was selected, so an exit-zero command cannot be
     read as success for a different output or a different resolution.
     """
-    if updated.connector != original.connector:
+    if updated.connector != target.connector or updated.output_id != target.output_id:
+        return False
+    expected_size = target.size
+    if mode is not None:
+        expected_size = mode.size
+    elif request.size is not None:
+        expected_size = request.size
+    if updated.size != expected_size:
+        return False
+    expected_position = request.position if request.position is not None else target.position
+    if updated.position != expected_position:
         return False
     if request.enabled is not None and updated.enabled != request.enabled:
         return False
@@ -827,22 +857,32 @@ class KScreenObserver:
             except Exception:  # noqa: BLE001 - a subscriber must not break observation
                 continue
 
-    async def snapshot(self) -> Result[LayoutSnapshot]:
-        """The current layout as a restorable flat baseline, with a canonical hash."""
-        result = await self._records()
-        if isinstance(result, Err):
-            return result
-        self._publish(_outputs(result.value))
-        return Ok(value=_snapshot(result.value))
+    async def observation(self) -> Result[tuple[tuple[OutputInfo, ...], LayoutSnapshot]]:
+        """Project candidates and complete evidence from the same raw read.
 
-    async def outputs(self) -> Result[tuple[OutputInfo, ...]]:
-        """The fully describable current outputs."""
+        A filtered candidate list alone cannot prove absence: entries with
+        unreadable geometry must remain visible in its accompanying snapshot.
+        """
         result = await self._records()
         if isinstance(result, Err):
             return result
         outputs = _outputs(result.value)
         self._publish(outputs)
-        return Ok(value=outputs)
+        return Ok(value=(outputs, _snapshot(result.value)))
+
+    async def snapshot(self) -> Result[LayoutSnapshot]:
+        """The current layout as a restorable flat baseline, with a canonical hash."""
+        result = await self.observation()
+        if isinstance(result, Err):
+            return result
+        return Ok(value=result.value[1])
+
+    async def outputs(self) -> Result[tuple[OutputInfo, ...]]:
+        """The fully describable current outputs; not complete absence evidence."""
+        result = await self.observation()
+        if isinstance(result, Err):
+            return result
+        return Ok(value=result.value[0])
 
     async def wait_for(
         self,
@@ -956,40 +996,83 @@ class KScreenObserver:
     # -- configuration ------------------------------------------------------
 
     async def configure(
-        self, output_id: str, values: Mapping[str, str | int | bool]
+        self, target: OutputIdentity | OutputInfo | str,
+        values: Mapping[str, str | int | bool],
+        *, expected: Mapping[str, str | int | bool] | None = None,
     ) -> Result[None]:
-        """Apply one atomic KScreen setting set and prove it in the readback.
+        """Apply settings only to the captured output instance and prove readback.
 
-        Supported keys are ``enabled``, ``mode``, ``size``, ``position`` and
-        ``scale``. ``mode`` must be a mode id KScreen reports for this output;
-        ``size`` is resolved to such an id rather than being passed as text.
+        ``target`` is a full observation: numeric ID, connector, size, and
+        position. A fresh read must still match all four fields before the
+        command starts, so numeric KScreen ID reuse or geometry drift cannot
+        redirect the command to another output. ``expected`` additionally fences
+        property-level restoration permission at that same locked read, including
+        scale and mode changes that do not affect the output's geometry.
         """
-        target = _id_token(output_id) if type(output_id) is str else None
+        identity = target.identity if type(target) is OutputInfo else target
         request = _request(values)
-        if target is None or request is None:
+        if request is None or (expected is not None and not isinstance(expected, Mapping)):
             return _failure(ErrorCode.invalid_input)
+        expected = dict(expected) if expected is not None else None
         async with self._configure_lock:
-            result, observed = await self._configure_locked(target, request)
+            initial: tuple[_Record, ...] | None = None
+            if type(target) is str:
+                output_id = _id_token(target)
+                if output_id is None:
+                    return _failure(ErrorCode.invalid_input)
+                current = await self._records()
+                if isinstance(current, Err):
+                    return current
+                initial = current.value
+                record = next(
+                    (item for item in initial if item.output_id == output_id), None,
+                )
+                if record is None or record.size is None or record.position is None:
+                    return _failure(ErrorCode.configuration_failed)
+                identity = OutputIdentity(
+                    output_id=output_id,
+                    connector=record.connector,
+                    size=record.size,
+                    position=record.position,
+                )
+            if type(identity) is not OutputIdentity:
+                return _failure(ErrorCode.invalid_input)
+            result, observed = await self._configure_locked(identity, request, initial=initial, expected=expected)
         if observed is not None:
             self._publish(observed)
         return result
 
     async def _configure_locked(
-        self, output_id: str, request: _Request,
+        self, target: OutputIdentity, request: _Request,
+        *, initial: tuple[_Record, ...] | None = None,
+        expected: Mapping[str, str | int | bool] | None = None,
     ) -> tuple[Result[None], tuple[OutputInfo, ...] | None]:
-        current = await self._records()
+        current = Ok(value=initial) if initial is not None else await self._records()
         if isinstance(current, Err):
             return current, None
         record = next(
-            (item for item in current.value if item.output_id == output_id), None,
+            (
+                item for item in current.value
+                if item.output_id == target.output_id
+                and item.connector == target.connector
+                and item.size == target.size
+                and item.position == target.position
+            ),
+            None,
         )
         if record is None:
+            return _failure(ErrorCode.configuration_failed), None
+        properties = _snapshot_properties(record)
+        if expected is not None and any(
+            name not in properties or type(properties[name]) is not type(value) or properties[name] != value
+            for name, value in expected.items()
+        ):
             return _failure(ErrorCode.configuration_failed), None
         resolved = _resolve_mode(record, request)
         if isinstance(resolved, Err):
             return resolved, None
         mode = resolved.value
-        tokens = _tokens(output_id, request, mode)
+        tokens = _tokens(target.output_id, request, mode)
         if not tokens:
             return _failure(ErrorCode.invalid_input), None
         applied = await self._bounded(
@@ -1008,9 +1091,9 @@ class KScreenObserver:
         if isinstance(readback, Err):
             return readback, None
         updated = next(
-            (item for item in readback.value if item.output_id == output_id), None,
+            (item for item in readback.value if item.output_id == target.output_id), None,
         )
-        if updated is None or not _verified(updated, record, request, mode):
+        if updated is None or not _verified(updated, target, request, mode):
             return _failure(ErrorCode.configuration_failed), None
         return Ok(value=None), _outputs(readback.value)
 
@@ -1039,6 +1122,7 @@ __all__ = [
     "KScreenMode",
     "KScreenObserver",
     "KScreenParseError",
+    "OutputIdentity",
     "OutputInfo",
     "layout_hash",
     "parse_outputs",
