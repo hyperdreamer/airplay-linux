@@ -457,33 +457,92 @@ async def test_cancelled_selection_leaves_no_lease_and_no_open_session() -> None
 # --------------------------------------------------------------------------- inventory adapter
 
 
-async def test_kscreen_inventory_is_read_only_and_filters_virtual_outputs() -> None:
+DISPLAYPORT = 14  # KScreen::Output::Type::DisplayPort
+HDMI = 6  # KScreen::Output::Type::HDMI
+PANEL = 7  # KScreen::Output::Type::Panel
+UNKNOWN_TYPE = 0  # KScreen::Output::Type::Unknown
+
+
+def kscreen_process(outputs: list[dict[str, Any]]) -> FakeProcess:
+    """A process double answering the real ``kscreen-doctor -j`` schema."""
     process = FakeProcess()
-    payload = {
-        "outputs": [
-            {"name": "DP-1", "enabled": True, "connected": True, "type": "DisplayPort"},
-            {"name": "HDMI-A-1", "enabled": True, "connected": True, "type": "HDMI"},
-            {"name": "Virtual-1", "enabled": True, "connected": True, "type": "Virtual"},
-            {"name": "DP-2", "enabled": False, "connected": True, "type": "DisplayPort"},
-            {"name": "DP-3", "enabled": True, "connected": False, "type": "DisplayPort"},
-        ]
-    }
     process.queue_result(
         "run",
         Ok(
             value=ports.CommandOutput(
-                exit_code=0, stdout=json.dumps(payload).encode(), stderr=b""
+                exit_code=0, stdout=json.dumps({"outputs": outputs}).encode(), stderr=b""
             )
         ),
     )
+    return process
+
+
+async def test_kscreen_inventory_is_read_only_and_reports_physical_outputs() -> None:
+    process = kscreen_process(
+        [
+            {"name": "DP-1", "enabled": True, "connected": True, "type": DISPLAYPORT},
+            {"name": "HDMI-A-1", "enabled": True, "connected": True, "type": HDMI},
+            {"name": "eDP-1", "enabled": True, "connected": True, "type": PANEL},
+            {"name": "Virtual-1", "enabled": True, "connected": True, "type": DISPLAYPORT},
+            {"name": "DP-2", "enabled": False, "connected": True, "type": DISPLAYPORT},
+            {"name": "DP-3", "enabled": True, "connected": False, "type": DISPLAYPORT},
+        ]
+    )
     inventory = KscreenConnectorInventory(process)
 
-    assert await inventory() == ("DP-1", "HDMI-A-1")
+    # ``Virtual-1`` carries a physical DisplayPort type and a virtual refusal
+    # name; a neutral name with unproven origin is the CAP-001 matrix below.
+    assert await inventory() == ("DP-1", "HDMI-A-1", "eDP-1")
     run = process.journal.calls("process.run")[0]
     assert run["spec"]["argv"] == ("kscreen-doctor", "-j")
     assert run["timeout"] == 5.0
     assert process.journal.calls("process.spawn") == []
     assert process.journal.calls("process.terminate") == []
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        # A helper-created output can appear with a neutral name and no origin.
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": UNKNOWN_TYPE},
+        {"name": "Cast-1", "enabled": True, "connected": True},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": None},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": "DisplayPort"},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": "Virtual"},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": 99},
+        # Ambiguous connection state is not proof of a connected monitor.
+        {"name": "Cast-1", "enabled": True, "connected": "true", "type": DISPLAYPORT},
+        {"name": "Cast-1", "enabled": True, "type": DISPLAYPORT},
+    ],
+)
+async def test_unproven_output_origin_is_never_reported_as_physical(entry: dict) -> None:
+    process = kscreen_process([entry])
+
+    assert await KscreenConnectorInventory(process)() == ()
+
+
+async def test_a_neutral_name_with_a_physical_type_is_verified_by_type_only() -> None:
+    process = kscreen_process(
+        [{"name": "Cast-1", "enabled": True, "connected": True, "type": DISPLAYPORT}]
+    )
+
+    assert await KscreenConnectorInventory(process)() == ("Cast-1",)
+
+
+async def test_unproven_inventory_entries_never_reach_the_provider() -> None:
+    process = kscreen_process(
+        [{"name": "Cast-1", "enabled": True, "connected": True, "type": UNKNOWN_TYPE}]
+    )
+    provider, portal, _ = make_provider(inventory=KscreenConnectorInventory(process))
+
+    listed = await provider.list_physical()
+    assert isinstance(listed, Ok)
+    assert listed.value == ()
+
+    selected = await provider.select("Cast-1")
+    assert isinstance(selected, Err)
+    assert selected.error.code is ErrorCode.unsupported_source
+    assert portal.select_calls == []
 
 
 @pytest.mark.parametrize(

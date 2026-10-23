@@ -39,6 +39,23 @@ from .portal import PortalClient, PortalMonitor
 KSCREEN_PROBE: Final[tuple[str, ...]] = ("kscreen-doctor", "-j")
 INVENTORY_TIMEOUT: Final[float] = 5.0
 
+#: ``KScreen::Output::Type`` members that denote a physical monitor connector.
+#: The installed KScreen schema serialises this enum as an integer and has no
+#: virtual member, so an absent, string, ``Unknown`` (0), television, or
+#: out-of-range value is unproven origin and is never reported as physical.
+PHYSICAL_OUTPUT_TYPES: Final[frozenset[int]] = frozenset(
+    {
+        1,  # VGA
+        2,  # DVI
+        3,  # DVII
+        4,  # DVIA
+        5,  # DVID
+        6,  # HDMI
+        7,  # Panel
+        14,  # DisplayPort
+    }
+)
+
 _CONNECTOR_NAME: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){0,3}"
 )
@@ -64,6 +81,15 @@ def _is_physical_connector(connector: object) -> bool:
     if any(marker in lowered for marker in _NON_PHYSICAL_MARKERS):
         return False
     return _CONNECTOR_NAME.fullmatch(connector) is not None
+
+
+def _is_physical_output_type(output_type: object) -> bool:
+    """Whether a KScreen output type positively identifies physical hardware.
+
+    Absence of a virtual marker is not evidence of a physical origin: only a
+    known physical connector type in the installed schema is accepted.
+    """
+    return type(output_type) is int and output_type in PHYSICAL_OUTPUT_TYPES
 
 
 def _physical_connectors(connectors: object) -> tuple[str, ...]:
@@ -101,10 +127,15 @@ class _UuidFactory:
 class KscreenConnectorInventory:
     """Read-only ``kscreen-doctor -j`` connector inventory.
 
-    The probe is deliberately conservative: an output counts only when it is
-    enabled, is not marked disconnected, and is not a virtual output.  A failed
-    probe returns an empty inventory, which callers treat as "nothing can be
+    An output is reported only once its physical origin is positively proven: it
+    is enabled, it is explicitly connected, its name is a real connector name
+    that is not a window/virtual identity, and its ``type`` is a known physical
+    connector type from the installed KScreen schema.  An unproven entry is
+    simply absent from the inventory, which callers treat as "nothing can be
     verified" rather than as permission to capture something else.
+
+    A failed probe raises :class:`InventoryProbeError`; an empty tuple therefore
+    always means a successfully verified empty inventory.
     """
 
     def __init__(self, process: ProcessPort, *, timeout: float = INVENTORY_TIMEOUT) -> None:
@@ -144,10 +175,9 @@ class KscreenConnectorInventory:
                 continue
             if entry.get("enabled") is not True:
                 continue
-            if entry.get("connected") is False:
+            if entry.get("connected") is not True:
                 continue
-            output_type = entry.get("type")
-            if type(output_type) is str and "virtual" in output_type.casefold():
+            if not _is_physical_output_type(entry.get("type")):
                 continue
             if connector not in selected:
                 selected.append(connector)
