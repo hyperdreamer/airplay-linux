@@ -51,6 +51,7 @@ class FakePortalPeer:
         self.closed_sessions: list[str] = []
         self.error_replies: dict[str, str] = {}
         self.handle_override: dict[str, str] = {}
+        self.held: dict[str, asyncio.Event] = {}
         self.disconnected = False
         self._next_serial = 0
         self._condition = asyncio.Condition()
@@ -115,6 +116,10 @@ class FakePortalPeer:
             self.open_sessions.discard(message.path)
             return Message.new_method_return(message)
 
+        hold = self.held.get(message.member)
+        if hold is not None:
+            await hold.wait()
+
         error = self.error_replies.get(message.member)
         if error is not None:
             return Message.new_error(message, error, "synthetic portal failure")
@@ -133,6 +138,17 @@ class FakePortalPeer:
 
     def count(self, member: str) -> int:
         return sum(1 for call in self.calls if call.member == member)
+
+    def hold(self, member: str) -> asyncio.Event:
+        """Make one method's reply never arrive until the test releases it."""
+        event = asyncio.Event()
+        self.held[member] = event
+        return event
+
+    def release_hold(self, member: str) -> None:
+        event = self.held.pop(member, None)
+        if event is not None:
+            event.set()
 
     async def wait_for(self, member: str, count: int = 1) -> None:
         async with self._condition:
@@ -227,6 +243,20 @@ class FakePortalPeer:
         return self.respond("Start", 0, results)
 
 
+async def settle(cycles: int = 12) -> None:
+    """Let the client reach the point where it waits for the Response signal.
+
+    A real bus delivers the method reply for a Request handle before the portal
+    can emit the ``Response`` signal, but the client needs a bounded number of
+    scheduler hand-offs to store that correlated path (it does not block its
+    event loop, and the acquisition races abandonment internally).  Yielding a
+    fixed, generous number of times keeps the test deterministic without
+    sleeping on the wall clock.
+    """
+    for _ in range(cycles):
+        await asyncio.sleep(0)
+
+
 async def complete_selection(
     client: PortalClient,
     peer: FakePortalPeer,
@@ -239,7 +269,7 @@ async def complete_selection(
 ) -> Any:
     """Drive one selection through every request/response exchange.
 
-    Each exchange yields once after the method call is observed: a real bus
+    Each exchange settles after the method call is observed: a real bus
     delivers the Request-handle reply before the portal can emit the Response
     signal, so the client always knows the correlated path first.  Counts are
     relative to the calls already made, so a peer reused for a second
@@ -250,13 +280,13 @@ async def complete_selection(
     started = peer.count("Start")
     task = asyncio.create_task(client.select_monitor(connector, restore_token))
     await peer.wait_for("CreateSession", created + 1)
-    await asyncio.sleep(0)
+    await settle()
     peer.respond_create(session_token=session_token)
     await peer.wait_for("SelectSources", selected + 1)
-    await asyncio.sleep(0)
+    await settle()
     peer.respond("SelectSources", 0, {})
     await peer.wait_for("Start", started + 1)
-    await asyncio.sleep(0)
+    await settle()
     peer.respond_start(connector, response=start_response, **(start_kwargs or {}))
     return await task
 
@@ -476,7 +506,7 @@ async def test_response_on_a_foreign_path_is_ignored() -> None:
         call=call,
         path=f"/org/example/request/{call.handle_token}",
     )
-    await asyncio.sleep(0)
+    await settle()
     assert not task.done()
     assert peer.open_sessions == set()
 
@@ -523,6 +553,70 @@ async def test_late_response_after_cancel_closes_the_new_session() -> None:
 
     assert peer.session_path("late") in peer.closed_sessions
     assert peer.session_path("late") not in peer.open_sessions
+
+
+async def test_cancelled_selection_finishes_without_waiting_for_a_suppressed_response() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    await settle()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+
+    # ``Request.Close`` succeeded, so the portal contract says no ``Response``
+    # will ever be emitted for this request.  Nothing may still be waiting on it.
+    assert peer.request_path(peer.last("CreateSession").handle_token) in peer.closed_requests
+    await asyncio.wait_for(client.drain(), timeout=2.0)
+
+    assert client._jobs == set()
+    assert client._cleanup == set()
+    assert peer.open_sessions == set()
+
+
+async def test_cancelled_selection_closes_the_session_it_already_created() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    await settle()
+    peer.respond_create(session_token="s1")
+    await peer.wait_for("SelectSources")
+    await settle()
+    peer.respond("SelectSources", 0, {})
+    await peer.wait_for("Start")
+    await settle()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(client.drain(), timeout=2.0)
+
+    assert peer.session_path("s1") in peer.closed_sessions
+    assert peer.open_sessions == set()
+    assert client._jobs == set()
+
+
+async def test_abandonment_does_not_wait_for_a_stalled_control_call() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    peer.hold("CreateSession")
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The method reply is still outstanding; the job must not wait for it.
+    await asyncio.wait_for(client.drain(), timeout=2.0)
+    assert client._jobs == set()
+
+    peer.release_hold("CreateSession")
+    await settle()
+    assert client._replies == set()
 
 
 # --------------------------------------------------------------------------- close/tokens

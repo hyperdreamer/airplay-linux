@@ -45,6 +45,11 @@ PERSIST_WHILE_RUNNING: Final[int] = 1
 
 _INVALID: Final[object] = object()
 
+#: Sentinel resolved into an abandoned request's future.  ``Request.Close`` makes
+#: the portal suppress the ``Response`` signal entirely, so a job that is still
+#: waiting for one has to be released by this adapter, never by the portal.
+_ABANDONED: Final[object] = object()
+
 
 class PortalPeer(Protocol):
     """The narrow slice of a D-Bus connection this adapter uses.
@@ -100,20 +105,35 @@ class PortalMonitor:
 class _Pending:
     """One outstanding Request handle and its correlated Response future."""
 
-    __slots__ = ("token", "paths", "future")
+    __slots__ = ("token", "paths", "future", "connector", "abandoned")
 
     def __init__(
-        self, token: str, paths: set[str], future: asyncio.Future[tuple[Any, Any]]
+        self,
+        token: str,
+        paths: set[str],
+        future: asyncio.Future[tuple[Any, Any]],
+        connector: str,
     ) -> None:
         self.token = token
         self.paths = paths
         self.future = future
+        self.connector = connector
+        self.abandoned = False
 
 
 class _Acquisition:
     """State that must survive cancellation of the caller's await."""
 
-    __slots__ = ("connector", "restore_token", "abandoned", "rolled_back", "session", "requests")
+    __slots__ = (
+        "connector",
+        "restore_token",
+        "abandoned",
+        "rolled_back",
+        "session",
+        "requests",
+        "pending",
+        "released",
+    )
 
     def __init__(self, connector: str, restore_token: str | None) -> None:
         self.connector = connector
@@ -122,6 +142,20 @@ class _Acquisition:
         self.rolled_back = False
         self.session: str | None = None
         self.requests: list[str] = []
+        self.pending: list[_Pending] = []
+        #: Set once the caller is gone; every acquisition wait races this, so no
+        #: job can stay blocked on a reply or a signal that will never arrive.
+        self.released = asyncio.Event()
+
+    def release_waiters(self) -> None:
+        """Unblock everything this acquisition can still be waiting on."""
+        self.abandoned = True
+        self.released.set()
+        for pending in tuple(self.pending):
+            pending.abandoned = True
+            if not pending.future.done():
+                pending.future.set_result((_ABANDONED, None))
+        self.pending.clear()
 
 
 def _failure(code: ErrorCode) -> Err:
@@ -184,6 +218,19 @@ def _already_gone(error_name: object) -> bool:
     }
 
 
+def _returned_handle(reply: object) -> str | None:
+    """The Request object path a portal method-return handed back, if any."""
+    if type(reply) is not Message or reply.message_type is not MessageType.METHOD_RETURN:
+        return None
+    body = reply.body
+    if type(body) not in (list, tuple) or len(body) != 1:
+        return None
+    handle = body[0]
+    if type(handle) is not str or not handle.startswith("/"):
+        return None
+    return handle
+
+
 def _bind_monitor(connector: str, streams: object) -> Result[None]:
     """Accept exactly one monitor stream whose mapping names ``connector``."""
     streams = _unwrap(streams)
@@ -229,7 +276,13 @@ class PortalClient:
         self._handler_installed = False
         self._pending: dict[str, _Pending] = {}
         self._sessions: dict[str, str] = {}
+        #: Request paths whose caller has gone.  ``Request.Close`` normally
+        #: suppresses the ``Response``, but one may already be in flight, so a
+        #: late success is still reaped instead of leaking its session.
+        self._orphaned: dict[str, str] = {}
         self._jobs: set[asyncio.Task[Any]] = set()
+        self._acquisitions: dict[asyncio.Task[Any], _Acquisition] = {}
+        self._replies: set[asyncio.Task[Any]] = set()
         self._abandoned: set[asyncio.Task[Any]] = set()
         self._cleanup: set[asyncio.Task[Any]] = set()
         self._closed = False
@@ -257,6 +310,7 @@ class PortalClient:
         acquisition = _Acquisition(connector, restore_token)
         job = asyncio.ensure_future(self._acquire(acquisition))
         self._jobs.add(job)
+        self._acquisitions[job] = acquisition
         job.add_done_callback(self._job_complete)
         try:
             return await asyncio.shield(job)
@@ -292,6 +346,10 @@ class PortalClient:
             if not tasks:
                 return
             await asyncio.gather(*tasks, return_exceptions=True)
+            # ``gather`` returns without suspending when every task already
+            # finished, and the completion callbacks that reap these records run
+            # on the next loop pass.  Yield so draining cannot spin the loop.
+            await asyncio.sleep(0)
 
     async def close(self) -> None:
         """Close every session this client still owns and detach the peer."""
@@ -332,17 +390,30 @@ class PortalClient:
         return self._peer
 
     def _abandon(self, acquisition: _Acquisition, job: asyncio.Task[Any]) -> None:
-        acquisition.abandoned = True
+        """Stop waiting for a portal that will never answer this request again."""
+        for pending in tuple(acquisition.pending):
+            for path in pending.paths:
+                self._orphaned[path] = acquisition.connector
         for path in tuple(acquisition.requests):
+            self._orphaned.setdefault(path, acquisition.connector)
             self._track_cleanup(self._close_request(path))
+        acquisition.release_waiters()
         self._abandoned.add(job)
+        if job.done():
+            # The outcome raced the cancellation and the caller will never see it.
+            self._reconcile(job)
 
     def _job_complete(self, task: asyncio.Task[Any]) -> None:
         self._jobs.discard(task)
+        self._acquisitions.pop(task, None)
         if task not in self._abandoned:
             return
         self._abandoned.discard(task)
-        if task.cancelled():
+        self._reconcile(task)
+
+    def _reconcile(self, task: asyncio.Task[Any]) -> None:
+        """Release an acquisition that succeeded even though its caller left."""
+        if not task.done() or task.cancelled():
             return
         try:
             result = task.result()
@@ -462,6 +533,9 @@ class PortalClient:
     ) -> Result[dict[str, Any]]:
         peer = self._peer
         assert peer is not None
+        if acquisition.abandoned:
+            # The caller is gone: never open another portal request for it.
+            return _failure(ErrorCode.portal_cancelled)
         token = _new_token()
         merged = dict(options or {})
         merged["handle_token"] = Variant("s", token)
@@ -470,32 +544,39 @@ class PortalClient:
             token=token,
             paths={expected},
             future=asyncio.get_running_loop().create_future(),
+            connector=acquisition.connector,
         )
         self._pending[token] = pending
+        acquisition.pending.append(pending)
         acquisition.requests.append(expected)
         try:
-            reply = await peer.call(self._call_message(member, merged, session, parent_window))
+            reply = await self._portal_call(
+                acquisition, self._call_message(member, merged, session, parent_window)
+            )
         except asyncio.CancelledError:
             raise
         except Exception:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
+        if reply is _ABANDONED:
+            self._forget(pending, acquisition)
+            return _failure(ErrorCode.portal_cancelled)
         if reply is None:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         if reply.message_type is MessageType.ERROR:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(_error_code(reply.error_name))
         if reply.message_type is not MessageType.METHOD_RETURN:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         body = reply.body
         if type(body) not in (list, tuple) or len(body) != 1 or type(body[0]) is not str:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         returned = body[0]
         if not returned:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         if returned != expected:
             # The portal may hand back a different Request handle; its Response
@@ -505,13 +586,68 @@ class PortalClient:
         try:
             response, results = await pending.future
         finally:
-            self._pending.pop(token, None)
+            self._forget(pending, acquisition)
+        if response is _ABANDONED:
+            return _failure(ErrorCode.portal_cancelled)
         mapped = _response_code(response)
         if isinstance(mapped, Err):
             return mapped
         if type(results) is not dict:
             return _failure(ErrorCode.dependency_incompatible)
         return Ok(value=results)
+
+    def _forget(self, pending: _Pending, acquisition: _Acquisition) -> None:
+        self._pending.pop(pending.token, None)
+        try:
+            acquisition.pending.remove(pending)
+        except ValueError:
+            return
+
+    async def _portal_call(
+        self, acquisition: _Acquisition, message: Message
+    ) -> Message | None | object:
+        """Call the portal without letting the call outlive its abandoned caller."""
+        peer = self._peer
+        if peer is None:
+            return None
+        call = asyncio.ensure_future(peer.call(message))
+        released = asyncio.ensure_future(acquisition.released.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {call, released}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            if not released.done():
+                released.cancel()
+        if call in done:
+            try:
+                return call.result()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return None
+        # Abandoned while the method call was in flight.  Its reply is no longer
+        # ours to await, but it may carry a Request handle the portal answers on,
+        # so keep consuming it instead of leaking a path nobody watches.
+        self._retain_reply(call, acquisition.connector)
+        return _ABANDONED
+
+    def _retain_reply(self, call: asyncio.Task[Any], connector: str) -> None:
+        self._replies.add(call)
+
+        def settle(task: asyncio.Task[Any]) -> None:
+            self._replies.discard(task)
+            if task.cancelled():
+                return
+            try:
+                reply = task.result()
+            except BaseException:
+                return
+            handle = _returned_handle(reply)
+            if handle is not None:
+                self._orphaned.setdefault(handle, connector)
+
+        call.add_done_callback(settle)
 
     def _call_message(
         self,
@@ -546,20 +682,43 @@ class PortalClient:
     def _on_message(self, message: Message) -> bool:
         if message.message_type is not MessageType.SIGNAL:
             return False
-        if message.interface != REQUEST_INTERFACE or message.member != "Response":
-            return False
         path = message.path
         if type(path) is not str:
             return False
-        pending = self._pending_for(path)
-        if pending is None:
+        if message.interface != REQUEST_INTERFACE or message.member != "Response":
             return False
+        pending = self._pending_for(path)
         body = message.body
         if type(body) not in (list, tuple) or len(body) != 2:
             return False
-        if not pending.future.done():
-            pending.future.set_result((body[0], body[1]))
-        return True
+        if pending is not None:
+            if not pending.future.done():
+                pending.future.set_result((body[0], body[1]))
+            elif pending.abandoned:
+                # Settled by abandonment: a success that still arrives owns a
+                # live session, so reap it instead of dropping the signal.
+                self._reap_response(body, pending.connector, path)
+            return True
+        if path in self._orphaned:
+            self._reap_response(body, self._orphaned[path], path)
+            return True
+        return False
+
+    def _reap_response(self, body: object, connector: str, path: str) -> None:
+        """Close a session created by a response no caller is waiting for."""
+        self._orphaned.pop(path, None)
+        if type(body) not in (list, tuple) or len(body) != 2:
+            return
+        if isinstance(_response_code(body[0]), Err):
+            return
+        results = _unwrap(body[1])
+        if type(results) is not dict:
+            return
+        session = _unwrap(results.get("session_handle"))
+        if type(session) is not str or not session.startswith("/"):
+            return
+        self._sessions.setdefault(session, connector)
+        self._track_cleanup(self._close_session(session))
 
     def _pending_for(self, path: str) -> _Pending | None:
         """Correlate by the exact request path, including a returned handle."""
