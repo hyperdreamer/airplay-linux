@@ -12,6 +12,7 @@ import pytest
 
 from airplay_linux.backend.contract import BackendFeatures
 from airplay_linux.capture.physical import (
+    InventoryProbeError,
     KscreenConnectorInventory,
     PhysicalCaptureProvider,
     is_physical_descriptor,
@@ -648,11 +649,63 @@ async def test_unproven_inventory_entries_never_reach_the_provider() -> None:
         Err(error=diagnostic(ErrorCode.dependency_missing)),
     ],
 )
-async def test_kscreen_inventory_fails_closed(outcome: Any) -> None:
+async def test_kscreen_inventory_probe_failure_is_never_an_empty_inventory(outcome: Any) -> None:
     process = FakeProcess()
     process.queue_result("run", outcome)
 
-    assert await KscreenConnectorInventory(process)() == ()
+    with pytest.raises(InventoryProbeError):
+        await KscreenConnectorInventory(process)()
+
+
+async def test_kscreen_inventory_probe_exception_is_never_an_empty_inventory() -> None:
+    class BrokenProcess:
+        async def run(self, spec: Any, timeout: float, stdin: Any = None) -> Any:
+            raise RuntimeError("spawn failed")
+
+    with pytest.raises(InventoryProbeError):
+        await KscreenConnectorInventory(BrokenProcess())()
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        Ok(value=ports.CommandOutput(exit_code=0, stdout=b"not json", stderr=b"")),
+        Ok(value=ports.CommandOutput(exit_code=2, stdout=b'{"outputs": []}', stderr=b"")),
+        Ok(value=ports.CommandOutput(exit_code=0, stdout=b'{"outputs": {}}', stderr=b"")),
+        Ok(value=ports.CommandOutput(exit_code=0, stdout=b"[]", stderr=b"")),
+        Err(error=diagnostic(ErrorCode.dependency_missing)),
+        Err(error=diagnostic(ErrorCode.dependency_incompatible)),
+        RuntimeError("wrong shaped probe result"),
+    ],
+)
+async def test_production_inventory_failure_reaches_the_provider(outcome: Any) -> None:
+    process = FakeProcess()
+    process.queue_result("run", outcome)
+    provider, portal, _ = make_provider(inventory=KscreenConnectorInventory(process))
+
+    listed = await provider.list_physical()
+    assert isinstance(listed, Err)
+    assert listed.error.code is ErrorCode.unsupported_source
+
+    selected = await provider.select("DP-1")
+    assert isinstance(selected, Err)
+    assert selected.error.code is ErrorCode.unsupported_source
+    assert portal.select_calls == []
+
+
+async def test_a_verified_empty_inventory_is_not_a_probe_failure() -> None:
+    provider, portal, _ = make_provider(
+        inventory=KscreenConnectorInventory(kscreen_process([]))
+    )
+
+    listed = await provider.list_physical()
+
+    assert isinstance(listed, Ok)
+    assert listed.value == ()
+    selected = await provider.select("DP-1")
+    assert isinstance(selected, Err)
+    assert selected.error.code is ErrorCode.unsupported_source
+    assert portal.select_calls == []
 
 
 # --------------------------------------------------------------------------- fake parity

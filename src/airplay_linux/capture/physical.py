@@ -69,6 +69,15 @@ _NON_PHYSICAL_MARKERS: Final[tuple[str, ...]] = (
 )
 
 
+class InventoryProbeError(RuntimeError):
+    """The read-only connector probe produced no verified inventory.
+
+    It is raised rather than returned as an empty tuple, so a broken or missing
+    probe can never be mistaken by the provider for a healthy system that has no
+    monitors.
+    """
+
+
 def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
 
@@ -149,22 +158,22 @@ class KscreenConnectorInventory:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:
-            return ()
+        except Exception as error:
+            raise InventoryProbeError("the connector probe could not run") from error
         if not isinstance(result, Ok) or type(result.value) is not CommandOutput:
-            return ()
+            raise InventoryProbeError("the connector probe returned no output")
         output = result.value
         if output.exit_code != 0:
-            return ()
+            raise InventoryProbeError("the connector probe did not succeed")
         try:
             document = json.loads(output.stdout)
-        except (TypeError, ValueError):
-            return ()
+        except (TypeError, ValueError) as error:
+            raise InventoryProbeError("the connector probe output is not JSON") from error
         if type(document) is not dict:
-            return ()
+            raise InventoryProbeError("the connector probe output is not an object")
         outputs = document.get("outputs")
         if type(outputs) is not list:
-            return ()
+            raise InventoryProbeError("the connector probe output has no outputs")
 
         selected: list[str] = []
         for entry in outputs:
@@ -227,6 +236,8 @@ class PhysicalCaptureProvider:
         except asyncio.CancelledError:
             raise
         except Exception:
+            # Includes InventoryProbeError: a probe that could not verify any
+            # monitor is a typed failure, never a healthy empty inventory.
             return _failure(ErrorCode.unsupported_source)
         if type(connectors) is not tuple:
             return _failure(ErrorCode.unsupported_source)
