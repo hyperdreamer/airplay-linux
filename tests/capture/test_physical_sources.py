@@ -594,8 +594,9 @@ async def test_kscreen_inventory_is_read_only_and_reports_physical_outputs() -> 
         {"name": "Cast-1", "enabled": True, "connected": True, "type": UNKNOWN_TYPE},
         {"name": "Cast-1", "enabled": True, "connected": True},
         {"name": "Cast-1", "enabled": True, "connected": True, "type": None},
-        {"name": "Cast-1", "enabled": True, "connected": True, "type": "DisplayPort"},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": "Unknown"},
         {"name": "Cast-1", "enabled": True, "connected": True, "type": "Virtual"},
+        {"name": "Cast-1", "enabled": True, "connected": True, "type": ""},
         {"name": "Cast-1", "enabled": True, "connected": True, "type": 99},
         # Ambiguous connection state is not proof of a connected monitor.
         {"name": "Cast-1", "enabled": True, "connected": "true", "type": DISPLAYPORT},
@@ -608,9 +609,21 @@ async def test_unproven_output_origin_is_never_reported_as_physical(entry: dict)
     assert await KscreenConnectorInventory(process)() == ()
 
 
-async def test_a_neutral_name_with_a_physical_type_is_verified_by_type_only() -> None:
+async def test_a_neutral_name_alone_never_proves_physical_origin() -> None:
+    """The virtual-type discriminator must be pinned on its own (M6 control)."""
     process = kscreen_process(
-        [{"name": "Cast-1", "enabled": True, "connected": True, "type": DISPLAYPORT}]
+        [{"name": "Cast-1", "enabled": True, "connected": True, "type": "Virtual"}]
+    )
+
+    assert await KscreenConnectorInventory(process)() == ()
+
+
+@pytest.mark.parametrize("output_type", [DISPLAYPORT, "DisplayPort", "HDMI", PANEL])
+async def test_a_neutral_name_with_a_physical_type_is_verified_by_type_only(
+    output_type: Any,
+) -> None:
+    process = kscreen_process(
+        [{"name": "Cast-1", "enabled": True, "connected": True, "type": output_type}]
     )
 
     assert await KscreenConnectorInventory(process)() == ("Cast-1",)

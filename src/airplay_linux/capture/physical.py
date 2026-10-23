@@ -56,6 +56,23 @@ PHYSICAL_OUTPUT_TYPES: Final[frozenset[int]] = frozenset(
     }
 )
 
+#: Textual spellings of the same enum, for a schema that serialises the connector
+#: type by name instead of by value.  A name outside this set -- notably
+#: ``Virtual`` or ``Unknown`` -- is not physical evidence.
+PHYSICAL_OUTPUT_TYPE_NAMES: Final[frozenset[str]] = frozenset(
+    {
+        "vga",
+        "dvi",
+        "dvii",
+        "dvi-i",
+        "dvia",
+        "dvid",
+        "hdmi",
+        "panel",
+        "displayport",
+    }
+)
+
 _CONNECTOR_NAME: Final[re.Pattern[str]] = re.compile(
     r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){0,3}"
 )
@@ -96,9 +113,13 @@ def _is_physical_output_type(output_type: object) -> bool:
     """Whether a KScreen output type positively identifies physical hardware.
 
     Absence of a virtual marker is not evidence of a physical origin: only a
-    known physical connector type in the installed schema is accepted.
+    known physical connector type from the installed schema is accepted.
     """
-    return type(output_type) is int and output_type in PHYSICAL_OUTPUT_TYPES
+    if type(output_type) is int:
+        return output_type in PHYSICAL_OUTPUT_TYPES
+    if type(output_type) is str:
+        return output_type.casefold() in PHYSICAL_OUTPUT_TYPE_NAMES
+    return False
 
 
 def _physical_connectors(connectors: object) -> tuple[str, ...]:

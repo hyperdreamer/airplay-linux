@@ -394,6 +394,42 @@ async def test_virtual_output_stream_cannot_be_bound_as_a_physical_monitor() -> 
     assert peer.session_path("s1") in peer.closed_sessions
 
 
+@pytest.mark.parametrize(
+    "source_type", [WINDOW, VIRTUAL], ids=["window", "virtual"]
+)
+async def test_a_forbidden_source_type_is_refused_even_with_the_requested_mapping(
+    source_type: int,
+) -> None:
+    """One discriminator only: the mapping matches, so the type must refuse it."""
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+
+    result = await complete_selection(
+        client,
+        peer,
+        "DP-1",
+        start_kwargs={"source_type": source_type, "mapping_id": "DP-1"},
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.unsupported_source
+    # No new lease, and the exact session it created is confirmed closed.
+    assert peer.session_path("s1") in peer.closed_sessions
+    assert peer.open_sessions == set()
+
+
+async def test_a_non_monitor_type_is_refused_before_the_mapping_is_examined() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    streams = peer.monitor_streams("DP-1", source_type=WINDOW, mapping_id="DP-1")
+
+    result = await complete_selection(client, peer, start_kwargs={"streams": streams})
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.unsupported_source
+    assert peer.session_path("s1") in peer.closed_sessions
+
+
 async def test_monitor_without_a_connector_mapping_is_unsupported() -> None:
     peer = FakePortalPeer()
     client = PortalClient(peer=peer)
