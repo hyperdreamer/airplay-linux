@@ -40,9 +40,8 @@ KSCREEN_PROBE: Final[tuple[str, ...]] = ("kscreen-doctor", "-j")
 INVENTORY_TIMEOUT: Final[float] = 5.0
 
 #: ``KScreen::Output::Type`` members that denote a physical monitor connector.
-#: The installed KScreen schema serialises this enum as an integer and has no
-#: virtual member, so an absent, string, ``Unknown`` (0), television, or
-#: out-of-range value is unproven origin and is never reported as physical.
+#: An absent, ``Unknown`` (0), television, or out-of-range value is unproven origin
+#: and is never reported as physical.
 PHYSICAL_OUTPUT_TYPES: Final[frozenset[int]] = frozenset(
     {
         1,  # VGA

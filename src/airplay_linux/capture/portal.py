@@ -680,7 +680,7 @@ class PortalClient:
         """
         peer = self._peer
         if peer is None:
-            return _failure(ErrorCode.dependency_missing)
+            return None
         waiters: set[asyncio.Task[Any]] = {call}
         released: asyncio.Task[Any] | None = None
         if acquisition is not None:
