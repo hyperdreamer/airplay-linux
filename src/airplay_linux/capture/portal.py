@@ -43,12 +43,20 @@ SCREEN_CAST_VIRTUAL: Final[int] = 4
 #: Keep permission only for this application run; this is what yields a token.
 PERSIST_WHILE_RUNNING: Final[int] = 1
 
+#: Control calls time out after five seconds (design global constraint).  The
+#: deadline bounds the method reply only: the lifetime of a user permission
+#: dialog is awaited with no deadline and is bounded by abandonment instead.
+CONTROL_DEADLINE: Final[float] = 5.0
+
 _INVALID: Final[object] = object()
 
 #: Sentinel resolved into an abandoned request's future.  ``Request.Close`` makes
 #: the portal suppress the ``Response`` signal entirely, so a job that is still
 #: waiting for one has to be released by this adapter, never by the portal.
 _ABANDONED: Final[object] = object()
+
+#: Sentinel for a control call that neither replied nor was abandoned.
+_TIMED_OUT: Final[object] = object()
 
 
 class PortalPeer(Protocol):
@@ -162,6 +170,11 @@ def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
 
 
+def _drop(_call: asyncio.Task[Any]) -> None:
+    """Overrun handler for a cleanup call: the resource is simply unconfirmed."""
+    return
+
+
 def _unwrap(value: object) -> object:
     if type(value) is Variant:
         return value.value
@@ -267,11 +280,13 @@ class PortalClient:
         peer: PortalPeer | None = None,
         *,
         connect: Callable[[], Awaitable[PortalPeer]] | None = None,
+        deadline: float = CONTROL_DEADLINE,
     ) -> None:
         if peer is not None and connect is not None:
             raise ValueError("provide a peer or a connect callable, not both")
         self._peer = peer
         self._connect = connect or _connect_session_bus
+        self._deadline = deadline
         self._owns_peer = False
         self._handler_installed = False
         self._pending: dict[str, _Pending] = {}
@@ -406,10 +421,11 @@ class PortalClient:
     def _abandon(self, acquisition: _Acquisition, job: asyncio.Task[Any]) -> None:
         """Stop waiting for a portal that will never answer this request again."""
         for pending in tuple(acquisition.pending):
-            for path in pending.paths:
-                self._orphaned[path] = acquisition.connector
+            self._orphan(pending, acquisition.connector)
         for path in tuple(acquisition.requests):
-            self._orphaned.setdefault(path, acquisition.connector)
+            if path in self._orphaned:
+                continue
+            self._orphaned[path] = acquisition.connector
             self._track_cleanup(self._close_request(path))
         acquisition.release_waiters()
         self._abandoned.add(job)
@@ -564,8 +580,11 @@ class PortalClient:
         acquisition.pending.append(pending)
         acquisition.requests.append(expected)
         try:
-            reply = await self._portal_call(
-                acquisition, self._call_message(member, merged, session, parent_window)
+            message = self._call_message(member, merged, session, parent_window)
+            reply = await self._watch(
+                acquisition,
+                asyncio.ensure_future(peer.call(message)),
+                lambda call: self._retain_reply(call, acquisition.connector),
             )
         except asyncio.CancelledError:
             raise
@@ -575,6 +594,13 @@ class PortalClient:
         if reply is _ABANDONED:
             self._forget(pending, acquisition)
             return _failure(ErrorCode.portal_cancelled)
+        if reply is _TIMED_OUT:
+            # The control call missed its deadline, so the resource it would have
+            # named is unconfirmed: close its request handle and keep the path
+            # orphaned in case the portal still answers with a session.
+            self._orphan(pending, acquisition.connector)
+            self._forget(pending, acquisition)
+            return _failure(ErrorCode.cleanup_timeout)
         if reply is None:
             self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
@@ -610,6 +636,17 @@ class PortalClient:
             return _failure(ErrorCode.dependency_incompatible)
         return Ok(value=results)
 
+    def _orphan(self, pending: _Pending, connector: str) -> None:
+        """Stop watching a request, but keep reaping whatever it still creates.
+
+        ``Request.Close`` suppresses the ``Response`` a waiter was blocked on, but
+        the portal may still answer: an unrecognised success owns a session that
+        has to be closed, so the path stays registered instead of being dropped.
+        """
+        for path in pending.paths:
+            self._orphaned[path] = connector
+            self._track_cleanup(self._close_request(path))
+
     def _forget(self, pending: _Pending, acquisition: _Acquisition) -> None:
         self._pending.pop(pending.token, None)
         try:
@@ -617,21 +654,36 @@ class PortalClient:
         except ValueError:
             return
 
-    async def _portal_call(
-        self, acquisition: _Acquisition, message: Message
+    async def _watch(
+        self,
+        acquisition: _Acquisition | None,
+        call: asyncio.Task[Any],
+        on_timeout: Callable[[asyncio.Task[Any]], None],
     ) -> Message | None | object:
-        """Call the portal without letting the call outlive its abandoned caller."""
+        """Await one portal call and stop at abandonment or the control deadline.
+
+        Abandonment matters because ``Request.Close`` suppresses the ``Response``
+        a job may be waiting for; the deadline matters because an unresponsive
+        portal must never stop Stop, exact release, or shutdown.  A call that
+        overruns either bound is handed to ``on_timeout`` so the caller can keep
+        the uncertain resource instead of discarding it.
+        """
         peer = self._peer
         if peer is None:
-            return None
-        call = asyncio.ensure_future(peer.call(message))
-        released = asyncio.ensure_future(acquisition.released.wait())
+            return _failure(ErrorCode.dependency_missing)
+        waiters: set[asyncio.Task[Any]] = {call}
+        released: asyncio.Task[Any] | None = None
+        if acquisition is not None:
+            released = asyncio.ensure_future(acquisition.released.wait())
+            waiters.add(released)
         try:
             done, _ = await asyncio.wait(
-                {call, released}, return_when=asyncio.FIRST_COMPLETED
+                waiters,
+                timeout=self._deadline,
+                return_when=asyncio.FIRST_COMPLETED,
             )
         finally:
-            if not released.done():
+            if released is not None and not released.done():
                 released.cancel()
         if call in done:
             try:
@@ -640,11 +692,8 @@ class PortalClient:
                 raise
             except Exception:
                 return None
-        # Abandoned while the method call was in flight.  Its reply is no longer
-        # ours to await, but it may carry a Request handle the portal answers on,
-        # so keep consuming it instead of leaking a path nobody watches.
-        self._retain_reply(call, acquisition.connector)
-        return _ABANDONED
+        on_timeout(call)
+        return _ABANDONED if released is not None and released in done else _TIMED_OUT
 
     def _retain_reply(self, call: asyncio.Task[Any], connector: str) -> None:
         self._replies.add(call)
@@ -763,12 +812,15 @@ class PortalClient:
                 interface=SESSION_INTERFACE,
                 member="Close",
             )
-            reply = await peer.call(message)
+            reply = await self._watch(None, asyncio.ensure_future(peer.call(message)), _drop)
         except asyncio.CancelledError:
             raise
         except Exception:
             return _failure(ErrorCode.cleanup_timeout)
-        if reply is None:
+        if reply is _ABANDONED or reply is _TIMED_OUT:
+            # Unconfirmed release: keep the exact session so a retry can confirm it.
+            return _failure(ErrorCode.cleanup_timeout)
+        if not isinstance(reply, Message):
             return _failure(ErrorCode.cleanup_timeout)
         if reply.message_type is MessageType.ERROR:
             if _already_gone(reply.error_name):
@@ -791,7 +843,7 @@ class PortalClient:
                 interface=REQUEST_INTERFACE,
                 member="Close",
             )
-            await peer.call(message)
+            await self._watch(None, asyncio.ensure_future(peer.call(message)), _drop)
         except asyncio.CancelledError:
             raise
         except Exception:

@@ -16,7 +16,7 @@ import pytest
 from dbus_next import Message, MessageType, Variant
 
 from airplay_linux.capture.physical import PhysicalCaptureProvider
-from airplay_linux.capture.portal import PortalClient
+from airplay_linux.capture.portal import CONTROL_DEADLINE, PortalClient, PortalMonitor
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
 
 PORTAL_DESTINATION = "org.freedesktop.portal.Desktop"
@@ -63,7 +63,7 @@ class FakePortalPeer:
         self.closed_sessions: list[str] = []
         self.error_replies: dict[str, str] = {}
         self.handle_override: dict[str, str] = {}
-        self.held: dict[str, asyncio.Event] = {}
+        self.held: dict[tuple[str | None, str], asyncio.Event] = {}
         self.session_close_error: str | None = None
         self.disconnected = False
         self._next_serial = 0
@@ -121,6 +121,12 @@ class FakePortalPeer:
         async with self._condition:
             self._condition.notify_all()
 
+        hold = self.held.get((message.interface, message.member)) or self.held.get(
+            (None, message.member)
+        )
+        if hold is not None:
+            await hold.wait()
+
         if message.interface == REQUEST_INTERFACE and message.member == "Close":
             self.closed_requests.append(message.path)
             return Message.new_method_return(message)
@@ -131,10 +137,6 @@ class FakePortalPeer:
                 return Message.new_error(message, self.session_close_error, "close refused")
             self.open_sessions.discard(message.path)
             return Message.new_method_return(message)
-
-        hold = self.held.get(message.member)
-        if hold is not None:
-            await hold.wait()
 
         error = self.error_replies.get(message.member)
         if error is not None:
@@ -155,14 +157,14 @@ class FakePortalPeer:
     def count(self, member: str) -> int:
         return sum(1 for call in self.calls if call.member == member)
 
-    def hold(self, member: str) -> asyncio.Event:
+    def hold(self, member: str, interface: str | None = None) -> asyncio.Event:
         """Make one method's reply never arrive until the test releases it."""
         event = asyncio.Event()
-        self.held[member] = event
+        self.held[(interface, member)] = event
         return event
 
-    def release_hold(self, member: str) -> None:
-        event = self.held.pop(member, None)
+    def release_hold(self, member: str, interface: str | None = None) -> None:
+        event = self.held.pop((interface, member), None)
         if event is not None:
             event.set()
 
@@ -586,6 +588,66 @@ async def test_late_response_after_cancel_closes_the_new_session() -> None:
 
     assert peer.session_path("late") in peer.closed_sessions
     assert peer.session_path("late") not in peer.open_sessions
+
+
+def test_the_control_deadline_is_the_five_second_design_constant() -> None:
+    assert CONTROL_DEADLINE == 5.0
+    assert PortalClient(peer=FakePortalPeer())._deadline == CONTROL_DEADLINE
+
+
+async def test_a_stalled_control_reply_is_a_bounded_typed_failure() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer, deadline=0.05)
+    peer.hold("CreateSession")
+
+    result = await asyncio.wait_for(client.select_monitor("DP-1", None), timeout=2.0)
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    # The request handle is still closed, so the portal cannot answer later.
+    assert peer.request_path(peer.last("CreateSession").handle_token) in peer.closed_requests
+    peer.release_hold("CreateSession")
+
+
+async def test_a_stalled_session_close_is_a_bounded_cleanup_failure() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer, deadline=0.05)
+    await complete_selection(client, peer)
+    peer.hold("Close", SESSION_INTERFACE)
+
+    released = await asyncio.wait_for(client.release_monitor(
+        PortalMonitor(
+            connector="DP-1",
+            source_type="physical_monitor",
+            restore_token="new-token",
+            portal_session_id=peer.session_path("s1"),
+        )
+    ), timeout=2.0)
+
+    assert isinstance(released, Err)
+    assert released.error.code is ErrorCode.cleanup_timeout
+    # Uncertain ownership is retained for a later confirmed retry.
+    assert peer.open_sessions == {peer.session_path("s1")}
+    peer.release_hold("Close", SESSION_INTERFACE)
+    assert isinstance(await client.close(), Ok)
+    assert peer.open_sessions == set()
+
+
+async def test_a_stalled_request_close_never_blocks_cancellation_cleanup() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer, deadline=0.05)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    await settle()
+    peer.hold("Close", REQUEST_INTERFACE)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(client.drain(), timeout=2.0)
+
+    assert client._cleanup == set()
+    peer.release_hold("Close", REQUEST_INTERFACE)
 
 
 async def test_cancelled_selection_finishes_without_waiting_for_a_suppressed_response() -> None:
