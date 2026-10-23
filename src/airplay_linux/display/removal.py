@@ -18,12 +18,12 @@ from uuid import UUID
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.display.helper import VirtualHelper
-from airplay_linux.display.kscreen import KScreenObserver, OutputInfo
+from airplay_linux.display.kscreen import KScreenObserver, OutputIdentity, OutputInfo
 from airplay_linux.domain.messages import DisplayEvent
 from airplay_linux.domain.operations import OperationContext, OwnerId, ProcessIdentity
 from airplay_linux.domain.ports import Clock, OwnershipStore, ProcessPort
 from airplay_linux.domain.records import LayoutSnapshot, OwnershipRecord
-from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
+from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result, Size
 from airplay_linux.process import IdentityEvidence, IdentityState, OwnedProcessScan, read_identity_evidence
 
 from .locking import CreationLock
@@ -35,6 +35,32 @@ TransportRelease = Callable[[OwnershipRecord, OperationContext], Awaitable[Resul
 
 def _failure(code: ErrorCode, record: OwnershipRecord | None = None) -> Err:
     return Err(error=diagnostic(code, record.receiver_id if record is not None else None))
+
+
+def _identity_from_layout(
+    connector: str, properties: Mapping[str, str | int | bool],
+) -> OutputIdentity | None:
+    output_id = properties.get("id")
+    width, height = properties.get("width"), properties.get("height")
+    x, y = properties.get("x"), properties.get("y")
+    if (
+        type(output_id) is not str
+        or type(width) is not int
+        or type(height) is not int
+        or type(x) is not int
+        or type(y) is not int
+    ):
+        return None
+    try:
+        size = Size(width=width, height=height)
+    except (TypeError, ValueError):
+        return None
+    return OutputIdentity(
+        output_id=output_id,
+        connector=connector,
+        size=size,
+        position=(x, y),
+    )
 
 
 def eligible_restore(
@@ -217,24 +243,46 @@ class DisplayRemover:
         if record.connector is not None:
             same_connector = layout.outputs.get(record.connector)
             same_ids = [c for c, p in layout.outputs.items() if p.get("id") == record.output_id]
+            candidates = [
+                o for o in outputs
+                if o.connector == record.connector or o.output_id == record.output_id
+            ]
             if same_connector is None and not same_ids:
-                return "absent", None
+                # The two adapter reads are separate observations. A matching
+                # output in the second one contradicts an absent full snapshot;
+                # absence is not safe until both observations agree.
+                return ("unknown", None) if candidates else ("absent", None)
             if same_connector is None or same_connector.get("id") != record.output_id or same_ids != [record.connector]:
                 return "unknown", None
-            candidates = [o for o in outputs if o.connector == record.connector and o.output_id == record.output_id]
+            candidates = [
+                o for o in outputs
+                if o.connector == record.connector and o.output_id == record.output_id
+            ]
         else:
             # The baseline is complete; outputs() can omit unknown geometry.
+            baseline_connectors = set(record.baseline.outputs)
+            baseline_ids = {p.get("id") for p in record.baseline.outputs.values()}
             new = {
                 c: p for c, p in layout.outputs.items()
-                if c not in record.baseline.outputs or p.get("id") not in {
-                    v.get("id") for v in record.baseline.outputs.values()
-                }
+                if c not in baseline_connectors or p.get("id") not in baseline_ids
             }
-            if not new:
+            new_candidates = [
+                o for o in outputs
+                if o.connector not in baseline_connectors or o.output_id not in baseline_ids
+            ]
+            if not new and not new_candidates:
                 return "absent", None
-            if len(new) != 1:
+            # Any disagreement between the full snapshot and the projected
+            # output list is uncertainty. In particular, a newly visible output
+            # must not be treated as absent merely because it arrived between
+            # the observer's two reads.
+            if len(new) != 1 or len(new_candidates) != 1:
                 return "unknown", None
-            candidates = [o for o in outputs if o.connector in new and new[o.connector].get("id") == o.output_id]
+            connector, properties = next(iter(new.items()))
+            candidate = new_candidates[0]
+            if candidate.connector != connector or candidate.output_id != properties.get("id"):
+                return "unknown", None
+            candidates = [candidate]
         if len(candidates) != 1 or candidates[0].virtual is not True:
             return "unknown", None
         candidate = candidates[0]
@@ -432,7 +480,8 @@ class DisplayRemover:
                    for c, p in layout.outputs.items())
 
     async def _restore(self, record: OwnershipRecord, current: LayoutSnapshot) -> Result[None]:
-        for connector in eligible_restore(record.baseline, record.last_applied, current):
+        eligible = eligible_restore(record.baseline, record.last_applied, current)
+        for connector in eligible:
             if connector == record.connector:
                 continue
             # Another receiver's still-owned output is never part of this
@@ -447,10 +496,14 @@ class DisplayRemover:
                 return latest
             values = eligible_restore(record.baseline, record.last_applied, latest.value).get(connector, {})
             if not values:
-                continue
+                # The property permission was lost while the guarded read was
+                # in flight. Preserve the user's newer value and keep cleanup
+                # unconfirmed so the caller can report that restoration did not
+                # occur.
+                return _failure(ErrorCode.configuration_failed, record)
             properties = latest.value.outputs[connector]
-            output_id = properties.get("id")
-            if type(output_id) is not str:
+            target = _identity_from_layout(connector, properties)
+            if target is None:
                 return _failure(ErrorCode.configuration_failed, record)
             command = {k: v for k, v in values.items() if k in {"enabled", "scale", "mode", "size", "position"}}
             # x/y and width/height are flattened snapshot aliases. Restore a
@@ -468,14 +521,14 @@ class DisplayRemover:
                 command["size"] = f"{width}x{height}"
             if not command:
                 return _failure(ErrorCode.configuration_failed, record)
-            configured = await self.observer.configure(output_id, command)
+            configured = await self.observer.configure(target, command)
             if isinstance(configured, Err):
                 return configured
             readback = await self.observer.snapshot()
             if isinstance(readback, Err):
                 return readback
             actual = readback.value.outputs.get(connector, {})
-            if actual.get("id") != output_id or any(actual.get(k) != v for k, v in values.items()):
+            if actual.get("id") != target.output_id or any(actual.get(k) != v for k, v in values.items()):
                 return _failure(ErrorCode.configuration_failed, record)
         return Ok(value=None)
 

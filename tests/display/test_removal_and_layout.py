@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import sys
+from copy import deepcopy
 from dataclasses import replace
 from uuid import UUID
 
@@ -79,6 +80,7 @@ class Desktop(FakeProcess):
         self.scan_accessible = True
         self.sticky_output = False
         self.no_configuration_effect = False
+        self.lose_geometry = False
 
     @staticmethod
     def entry(oid, connector, physical=False):
@@ -140,6 +142,11 @@ class Desktop(FakeProcess):
 
     def _forget(self, identity):
         pair = self.associations.pop(identity, None)
+        if pair is not None and self.lose_geometry:
+            for entry in self.entries:
+                if (str(entry["id"]), entry["name"]) == pair:
+                    entry.pop("size", None)
+                    entry["currentModeId"] = "0"
         if pair is not None and not self.sticky_output:
             self.entries = [e for e in self.entries if (str(e["id"]), e["name"]) != pair]
         super()._forget(identity)
@@ -340,6 +347,20 @@ async def test_missing_association_authority_cannot_remove_live_output(tmp_path)
     assert not rig.process.terminated and await records(rig)
 
 
+async def test_full_snapshot_blocks_false_disappearance_when_geometry_is_lost(tmp_path):
+    rig = Rig(tmp_path)
+    await rig.seed()
+    rig.process.sticky_output = True
+    rig.process.lose_geometry = True
+
+    result = await rig.remover.remove(OWNER, context())
+
+    assert isinstance(result, Err)
+    assert await records(rig)
+    assert any(entry["name"] == "Virtual-owned" for entry in rig.process.entries)
+    assert rig.events[-1].kind == "cleanup_required"
+
+
 async def test_sticky_output_retains_record_until_disappearance(tmp_path):
     rig = Rig(tmp_path)
     await rig.seed()
@@ -351,6 +372,119 @@ async def test_sticky_output_retains_record_until_disappearance(tmp_path):
     rig.process.entries.pop()
     assert isinstance(await rig.remover.remove(OWNER, context()), Ok)
     assert not await records(rig)
+
+
+@pytest.mark.parametrize("stage", ("published", "reserved"))
+async def test_contradictory_observation_never_stops_helper_without_association_proof(tmp_path, stage):
+    rig = Rig(tmp_path, verifier=False)
+    await rig.seed(stage, output="absent")
+    original_run = rig.process.run
+    reads = 0
+
+    async def interleaved_run(spec, timeout, stdin=None):
+        nonlocal reads
+        if spec.argv[1:] == ("-j",):
+            reads += 1
+            if reads == 4:
+                rig.process.entries.append(rig.process.entry("7", "Virtual-owned"))
+        return await original_run(spec, timeout, stdin)
+
+    rig.process.run = interleaved_run
+    result = await rig.remover.remove(OWNER, context())
+
+    assert reads >= 4
+    assert isinstance(result, Err)
+    assert rig.process.alive(HELPER)
+    assert any(entry["name"] == "Virtual-owned" for entry in rig.process.entries)
+    assert await records(rig)
+
+
+async def test_recovery_does_not_configure_reassigned_output(tmp_path):
+    rig = Rig(tmp_path)
+    await rig.seed("output_observed", output="misconfigured")
+    original_run = rig.process.run
+    reads = 0
+    foreign = rig.process.entry("7", "HDMI-foreign", physical=True)
+    foreign.update(enabled=False, pos={"x": 777, "y": 888},
+                   size={"width": 1280, "height": 720}, currentModeId="2")
+    foreign_before = deepcopy(foreign)
+
+    async def interleaved_run(spec, timeout, stdin=None):
+        nonlocal reads
+        if spec.argv[1:] == ("-j",):
+            reads += 1
+            if reads == 7:
+                rig.process.entries[1] = foreign
+        return await original_run(spec, timeout, stdin)
+
+    rig.process.run = interleaved_run
+    item, = await rig.recovery().reconcile()
+
+    assert reads >= 7
+    assert item.kind == "cleanup_required"
+    assert rig.process.entries[1] == foreign_before
+    assert not rig.process.commands
+
+
+async def test_restore_does_not_configure_reassigned_output(tmp_path):
+    rig = Rig(tmp_path)
+    record = await rig.seed()
+    rig.process.entries[0]["pos"] = {"x": 1920, "y": 900}
+    await rig.store.write(replace(record, last_applied={"DP-1": {"x": 1920}}))
+    original_run = rig.process.run
+    reads = 0
+    foreign = rig.process.entry("1", "HDMI-foreign", physical=True)
+    foreign.update(enabled=False, pos={"x": 777, "y": 888},
+                   size={"width": 1280, "height": 720}, currentModeId="2")
+    foreign_before = deepcopy(foreign)
+
+    async def interleaved_run(spec, timeout, stdin=None):
+        nonlocal reads
+        if spec.argv[1:] == ("-j",):
+            reads += 1
+            if reads == 8:
+                rig.process.entries[0] = foreign
+        return await original_run(spec, timeout, stdin)
+
+    rig.process.run = interleaved_run
+    result = await rig.remover.remove(OWNER, context())
+
+    assert reads >= 8
+    assert isinstance(result, Err)
+    assert rig.process.entries[0] == foreign_before
+    assert not rig.process.commands
+    assert await records(rig)
+
+
+@pytest.mark.parametrize("changed_position", [(1930, 900), (1920, 950)])
+async def test_restore_refuses_when_touched_or_companion_coordinate_changes(tmp_path, changed_position):
+    rig = Rig(tmp_path)
+    record = await rig.seed()
+    rig.process.entries[0]["pos"] = {"x": 1920, "y": 900}
+    await rig.store.write(replace(record, last_applied={"DP-1": {"x": 1920}}))
+    original_run = rig.process.run
+    reads = 0
+
+    async def interleaved_run(spec, timeout, stdin=None):
+        nonlocal reads
+        if spec.argv[1:] == ("-j",):
+            reads += 1
+            if reads == 8:
+                rig.process.entries[0]["pos"] = {
+                    "x": changed_position[0], "y": changed_position[1],
+                }
+        return await original_run(spec, timeout, stdin)
+
+    rig.process.run = interleaved_run
+    result = await rig.remover.remove(OWNER, context())
+
+    assert reads >= 8
+    assert isinstance(result, Err)
+    assert rig.process.entries[0]["pos"] == {
+        "x": changed_position[0], "y": changed_position[1],
+    }
+    assert not rig.process.commands
+    assert await records(rig)
 
 
 async def test_false_stop_acknowledgement_does_not_delete_evidence(tmp_path):

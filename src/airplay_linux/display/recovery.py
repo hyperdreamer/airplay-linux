@@ -147,7 +147,7 @@ class DisplayRecovery:
         if isinstance(verified, Err):
             return self._item("cleanup_required", record, verified.error), False
         if not self._configured(record, candidate):
-            configured = await self.observer.configure(candidate.output_id, {
+            configured = await self.observer.configure(candidate, {
                 "enabled": True, "size": record.requested_size, "position": "0,0",
             })
             if isinstance(configured, Err):

@@ -452,7 +452,7 @@ class DisplayCreator:
                         return await self._finish_failure(
                             state, _failure(ErrorCode.stale_event, state.receiver_id),
                         )
-                    configured = await self._observer.configure(selected.output_id, values)
+                    configured = await self._observer.configure(selected, values)
                     if isinstance(configured, Err):
                         return await self._finish_failure(state, configured)
                     if self._is_fenced(state):
