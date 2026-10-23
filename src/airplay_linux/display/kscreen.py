@@ -857,22 +857,32 @@ class KScreenObserver:
             except Exception:  # noqa: BLE001 - a subscriber must not break observation
                 continue
 
-    async def snapshot(self) -> Result[LayoutSnapshot]:
-        """The current layout as a restorable flat baseline, with a canonical hash."""
-        result = await self._records()
-        if isinstance(result, Err):
-            return result
-        self._publish(_outputs(result.value))
-        return Ok(value=_snapshot(result.value))
+    async def observation(self) -> Result[tuple[tuple[OutputInfo, ...], LayoutSnapshot]]:
+        """Project candidates and complete evidence from the same raw read.
 
-    async def outputs(self) -> Result[tuple[OutputInfo, ...]]:
-        """The fully describable current outputs."""
+        A filtered candidate list alone cannot prove absence: entries with
+        unreadable geometry must remain visible in its accompanying snapshot.
+        """
         result = await self._records()
         if isinstance(result, Err):
             return result
         outputs = _outputs(result.value)
         self._publish(outputs)
-        return Ok(value=outputs)
+        return Ok(value=(outputs, _snapshot(result.value)))
+
+    async def snapshot(self) -> Result[LayoutSnapshot]:
+        """The current layout as a restorable flat baseline, with a canonical hash."""
+        result = await self.observation()
+        if isinstance(result, Err):
+            return result
+        return Ok(value=result.value[1])
+
+    async def outputs(self) -> Result[tuple[OutputInfo, ...]]:
+        """The fully describable current outputs; not complete absence evidence."""
+        result = await self.observation()
+        if isinstance(result, Err):
+            return result
+        return Ok(value=result.value[0])
 
     async def wait_for(
         self,
@@ -988,18 +998,22 @@ class KScreenObserver:
     async def configure(
         self, target: OutputIdentity | OutputInfo | str,
         values: Mapping[str, str | int | bool],
+        *, expected: Mapping[str, str | int | bool] | None = None,
     ) -> Result[None]:
         """Apply settings only to the captured output instance and prove readback.
 
         ``target`` is a full observation: numeric ID, connector, size, and
         position. A fresh read must still match all four fields before the
         command starts, so numeric KScreen ID reuse or geometry drift cannot
-        redirect the command to another output.
+        redirect the command to another output. ``expected`` additionally fences
+        property-level restoration permission at that same locked read, including
+        scale and mode changes that do not affect the output's geometry.
         """
         identity = target.identity if type(target) is OutputInfo else target
         request = _request(values)
-        if request is None:
+        if request is None or (expected is not None and not isinstance(expected, Mapping)):
             return _failure(ErrorCode.invalid_input)
+        expected = dict(expected) if expected is not None else None
         async with self._configure_lock:
             initial: tuple[_Record, ...] | None = None
             if type(target) is str:
@@ -1023,7 +1037,7 @@ class KScreenObserver:
                 )
             if type(identity) is not OutputIdentity:
                 return _failure(ErrorCode.invalid_input)
-            result, observed = await self._configure_locked(identity, request, initial=initial)
+            result, observed = await self._configure_locked(identity, request, initial=initial, expected=expected)
         if observed is not None:
             self._publish(observed)
         return result
@@ -1031,6 +1045,7 @@ class KScreenObserver:
     async def _configure_locked(
         self, target: OutputIdentity, request: _Request,
         *, initial: tuple[_Record, ...] | None = None,
+        expected: Mapping[str, str | int | bool] | None = None,
     ) -> tuple[Result[None], tuple[OutputInfo, ...] | None]:
         current = Ok(value=initial) if initial is not None else await self._records()
         if isinstance(current, Err):
@@ -1046,6 +1061,12 @@ class KScreenObserver:
             None,
         )
         if record is None:
+            return _failure(ErrorCode.configuration_failed), None
+        properties = _snapshot_properties(record)
+        if expected is not None and any(
+            name not in properties or type(properties[name]) is not type(value) or properties[name] != value
+            for name, value in expected.items()
+        ):
             return _failure(ErrorCode.configuration_failed), None
         resolved = _resolve_mode(record, request)
         if isinstance(resolved, Err):

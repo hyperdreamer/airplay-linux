@@ -525,10 +525,12 @@ async def test_restore_layout_after_disappearance_and_confirm_readback(tmp_path)
     rig.process.entries[0].update(pos={"x": 1920, "y": 900}, scale=2)
     baseline = replace(record.baseline, outputs={"DP-1": {**record.baseline.outputs["DP-1"], "y": 100}})
     await rig.store.write(replace(record, baseline=baseline, last_applied={"DP-1": {"x": 1920, "y": 0, "scale": 1}}))
-    assert isinstance(await rig.remover.remove(OWNER, context()), Ok)
+    assert isinstance(await rig.remover.remove(OWNER, context()), Err)
     assert rig.process.entries[0]["pos"] == {"x": 0, "y": 900}
     assert rig.process.entries[0]["scale"] == 2
-    assert not await records(rig)
+    # Eligible x is restored, but touched y/scale still differ from baseline.
+    assert await records(rig)
+    assert not any(event.kind == "removed" for event in rig.events)
 
 
 async def test_unconfirmed_layout_restore_keeps_cleanup_record(tmp_path):
@@ -614,10 +616,12 @@ async def test_layout_restore_does_not_change_other_receivers_owned_output(tmp_p
     baseline = replace(record.baseline, outputs={**record.baseline.outputs,
                                                 "Virtual-other": {"id": "8", "x": 1920, "y": 0}})
     await rig.store.write(replace(record, baseline=baseline, last_applied={"Virtual-other": {"x": 0}}))
-    assert isinstance(await rig.remover.remove(OWNER, context()), Ok)
+    assert isinstance(await rig.remover.remove(OWNER, context()), Err)
     assert rig.process.alive(other_helper)
     assert rig.process.entries[-1]["pos"] == {"x": 0, "y": 0}
-    assert not rig.process.commands and await records(rig) == (second,)
+    assert not rig.process.commands
+    assert second in await records(rig) and len(await records(rig)) == 2
+    assert not any(event.kind == "removed" for event in rig.events)
 
 
 async def test_process_identity_none_without_absence_evidence_blocks_deletion(tmp_path):

@@ -222,12 +222,18 @@ class DisplayRemover:
             layout = await self.observer.snapshot()
             if isinstance(layout, Err):
                 return layout
-            outputs = await self.observer.outputs()
-            if isinstance(outputs, Err):
-                return outputs
-            if type(layout.value) is not LayoutSnapshot or type(outputs.value) is not tuple:
+            observed = await self.observer.observation()
+            if isinstance(observed, Err):
+                return observed
+            outputs, latest = observed.value
+            if type(layout.value) is not LayoutSnapshot or type(latest) is not LayoutSnapshot or type(outputs) is not tuple:
                 return _failure(ErrorCode.configuration_failed)
-            return Ok(value=(outputs.value, layout.value))
+            # Retain complete evidence from *both* reads. Projection can omit an
+            # unreadable output, so it cannot make a contradictory window safe.
+            # A fresh coherent observation is needed before any destructive act.
+            if layout.value.outputs != latest.outputs:
+                return _failure(ErrorCode.ownership_mismatch)
+            return Ok(value=(outputs, latest))
         except Exception:
             return _failure(ErrorCode.configuration_failed)
 
@@ -457,6 +463,8 @@ class DisplayRemover:
             final = await self.observer.snapshot()
             if isinstance(final, Err) or not self._gone(record, final.value):
                 return _failure(ErrorCode.cleanup_timeout, record)
+            if not self._layout_restored(record, final.value):
+                return _failure(ErrorCode.configuration_failed, record)
             if self.helper_evidence(record)[0] != "dead":
                 return _failure(ErrorCode.ownership_mismatch, record)
             deleted = await self.store.delete(record.owner_uuid)
@@ -478,6 +486,29 @@ class DisplayRemover:
             )
         return all(c in record.baseline.outputs and p.get("id") == record.baseline.outputs[c].get("id")
                    for c, p in layout.outputs.items())
+
+    @staticmethod
+    def _layout_restored(record: OwnershipRecord, layout: LayoutSnapshot) -> bool:
+        """Deletion needs baseline equality, not merely no eligible commands.
+
+        User-modified, missing, or reassigned properties are left alone but still
+        require cleanup evidence. Created outputs have no pre-change properties
+        to restore; their disappearance is proved separately by _gone.
+        """
+        for connector, applied in record.last_applied.items():
+            before = record.baseline.outputs.get(connector)
+            if connector == record.connector or before is None or not applied:
+                continue
+            actual = layout.outputs.get(connector)
+            if actual is None or ("id" in before and actual.get("id") != before["id"]):
+                return False
+            if any(
+                name not in before or name not in actual
+                or type(actual[name]) is not type(before[name]) or actual[name] != before[name]
+                for name in applied if name != "id"
+            ):
+                return False
+        return True
 
     async def _restore(self, record: OwnershipRecord, current: LayoutSnapshot) -> Result[None]:
         eligible = eligible_restore(record.baseline, record.last_applied, current)
@@ -521,7 +552,10 @@ class DisplayRemover:
                 command["size"] = f"{width}x{height}"
             if not command:
                 return _failure(ErrorCode.configuration_failed, record)
-            configured = await self.observer.configure(target, command)
+            # Freeze all known properties from the eligibility observation.
+            # The locked configuration read must still match, including mode,
+            # scale and the companions a composite command can overwrite.
+            configured = await self.observer.configure(target, command, expected=properties)
             if isinstance(configured, Err):
                 return configured
             readback = await self.observer.snapshot()
