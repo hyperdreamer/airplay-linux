@@ -13,6 +13,16 @@ outcome arrives as a ``Response`` signal.  A late response for an abandoned
 request therefore cannot satisfy a different acquisition; if a session appears
 after its caller was cancelled, this adapter closes it.  Restore tokens stay
 inside the adapter-private :class:`PortalMonitor` and are never rendered.
+
+Restore-token expiry is defined as **the portal did not accept the offered
+token**, because the ``org.freedesktop.portal.ScreenCast`` contract has no expiry
+notification and no distinct expiry error: a token it cannot restore is simply
+ignored and the user is prompted normally.  Expiry is therefore never inferred
+from a token's contents or from a general ``InvalidArgument`` error, and it never
+gets its own :class:`ErrorCode` -- the frozen contract has none, and inventing
+one from a generic portal failure would misclassify real denials.  Every failed
+selection erases the cached token, so the next attempt reacquires permission
+through the portal with no token at all.
 """
 
 from __future__ import annotations

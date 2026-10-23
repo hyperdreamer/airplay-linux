@@ -488,6 +488,29 @@ async def test_portal_denial_is_recoverable_and_creates_no_lease() -> None:
 # --------------------------------------------------------------------------- restore tokens
 
 
+async def test_an_expired_restore_token_is_reacquired_without_claiming_expiry() -> None:
+    """Expiry is a plain recoverable failure plus a token erased from the cache.
+
+    There is no distinct expired-token ``ErrorCode`` in the frozen contract, and
+    the portal gives no expiry signal, so the only correct behaviour is to drop
+    the unusable token and reacquire permission through the portal.
+    """
+    provider, portal, _ = make_provider()
+    first = (await provider.select("DP-1")).value
+    await provider.release(first)
+    assert portal.tokens_seen == [None]
+
+    portal.queue(Err(error=diagnostic(ErrorCode.portal_denied)))
+    stale = await provider.select("DP-1")
+
+    assert isinstance(stale, Err)
+    assert stale.error.code is ErrorCode.portal_denied
+    assert portal.tokens_seen[-1] == "token-1"
+
+    await provider.select("DP-1")
+    assert portal.tokens_seen[-1] is None
+
+
 async def test_restore_token_is_reused_then_erased_after_a_failed_selection() -> None:
     provider, portal, _ = make_provider()
 

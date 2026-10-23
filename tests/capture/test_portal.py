@@ -922,6 +922,36 @@ async def test_a_new_restore_token_replaces_the_used_one() -> None:
     assert result.value.restore_token == "replacement-token"
 
 
+async def test_an_unusable_restore_token_is_not_reported_as_expiry() -> None:
+    """Expiry means "the portal did not accept the token", nothing more.
+
+    The ScreenCast contract ignores a token it cannot restore and prompts
+    normally, so a general ``InvalidArgument`` reply must stay a plain
+    ``portal_denied`` instead of being upgraded to a fabricated expiry result.
+    """
+    peer = FakePortalPeer()
+    peer.error_replies["SelectSources"] = "org.freedesktop.DBus.Error.InvalidArgument"
+    client = PortalClient(peer=peer)
+    task = asyncio.create_task(client.select_monitor("DP-1", "stale-token"))
+    await peer.wait_for("CreateSession")
+    await settle()
+    peer.respond_create(session_token="s1")
+    await peer.wait_for("SelectSources")
+    result = await task
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.portal_denied
+    rendered = f"{result!r} {result.error.message} {result.error.detail}"
+    assert "stale-token" not in rendered
+    assert peer.session_path("s1") in peer.closed_sessions
+    assert peer.open_sessions == set()
+
+    # Nothing is cached by the client, so the next caller decides what to offer.
+    peer.error_replies.clear()
+    await complete_selection(client, peer, session_token="s2")
+    assert "restore_token" not in peer.last("SelectSources").message.body[-1]
+
+
 async def test_no_restore_token_is_reused_after_a_failed_selection() -> None:
     peer = FakePortalPeer()
     client = PortalClient(peer=peer)
