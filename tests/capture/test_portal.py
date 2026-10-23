@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from dbus_next import Message, MessageType, Variant
 
+from airplay_linux.capture.physical import PhysicalCaptureProvider
 from airplay_linux.capture.portal import PortalClient
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
 
@@ -27,6 +28,17 @@ SESSION_INTERFACE = "org.freedesktop.portal.Session"
 MONITOR = 1
 WINDOW = 2
 VIRTUAL = 4
+
+
+class _PhysicalFeatures:
+    """Minimal capability seam: the provider only asks about physical_source."""
+
+    def supports(self, capability: str) -> bool:
+        return capability == "physical_source"
+
+
+async def _physical_inventory() -> tuple[str, ...]:
+    return ("DP-1",)
 
 
 @dataclass(frozen=True)
@@ -195,6 +207,23 @@ class FakePortalPeer:
                         self.open_sessions.add(session)
                 return True
         return False
+
+    def close_session(self, path: str) -> bool:
+        """The portal closes a session on its own (revocation, logout, ...)."""
+        signal = Message(
+            message_type=MessageType.SIGNAL,
+            path=path,
+            interface=SESSION_INTERFACE,
+            member="Closed",
+            signature="a{sv}",
+            body=[{}],
+        )
+        delivered = False
+        for handler in tuple(self.handlers):
+            if handler(signal):
+                delivered = True
+        self.open_sessions.discard(path)
+        return delivered
 
     def respond_create(self, *, session_token: str = "s1", response: int = 0) -> bool:
         if response != 0:
@@ -653,6 +682,40 @@ async def test_client_owns_and_disconnects_the_connection_it_opens() -> None:
     await client.close()
     assert peer.disconnected is True
     assert peer.closed_sessions == [peer.session_path("s1")]
+
+
+async def test_a_portal_closed_session_no_longer_verifies_as_live() -> None:
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    provider = PhysicalCaptureProvider(
+        portal=client,
+        connectors=_physical_inventory,
+        features=_PhysicalFeatures(),
+    )
+    task = asyncio.create_task(provider.select("DP-1"))
+    await peer.wait_for("CreateSession")
+    await settle()
+    peer.respond_create(session_token="s1")
+    await peer.wait_for("SelectSources")
+    await settle()
+    peer.respond("SelectSources", 0, {})
+    await peer.wait_for("Start")
+    await settle()
+    peer.respond_start("DP-1")
+    selected = await task
+
+    assert isinstance(selected, Ok)
+    assert isinstance(await provider.verify(selected.value), Ok)
+
+    # The portal revokes the session and says so on that exact session path.
+    assert peer.close_session(peer.session_path("s1")) is True
+
+    stale = await provider.verify(selected.value)
+    assert isinstance(stale, Err)
+    assert stale.error.code is ErrorCode.stale_event
+    # The exact handle stays idempotently releasable; nothing is sent twice.
+    assert isinstance(await provider.release(selected.value), Ok)
+    assert peer.closed_sessions == []
 
 
 async def test_close_reports_unconfirmed_cleanup_and_retries_the_same_sessions() -> None:

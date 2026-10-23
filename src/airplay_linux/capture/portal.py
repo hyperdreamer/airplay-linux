@@ -333,6 +333,9 @@ class PortalClient:
 
     def is_open(self, monitor: PortalMonitor) -> bool:
         """Whether this exact monitor's session is still tracked as open."""
+        if self._closed:
+            # A closing client cannot vouch for a resource it still has to clean up.
+            return False
         return (
             type(monitor) is PortalMonitor
             and monitor.source_type == "physical_monitor"
@@ -696,6 +699,9 @@ class PortalClient:
         path = message.path
         if type(path) is not str:
             return False
+        if message.interface == SESSION_INTERFACE and message.member == "Closed":
+            # The portal may close a session at any time; that lease is dead.
+            return self._on_session_closed(path)
         if message.interface != REQUEST_INTERFACE or message.member != "Response":
             return False
         pending = self._pending_for(path)
@@ -730,6 +736,10 @@ class PortalClient:
             return
         self._sessions.setdefault(session, connector)
         self._track_cleanup(self._close_session(session))
+
+    def _on_session_closed(self, path: str) -> bool:
+        """Drop liveness for an exact session the portal reports as closed."""
+        return self._sessions.pop(path, None) is not None
 
     def _pending_for(self, path: str) -> _Pending | None:
         """Correlate by the exact request path, including a returned handle."""
