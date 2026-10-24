@@ -123,7 +123,7 @@ class PortalMonitor:
 class _Pending:
     """One outstanding Request handle and its correlated Response future."""
 
-    __slots__ = ("token", "paths", "future", "connector", "abandoned")
+    __slots__ = ("token", "paths", "future", "connector", "abandoned", "settled_path")
 
     def __init__(
         self,
@@ -137,6 +137,9 @@ class _Pending:
         self.future = future
         self.connector = connector
         self.abandoned = False
+        #: The exact request path the buffered ``Response`` arrived on, so the
+        #: cleanup of a forgotten waiter still retires the right handle.
+        self.settled_path: str | None = None
 
 
 class _Acquisition:
@@ -178,11 +181,6 @@ class _Acquisition:
 
 def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
-
-
-def _drop(_call: asyncio.Task[Any]) -> None:
-    """Overrun handler for a cleanup call: the resource is simply unconfirmed."""
-    return
 
 
 def _unwrap(value: object) -> object:
@@ -301,16 +299,23 @@ class PortalClient:
         self._handler_installed = False
         self._pending: dict[str, _Pending] = {}
         self._sessions: dict[str, str] = {}
-        #: Request paths whose caller has gone.  ``Request.Close`` normally
-        #: suppresses the ``Response``, but one may already be in flight, so a
-        #: late success is still reaped instead of leaking its session.
-        self._orphaned: dict[str, str] = {}
+        #: Request handles this client still owns: the portal has not confirmed
+        #: their Close, so a session they create still needs an exact owner.
+        self._requests: dict[str, str] = {}
+        #: Request handles that are finished: the portal confirmed their Close or
+        #: the ``Response`` was consumed.  ``Request.Close`` suppresses a pending
+        #: Response, but one already in flight is still reaped; nothing here
+        #: blocks finalisation.
+        self._retired: dict[str, str] = {}
+        #: Request handles with a Close method call currently in flight.
+        self._closing_requests: set[str] = set()
         self._jobs: set[asyncio.Task[Any]] = set()
         self._acquisitions: dict[asyncio.Task[Any], _Acquisition] = {}
         self._replies: set[asyncio.Task[Any]] = set()
         self._abandoned: set[asyncio.Task[Any]] = set()
         self._cleanup: set[asyncio.Task[Any]] = set()
         self._closed = False
+        self._destroyed = False
         self._close_lock = asyncio.Lock()
 
     # -- public interface ---------------------------------------------------
@@ -379,42 +384,85 @@ class PortalClient:
             # on the next loop pass.  Yield so draining cannot spin the loop.
             await asyncio.sleep(0)
 
+    @property
+    def _orphaned(self) -> dict[str, str]:
+        """Request handles still awaiting confirmation (read-only legacy view)."""
+        return {**self._retired, **self._requests}
+
     async def close(self) -> Result[None]:
         """Refuse new selections and confirm every resource this client owns.
 
-        ``Ok`` means every exact session was confirmed closed and no abandoned
-        request can still produce a new one.  Otherwise the uncertain records are
-        retained and the handler stays installed, so the portal can still report
-        a late completion and calling ``close()`` again retries the same cleanup
-        instead of finalising over an unconfirmed resource.
+        ``Ok`` means every exact session was confirmed closed and every request
+        this client opened is either settled by its ``Response`` or confirmed
+        closed.  Otherwise the uncertain records are retained and the handler
+        stays installed, so the portal can still report a late completion and
+        calling ``close()`` again advances the same cleanup instead of
+        finalising over an unconfirmed resource.
+
+        A barrier that has to abandon a request whose ``Response`` never
+        arrived cannot prove the portal suppresses that completion, so it
+        reports ``cleanup_timeout`` once; the next ``close()`` observes the
+        confirmed state and finalises.  A request abandoned before the barrier
+        (by a caller's own cancellation) is already reconciled by the time the
+        barrier runs.
         """
         async with self._close_lock:
+            if self._destroyed:
+                return Ok(value=None)
             self._closed = True
+            abandoned_by_barrier: set[str] = set()
             for job in tuple(self._jobs):
                 acquisition = self._acquisitions.get(job)
                 if acquisition is not None:
                     # Reconcile in flight work instead of dropping its handler.
-                    self._abandon(acquisition, job)
+                    abandoned_by_barrier |= self._abandon(acquisition, job)
                 elif not job.done():
                     job.cancel()
             await self.drain()
+
             unconfirmed = False
             for session in tuple(self._sessions):
                 if isinstance(await self._close_session(session), Err):
                     unconfirmed = True
-            if unconfirmed or self._jobs or self._cleanup or self._orphaned:
+            # Retry every request whose Close is not confirmed yet; a bounded
+            # retry is what lets a later call advance an uncertain record.
+            for path in tuple(self._requests):
+                await self._close_request(path)
+
+            # A request this barrier had to abandon is only sure to be free of a
+            # late session once a following barrier observes no new completion.
+            barrier_uncertain = any(
+                path in self._retired for path in abandoned_by_barrier
+            )
+            if (
+                unconfirmed
+                or barrier_uncertain
+                or bool(self._jobs)
+                or bool(self._cleanup)
+                or bool(self._requests)
+                or bool(self._replies)
+            ):
                 return _failure(ErrorCode.cleanup_timeout)
-            peer = self._peer
-            if peer is not None and self._handler_installed:
-                peer.remove_message_handler(self._on_message)
-                self._handler_installed = False
-            if peer is not None and self._owns_peer:
-                try:
-                    peer.disconnect()
-                except Exception:
-                    pass
-                self._peer = None
+            self._finalise()
             return Ok(value=None)
+
+    def _finalise(self) -> None:
+        """Detach the handler and drop a connection this client owns."""
+        peer = self._peer
+        if peer is not None and self._handler_installed:
+            peer.remove_message_handler(self._on_message)
+            self._handler_installed = False
+        if peer is not None and self._owns_peer:
+            try:
+                peer.disconnect()
+            except Exception:
+                pass
+        self._peer = None
+        self._destroyed = True
+        self._pending.clear()
+        self._sessions.clear()
+        self._requests.clear()
+        self._retired.clear()
 
     # -- acquisition --------------------------------------------------------
 
@@ -428,20 +476,33 @@ class PortalClient:
             self._handler_installed = True
         return self._peer
 
-    def _abandon(self, acquisition: _Acquisition, job: asyncio.Task[Any]) -> None:
-        """Stop waiting for a portal that will never answer this request again."""
+    def _abandon(
+        self, acquisition: _Acquisition, job: asyncio.Task[Any]
+    ) -> set[str]:
+        """Stop waiting for a portal that will never answer this request again.
+
+        Ownership is kept, never dropped: a ``Response`` already buffered in the
+        pending future, and every request handle the acquisition opened, stay
+        with this client until an exact Close is confirmed.  The returned paths
+        are the ones this call had to take over, so a shutdown barrier can tell
+        "already reconciled" from "this barrier races a completion".
+        """
+        abandoned: set[str] = set()
         for pending in tuple(acquisition.pending):
-            self._orphan(pending, acquisition.connector)
+            self._retain_pending(pending, acquisition)
+            abandoned.update(path for path in pending.paths if path in self._requests)
         for path in tuple(acquisition.requests):
-            if path in self._orphaned:
+            if path not in self._requests:
                 continue
-            self._orphaned[path] = acquisition.connector
-            self._track_cleanup(self._close_request(path))
+            abandoned.add(path)
+            self._own_request(path, acquisition.connector)
+        self._kick_request_closes()
         acquisition.release_waiters()
         self._abandoned.add(job)
         if job.done():
             # The outcome raced the cancellation and the caller will never see it.
             self._reconcile(job)
+        return abandoned
 
     def _job_complete(self, task: asyncio.Task[Any]) -> None:
         self._jobs.discard(task)
@@ -546,7 +607,7 @@ class PortalClient:
         return _failure(code)
 
     async def _rollback(self, acquisition: _Acquisition) -> bool:
-        """Close the session and outstanding requests; report whether it closed."""
+        """Close the session and hand every open request to exact cleanup."""
         if acquisition.rolled_back:
             return True
         acquisition.rolled_back = True
@@ -555,10 +616,21 @@ class PortalClient:
         if session is not None:
             result = await self._close_session(session)
             closed = isinstance(result, Ok)
-        for path in tuple(acquisition.requests):
-            await self._close_request(path)
-        acquisition.requests.clear()
+        self._retain_pending_requests(acquisition)
+        await self._drain_request_closes()
         return closed
+
+    def _retain_pending_requests(self, acquisition: _Acquisition) -> None:
+        """Keep exact ownership of every request this acquisition still owns."""
+        for path in tuple(acquisition.requests):
+            self._own_request(path, acquisition.connector)
+        self._kick_request_closes()
+
+    async def _drain_request_closes(self) -> None:
+        """Await the request closes this client just scheduled."""
+        tasks = tuple(self._cleanup)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- request/response correlation --------------------------------------
 
@@ -591,41 +663,50 @@ class PortalClient:
         acquisition.requests.append(expected)
         try:
             message = self._call_message(member, merged, session, parent_window)
-            reply = await self._watch(
-                acquisition,
-                asyncio.ensure_future(peer.call(message)),
-                lambda call: self._retain_reply(call, acquisition.connector),
+            call = asyncio.ensure_future(peer.call(message))
+            self._replies.add(call)
+            call.add_done_callback(
+                lambda settled: self._settle_call(settled, pending, acquisition)
             )
+            reply = await self._watch(acquisition, call)
         except asyncio.CancelledError:
+            self._retain_pending(pending, acquisition)
+            self._forget(pending, acquisition)
             raise
         except Exception:
             self._forget(pending, acquisition)
+            self._release_requests(pending.paths)
             return _failure(ErrorCode.dependency_incompatible)
-        if reply is _ABANDONED:
+        if reply is _ABANDONED or reply is _TIMED_OUT:
+            # Abandonment and the control deadline both leave the request's real
+            # outcome unknown, so keep it owned.  A success already buffered in
+            # the future is reaped rather than forgotten with the waiter.
+            self._retain_pending(pending, acquisition)
             self._forget(pending, acquisition)
-            return _failure(ErrorCode.portal_cancelled)
-        if reply is _TIMED_OUT:
-            # The control call missed its deadline, so the resource it would have
-            # named is unconfirmed: close its request handle and keep the path
-            # orphaned in case the portal still answers with a session.
-            self._orphan(pending, acquisition.connector)
-            self._forget(pending, acquisition)
+            if reply is _ABANDONED:
+                return _failure(ErrorCode.portal_cancelled)
             return _failure(ErrorCode.cleanup_timeout)
         if reply is None:
             self._forget(pending, acquisition)
+            self._release_requests(pending.paths)
             return _failure(ErrorCode.dependency_incompatible)
         if reply.message_type is MessageType.ERROR:
+            # The method call failed: the portal never handed us a Request.
             self._forget(pending, acquisition)
+            self._release_requests(pending.paths)
             return _failure(_error_code(reply.error_name))
         if reply.message_type is not MessageType.METHOD_RETURN:
+            self._retain_pending(pending, acquisition)
             self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         body = reply.body
         if type(body) not in (list, tuple) or len(body) != 1 or type(body[0]) is not str:
+            self._retain_pending(pending, acquisition)
             self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         returned = body[0]
         if not returned:
+            self._retain_pending(pending, acquisition)
             self._forget(pending, acquisition)
             return _failure(ErrorCode.dependency_incompatible)
         if returned != expected:
@@ -633,12 +714,18 @@ class PortalClient:
             # arrives on that path, so correlate on both known paths.
             pending.paths.add(returned)
             acquisition.requests.append(returned)
+            self._own_request(returned, acquisition.connector)
         try:
             response, results = await pending.future
         finally:
             self._forget(pending, acquisition)
         if response is _ABANDONED:
+            # The caller left while the request was open: the completion that
+            # owns the resource has already been taken over by ``_abandon``.
+            self._retain_pending(pending, acquisition)
             return _failure(ErrorCode.portal_cancelled)
+        # A delivered Response finishes this Request: nothing is left to close.
+        self._retire_settled(pending.paths)
         mapped = _response_code(response)
         if isinstance(mapped, Err):
             return mapped
@@ -646,16 +733,79 @@ class PortalClient:
             return _failure(ErrorCode.dependency_incompatible)
         return Ok(value=results)
 
-    def _orphan(self, pending: _Pending, connector: str) -> None:
-        """Stop watching a request, but keep reaping whatever it still creates.
+    def _own_request(self, path: str, connector: str) -> None:
+        """Take exact ownership of one Request handle, idempotently."""
+        if not path or path in self._retired:
+            return
+        self._requests.setdefault(path, connector)
 
-        ``Request.Close`` suppresses the ``Response`` a waiter was blocked on, but
-        the portal may still answer: an unrecognised success owns a session that
-        has to be closed, so the path stays registered instead of being dropped.
+    def _release_requests(self, paths: object) -> None:
+        """Drop ownership of handles the portal never created for this client."""
+        for path in paths:  # type: ignore[union-attr]
+            if path in self._requests and path not in self._closing_requests:
+                self._requests.pop(path, None)
+
+    def _retire_settled(self, paths: object) -> None:
+        """A consumed Response finishes a Request; keep no cleanup obligation."""
+        for path in paths:  # type: ignore[union-attr]
+            if path in self._closing_requests:
+                continue
+            connector = self._requests.pop(path, None)
+            if connector is not None:
+                self._retired[path] = connector
+
+    def _retain_pending(self, pending: _Pending, acquisition: _Acquisition) -> None:
+        """Keep everything one abandoned request can still own.
+
+        ``Response`` may already have been delivered into the pending future
+        before the caller left; that success names a live session, so it is
+        reaped here instead of being discarded with the waiter.
         """
+        if pending.future.done() and not pending.future.cancelled():
+            buffered = pending.future.result()
+            if (
+                type(buffered) is tuple
+                and len(buffered) == 2
+                and buffered[0] is not _ABANDONED
+            ):
+                path = pending.settled_path or next(iter(pending.paths), "")
+                self._reap_response(buffered, pending.connector, path)
         for path in pending.paths:
-            self._orphaned[path] = connector
-            self._track_cleanup(self._close_request(path))
+            self._own_request(path, acquisition.connector)
+        self._kick_request_closes()
+
+    def _settle_call(
+        self,
+        call: asyncio.Task[Any],
+        pending: _Pending,
+        acquisition: _Acquisition,
+    ) -> None:
+        """Learn a late Request handle and cancel it if nobody is waiting."""
+        self._replies.discard(call)
+        if call.cancelled():
+            return
+        try:
+            reply = call.result()
+        except BaseException:
+            return
+        returned = _returned_handle(reply)
+        if returned is None:
+            return
+        pending.paths.add(returned)
+        if returned not in acquisition.requests:
+            acquisition.requests.append(returned)
+        unwatched = (
+            self._closed
+            or pending.abandoned
+            or self._pending.get(pending.token) is not pending
+        )
+        if not unwatched:
+            # A live waiter correlates this handle and delays its Close until the
+            # Response arrives; owning it early keeps it from escaping.
+            self._own_request(returned, acquisition.connector)
+            return
+        self._own_request(returned, acquisition.connector)
+        self._kick_request_closes()
 
     def _forget(self, pending: _Pending, acquisition: _Acquisition) -> None:
         self._pending.pop(pending.token, None)
@@ -668,15 +818,13 @@ class PortalClient:
         self,
         acquisition: _Acquisition | None,
         call: asyncio.Task[Any],
-        on_timeout: Callable[[asyncio.Task[Any]], None],
     ) -> Message | None | object:
         """Await one portal call and stop at abandonment or the control deadline.
 
         Abandonment matters because ``Request.Close`` suppresses the ``Response``
         a job may be waiting for; the deadline matters because an unresponsive
-        portal must never stop Stop, exact release, or shutdown.  A call that
-        overruns either bound is handed to ``on_timeout`` so the caller can keep
-        the uncertain resource instead of discarding it.
+        portal must never stop Stop, exact release, or shutdown.  The caller
+        keeps ownership of whatever the overrunning call may still create.
         """
         peer = self._peer
         if peer is None:
@@ -702,25 +850,7 @@ class PortalClient:
                 raise
             except Exception:
                 return None
-        on_timeout(call)
         return _ABANDONED if released is not None and released in done else _TIMED_OUT
-
-    def _retain_reply(self, call: asyncio.Task[Any], connector: str) -> None:
-        self._replies.add(call)
-
-        def settle(task: asyncio.Task[Any]) -> None:
-            self._replies.discard(task)
-            if task.cancelled():
-                return
-            try:
-                reply = task.result()
-            except BaseException:
-                return
-            handle = _returned_handle(reply)
-            if handle is not None:
-                self._orphaned.setdefault(handle, connector)
-
-        call.add_done_callback(settle)
 
     def _call_message(
         self,
@@ -763,26 +893,36 @@ class PortalClient:
             return self._on_session_closed(path)
         if message.interface != REQUEST_INTERFACE or message.member != "Response":
             return False
-        pending = self._pending_for(path)
         body = message.body
         if type(body) not in (list, tuple) or len(body) != 2:
             return False
+        pending = self._pending_for(path)
         if pending is not None:
             if not pending.future.done():
+                pending.settled_path = path
                 pending.future.set_result((body[0], body[1]))
             elif pending.abandoned:
                 # Settled by abandonment: a success that still arrives owns a
                 # live session, so reap it instead of dropping the signal.
                 self._reap_response(body, pending.connector, path)
             return True
-        if path in self._orphaned:
-            self._reap_response(body, self._orphaned[path], path)
+        connector = self._requests.get(path) or self._retired.get(path)
+        if connector is not None:
+            # No caller is waiting, but this exact handle still owns whatever
+            # the completion creates.
+            self._reap_response(body, connector, path)
             return True
         return False
 
     def _reap_response(self, body: object, connector: str, path: str) -> None:
+        """Take ownership of a completion no caller is waiting for."""
+        self._track_cleanup(self._reap_request(body, connector, path))
+
+    async def _reap_request(self, body: object, connector: str, path: str) -> None:
         """Close a session created by a response no caller is waiting for."""
-        self._orphaned.pop(path, None)
+        if path:
+            self._retired.pop(path, None)
+            self._requests.pop(path, None)
         if type(body) not in (list, tuple) or len(body) != 2:
             return
         if isinstance(_response_code(body[0]), Err):
@@ -794,7 +934,7 @@ class PortalClient:
         if type(session) is not str or not session.startswith("/"):
             return
         self._sessions.setdefault(session, connector)
-        self._track_cleanup(self._close_session(session))
+        await self._close_session(session)
 
     def _on_session_closed(self, path: str) -> bool:
         """Drop liveness for an exact session the portal reports as closed."""
@@ -822,7 +962,7 @@ class PortalClient:
                 interface=SESSION_INTERFACE,
                 member="Close",
             )
-            reply = await self._watch(None, asyncio.ensure_future(peer.call(message)), _drop)
+            reply = await self._watch(None, asyncio.ensure_future(peer.call(message)))
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -842,10 +982,30 @@ class PortalClient:
         self._sessions.pop(session, None)
         return Ok(value=None)
 
-    async def _close_request(self, path: str) -> None:
+    def _kick_request_closes(self) -> None:
+        """Start a bounded Close for every owned request that has none in flight."""
+        for path in tuple(self._requests):
+            if path in self._closing_requests:
+                continue
+            self._track_cleanup(self._close_request(path))
+
+    async def _close_request(self, path: str) -> bool:
+        """Close one exact Request handle; report whether the portal confirmed it.
+
+        A confirmed Close is the transition that retires an abandoned request:
+        the contract says its ``Response`` is suppressed, so waiting for one
+        would keep ``close()`` from ever finalising.  Any reply (a method return
+        or an error such as ``UnknownObject``) is a confirmation; a timeout or a
+        transport failure keeps the handle owned so a retry can advance it.
+        """
+        if not path:
+            return True
+        if path in self._closing_requests:
+            return path not in self._requests
         peer = self._peer
-        if peer is None or not path:
-            return
+        if peer is None:
+            return False
+        self._closing_requests.add(path)
         try:
             message = Message(
                 destination=PORTAL_DESTINATION,
@@ -853,13 +1013,23 @@ class PortalClient:
                 interface=REQUEST_INTERFACE,
                 member="Close",
             )
-            await self._watch(None, asyncio.ensure_future(peer.call(message)), _drop)
+            reply = await self._watch(None, asyncio.ensure_future(peer.call(message)))
         except asyncio.CancelledError:
             raise
         except Exception:
             # A peer-supplied handle that is not a valid object path cannot be
             # closed; cancellation cleanup stays best-effort and never raises.
-            return
+            return False
+        finally:
+            self._closing_requests.discard(path)
+        if not isinstance(reply, Message):
+            return False
+        connector = self._requests.pop(path, None)
+        if connector is None:
+            connector = self._retired.get(path)
+        if connector is not None:
+            self._retired[path] = connector
+        return True
 
 
 __all__ = ["PortalClient"]
