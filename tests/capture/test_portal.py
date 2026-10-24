@@ -283,6 +283,88 @@ class FakePortalPeer:
         return self.respond("Start", 0, results)
 
 
+class RefusedRequestClosePeer(FakePortalPeer):
+    """A portal that refuses ``Request.Close`` and keeps the request live.
+
+    The refusal is an ordinary ``AccessDenied`` error reply, which is *not*
+    evidence that anything was released: the fake independently retains the
+    server-side request until a successful close arrives.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.live_requests: set[str] = set()
+        self.refused_requests: list[str] = []
+        self.refuse = True
+
+    async def call(self, message: Message) -> Message | None:
+        if (
+            message.interface == REQUEST_INTERFACE
+            and message.member == "Close"
+            and self.refuse
+        ):
+            if not message.serial:
+                self._next_serial += 1
+                message.serial = self._next_serial
+            self.refused_requests.append(message.path)
+            return Message.new_error(
+                message, "org.freedesktop.DBus.Error.AccessDenied", "close refused"
+            )
+        reply = await super().call(message)
+        if (
+            message.interface == SCREEN_CAST_INTERFACE
+            and message.member == "CreateSession"
+            and isinstance(reply, Message)
+            and reply.message_type is MessageType.METHOD_RETURN
+        ):
+            self.live_requests.add(reply.body[0])
+        elif message.interface == REQUEST_INTERFACE and message.member == "Close":
+            self.live_requests.discard(message.path)
+        return reply
+
+
+class OwnerSubscriptionPeer(FakePortalPeer):
+    """A bus peer that only broadcasts owner loss to a matching subscriber.
+
+    ``AddMatch`` is either confirmed, explicitly refused, or never answered
+    before the control deadline.  Only a confirmed subscription can deliver
+    ``NameOwnerChanged``, exactly like the real session bus.
+    """
+
+    def __init__(self, subscription: str) -> None:
+        super().__init__()
+        self.owner_subscription = False
+        if subscription == "denied":
+            self.error_replies["AddMatch"] = "org.freedesktop.DBus.Error.AccessDenied"
+        elif subscription == "deadline":
+            self.hold("AddMatch")
+
+    async def call(self, message: Message) -> Message | None:
+        reply = await super().call(message)
+        if message.member == "AddMatch":
+            self.owner_subscription = (
+                isinstance(reply, Message)
+                and reply.message_type is MessageType.METHOD_RETURN
+            )
+        return reply
+
+    def lose_owner(self) -> bool:
+        """The portal service disappears; only subscribers hear about it."""
+        self.open_sessions.clear()
+        if not self.owner_subscription:
+            return False
+        message = Message(
+            message_type=MessageType.SIGNAL,
+            path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus",
+            member="NameOwnerChanged",
+            signature="sss",
+            body=[PORTAL_DESTINATION, ":1.77", ""],
+            sender="org.freedesktop.DBus",
+        )
+        return any(handler(message) for handler in tuple(self.handlers))
+
+
 async def bounded(awaitable: Any, timeout: float = 2.0) -> Any:
     """Await one client operation but fail fast instead of hanging the suite.
 
@@ -1178,6 +1260,135 @@ async def test_a_late_request_handle_after_the_control_deadline_is_cancelled() -
     assert returned in peer.closed_requests, (returned, peer.closed_requests, client._orphaned)
     # Nothing is left owned: both handles were confirmed closed.
     assert client._requests == {}
+
+
+async def test_a_refused_request_close_cannot_confirm_client_shutdown() -> None:
+    """CAP-016: an explicit refusal is not evidence that a request was closed."""
+    peer = RefusedRequestClosePeer()
+    client = PortalClient(peer=peer, deadline=0.02)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await bounded(peer.wait_for("CreateSession"))
+    await settle(24)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await bounded(client.drain())
+
+    assert peer.refused_requests, "the fake must have refused a Request.Close"
+    refused = peer.refused_requests[0]
+
+    result = await bounded(client.close())
+
+    assert isinstance(result, Err), (result, peer.refused_requests, peer.live_requests)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    # The refusal released nothing: the exact request is still live, so the
+    # handler has to stay installed for the completion and the retry.
+    assert refused in peer.live_requests, (refused, peer.live_requests)
+    assert peer.handlers != []
+
+    peer.refuse = False
+    retried = await bounded(client.close())
+
+    assert isinstance(retried, Ok), (retried, peer.closed_requests, peer.live_requests)
+    assert peer.live_requests == set()
+    assert peer.handlers == []
+
+
+async def test_a_late_abandoned_reply_must_not_cancel_the_next_provider_selection() -> None:
+    """CAP-017: cleanup belongs to the abandoned request, not to the client."""
+    peer = FakePortalPeer()
+    peer.hold("CreateSession")
+    client = PortalClient(peer=peer, deadline=0.02)
+    provider = PhysicalCaptureProvider(client, _physical_inventory, _PhysicalFeatures())
+
+    first = asyncio.create_task(provider.select("DP-1"))
+    await bounded(peer.wait_for("CreateSession"))
+    first_call = peer.last("CreateSession")
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await bounded(client.drain())
+    assert client._replies
+
+    # Only future calls are released; the abandoned call keeps its own hold.
+    old_hold = peer.held.pop((None, "CreateSession"))
+    assert old_hold is not None
+
+    second = asyncio.create_task(provider.select("DP-1"))
+    await bounded(peer.wait_for("CreateSession", 2))
+    await settle(24)
+    second_call = peer.last("CreateSession")
+    assert second_call is not first_call
+    second_path = peer.request_path(second_call.handle_token or "")
+    assert second_path not in peer.closed_requests
+    assert not second.done()
+
+    # The first selection's method reply finally arrives with its real handle.
+    old_hold.set()
+    await settle(32)
+
+    assert second_path not in peer.closed_requests, (
+        second_path,
+        peer.closed_requests,
+    )
+    assert not second.done()
+
+    # The newer selection is untouched and can still finish its acquisition.
+    peer.respond_create(session_token="s2")
+    await bounded(peer.wait_for("SelectSources"))
+    await settle()
+    peer.respond("SelectSources", 0, {})
+    await bounded(peer.wait_for("Start"))
+    await settle()
+    peer.respond_start("DP-1")
+    selected = await bounded(second)
+
+    assert isinstance(selected, Ok), (selected, peer.closed_requests)
+    assert selected.value.connector == "DP-1"
+    await bounded(client.drain())
+    assert isinstance(await bounded(client.close()), Ok)
+
+
+@pytest.mark.parametrize("subscription", ["confirmed", "denied", "deadline"])
+async def test_owner_watch_failure_cannot_leave_a_dead_lease_verifying(
+    subscription: str,
+) -> None:
+    """CAP-018: only a confirmed owner subscription can support a live lease."""
+    peer = OwnerSubscriptionPeer(subscription)
+    client = PortalClient(peer=peer, deadline=0.02)
+    provider = PhysicalCaptureProvider(client, _physical_inventory, _PhysicalFeatures())
+    task = asyncio.create_task(provider.select("DP-1"))
+    await bounded(peer.wait_for("CreateSession"))
+    await settle(24)
+    peer.respond_create()
+    await bounded(peer.wait_for("SelectSources"))
+    await settle(24)
+    peer.respond("SelectSources", 0, {})
+    await bounded(peer.wait_for("Start"))
+    await settle(24)
+    peer.respond_start("DP-1")
+    selected = await bounded(task)
+    await bounded(client.drain())
+    try:
+        if isinstance(selected, Err):
+            # A typed refusal also preserves fail-closed verification.
+            return
+        assert isinstance(selected, Ok)
+        assert isinstance(await provider.verify(selected.value), Ok)
+        delivered = peer.lose_owner()
+        result = await provider.verify(selected.value)
+        assert isinstance(result, Err), (
+            subscription,
+            peer.owner_subscription,
+            delivered,
+            peer.connected,
+            result,
+        )
+    finally:
+        peer.release_hold("AddMatch")
+        await settle(24)
+        await bounded(client.close())
 
 
 async def test_a_connection_that_arrives_after_the_deadline_is_never_used() -> None:
