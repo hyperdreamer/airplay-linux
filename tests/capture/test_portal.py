@@ -1218,6 +1218,153 @@ async def test_a_connection_in_progress_cannot_open_requests_after_confirmed_clo
     assert calls_after_close == [], (closing, calls_after_close, len(peer.handlers))
 
 
+async def test_confirmed_close_cancels_a_connection_that_never_returns() -> None:
+    """CAP-019/L3a: confirmed close must stop setup even if it never replies."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        started.set()
+        try:
+            return await asyncio.Future()
+        finally:
+            cancelled.set()
+
+    client = PortalClient(connect=connect)
+    selection = asyncio.create_task(client.select_monitor("DP-1", None))
+    connection = None
+    try:
+        await bounded(started.wait())
+        connection = client._connection.task
+        assert connection is not None and not connection.done()
+
+        closed = await bounded(client.close())
+        await asyncio.sleep(0)
+
+        assert isinstance(closed, Ok)
+        assert cancelled.is_set(), "confirmed close left connect() running"
+        assert connection.cancelled()
+        result = await bounded(selection)
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.portal_cancelled
+    finally:
+        # Also reap the mutant's still-live connect without releasing its hold.
+        selection.cancel()
+        if connection is not None:
+            connection.cancel()
+        await bounded(asyncio.gather(
+            selection, *(() if connection is None else (connection,)),
+            return_exceptions=True,
+        ))
+
+
+async def test_connection_completion_cannot_resurrect_a_peer_after_finalization() -> None:
+    """CAP-019/L3b: a resumed admission cannot reinstall a finalized peer."""
+    peer = FakePortalPeer()
+    started, release = asyncio.Event(), asyncio.Event()
+    closing_waits = asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        started.set()
+        await release.wait()
+        return peer
+
+    client = PortalClient(connect=connect)
+    selection = asyncio.create_task(client.select_monitor("DP-1", None))
+    closing = None
+    connection = None
+    try:
+        await bounded(started.wait())
+        connection = client._connection.task
+        assert connection is not None and not connection.done()
+
+        async def close_on_completion() -> Any:
+            closing_waits.set()
+            # A direct waiter resumes before admission's shield continuation:
+            # _connect_complete retains the peer, close finalizes, admission resumes.
+            await connection
+            return await client.close()
+
+        closing = asyncio.create_task(close_on_completion())
+        await bounded(closing_waits.wait())
+        release.set()
+        closed = await bounded(closing)
+        result = await bounded(selection)
+
+        assert isinstance(closed, Ok)
+        assert client._destroyed
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.unsupported_operation
+        assert peer.disconnected
+        assert peer.handlers == [], "admission reattached a handler after finalization"
+        assert client._peer is None
+        assert client._connection.peer is None
+        assert peer.calls == []
+    finally:
+        tasks = [selection]
+        if connection is not None:
+            tasks.append(connection)
+        if closing is not None:
+            tasks.append(closing)
+        for task in tasks:
+            task.cancel()
+        await bounded(asyncio.gather(*tasks, return_exceptions=True))
+        # A mutant can reinstall a handler after close() became idempotent.
+        client._finalise()
+
+
+async def test_connection_callback_after_finalization_discards_the_late_peer() -> None:
+    """CAP-019/L3e: a queued completion cannot retain a peer after shutdown."""
+    peer = FakePortalPeer()
+    started, release = asyncio.Event(), asyncio.Event()
+    callback_delivered = asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        started.set()
+        await release.wait()
+        return peer
+
+    client = PortalClient(connect=connect)
+    selection = asyncio.create_task(client.select_monitor("DP-1", None))
+    connection = None
+    try:
+        await bounded(started.wait())
+        connection = client._connection.task
+        assert connection is not None and not connection.done()
+        selection.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await bounded(selection)
+        assert not connection.done(), "caller cancellation must leave setup tracked"
+        connection.add_done_callback(lambda _: callback_delivered.set())
+
+        release.set()
+        # Complete connect(), but close inline before its queued callbacks run.
+        await asyncio.sleep(0)
+        assert connection.done() and not connection.cancelled()
+        assert not callback_delivered.is_set()
+        async with asyncio.timeout(2.0):
+            closed = await client.close()
+        assert isinstance(closed, Ok)
+        assert client._destroyed
+        assert client._connection.task is None
+
+        await bounded(callback_delivered.wait())
+
+        assert peer.disconnected, "late completion retained a connected peer after shutdown"
+        assert client._connection.peer is None
+        assert client._peer is None
+        assert peer.handlers == []
+        assert peer.calls == []
+    finally:
+        selection.cancel()
+        if connection is not None:
+            connection.cancel()
+        await bounded(asyncio.gather(
+            selection, *(() if connection is None else (connection,)),
+            return_exceptions=True,
+        ))
+        client._finalise()
+
+
 @pytest.mark.parametrize("configured_deadline", [0.02, 5.0])
 async def test_connection_setup_obeys_the_control_deadline(configured_deadline: float) -> None:
     """CAP-014: the initial session-bus connect is bounded like every control call."""
