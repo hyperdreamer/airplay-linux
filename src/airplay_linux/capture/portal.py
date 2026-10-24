@@ -370,8 +370,12 @@ class PortalClient:
         self._closed = False
         self._destroyed = False
         self._close_lock = asyncio.Lock()
-        #: Whether this connection asked the bus for portal owner changes.
-        self._owner_watch = False
+        #: The in-flight (or last) owner-change subscription attempt.  Success is
+        #: tracked separately from the attempt: only a confirmed match rule makes
+        #: a lease verifiable, and a failed attempt may be retried by the next
+        #: admission.
+        self._owner_watch: asyncio.Task[ErrorCode | None] | None = None
+        self._owner_watch_confirmed = False
 
     # -- public interface ---------------------------------------------------
 
@@ -447,6 +451,10 @@ class PortalClient:
         ):
             return False
         if self._sessions.get(monitor.portal_session_id) != monitor.connector:
+            return False
+        if not self._owner_watch_confirmed:
+            # The bus never confirmed the owner-change match rule, so no owner
+            # loss could ever be observed: that lease cannot be verified.
             return False
         peer = self._peer
         if peer is None:
@@ -558,6 +566,8 @@ class PortalClient:
         self._due_requests.clear()
         self._retired.clear()
         self._dead_sessions.clear()
+        self._owner_watch = None
+        self._owner_watch_confirmed = False
 
     # -- connection ---------------------------------------------------------
 
@@ -589,25 +599,20 @@ class PortalClient:
                 self._owns_peer = True
                 connection.peer = None
         assert self._peer is not None
+        peer = self._peer
         if not self._handler_installed:
-            self._peer.add_message_handler(self._on_message)
+            peer.add_message_handler(self._on_message)
             self._handler_installed = True
-            self._watch_portal_owner(self._peer)
+            # Owner monitoring is part of liveness, not a best-effort extra: the
+            # match rule is the only path that reports a vanished portal owner.
+            # It starts here so the bus can answer while the portal prompts, and
+            # every selection confirms it before publishing a lease.
+            self._start_owner_watch(peer)
         return self._peer
 
-    def _watch_portal_owner(self, peer: PortalPeer) -> None:
-        """Subscribe to portal owner changes; best effort, bounded by the deadline.
-
-        Without the match rule the real bus never delivers ``NameOwnerChanged``
-        for the portal name, so the client could not tell that the service it
-        holds sessions for has disappeared.  A refused subscription is not a
-        selection failure; ``is_open`` then relies on the session and connection
-        evidence it does have.
-        """
-        if self._owner_watch:
-            return
-        self._owner_watch = True
-        message = Message(
+    @staticmethod
+    def _owner_match_message() -> Message:
+        return Message(
             destination=DBUS_DESTINATION,
             path=DBUS_PATH,
             interface=DBUS_INTERFACE,
@@ -618,15 +623,56 @@ class PortalClient:
                 "member='NameOwnerChanged',arg0='" + PORTAL_DESTINATION + "'"
             ],
         )
-        self._track_cleanup(self._subscribe(peer, message))
 
-    async def _subscribe(self, peer: PortalPeer, message: Message) -> None:
+    def _start_owner_watch(self, peer: PortalPeer) -> None:
+        """Start the bounded owner-change subscription for this connection.
+
+        The attempt is shared by concurrent selections and bounded by the
+        control deadline inside :meth:`_subscribe`; its outcome is awaited by
+        :meth:`_confirm_owner_watch` before a lease is published.
+        """
+        if self._owner_watch_confirmed or self._owner_watch is not None:
+            return
+        task = asyncio.ensure_future(self._subscribe(peer, self._owner_match_message()))
+        self._owner_watch = task
+        task.add_done_callback(_discard_result)
+
+    async def _confirm_owner_watch(self) -> Result[None]:
+        """Await the bounded subscription before a lease may be published.
+
+        Only a confirmed match rule makes a lease verifiable: without it, the
+        bus never reports the portal owner going away.  A refusal or an
+        unanswered subscription therefore fails the selection closed instead of
+        handing out a monitor that could keep verifying after its owner is gone.
+        The next admission is allowed one fresh bounded attempt.
+        """
+        task = self._owner_watch
+        if task is None:
+            return _failure(ErrorCode.dependency_incompatible)
+        failure = await asyncio.shield(task)
+        if failure is None:
+            self._owner_watch_confirmed = True
+            return Ok(value=None)
+        self._owner_watch = None
+        return _failure(failure)
+
+    async def _subscribe(
+        self, peer: PortalPeer, message: Message
+    ) -> ErrorCode | None:
+        """Send one match rule; ``None`` means the bus confirmed it."""
         try:
-            await self._watch(None, asyncio.ensure_future(peer.call(message)))
+            reply = await self._watch(None, asyncio.ensure_future(peer.call(message)))
         except asyncio.CancelledError:
             raise
         except Exception:
-            return
+            return ErrorCode.dependency_incompatible
+        if isinstance(reply, Message):
+            if reply.message_type is MessageType.METHOD_RETURN:
+                return None
+            if reply.message_type is MessageType.ERROR:
+                return _error_code(reply.error_name)
+        # Unanswered past the deadline: the subscription is unconfirmed.
+        return ErrorCode.cleanup_timeout
 
     async def _connect_within_deadline(
         self, task: asyncio.Task[PortalPeer]
@@ -779,6 +825,14 @@ class PortalClient:
                 restore_token=token,  # type: ignore[arg-type]
                 portal_session_id=session,
             )
+            if (abandoned := await self._abandoned_result(acquisition)) is not None:
+                return abandoned
+            # A lease this client cannot monitor for owner loss is not a
+            # verifiable lease, so a refused or unanswered subscription fails
+            # the selection closed and rolls back the session it just opened.
+            watch = await self._confirm_owner_watch()
+            if isinstance(watch, Err):
+                return await self._fail(acquisition, watch.error.code)
             if (abandoned := await self._abandoned_result(acquisition)) is not None:
                 return abandoned
             return Ok(value=monitor)
