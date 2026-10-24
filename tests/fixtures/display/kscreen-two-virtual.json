@@ -1,0 +1,166 @@
+{
+    "outputs": [
+        {
+            "brightness": 1,
+            "clones": [],
+            "connected": true,
+            "currentModeId": "34",
+            "enabled": true,
+            "followPreferredMode": false,
+            "iccProfilePath": "",
+            "icon": "",
+            "id": 1,
+            "maxBpc": 0,
+            "modes": [
+                {
+                    "id": "34",
+                    "name": "1920x1080@60",
+                    "refreshRate": 60,
+                    "size": {
+                        "height": 1080,
+                        "width": 1920
+                    }
+                },
+                {
+                    "id": "35",
+                    "name": "1920x1080@120",
+                    "refreshRate": 120,
+                    "size": {
+                        "height": 1080,
+                        "width": 1920
+                    }
+                }
+            ],
+            "name": "DP-1",
+            "pos": {
+                "x": 0,
+                "y": 0
+            },
+            "preferredModes": [
+                "34"
+            ],
+            "priority": 1,
+            "replicationSource": 0,
+            "rgbRange": 0,
+            "rotation": 1,
+            "scale": 1,
+            "size": {
+                "height": 1080,
+                "width": 1920
+            },
+            "sizeMM": {
+                "height": 336,
+                "width": 598
+            },
+            "type": 14
+        },
+        {
+            "brightness": 1,
+            "clones": [],
+            "connected": true,
+            "currentModeId": "51",
+            "enabled": true,
+            "followPreferredMode": false,
+            "iccProfilePath": "",
+            "icon": "",
+            "id": 5,
+            "maxBpc": 0,
+            "modes": [
+                {
+                    "id": "51",
+                    "name": "1920x1080@60",
+                    "refreshRate": 60,
+                    "size": {
+                        "height": 1080,
+                        "width": 1920
+                    }
+                }
+            ],
+            "name": "Virtual-1",
+            "pos": {
+                "x": 1920,
+                "y": 0
+            },
+            "preferredModes": [
+                "51"
+            ],
+            "priority": 2,
+            "replicationSource": 0,
+            "rgbRange": 0,
+            "rotation": 1,
+            "scale": 1,
+            "size": {
+                "height": 1080,
+                "width": 1920
+            },
+            "sizeMM": {
+                "height": 336,
+                "width": 598
+            },
+            "type": 0
+        },
+        {
+            "brightness": 1,
+            "clones": [],
+            "connected": true,
+            "currentModeId": "61",
+            "enabled": true,
+            "followPreferredMode": false,
+            "iccProfilePath": "",
+            "icon": "",
+            "id": 6,
+            "maxBpc": 0,
+            "modes": [
+                {
+                    "id": "61",
+                    "name": "1920x1080@60",
+                    "refreshRate": 60,
+                    "size": {
+                        "height": 1080,
+                        "width": 1920
+                    }
+                }
+            ],
+            "name": "Virtual-2",
+            "pos": {
+                "x": 3840,
+                "y": 0
+            },
+            "preferredModes": [
+                "61"
+            ],
+            "priority": 3,
+            "replicationSource": 0,
+            "rgbRange": 0,
+            "rotation": 1,
+            "scale": 1,
+            "size": {
+                "height": 1080,
+                "width": 1920
+            },
+            "sizeMM": {
+                "height": 336,
+                "width": 598
+            },
+            "type": 0
+        }
+    ],
+    "screen": {
+        "currentSize": {
+            "height": 1080,
+            "width": 5760
+        },
+        "id": 0,
+        "maxActiveOutputsCount": 3,
+        "maxSize": {
+            "height": 64000,
+            "width": 64000
+        },
+        "minSize": {
+            "height": 0,
+            "width": 0
+        }
+    },
+    "tabletModeAvailable": false,
+    "tabletModeEngaged": false
+}
