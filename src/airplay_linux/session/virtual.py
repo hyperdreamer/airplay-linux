@@ -8,18 +8,19 @@ Pairing and destructive teardown reuse the Mirror lifecycle's shared owners.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverRecordSet
 from airplay_linux.domain.messages import (
     Cancel, ChangeResolution, ChooseResolution, DisplayEvent, DiscoveryEvent,
-    EffectEvent, ModePayload, Pair, RecreateAccepted, Retry, RetryAudio, Start,
-    Stop, TimerEvent, TransportEvent, TransportEventKind,
+    EffectEvent, ModePayload, Pair, RecreateAccepted, Retry, RetryAudio, RetryCleanup,
+    Start, Stop, TimerEvent, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import (
-    DisplayHandle, OperationContext, OwnerId, ProcessIdentity, StreamHandle,
+    DisplayHandle, OperationContext, OperationId, OwnerId, ProcessIdentity, StreamHandle,
 )
+from airplay_linux.domain.ports import Subscription
 from airplay_linux.domain.records import SavedReceiver
 from airplay_linux.domain.resources import (
     AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
@@ -30,6 +31,7 @@ from airplay_linux.storage import PreferenceAccess, is_ambiguous_identity
 
 from .cleanup import OrderedCleanup, runtime_for
 from .engine import Handler, ManagerDeps, Route, SessionContext
+from .fencing import accept_transport
 from .mirror import MirrorLifecycle, _current_context, _start_gate
 
 
@@ -126,6 +128,9 @@ class _VirtualRuntime:
     recreating: bool = False
     pause_inflight: bool = False
     pause_reason: str | None = None
+    pending_ready: TransportEvent | None = None
+    ready_stream: StreamHandle | None = None
+    start_bridges: dict[OperationId, Subscription] = field(default_factory=dict)
 
 
 def _virtual_runtime(ctx: SessionContext) -> _VirtualRuntime:
@@ -178,6 +183,22 @@ class VirtualLifecycle(MirrorLifecycle):
         if isinstance(message, (Cancel, Stop)):
             runtime.recreating = False
             runtime.pause_reason = None
+        if isinstance(message, EffectEvent) and message.kind == "cleanup:transport_start":
+            self._close_start_bridge(ctx, message.operation_id)
+        if isinstance(message, EffectEvent) and message.kind == "cleanup:virtual_stale_stop":
+            return self._stale_stream_stopped(ctx, message)
+        if (
+            ctx.state.mode is Mode.VIRTUAL and ctx.state.intent_active
+            and ctx.state.display is DisplayState.Owned and ctx.state.display_handle is not None
+            and not runtime_for(ctx).active
+        ):
+            if isinstance(message, EffectEvent) and message.kind == "cleanup:transport_start":
+                return self._stale_transport(ctx, message)
+            if isinstance(message, RetryCleanup) and runtime_for(ctx).late_resources:
+                for resource in tuple(runtime_for(ctx).late_resources):
+                    if isinstance(resource, StreamHandle):
+                        self._release_stale_stream(ctx, resource)
+                return True
         if isinstance(message, EffectEvent) and message.kind == "cleanup:virtual_retained_stop":
             return self._paused(ctx, message)
         if isinstance(message, EffectEvent) and message.kind == "cleanup:virtual_display_confirm":
@@ -191,6 +212,50 @@ class VirtualLifecycle(MirrorLifecycle):
         if runtime.recreating and runtime_for(ctx).active and ctx.state.intent_stage is IntentStage.stopping:
             ctx.apply(intent_stage=IntentStage.reconfiguring, cleanup_pending=False)
         return handled
+
+    def _stale_transport(self, ctx, message):
+        # A retired connect owns only its exact stream, never the healthy output
+        # of the active Virtual intent. Err carries no acquisition to release.
+        runtime = _virtual_runtime(ctx)
+        if ctx.state.stream is None and message.operation_id == ctx.state.operation_id:
+            runtime.pending_ready = None
+            ctx.cancel_audio()
+            ctx.apply(transport=TransportState.Reconnecting, transport_lease_id=None,
+                      intent_stage=IntentStage.active, audio=AudioState.Disabled)
+        resource = message.resource
+        if isinstance(message.result, Ok) and isinstance(resource, StreamHandle):
+            cleanup = runtime_for(ctx)
+            if resource not in cleanup.late_resources:
+                cleanup.late_resources.append(resource)
+            self._release_stale_stream(ctx, resource)
+            # Retain the acquisition in the manager ledger until exact release.
+            return False
+        return True
+
+    def _release_stale_stream(self, ctx, stream):
+        runtime = runtime_for(ctx)
+        if stream in runtime.late_inflight:
+            return
+        runtime.late_inflight.add(stream)
+        operation = _current_context(ctx)
+        ctx.launch(Route.cleanup, "virtual_stale_stop", operation,
+                   lambda: self.deps.transport.stop_stream(stream, operation), resource=stream)
+
+    def _stale_stream_stopped(self, ctx, message):
+        runtime = runtime_for(ctx)
+        runtime.late_inflight.discard(message.resource)
+        if isinstance(message.result, Err):
+            ctx.apply(cleanup_pending=True, intent_stage=IntentStage.cleanup, last_error=message.result.error)
+            return True
+        if message.resource in runtime.late_resources:
+            runtime.late_resources.remove(message.resource)
+        if runtime.active:
+            # Stop may have joined this release. Its next actor turn sees the
+            # manager's pending-ledger removal and can advance ordered teardown.
+            self.cleanup._enqueue_recheck(ctx)
+        elif not runtime.late_resources and ctx.state.cleanup_pending:
+            ctx.apply(cleanup_pending=False, intent_stage=IntentStage.active, last_error=None)
+        return True
 
     def trust_route(self, ctx, message):
         if (
@@ -385,15 +450,24 @@ class VirtualLifecycle(MirrorLifecycle):
         ctx.launch(Route.virtual, "resolution_query", operation,
                    lambda: self._with_backend_events(ctx, operation, lambda: self.deps.transport.query_modes(target, operation)))
 
-    async def _with_backend_events(self, ctx, operation, work):
+    def _close_start_bridge(self, ctx, operation_id):
+        subscription = _virtual_runtime(ctx).start_bridges.pop(operation_id, None)
+        if subscription is not None:
+            subscription.close()
+
+    async def _with_backend_events(self, ctx, operation, work, *, acquisition=False):
         # Before a stream exists, engine admission intentionally rejects raw
-        # stream-less events. This scoped bridge delivers only messages emitted
-        # by the particular query/start call; the actor checks every applicable
-        # target, operation, session, and lease field before using them.
+        # stream-less events. This scoped bridge delivers messages for the
+        # particular query/start; the actor checks target, operation, session,
+        # and lease fields. A start bridge stays alive through actor adoption,
+        # covering notifications queued between task return and result delivery.
         def receive(event):
             if event.receiver_id != ctx.state.receiver_id:
                 return
-            if event.kind not in (TransportEventKind.pairing_required, TransportEventKind.credential_invalid):
+            if event.kind not in (
+                TransportEventKind.pairing_required, TransportEventKind.credential_invalid,
+                TransportEventKind.ready,
+            ):
                 return
             ctx.enqueue(EffectEvent(
                 receiver_id=event.receiver_id, operation_id=operation.operation_id,
@@ -401,10 +475,18 @@ class VirtualLifecycle(MirrorLifecycle):
                 kind="virtual:backend_request", result=Ok(value=event), resource=None,
             ))
         subscription = self.deps.transport.subscribe(receive)
+        if acquisition:
+            _virtual_runtime(ctx).start_bridges[operation.operation_id] = subscription
         try:
             return await work()
+        except BaseException:
+            # A cancelled call has no acquisition delivery to close its bridge.
+            if acquisition:
+                self._close_start_bridge(ctx, operation.operation_id)
+            raise
         finally:
-            subscription.close()
+            if not acquisition:
+                subscription.close()
 
     def _resolved(self, ctx):
         runtime = _virtual_runtime(ctx)
@@ -562,11 +644,14 @@ class VirtualLifecycle(MirrorLifecycle):
             or ctx.state.trust in (TrustState.Pairing, TrustState.CleanupRequired, TrustState.RevocationPending)
         ):
             return
+        runtime = _virtual_runtime(ctx)
+        runtime.pending_ready = None
+        runtime.ready_stream = None
         operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
         ctx.launch(
             Route.virtual, "transport_start", operation,
-            lambda: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, ctx.state.audio_policy, operation)),
+            lambda: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, ctx.state.audio_policy, operation), acquisition=True),
             acquisition=True,
         )
 
@@ -613,6 +698,21 @@ class VirtualLifecycle(MirrorLifecycle):
                 or event.context.trust_generation != ctx.state.trust_generation
             ):
                 return True
+            if event.kind is TransportEventKind.ready:
+                handle = event.stream
+                if (
+                    not isinstance(handle, StreamHandle)
+                    or handle.start_operation_id != ctx.state.operation_id
+                    or not accept_transport(replace(ctx.state, stream=handle), event)
+                ):
+                    return True
+                if ctx.state.stream is None:
+                    # A real transport can emit ready inside start_stream. Hold
+                    # the proof until the acquisition returns the exact handle.
+                    runtime.pending_ready = event
+                elif accept_transport(ctx.state, event):
+                    self._transport_event(ctx, event)
+                return True
             self._transport_event(ctx, event)
             return True
         if kind == "creation_progress":
@@ -652,7 +752,11 @@ class VirtualLifecycle(MirrorLifecycle):
             self._prepare_audio(ctx)
             return True
         if kind == "transport_start" and ctx.state.mode is Mode.VIRTUAL:
+            self._close_start_bridge(ctx, message.operation_id)
+            if not ctx.state.online:
+                return self._stale_transport(ctx, message)
             if isinstance(message.result, Err):
+                runtime.pending_ready = None
                 if runtime.resume_after_start:
                     runtime.resume_after_start = False
                     self._new_operation(ctx)
@@ -664,7 +768,7 @@ class VirtualLifecycle(MirrorLifecycle):
             if not isinstance(handle, StreamHandle):
                 ctx.apply(transport=TransportState.Failed, last_error=diagnostic(ErrorCode.transport_failed, ctx.state.receiver_id))
                 return True
-            ctx.apply(stream=handle)
+            ctx.apply(stream=handle, transport=TransportState.Connecting, intent_stage=IntentStage.starting)
             if runtime.resume_after_start:
                 runtime.resume_after_start = False
                 self._pause(ctx, "retry")
@@ -672,21 +776,9 @@ class VirtualLifecycle(MirrorLifecycle):
             if ctx.state.trust in (TrustState.Pairing, TrustState.CleanupRequired, TrustState.RevocationPending):
                 self._pause(ctx, "pairing")
                 return True
-            ctx.apply(
-                transport=TransportState.Streaming, intent_stage=IntentStage.active,
-                accepted_resolution=None,
-            )
-            if ctx.state.audio_policy.enabled:
-                audio_id = ctx.operation().operation_id
-                ctx.apply(audio=AudioState.Starting, audio_operation_id=audio_id)
-                audio_context = _current_context(ctx, audio=audio_id)
-                ctx.launch(
-                    Route.audio, "audio_start", audio_context,
-                    lambda: self.deps.transport.start_audio(handle, audio_context),
-                )
-            else:
-                ctx.apply(audio=AudioState.Disabled)
-            self._remember(ctx)
+            pending, runtime.pending_ready = runtime.pending_ready, None
+            if pending is not None and accept_transport(ctx.state, pending):
+                self._transport_event(ctx, pending)
             return True
         if kind == "resume_after_pairing":
             self._prepare_audio(ctx)
@@ -696,6 +788,30 @@ class VirtualLifecycle(MirrorLifecycle):
                 ctx.apply(last_error=message.result.error)
             return True
         return super()._effect(ctx, message)
+
+    def _stream_ready(self, ctx):
+        runtime = _virtual_runtime(ctx)
+        handle = ctx.state.stream
+        if (
+            handle is None or not ctx.state.online or not ctx.state.intent_active
+            or ctx.state.cleanup_pending or runtime_for(ctx).active or runtime.pause_inflight
+            or ctx.state.display is not DisplayState.Owned or ctx.state.accepted_resolution is not None
+            or ctx.state.trust in (TrustState.Pairing, TrustState.CleanupRequired, TrustState.RevocationPending)
+        ):
+            return
+        ctx.apply(transport=TransportState.Streaming, intent_stage=IntentStage.active)
+        if runtime.ready_stream == handle:
+            return
+        runtime.ready_stream = handle
+        if ctx.state.audio_policy.enabled:
+            audio_id = ctx.operation().operation_id
+            ctx.apply(audio=AudioState.Starting, audio_operation_id=audio_id)
+            audio_context = _current_context(ctx, audio=audio_id)
+            ctx.launch(Route.audio, "audio_start", audio_context,
+                       lambda: self.deps.transport.start_audio(handle, audio_context))
+        else:
+            ctx.apply(audio=AudioState.Disabled)
+        self._remember(ctx)
 
     def _remember(self, ctx):
         record_set = self._record_set(ctx)
@@ -766,14 +882,18 @@ class VirtualLifecycle(MirrorLifecycle):
             ctx.apply(transport=TransportState.Reconnecting, intent_stage=IntentStage.active)
             return True
         if event.kind is TransportEventKind.ready:
-            if not runtime.pause_inflight and ctx.state.accepted_resolution is None and ctx.state.trust is not TrustState.Pairing:
-                ctx.apply(transport=TransportState.Streaming, intent_stage=IntentStage.active)
+            if (
+                event.context.trust_generation == ctx.state.trust_generation
+                and accept_transport(ctx.state, event)
+            ):
+                self._stream_ready(ctx)
             return True
         return super()._transport_event(ctx, event)
 
     def _pause(self, ctx, reason):
         runtime = _virtual_runtime(ctx)
         runtime.pause_reason = reason
+        runtime.pending_ready = None
         if runtime.pause_inflight:
             return
         stream = ctx.state.stream

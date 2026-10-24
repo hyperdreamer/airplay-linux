@@ -5,7 +5,7 @@ from dataclasses import replace
 
 from airplay_linux.domain.messages import EmptyPayload, TransportEvent, TransportEventKind
 from airplay_linux.domain.operations import StreamHandle
-from airplay_linux.domain.resources import ResolutionDecision, ResolutionEvidence, Size
+from airplay_linux.domain.resources import Ok, ResolutionDecision, ResolutionEvidence, Size
 from airplay_linux.session.engine import SessionManager
 from airplay_linux.session.mirror import build_lifecycle_handlers
 from airplay_linux.session.testing import SessionRig
@@ -27,7 +27,23 @@ def virtual_handlers(deps):
 
 
 class ContextTransport(FakeTransport):
-    """The frozen fake allocates a lease; sessions must echo the requested lease."""
+    """Echo the requested lease and report readiness for a successful setup."""
+
+    def __init__(self, *, ready=True):
+        super().__init__()
+        self.ready = ready
+
+    async def start_stream(self, destination, source, audio, operation):
+        result = await super().start_stream(destination, source, audio, operation)
+        if isinstance(result, Ok) and self.ready:
+            self.emit(TransportEvent(
+                kind=TransportEventKind.ready, receiver_id=destination.receiver_id,
+                stream=result.value, endpoint_fingerprint=destination.endpoint_fingerprint,
+                endpoint_generation=destination.endpoint_generation,
+                daemon_instance_uuid=result.value.daemon_instance_uuid,
+                context=operation, payload=EmptyPayload(),
+            ))
+        return result
 
     def _new_handle(self, destination, operation):
         handle = super()._new_handle(destination, operation)
