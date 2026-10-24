@@ -45,6 +45,14 @@ SCREEN_CAST_INTERFACE: Final[str] = "org.freedesktop.portal.ScreenCast"
 REQUEST_INTERFACE: Final[str] = "org.freedesktop.portal.Request"
 SESSION_INTERFACE: Final[str] = "org.freedesktop.portal.Session"
 
+#: The bus daemon's own interface, used to notice the portal owner appearing,
+#: disappearing or being replaced.  A ``Session.Closed`` signal is not the only
+#: way a lease dies: losing the bus connection or the portal name does too.
+DBUS_DESTINATION: Final[str] = "org.freedesktop.DBus"
+DBUS_PATH: Final[str] = "/org/freedesktop/DBus"
+DBUS_INTERFACE: Final[str] = "org.freedesktop.DBus"
+OWNER_CHANGED: Final[str] = "NameOwnerChanged"
+
 #: ``SourceType`` bits from the ScreenCast contract.
 SCREEN_CAST_MONITOR: Final[int] = 1
 SCREEN_CAST_WINDOW: Final[int] = 2
@@ -337,6 +345,9 @@ class PortalClient:
         self._retired: dict[str, str] = {}
         #: Request handles with a Close method call currently in flight.
         self._closing_requests: set[str] = set()
+        #: Sessions whose portal owner is gone: retained for exact cleanup, but
+        #: never reported as a live lease again.
+        self._dead_sessions: set[str] = set()
         self._jobs: set[asyncio.Task[Any]] = set()
         self._acquisitions: dict[asyncio.Task[Any], _Acquisition] = {}
         self._replies: set[asyncio.Task[Any]] = set()
@@ -348,6 +359,8 @@ class PortalClient:
         self._closed = False
         self._destroyed = False
         self._close_lock = asyncio.Lock()
+        #: Whether this connection asked the bus for portal owner changes.
+        self._owner_watch = False
 
     # -- public interface ---------------------------------------------------
 
@@ -405,15 +418,33 @@ class PortalClient:
         return await self._close_session(monitor.portal_session_id)
 
     def is_open(self, monitor: PortalMonitor) -> bool:
-        """Whether this exact monitor's session is still tracked as open."""
-        if self._closed:
+        """Whether this exact monitor's session is still a verifiable lease.
+
+        Liveness needs positive evidence beyond the tracked session id: the
+        client must still hold a connection, that connection must be connected,
+        and the portal owner that created the session must not have gone away.
+        Without that, a stale selection would keep verifying after its portal
+        session (or the whole bus) disappeared.
+        """
+        if self._closed or self._destroyed:
             # A closing client cannot vouch for a resource it still has to clean up.
             return False
-        return (
-            type(monitor) is PortalMonitor
-            and monitor.source_type == "physical_monitor"
-            and self._sessions.get(monitor.portal_session_id) == monitor.connector
-        )
+        if (
+            type(monitor) is not PortalMonitor
+            or monitor.source_type != "physical_monitor"
+            or monitor.portal_session_id in self._dead_sessions
+        ):
+            return False
+        if self._sessions.get(monitor.portal_session_id) != monitor.connector:
+            return False
+        peer = self._peer
+        if peer is None:
+            return False
+        # ``connected`` is part of dbus-next's own bus API; a peer double that
+        # does not model it is only judged by the session and owner evidence.
+        if getattr(peer, "connected", True) is not True:
+            return False
+        return True
 
     async def drain(self) -> None:
         """Await acquisitions and cleanup that outlived a cancelled caller."""
@@ -512,6 +543,7 @@ class PortalClient:
         self._sessions.clear()
         self._requests.clear()
         self._retired.clear()
+        self._dead_sessions.clear()
 
     # -- connection ---------------------------------------------------------
 
@@ -546,7 +578,41 @@ class PortalClient:
         if not self._handler_installed:
             self._peer.add_message_handler(self._on_message)
             self._handler_installed = True
+            self._watch_portal_owner(self._peer)
         return self._peer
+
+    def _watch_portal_owner(self, peer: PortalPeer) -> None:
+        """Subscribe to portal owner changes; best effort, bounded by the deadline.
+
+        Without the match rule the real bus never delivers ``NameOwnerChanged``
+        for the portal name, so the client could not tell that the service it
+        holds sessions for has disappeared.  A refused subscription is not a
+        selection failure; ``is_open`` then relies on the session and connection
+        evidence it does have.
+        """
+        if self._owner_watch:
+            return
+        self._owner_watch = True
+        message = Message(
+            destination=DBUS_DESTINATION,
+            path=DBUS_PATH,
+            interface=DBUS_INTERFACE,
+            member="AddMatch",
+            signature="s",
+            body=[
+                "type='signal',interface='org.freedesktop.DBus',"
+                "member='NameOwnerChanged',arg0='" + PORTAL_DESTINATION + "'"
+            ],
+        )
+        self._track_cleanup(self._subscribe(peer, message))
+
+    async def _subscribe(self, peer: PortalPeer, message: Message) -> None:
+        try:
+            await self._watch(None, asyncio.ensure_future(peer.call(message)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
 
     async def _connect_within_deadline(
         self, task: asyncio.Task[PortalPeer]
@@ -1009,6 +1075,8 @@ class PortalClient:
         if message.interface == SESSION_INTERFACE and message.member == "Closed":
             # The portal may close a session at any time; that lease is dead.
             return self._on_session_closed(path)
+        if message.interface == DBUS_INTERFACE and message.member == OWNER_CHANGED:
+            return self._on_portal_owner_changed(message)
         if message.interface != REQUEST_INTERFACE or message.member != "Response":
             return False
         body = message.body
@@ -1056,7 +1124,29 @@ class PortalClient:
 
     def _on_session_closed(self, path: str) -> bool:
         """Drop liveness for an exact session the portal reports as closed."""
+        self._dead_sessions.discard(path)
         return self._sessions.pop(path, None) is not None
+
+    def _on_portal_owner_changed(self, message: Message) -> bool:
+        """Invalidate every session created by a portal owner that is gone.
+
+        ``NameOwnerChanged`` for the portal name means the service that owns the
+        sessions disappeared or was replaced; those sessions can never answer
+        again, so they stop being verifiable leases while their exact handles
+        stay owned for an idempotent release attempt.
+        """
+        body = message.body
+        if type(body) not in (list, tuple) or len(body) != 3:
+            return False
+        name, old_owner, new_owner = body
+        if _unwrap(name) != PORTAL_DESTINATION:
+            return False
+        old_owner = _unwrap(old_owner)
+        new_owner = _unwrap(new_owner)
+        if type(old_owner) is not str or not old_owner:
+            return False
+        self._dead_sessions.update(self._sessions)
+        return True
 
     def _pending_for(self, path: str) -> _Pending | None:
         """Correlate by the exact request path, including a returned handle."""
@@ -1093,11 +1183,13 @@ class PortalClient:
         if reply.message_type is MessageType.ERROR:
             if _already_gone(reply.error_name):
                 self._sessions.pop(session, None)
+                self._dead_sessions.discard(session)
                 return Ok(value=None)
             return _failure(ErrorCode.cleanup_timeout)
         if reply.message_type is not MessageType.METHOD_RETURN:
             return _failure(ErrorCode.cleanup_timeout)
         self._sessions.pop(session, None)
+        self._dead_sessions.discard(session)
         return Ok(value=None)
 
     def _kick_request_closes(self) -> None:
