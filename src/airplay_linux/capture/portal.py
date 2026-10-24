@@ -88,6 +88,30 @@ class PortalPeer(Protocol):
     def disconnect(self) -> None: ...
 
 
+class _Closed(Exception):
+    """The client was closed while a selection was still being admitted."""
+
+
+class _Connection:
+    """The single connection attempt and the peer that owns it.
+
+    A connection is not a side effect of one selection: it is part of the
+    client's lifecycle, so the attempt is tracked by the client, shared by every
+    caller, and reconciled by :meth:`PortalClient.close` instead of being left
+    untracked while it outlives the call that started it.
+    """
+
+    __slots__ = ("task", "peer")
+
+    def __init__(self) -> None:
+        self.task: asyncio.Task[PortalPeer] | None = None
+        self.peer: PortalPeer | None = None
+
+    def reset(self) -> None:
+        self.task = None
+        self.peer = None
+
+
 async def _connect_session_bus() -> PortalPeer:
     return await MessageBus().connect()
 
@@ -314,6 +338,9 @@ class PortalClient:
         self._replies: set[asyncio.Task[Any]] = set()
         self._abandoned: set[asyncio.Task[Any]] = set()
         self._cleanup: set[asyncio.Task[Any]] = set()
+        #: The one connection this client may own, tracked from the moment its
+        #: attempt starts so shutdown can fence it before any request exists.
+        self._connection = _Connection()
         self._closed = False
         self._destroyed = False
         self._close_lock = asyncio.Lock()
@@ -331,11 +358,20 @@ class PortalClient:
         if restore_token is not None and type(restore_token) is not str:
             return _failure(ErrorCode.invalid_input)
         try:
-            await self._ensure_peer()
+            await self._open_peer()
         except asyncio.CancelledError:
+            if self._closed:
+                # Shutdown fenced this admission; it is not a caller cancel.
+                return _failure(ErrorCode.portal_cancelled)
             raise
+        except _Closed:
+            return _failure(ErrorCode.unsupported_operation)
         except Exception:
             return _failure(ErrorCode.dependency_missing)
+        if self._closed:
+            # close() was confirmed while this selection was connecting; a
+            # successful close must never be followed by a portal Request.
+            return _failure(ErrorCode.unsupported_operation)
 
         acquisition = _Acquisition(connector, restore_token)
         job = asyncio.ensure_future(self._acquire(acquisition))
@@ -410,6 +446,11 @@ class PortalClient:
             if self._destroyed:
                 return Ok(value=None)
             self._closed = True
+            # Connection admission is part of the barrier: a setup that has not
+            # produced a peer yet can never install one after this point.
+            connection = self._connection
+            if connection.task is not None and not connection.task.done():
+                connection.task.cancel()
             abandoned_by_barrier: set[str] = set()
             for job in tuple(self._jobs):
                 acquisition = self._acquisitions.get(job)
@@ -459,22 +500,73 @@ class PortalClient:
                 pass
         self._peer = None
         self._destroyed = True
+        self._connection.reset()
         self._pending.clear()
         self._sessions.clear()
         self._requests.clear()
         self._retired.clear()
 
-    # -- acquisition --------------------------------------------------------
+    # -- connection ---------------------------------------------------------
 
-    async def _ensure_peer(self) -> PortalPeer:
+    async def _open_peer(self) -> PortalPeer:
+        """Return the client's connection, opening and watching it at most once.
+
+        The attempt is tracked on the client rather than the caller, so a
+        ``close()`` that runs while the bus is still connecting can fence it and
+        a connection that completes too late is discarded instead of installing
+        a handler behind a confirmed shutdown.
+        """
+        if self._closed:
+            raise _Closed()
+        connection = self._connection
         if self._peer is None:
-            self._peer = await self._connect()
-            self._owns_peer = True
+            peer = connection.peer
+            if peer is None:
+                task = connection.task
+                if task is None:
+                    task = asyncio.ensure_future(self._connect())
+                    connection.task = task
+                    task.add_done_callback(self._connect_complete)
+                peer = await asyncio.shield(task)
+            if self._closed or self._destroyed:
+                self._discard_peer(peer)
+                raise _Closed()
+            if self._peer is None:
+                self._peer = peer
+                self._owns_peer = True
+                connection.peer = None
         assert self._peer is not None
         if not self._handler_installed:
             self._peer.add_message_handler(self._on_message)
             self._handler_installed = True
         return self._peer
+
+    def _connect_complete(self, task: asyncio.Task[PortalPeer]) -> None:
+        """Reconcile a connection attempt nobody is waiting for any more."""
+        connection = self._connection
+        if connection.task is task:
+            connection.task = None
+        if task.cancelled():
+            return
+        try:
+            peer = task.result()
+        except BaseException:
+            return
+        if self._peer is peer:
+            return
+        if self._closed or self._destroyed:
+            self._discard_peer(peer)
+            return
+        # The caller hit its deadline first; keep the live connection for the
+        # next admission instead of leaking one, but never install it as closed.
+        connection.peer = peer
+
+    def _discard_peer(self, peer: PortalPeer) -> None:
+        """Close a connection this client opened but must no longer use."""
+        try:
+            peer.disconnect()
+        except Exception:
+            pass
 
     def _abandon(
         self, acquisition: _Acquisition, job: asyncio.Task[Any]
@@ -645,8 +737,9 @@ class PortalClient:
     ) -> Result[dict[str, Any]]:
         peer = self._peer
         assert peer is not None
-        if acquisition.abandoned:
-            # The caller is gone: never open another portal request for it.
+        if self._closed or acquisition.abandoned:
+            # The caller is gone or shutdown is confirmed: never open another
+            # portal request, even one admitted before the close.
             return _failure(ErrorCode.portal_cancelled)
         token = _new_token()
         merged = dict(options or {})
