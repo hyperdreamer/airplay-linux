@@ -5,13 +5,22 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.domain.messages import ConfirmSwitch, Start, Stop
+from airplay_linux.diagnostics import diagnostic
+from airplay_linux.domain.messages import (
+    ConfirmSwitch,
+    KeepCleanup,
+    RetryCleanup,
+    Start,
+    Stop,
+)
 from airplay_linux.domain.operations import DisplayHandle, InstanceId, OwnerId, ProcessIdentity, StreamHandle
 from airplay_linux.domain.records import SessionSnapshot
 from airplay_linux.testing.adapters import Deferred
 from airplay_linux.domain.resources import (
     AudioState,
     DisplayState,
+    Err,
+    ErrorCode,
     IntentStage,
     Mode,
     Ok,
@@ -136,6 +145,7 @@ async def test_confirmed_switch_waits_for_cleanup_before_queued_mirror_start() -
     before = rig.manager.snapshot(destination.receiver_id)
 
     request = StartRequest(mode=Mode.MIRROR, source=physical())
+    initial_generation = before.session_generation
     await rig.manager.dispatch(
         ConfirmSwitch(
             receiver_id=destination.receiver_id,
@@ -178,5 +188,61 @@ async def test_confirmed_switch_waits_for_cleanup_before_queued_mirror_start() -
         )
     )
     await rig.settle()
-    assert rig.manager.snapshot(destination.receiver_id).phase.value == "Mirroring"
+    switched = rig.manager.snapshot(destination.receiver_id)
+    assert switched.phase.value == "Mirroring"
+    assert switched.session_generation == initial_generation + 1
     assert "display.create" not in rig.display.journal.names()
+
+
+@pytest.mark.asyncio
+async def test_keep_and_retry_cleanup_never_report_an_unconfirmed_release() -> None:
+    rig = SessionRig(build_lifecycle_handlers)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    await rig.settle()
+    await _start_mirror(rig, destination)
+
+    rig.capture.queue_result("release", Err(error=diagnostic(ErrorCode.cleanup_timeout)))
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+
+    blocked = rig.manager.snapshot(destination.receiver_id)
+    assert blocked.cleanup_pending
+    assert blocked.physical_source is not None
+    assert rig.capture.journal.names().count("capture.release") == 1
+
+    await rig.manager.dispatch(KeepCleanup(receiver_id=destination.receiver_id))
+    await rig.settle()
+    kept = rig.manager.snapshot(destination.receiver_id)
+    assert kept.cleanup_pending
+    assert kept.physical_source == blocked.physical_source
+    assert rig.capture.journal.names().count("capture.release") == 1
+
+    await rig.manager.dispatch(RetryCleanup(receiver_id=destination.receiver_id))
+    await rig.settle()
+    released = rig.manager.snapshot(destination.receiver_id)
+    assert not released.cleanup_pending
+    assert released.physical_source is None
+    assert rig.capture.journal.names().count("capture.release") == 2
+
+
+@pytest.mark.asyncio
+async def test_repeated_stop_uses_a_fresh_ordered_cleanup_transaction() -> None:
+    rig = SessionRig(build_lifecycle_handlers)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    await rig.settle()
+
+    await _start_mirror(rig, destination)
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+    await _start_mirror(rig, destination)
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.phase.value == "Available"
+    assert rig.transport.journal.names().count("transport.stop_stream") == 2
+    assert rig.capture.journal.names().count("capture.release") == 2

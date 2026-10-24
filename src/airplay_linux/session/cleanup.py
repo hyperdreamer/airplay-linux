@@ -261,6 +261,12 @@ class OrderedCleanup:
             if queued is not None:
                 runtime.queued_start = queued
                 ctx.apply(queued_start=queued)
+            else:
+                # A plain Stop/Cancel supersedes a previously confirmed switch
+                # that is still waiting for cleanup; it must not resurrect that
+                # request after the transaction completes.
+                runtime.queued_start = None
+                ctx.apply(queued_start=None)
             self._continue(ctx)
             return
 
@@ -275,11 +281,7 @@ class OrderedCleanup:
             and state.audio is AudioState.Disabled
             and state.display is DisplayState.None_
             and state.challenge is None
-            and state.trust not in (
-                TrustState.Pairing,
-                TrustState.RevocationPending,
-                TrustState.CleanupRequired,
-            )
+            and state.trust is not TrustState.Pairing
             and state.stream is None
             and state.physical_source is None
             and state.display_handle is None
@@ -291,6 +293,25 @@ class OrderedCleanup:
 
         old_operation = state.operation_id
         old_challenge = state.challenge
+        # A context owns one ephemeral cleanup transaction at a time.  A later
+        # Stop after a completed start/stop cycle must not inherit the prior
+        # stage completion flags or old display-owner acknowledgements.  Keep
+        # late_resources: those are exact provider handles that still need the
+        # new transaction to release them if a previous superseded acquisition
+        # was remembered outside the public snapshot.
+        runtime.prepare_inflight = False
+        runtime.prepared = False
+        runtime.transport_inflight = False
+        runtime.transport_done = False
+        runtime.stopped_stream = None
+        runtime.audio_inflight = False
+        runtime.audio_done = False
+        runtime.capture_inflight = False
+        runtime.capture_done = False
+        runtime.owners = ()
+        runtime.removed.clear()
+        runtime.display_inflight.clear()
+        runtime.finishing = False
         context = ctx.supersede("stop")
         runtime.active = True
         runtime.context = context
@@ -311,13 +332,17 @@ class OrderedCleanup:
             trust=TrustState.RevocationPending
             if runtime.trust_pending
             else state.trust,
-            last_error=None,
+            last_error=state.last_error,
         )
 
         # Keep the old challenge id only in this transient closure.  The public
         # snapshot was synchronously cleared by ``supersede``.
-        if old_challenge is not None and self.cancel_pairing_callback is not None:
-            self.cancel_pairing_callback(ctx, old_challenge.challenge_id, context)
+        if runtime.trust_pending and self.cancel_pairing_callback is not None:
+            self.cancel_pairing_callback(
+                ctx,
+                old_challenge.challenge_id if old_challenge is not None else None,
+                context,
+            )
 
         self._launch_prepare(ctx)
 

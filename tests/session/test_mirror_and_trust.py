@@ -20,6 +20,8 @@ from airplay_linux.domain.messages import (
 from airplay_linux.domain.operations import (
     ChallengeId,
     InstanceId,
+    OperationContext,
+    OperationId,
     PairingResult,
     SensitiveText,
     StreamHandle,
@@ -172,6 +174,8 @@ async def test_mirror_rejects_a_substituted_physical_connector() -> None:
     assert "transport.start_stream" not in rig.transport.journal.names()
     assert rig.capture.released == [substituted]
     assert state.stream is None
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.unsupported_source
 
 
 @pytest.mark.asyncio
@@ -318,6 +322,63 @@ async def test_cancel_during_portal_selection_releases_late_source() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stop_cancels_pairing_begin_that_has_not_returned_a_challenge() -> None:
+    rig, destination = await _online_rig()
+    begin: Deferred[object] = Deferred()
+    rig.pairing.queue_result("begin_pairing", begin)
+
+    await rig.manager.dispatch(Pair(receiver_id=destination.receiver_id))
+    await rig.settle()
+    assert rig.manager.snapshot(destination.receiver_id).trust is TrustState.Pairing
+
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+    assert "pairing.cancel_pairing" in rig.pairing.journal.names()
+    cancel = next(
+        entry for name, entry in rig.pairing.journal.entries
+        if name == "pairing.cancel_pairing"
+    )
+    assert cancel["challenge_id"] is None
+
+    logged_context = rig.pairing.journal.entries[0][1]["context"]
+    begin_context = OperationContext(
+        operation_id=OperationId(logged_context["operation_id"]),
+        session_generation=logged_context["session_generation"],
+        endpoint_generation=logged_context["endpoint_generation"],
+        transport_lease_id=None,
+        trust_generation=logged_context["trust_generation"],
+    )
+    late_challenge = rig.pairing.script_challenge(destination, begin_context)
+    begin.resolve(Ok(value=late_challenge))
+    await rig.settle()
+
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.challenge is None
+    assert state.trust is TrustState.Untrusted
+
+
+@pytest.mark.asyncio
+async def test_pair_is_rejected_while_ordered_cleanup_is_pending() -> None:
+    rig, destination = await _online_rig()
+    await _start_mirror(rig, destination)
+    release: Deferred[object] = Deferred()
+    rig.capture.queue_result("release", release)
+
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+    assert rig.manager.snapshot(destination.receiver_id).cleanup_pending
+
+    await rig.manager.dispatch(Pair(receiver_id=destination.receiver_id))
+    await rig.settle()
+
+    assert "pairing.begin_pairing" not in rig.pairing.journal.names()
+    assert rig.manager.snapshot(destination.receiver_id).trust is not TrustState.Pairing
+
+    release.resolve(Ok(value=None))
+    await rig.settle()
+
+
+@pytest.mark.asyncio
 async def test_stop_cancels_pairing_before_reporting_available() -> None:
     rig, destination = await _online_rig()
     await rig.manager.dispatch(Pair(receiver_id=destination.receiver_id))
@@ -348,6 +409,12 @@ async def test_failed_pairing_cancellation_locks_trust_until_revocation_retry() 
     blocked = rig.manager.snapshot(destination.receiver_id)
     assert blocked.trust is TrustState.CleanupRequired
     assert blocked.phase is SessionPhase.TrustCleanupRequired
+
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await rig.settle()
+    still_blocked = rig.manager.snapshot(destination.receiver_id)
+    assert still_blocked.session_generation == blocked.session_generation
+    assert still_blocked.trust is TrustState.CleanupRequired
 
     await rig.manager.dispatch(Pair(receiver_id=destination.receiver_id))
     await rig.settle()

@@ -132,6 +132,7 @@ class PairingFlow:
             return False
         challenge_id = challenge.challenge_id
         ctx.invalidate_trust()
+        ctx.cancel_timers()
         ctx.apply(
             trust=TrustState.RevocationPending,
             last_error=diagnostic(ErrorCode.pairing_expired),
@@ -156,6 +157,12 @@ class PairingFlow:
             ctx.apply(last_error=diagnostic(ErrorCode.stale_target, state.receiver_id))
             return
         if state.stream is not None or state.intent_active:
+            ctx.apply(last_error=diagnostic(ErrorCode.invalid_input, state.receiver_id))
+            return
+        if state.cleanup_pending or state.intent_stage in (
+            IntentStage.stopping,
+            IntentStage.cleanup,
+        ):
             ctx.apply(last_error=diagnostic(ErrorCode.invalid_input, state.receiver_id))
             return
         if state.trust in (TrustState.CleanupRequired, TrustState.RevocationPending):
@@ -228,6 +235,7 @@ class PairingFlow:
             ctx.apply(last_error=diagnostic(ErrorCode.invalid_input, state.receiver_id))
             return
         ctx.invalidate_trust()
+        ctx.cancel_timers()
         ctx.apply(trust=TrustState.RevocationPending, last_error=None)
         context = ctx.operation()
         setattr(ctx, "_task2_pairing_operation", context.operation_id)
@@ -325,6 +333,7 @@ class PairingFlow:
             if expected_operation is not None and message.operation_id != expected_operation:
                 return True
             if isinstance(message.result, Ok):
+                ctx.cancel_timers()
                 if kind == "pairing_cancel":
                     ctx.apply(
                         challenge=None,
@@ -352,6 +361,7 @@ class PairingFlow:
                     if callable(continuation):
                         continuation(ctx)
                 return True
+            ctx.cancel_timers()
             ctx.apply(
                 trust=TrustState.CleanupRequired,
                 challenge=None,
@@ -407,6 +417,7 @@ class PairingFlow:
             # coordinator owns backend compensation; the actor exposes the
             # conservative blocked state until that authority confirms cleanup.
             ctx.invalidate_trust()
+            ctx.cancel_timers()
             ctx.apply(
                 trust=TrustState.CleanupRequired,
                 challenge=None,
@@ -414,6 +425,7 @@ class PairingFlow:
             )
             return True
         if isinstance(message.result, Err) or not isinstance(value, PairingResult):
+            ctx.cancel_timers()
             ctx.apply(
                 trust=TrustState.CleanupRequired,
                 challenge=None,
@@ -422,6 +434,7 @@ class PairingFlow:
             return True
         result = value
         if result.kind == "Trusted":
+            ctx.cancel_timers()
             ctx.apply(
                 challenge=None,
                 trust=TrustState.Trusted,
@@ -434,6 +447,7 @@ class PairingFlow:
             ctx.apply(last_error=result.diagnostic)
             return True
         if result.kind == "ReceiverRejected":
+            ctx.cancel_timers()
             ctx.apply(
                 challenge=None,
                 trust=TrustState.Untrusted,
@@ -441,6 +455,7 @@ class PairingFlow:
             )
             return True
         if result.kind == "TrustCleanupRequired":
+            ctx.cancel_timers()
             ctx.apply(
                 challenge=None,
                 trust=TrustState.CleanupRequired,
@@ -451,6 +466,7 @@ class PairingFlow:
         # Cancelled, CredentialUnavailable, and TransportFailure all retire the
         # active challenge.  Only an explicit cleanup-required result blocks new
         # starts; an ordinary cancelled challenge is safe to begin again.
+        ctx.cancel_timers()
         ctx.apply(
             challenge=None,
             trust=TrustState.Untrusted,

@@ -164,10 +164,16 @@ class MirrorLifecycle:
 
     def start_request(self, ctx: SessionContext, request: StartRequest) -> bool:
         """Start a queued request after cleanup has confirmed every resource."""
-        self._start(ctx, Start(receiver_id=ctx.state.receiver_id, request=request))
+        self._start(
+            ctx,
+            Start(receiver_id=ctx.state.receiver_id, request=request),
+            supersede=False,
+        )
         return True
 
-    def _start(self, ctx: SessionContext, message: Start) -> None:
+    def _start(
+        self, ctx: SessionContext, message: Start, *, supersede: bool = True,
+    ) -> None:
         request = message.request
         state = ctx.state
         if request.mode is not Mode.MIRROR:
@@ -203,7 +209,7 @@ class MirrorLifecycle:
             ctx.apply(last_error=diagnostic(ErrorCode.stale_target, state.receiver_id))
             return
 
-        context = ctx.supersede("start")
+        context = ctx.supersede("start") if supersede else _current_context(ctx)
         ctx.apply(
             mode=Mode.MIRROR,
             intent_active=True,
@@ -491,12 +497,15 @@ class MirrorLifecycle:
         # an already-completed adapter may enqueue its acknowledgement during
         # the same actor turn.
         setattr(ctx, "_task2_requested_mute", muted)
+        stream = ctx.state.stream
         context = _current_context(ctx)
         ctx.launch(
             Route.audio,
             "mute",
             context,
-            lambda: self.deps.transport.set_muted(ctx.state.stream, muted, context),
+            lambda stream=stream, muted=muted, context=context: self.deps.transport.set_muted(
+                stream, muted, context,
+            ),
         )
 
 
