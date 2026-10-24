@@ -1391,6 +1391,31 @@ async def test_owner_watch_failure_cannot_leave_a_dead_lease_verifying(
         await bounded(client.close())
 
 
+async def test_a_failed_owner_watch_is_retried_by_the_next_selection() -> None:
+    """CAP-018: one refused subscription does not poison every later selection."""
+    peer = OwnerSubscriptionPeer("denied")
+    client = PortalClient(peer=peer, deadline=0.02)
+
+    first = await complete_selection(client, peer, session_token="s1")
+
+    assert isinstance(first, Err)
+    assert first.error.code is ErrorCode.dependency_incompatible
+    assert peer.owner_subscription is False
+    # The rejected lease was rolled back: no session and no monitor survive it.
+    assert peer.open_sessions == set()
+
+    # The bus policy is fixed between attempts; the next admission retries.
+    peer.error_replies.pop("AddMatch")
+
+    second = await complete_selection(client, peer, session_token="s2")
+
+    assert isinstance(second, Ok), (second, peer.owner_subscription, peer.calls)
+    assert peer.owner_subscription is True
+    assert second.value.portal_session_id == peer.session_path("s2")
+    assert isinstance(await bounded(client.close()), Ok)
+    assert peer.open_sessions == set()
+
+
 async def test_a_connection_that_arrives_after_the_deadline_is_never_used() -> None:
     """A late connection is reconciled: neither admitted nor left open."""
     peer = FakePortalPeer()

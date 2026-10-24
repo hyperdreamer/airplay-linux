@@ -603,11 +603,12 @@ class PortalClient:
         if not self._handler_installed:
             peer.add_message_handler(self._on_message)
             self._handler_installed = True
-            # Owner monitoring is part of liveness, not a best-effort extra: the
-            # match rule is the only path that reports a vanished portal owner.
-            # It starts here so the bus can answer while the portal prompts, and
-            # every selection confirms it before publishing a lease.
-            self._start_owner_watch(peer)
+        # Owner monitoring is part of liveness, not a best-effort extra: the
+        # match rule is the only path that reports a vanished portal owner.  It
+        # starts here so the bus can answer while the portal prompts, every
+        # selection confirms it before publishing a lease, and a failed attempt
+        # is retried by the next admission.
+        self._start_owner_watch(peer)
         return self._peer
 
     @staticmethod
