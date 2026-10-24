@@ -92,6 +92,10 @@ class _Closed(Exception):
     """The client was closed while a selection was still being admitted."""
 
 
+class _SetupTimedOut(Exception):
+    """Connection setup exceeded the control deadline."""
+
+
 class _Connection:
     """The single connection attempt and the peer that owns it.
 
@@ -366,6 +370,9 @@ class PortalClient:
             raise
         except _Closed:
             return _failure(ErrorCode.unsupported_operation)
+        except _SetupTimedOut:
+            # Bounded like every other control call: no dialog had started yet.
+            return _failure(ErrorCode.cleanup_timeout)
         except Exception:
             return _failure(ErrorCode.dependency_missing)
         if self._closed:
@@ -527,7 +534,7 @@ class PortalClient:
                     task = asyncio.ensure_future(self._connect())
                     connection.task = task
                     task.add_done_callback(self._connect_complete)
-                peer = await asyncio.shield(task)
+                peer = await self._connect_within_deadline(task)
             if self._closed or self._destroyed:
                 self._discard_peer(peer)
                 raise _Closed()
@@ -540,6 +547,24 @@ class PortalClient:
             self._peer.add_message_handler(self._on_message)
             self._handler_installed = True
         return self._peer
+
+    async def _connect_within_deadline(
+        self, task: asyncio.Task[PortalPeer]
+    ) -> PortalPeer:
+        """Await the shared connection attempt for at most one control deadline.
+
+        The 5s bound is the same control deadline every ScreenCast call obeys:
+        no portal request and no user dialog can have started yet, so a hung bus
+        connect must fail closed instead of hanging the caller.  The attempt
+        itself is not cancelled: a connection that completes after the caller
+        gave up is reconciled by :meth:`_connect_complete` for reuse or
+        disconnection, never leaked.
+        """
+        try:
+            async with asyncio.timeout(self._deadline):
+                return await asyncio.shield(task)
+        except TimeoutError:
+            raise _SetupTimedOut() from None
 
     def _connect_complete(self, task: asyncio.Task[PortalPeer]) -> None:
         """Reconcile a connection attempt nobody is waiting for any more."""
