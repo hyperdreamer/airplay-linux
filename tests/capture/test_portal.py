@@ -1151,3 +1151,30 @@ async def test_connection_setup_obeys_the_control_deadline(configured_deadline: 
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert done, f"connection setup outlasted the {configured_deadline}s control deadline"
+
+
+async def test_a_late_request_handle_after_the_control_deadline_is_cancelled() -> None:
+    """CAP-014: the deadline interleaving must cancel the real returned handle too."""
+    peer = FakePortalPeer()
+    returned = "/org/example/request/actual"
+    peer.handle_override["CreateSession"] = returned
+    peer.hold("CreateSession")
+    client = PortalClient(peer=peer, deadline=0.02)
+
+    result = await bounded(client.select_monitor("DP-1", None))
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    # The predicted handle is closed before the method reply is ever released.
+    await bounded(client.drain())
+    predicted = peer.request_path(peer.last("CreateSession").handle_token or "")
+    assert predicted in peer.closed_requests
+
+    peer.release_hold("CreateSession")
+    await settle(24)
+    await bounded(client.drain())
+
+    assert not client._replies
+    assert returned in peer.closed_requests, (returned, peer.closed_requests, client._orphaned)
+    # Nothing is left owned: both handles were confirmed closed.
+    assert client._requests == {}
