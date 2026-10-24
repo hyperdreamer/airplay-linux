@@ -1217,9 +1217,12 @@ class PortalClient:
 
         A confirmed Close is the transition that retires an abandoned request:
         the contract says its ``Response`` is suppressed, so waiting for one
-        would keep ``close()`` from ever finalising.  Any reply (a method return
-        or an error such as ``UnknownObject``) is a confirmation; a timeout or a
-        transport failure keeps the handle owned so a retry can advance it.
+        would keep ``close()`` from ever finalising.  Only a successful method
+        return, or an error that specifically says this exact object is already
+        gone, is confirmation.  An explicit refusal (for example
+        ``AccessDenied``) released nothing, so the handle stays owned and
+        closable again and shutdown reports uncertainty; a timeout or a
+        transport failure is unconfirmed in the same way.
         """
         if not path:
             return True
@@ -1246,6 +1249,11 @@ class PortalClient:
         finally:
             self._closing_requests.discard(path)
         if not isinstance(reply, Message):
+            return False
+        if reply.message_type is MessageType.ERROR:
+            if not _already_gone(reply.error_name):
+                return False
+        elif reply.message_type is not MessageType.METHOD_RETURN:
             return False
         connector = self._requests.pop(path, None)
         if connector is None:
