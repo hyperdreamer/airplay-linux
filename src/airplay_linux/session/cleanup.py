@@ -76,6 +76,7 @@ class CleanupRuntime:
     context: OperationContext | None = None
     superseded_operation_id: OperationId | None = None
     prepare_inflight: bool = False
+    prepare_again: bool = False
     prepared: bool = False
     transport_inflight: bool = False
     transport_done: bool = False
@@ -246,7 +247,7 @@ class OrderedCleanup:
                     transport_lease_id=None,
                 )
             runtime.transport_inflight = False
-            runtime.transport_done = True
+            runtime.transport_done = False
             self._continue(ctx)
             return True
         if isinstance(message, EffectEvent):
@@ -300,6 +301,7 @@ class OrderedCleanup:
         # new transaction to release them if a previous superseded acquisition
         # was remembered outside the public snapshot.
         runtime.prepare_inflight = False
+        runtime.prepare_again = False
         runtime.prepared = False
         runtime.transport_inflight = False
         runtime.transport_done = False
@@ -351,6 +353,7 @@ class OrderedCleanup:
         if runtime.prepared or runtime.prepare_inflight or runtime.context is None:
             return
         runtime.prepare_inflight = True
+        runtime.prepare_again = False
         context = runtime.context
         ctx.launch(
             Route.cleanup,
@@ -411,6 +414,10 @@ class OrderedCleanup:
             if not runtime.capture_inflight:
                 self._launch_capture_release(ctx)
             return
+        # A creator may still return an exact handle for one of the published
+        # owners. Wait for delivery so its release can acknowledge that handle.
+        if ctx.outstanding_acquisitions(names=frozenset({"display_create", "virtual_create", "create"})):
+            return
         self._launch_display_removals(ctx)
         self._finish_if_possible(ctx)
 
@@ -423,6 +430,18 @@ class OrderedCleanup:
             return
         stream = ctx.state.stream
         if stream is None:
+            late_streams = tuple(
+                resource for resource in runtime.late_resources
+                if isinstance(resource, StreamHandle)
+            )
+            for resource in late_streams:
+                self._release_late(ctx, resource)
+            if (
+                late_streams
+                or any(isinstance(resource, StreamHandle) for resource in ctx._manager.pending_resources(ctx.state.receiver_id))
+                or ctx.outstanding_acquisitions(names=frozenset({"transport_start"}))
+            ):
+                return
             runtime.transport_done = True
             ctx.apply(transport=TransportState.Idle, transport_lease_id=None)
             self._continue(ctx)
@@ -467,6 +486,14 @@ class OrderedCleanup:
             return
         source = ctx.state.physical_source
         if source is None:
+            late_sources = tuple(
+                resource for resource in runtime.late_resources
+                if isinstance(resource, PhysicalMonitorSource)
+            )
+            for resource in late_sources:
+                self._release_late(ctx, resource)
+            if late_sources:
+                return
             runtime.capture_done = True
             self._continue(ctx)
             return
@@ -486,8 +513,7 @@ class OrderedCleanup:
             return
         owners = _owned_display_owners(ctx.state, runtime.owners)
         runtime.owners = owners
-        # A stale display acquisition can arrive after prepare_teardown.  Its
-        # owner is added by ``_remember_late`` and follows this same stage.
+        # Late display owners follow the same ordered stage as snapshot owners.
         for owner in owners:
             if owner in runtime.removed or owner in runtime.display_inflight:
                 continue
@@ -582,8 +608,13 @@ class OrderedCleanup:
                     last_error=diagnostic(ErrorCode.cleanup_timeout),
                 )
                 return True
-            runtime.owners = tuple(owner for owner in owners if owner is not None)
-            runtime.prepared = True
+            runtime.owners = tuple(dict.fromkeys(
+                (*runtime.owners, *(owner for owner in owners if owner is not None)),
+            ))
+            # If a new owner arrived while publication was suspended, publish
+            # again before advancing. The provider's earlier snapshot may not
+            # have included that reservation.
+            runtime.prepared = not runtime.prepare_again
             runtime.owners = _owned_display_owners(ctx.state, runtime.owners)
             if runtime.owners:
                 ctx.apply(display=DisplayState.Removing)
@@ -600,7 +631,7 @@ class OrderedCleanup:
                     last_error=message.result.error,
                 )
                 return True
-            runtime.transport_done = True
+            runtime.transport_done = False
             stream = runtime.stopped_stream
             if stream is None or ctx.state.stream == stream:
                 ctx.apply(
@@ -635,7 +666,7 @@ class OrderedCleanup:
                     last_error=message.result.error,
                 )
                 return True
-            runtime.capture_done = True
+            runtime.capture_done = False
             source = ctx.state.physical_source
             if source is None or message.resource in (None, source):
                 ctx.apply(physical_source=None)
@@ -685,20 +716,25 @@ class OrderedCleanup:
         runtime = runtime_for(ctx)
         if resource is not None and resource not in runtime.late_resources:
             runtime.late_resources.append(resource)
+            if isinstance(resource, StreamHandle):
+                runtime.transport_done = False
+            elif isinstance(resource, PhysicalMonitorSource):
+                runtime.capture_done = False
+            elif resource.owner_uuid not in runtime.owners:
+                runtime.owners = runtime.owners + (resource.owner_uuid,)
+                runtime.prepared = False
+                runtime.prepare_again = runtime.prepare_inflight
         # An acquisition can be rerouted here because endpoint churn or another
         # superseding command made it stale before an explicit Stop arrived.
         # Start the same ordered transaction in that case; merely remembering a
         # late handle would otherwise strand it when the runtime was idle.
         if not runtime.active:
             self._stop(ctx, None)
-        if resource is None:
-            return True
-        # Do not acknowledge the acquisition yet.  The manager must retain it in
-        # its pending ledger until the exact release below completes.
-        if not runtime.prepared:
-            return False
-        self._release_late(ctx, resource)
-        return False
+        # Recheck after this delivery removes acquisition bookkeeping, including
+        # Err/no-resource outcomes. Successful handles remain in the separate
+        # pending ledger until their exact release acknowledgement is delivered.
+        self._enqueue_recheck(ctx)
+        return resource is None
 
     def _release_late(
         self, ctx: SessionContext,
@@ -730,19 +766,7 @@ class OrderedCleanup:
                 resource=resource,
             )
             return
-        # Display providers publish removal intent as part of prepare_teardown.
-        # A late handle may have been durably recorded after that call, so add its
-        # owner to the same exact-owner removal set and let the normal stage run.
-        if resource.owner_uuid not in runtime.owners:
-            runtime.owners = runtime.owners + (resource.owner_uuid,)
-        self._launch_display_removals(ctx)
-
-    def _remember_late(self, ctx: SessionContext) -> None:
-        runtime = runtime_for(ctx)
-        if not runtime.prepared:
-            return
-        for resource in tuple(runtime.late_resources):
-            self._release_late(ctx, resource)
+        raise TypeError("late display handles must use the ordered display stage")
 
     def _enqueue_recheck(self, ctx: SessionContext) -> None:
         runtime = runtime_for(ctx)
@@ -762,9 +786,11 @@ class OrderedCleanup:
 
     def _finish_if_possible(self, ctx: SessionContext) -> None:
         runtime = runtime_for(ctx)
-        if not runtime.active or runtime.finishing:
+        if (
+            not runtime.active or runtime.finishing or not runtime.prepared
+            or not runtime.transport_done or not runtime.audio_done or not runtime.capture_done
+        ):
             return
-        self._remember_late(ctx)
         if (
             runtime.transport_inflight
             or runtime.audio_inflight

@@ -216,7 +216,7 @@ class SessionContext:
     def invalidate_trust(self) -> None:
         self._require_dispatch()
         generation = self.state.trust_generation + 1
-        target = self.state.target
+        target = self.state.target if self.state.online else None
         endpoint_fingerprint = target.endpoint_fingerprint if target else None
         endpoint_generation = target.endpoint_generation if target else 0
         self.deps.fences.set(
@@ -291,8 +291,8 @@ class SessionContext:
 
         self._timers.append(self.deps.scheduler.call_at(when, fire))
 
-    def outstanding_acquisitions(self) -> int:
-        return self._manager._outstanding(self.state.receiver_id)
+    def outstanding_acquisitions(self, *, names: frozenset[str] | None = None) -> int:
+        return self._manager._outstanding(self.state.receiver_id, names=names)
 
     def _new_operation_id(self) -> OperationId:
         return OperationId(self.deps.ids.new())
@@ -498,8 +498,15 @@ class SessionManager:
                 handled = False
                 if handler is not None:
                     handled = handler(context, message)
-                if isinstance(message, EffectEvent) and handled:
-                    self._finish_acquisition(message, context)
+                if isinstance(message, EffectEvent):
+                    if handled:
+                        self._finish_acquisition(message, context)
+                    else:
+                        # Delivery is complete even when cleanup retains an
+                        # acquired resource in the independent pending ledger.
+                        self._completed_effects.pop(
+                            (receiver_id, message.operation_id, message.kind), None,
+                        )
         finally:
             self._draining.remove(receiver_id)
 
@@ -634,7 +641,33 @@ class SessionManager:
         if event.receiver is None:
             return
         target = self._target_from_view(event.receiver)
-        context.apply(target=target, online=event.receiver.online)
+        online = event.receiver.online
+        previous = context.state
+        fence = self.deps.fences.get(previous.receiver_id)
+        old_target = previous.target
+        endpoint_changed = old_target is None or (
+            old_target.endpoint_fingerprint != target.endpoint_fingerprint
+            or old_target.endpoint_generation != target.endpoint_generation
+            or old_target.canonical_host != target.canonical_host
+            or old_target.service_port != target.service_port
+            or old_target.protocol != target.protocol
+        )
+        if fence is not None and (endpoint_changed or previous.online != online):
+            # Retire authority synchronously, before publishing discovery or
+            # resuming any coordinator await. This also covers assemblies whose
+            # transport and pairing ports do not share a target registry.
+            self.deps.fences.set(replace(
+                fence,
+                endpoint_fingerprint=target.endpoint_fingerprint if online else None,
+                endpoint_generation=target.endpoint_generation,
+                trust_generation=fence.trust_generation + 1,
+                active_challenge_id=None,
+            ))
+        try:
+            self.deps.transport.update_target(target if online else None, previous.receiver_id)
+        except Exception:  # noqa: BLE001 - keep discovery fencing fail-closed
+            context.apply(last_error=diagnostic(ErrorCode.stale_target, previous.receiver_id))
+        context.apply(target=target, online=online)
 
     def _finish_acquisition(self, event: EffectEvent, context: SessionContext) -> None:
         resource = event.resource
@@ -702,14 +735,18 @@ class SessionManager:
             )
         )
 
-    def _outstanding(self, receiver_id: ReceiverId) -> int:
+    def _outstanding(self, receiver_id: ReceiverId, *, names: frozenset[str] | None = None) -> int:
+        # A completed acquisition remains uncertain until its queued delivery
+        # has been handled. In particular a straggler's recheck runs after that
+        # delivery removes the completed-effect record.
         return sum(
             effect.receiver_id == receiver_id and effect.acquisition
-            for effect in self._effects.values()
+            and (names is None or effect.name in names)
+            for effect in (*self._effects.values(), *self._completed_effects.values())
         )
 
     def _fence_receiver(self, state: SessionSnapshot) -> None:
-        target = state.target
+        target = state.target if state.online else None
         self.deps.fences.set(
             TrustFence(
                 receiver_id=state.receiver_id,

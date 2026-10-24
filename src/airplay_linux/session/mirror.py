@@ -107,6 +107,8 @@ class MirrorLifecycle:
         return False
 
     def reconnect(self, ctx: SessionContext, message: object) -> bool:
+        if isinstance(message, DiscoveryEvent):
+            return self.pairing.discovery_changed(ctx)
         if isinstance(message, TransportEvent):
             return self._transport_event(ctx, message)
         if isinstance(message, TimerEvent):

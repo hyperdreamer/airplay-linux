@@ -74,6 +74,25 @@ class PairingFlow:
             return self._effect(ctx, message)
         return False
 
+    def discovery_changed(self, ctx: SessionContext) -> bool:
+        """Cancel retired authority after discovery synchronously fences it."""
+        fence = self.deps.fences.get(ctx.state.receiver_id)
+        if fence is None or fence.trust_generation == ctx.state.trust_generation:
+            return True
+        challenge = ctx.state.challenge
+        was_pairing = challenge is not None or ctx.state.trust is TrustState.Pairing
+        ctx.invalidate_trust()
+        ctx.cancel_timers()
+        if was_pairing:
+            ctx.apply(trust=TrustState.RevocationPending)
+            self.cancel_from_cleanup(
+                ctx, challenge.challenge_id if challenge is not None else None,
+                ctx.operation(),
+            )
+        elif ctx.state.trust is TrustState.Trusted:
+            ctx.apply(trust=TrustState.Untrusted)
+        return True
+
     def begin_from_backend(self, ctx: SessionContext) -> bool:
         """Begin only after the current backend has requested pairing."""
         if ctx.state.challenge is not None:
@@ -177,6 +196,14 @@ class PairingFlow:
     def _begin(self, ctx: SessionContext) -> None:
         target = ctx.state.target
         if target is None:
+            ctx.apply(
+                trust=TrustState.Untrusted,
+                last_error=diagnostic(ErrorCode.stale_target, ctx.state.receiver_id),
+            )
+            return
+        try:
+            self.deps.transport.update_target(target, ctx.state.receiver_id)
+        except Exception:  # noqa: BLE001 - no authority for an unregistered target
             ctx.apply(
                 trust=TrustState.Untrusted,
                 last_error=diagnostic(ErrorCode.stale_target, ctx.state.receiver_id),
