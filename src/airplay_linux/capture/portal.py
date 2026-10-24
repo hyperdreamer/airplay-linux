@@ -344,6 +344,11 @@ class PortalClient:
         #: Request handles this client still owns: the portal has not confirmed
         #: their Close, so a session they create still needs an exact owner.
         self._requests: dict[str, str] = {}
+        #: Owned handles whose Close this client owes.  Ownership alone is not
+        #: an obligation: a request a live selection is still waiting on is
+        #: owned so a late ``Response`` is reaped, but only the operation that
+        #: abandoned it may close it, never another operation's late reply.
+        self._due_requests: set[str] = set()
         #: Request handles that are finished: the portal confirmed their Close or
         #: the ``Response`` was consumed.  ``Request.Close`` suppresses a pending
         #: Response, but one already in flight is still reaped; nothing here
@@ -550,6 +555,7 @@ class PortalClient:
         self._pending.clear()
         self._sessions.clear()
         self._requests.clear()
+        self._due_requests.clear()
         self._retired.clear()
         self._dead_sessions.clear()
 
@@ -686,7 +692,7 @@ class PortalClient:
             if path not in self._requests:
                 continue
             abandoned.add(path)
-            self._own_request(path, acquisition.connector)
+            self._own_request(path, acquisition.connector, due=True)
         self._kick_request_closes()
         acquisition.release_waiters()
         self._abandoned.add(job)
@@ -814,7 +820,7 @@ class PortalClient:
     def _retain_pending_requests(self, acquisition: _Acquisition) -> None:
         """Keep exact ownership of every request this acquisition still owns."""
         for path in tuple(acquisition.requests):
-            self._own_request(path, acquisition.connector)
+            self._own_request(path, acquisition.connector, due=True)
         self._kick_request_closes()
 
     async def _drain_request_closes(self) -> None:
@@ -925,17 +931,26 @@ class PortalClient:
             return _failure(ErrorCode.dependency_incompatible)
         return Ok(value=results)
 
-    def _own_request(self, path: str, connector: str) -> None:
-        """Take exact ownership of one Request handle, idempotently."""
+    def _own_request(self, path: str, connector: str, *, due: bool = False) -> None:
+        """Take exact ownership of one Request handle, idempotently.
+
+        ``due`` says this handle also owes a ``Request.Close`` because nobody
+        is waiting for its ``Response`` any more.  A live waiter's request is
+        owned without being due: it is the newer operation's request, and an
+        unrelated late reply must not close it.
+        """
         if not path or path in self._retired:
             return
         self._requests.setdefault(path, connector)
+        if due:
+            self._due_requests.add(path)
 
     def _release_requests(self, paths: Iterable[str]) -> None:
         """Drop ownership of handles the portal never created for this client."""
         for path in paths:
             if path in self._requests and path not in self._closing_requests:
                 self._requests.pop(path, None)
+                self._due_requests.discard(path)
 
     def _retire_settled(self, paths: Iterable[str]) -> None:
         """A consumed Response finishes a Request; keep no cleanup obligation."""
@@ -943,6 +958,7 @@ class PortalClient:
             if path in self._closing_requests:
                 continue
             connector = self._requests.pop(path, None)
+            self._due_requests.discard(path)
             if connector is not None:
                 self._retired[path] = connector
 
@@ -963,7 +979,7 @@ class PortalClient:
                 path = pending.settled_path or next(iter(pending.paths), "")
                 self._reap_response(buffered, pending.connector, path)
         for path in pending.paths:
-            self._own_request(path, acquisition.connector)
+            self._own_request(path, acquisition.connector, due=True)
         self._kick_request_closes()
 
     def _settle_call(
@@ -993,10 +1009,12 @@ class PortalClient:
         )
         if not unwatched:
             # A live waiter correlates this handle and delays its Close until the
-            # Response arrives; owning it early keeps it from escaping.
+            # Response arrives.  Owning it early keeps it from escaping; it is
+            # deliberately not ``due``, so another operation's cleanup cannot
+            # close a request this selection is still using.
             self._own_request(returned, acquisition.connector)
             return
-        self._own_request(returned, acquisition.connector)
+        self._own_request(returned, acquisition.connector, due=True)
         self._kick_request_closes()
 
     def _forget(self, pending: _Pending, acquisition: _Acquisition) -> None:
@@ -1121,6 +1139,7 @@ class PortalClient:
         if path:
             self._retired.pop(path, None)
             self._requests.pop(path, None)
+            self._due_requests.discard(path)
         if type(body) not in (list, tuple) or len(body) != 2:
             return
         if isinstance(_response_code(body[0]), Err):
@@ -1204,10 +1223,18 @@ class PortalClient:
         return Ok(value=None)
 
     def _kick_request_closes(self) -> None:
-        """Start a bounded Close for every owned request that has none in flight."""
+        """Start a bounded Close for every request that owes one.
+
+        Eligibility, not ownership, decides: a request a live selection is
+        still awaiting is owned here but not due, so an abandoned operation's
+        late reply cannot cancel the newer selection's dialog.
+        """
         if self._destroyed:
             return
-        for path in tuple(self._requests):
+        for path in tuple(self._due_requests):
+            if path not in self._requests:
+                self._due_requests.discard(path)
+                continue
             if path in self._closing_requests:
                 continue
             self._track_cleanup(self._close_request(path))
@@ -1260,6 +1287,7 @@ class PortalClient:
             connector = self._retired.get(path)
         if connector is not None:
             self._retired[path] = connector
+        self._due_requests.discard(path)
         return True
 
 
