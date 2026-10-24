@@ -28,7 +28,7 @@ through the portal with no token at all.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Final, Literal, Protocol
 from uuid import uuid4
@@ -931,15 +931,15 @@ class PortalClient:
             return
         self._requests.setdefault(path, connector)
 
-    def _release_requests(self, paths: object) -> None:
+    def _release_requests(self, paths: Iterable[str]) -> None:
         """Drop ownership of handles the portal never created for this client."""
-        for path in paths:  # type: ignore[union-attr]
+        for path in paths:
             if path in self._requests and path not in self._closing_requests:
                 self._requests.pop(path, None)
 
-    def _retire_settled(self, paths: object) -> None:
+    def _retire_settled(self, paths: Iterable[str]) -> None:
         """A consumed Response finishes a Request; keep no cleanup obligation."""
-        for path in paths:  # type: ignore[union-attr]
+        for path in paths:
             if path in self._closing_requests:
                 continue
             connector = self._requests.pop(path, None)
@@ -1150,11 +1150,10 @@ class PortalClient:
         body = message.body
         if type(body) not in (list, tuple) or len(body) != 3:
             return False
-        name, old_owner, new_owner = body
+        name, old_owner = body[0], body[1]
         if _unwrap(name) != PORTAL_DESTINATION:
             return False
         old_owner = _unwrap(old_owner)
-        new_owner = _unwrap(new_owner)
         if type(old_owner) is not str or not old_owner:
             return False
         self._dead_sessions.update(self._sessions)
