@@ -219,6 +219,12 @@ def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
 
 
+def _discard_result(task: asyncio.Task[Any]) -> None:
+    """Read a discarded call's outcome so no 'never retrieved' error is logged."""
+    if not task.cancelled():
+        task.exception()
+
+
 def _unwrap(value: object) -> object:
     if type(value) is Variant:
         return value.value
@@ -526,16 +532,18 @@ class PortalClient:
             return Ok(value=None)
 
     def _finalise(self) -> None:
-        """Detach the handler and drop a connection this client owns."""
+        """Detach the handler and drop any connection this client still owns."""
         peer = self._peer
         if peer is not None and self._handler_installed:
             peer.remove_message_handler(self._on_message)
             self._handler_installed = False
         if peer is not None and self._owns_peer:
-            try:
-                peer.disconnect()
-            except Exception:
-                pass
+            self._discard_peer(peer)
+        # A connection that completed after its caller's deadline is retained for
+        # a later admission; a confirmed shutdown must not leave it open.
+        retained = self._connection.peer
+        if retained is not None and retained is not peer:
+            self._discard_peer(retained)
         self._peer = None
         self._destroyed = True
         self._connection.reset()
@@ -973,7 +981,7 @@ class PortalClient:
         except BaseException:
             return
         returned = _returned_handle(reply)
-        if returned is None:
+        if returned is None or self._destroyed:
             return
         pending.paths.add(returned)
         if returned not in acquisition.requests:
@@ -1034,6 +1042,10 @@ class PortalClient:
                 raise
             except Exception:
                 return None
+        if not call.done():
+            # The call keeps running past the bound; nobody will read its result,
+            # so consume a later exception instead of leaking it as unretrieved.
+            call.add_done_callback(_discard_result)
         return _ABANDONED if released is not None and released in done else _TIMED_OUT
 
     def _call_message(
@@ -1194,6 +1206,8 @@ class PortalClient:
 
     def _kick_request_closes(self) -> None:
         """Start a bounded Close for every owned request that has none in flight."""
+        if self._destroyed:
+            return
         for path in tuple(self._requests):
             if path in self._closing_requests:
                 continue

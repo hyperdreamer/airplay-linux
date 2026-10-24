@@ -1178,3 +1178,33 @@ async def test_a_late_request_handle_after_the_control_deadline_is_cancelled() -
     assert returned in peer.closed_requests, (returned, peer.closed_requests, client._orphaned)
     # Nothing is left owned: both handles were confirmed closed.
     assert client._requests == {}
+
+
+async def test_a_connection_that_arrives_after_the_deadline_is_never_used() -> None:
+    """A late connection is reconciled: neither admitted nor left open."""
+    peer = FakePortalPeer()
+    release = asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        await release.wait()
+        return peer
+
+    client = PortalClient(connect=connect, deadline=0.02)
+    result = await bounded(client.select_monitor("DP-1", None))
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+
+    # The attempt outlived its caller; its completion must not admit the peer.
+    release.set()
+    await settle(24)
+    assert peer.handlers == []
+    assert peer.calls == []
+
+    closing = await bounded(client.close())
+
+    assert isinstance(closing, Ok)
+    # A retained connection a confirmed shutdown never used is not left open.
+    assert peer.disconnected is True
+    assert peer.handlers == []
+    assert [call.member for call in peer.calls] == []
