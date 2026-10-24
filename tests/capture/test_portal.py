@@ -72,6 +72,11 @@ class FakePortalPeer:
     # -- request/session identities ----------------------------------------
 
     @property
+    def connected(self) -> bool:
+        """Bus liveness, like ``dbus_next.aio.MessageBus.connected``."""
+        return not self.disconnected
+
+    @property
     def sender(self) -> str:
         return self.unique_name.removeprefix(":").replace(".", "_")
 
@@ -974,3 +979,175 @@ async def test_no_restore_token_is_reused_after_a_failed_selection() -> None:
     await complete_selection(client, peer, session_token="s2")
 
     assert "restore_token" not in peer.last("SelectSources").message.body[-1]
+
+
+# --------------------------------------------------------------------------- lifecycle
+#
+# The following expectations came from the independent re-review.  They describe
+# one portal lifecycle -- request, buffered response, session, close, lease --
+# instead of one defect at a time, so they are kept verbatim: a fix that makes
+# one of them pass by weakening another is not a fix.
+
+
+async def test_confirmed_request_close_with_no_response_can_finalise() -> None:
+    """CAP-011: a successful Request.Close suppresses Response; close must finalise."""
+    peer = FakePortalPeer()
+
+    async def connect() -> FakePortalPeer:
+        return peer
+
+    client = PortalClient(connect=connect)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    await settle()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await bounded(client.drain())
+    assert peer.closed_requests
+    assert peer.open_sessions == set()
+    first = await bounded(client.close())
+    second = await bounded(client.close())
+    assert isinstance(second, Ok), (
+        first,
+        second,
+        client._orphaned,
+        peer.disconnected,
+        len(peer.handlers),
+    )
+    assert peer.handlers == []
+    assert peer.disconnected
+
+
+@pytest.mark.parametrize("ending", ["cancel", "deadline"])
+async def test_a_buffered_creation_response_is_reaped_after_abandonment(
+    ending: str,
+) -> None:
+    """CAP-010: a Response already buffered in a forgotten future still owns a session."""
+    peer = FakePortalPeer()
+    peer.hold("CreateSession")
+    client = PortalClient(peer=peer, deadline=0.02)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    session = peer.session_path(peer.last("CreateSession").session_handle_token or "")
+    # The server creates the resource regardless of whether the client consumes it.
+    peer.open_sessions.add(session)
+    assert peer.respond("CreateSession", 0, {"session_handle": session})
+    if ending == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        result = await bounded(task)
+        assert isinstance(result, Err)
+    await bounded(client.drain())
+    peer.release_hold("CreateSession")
+    await settle(24)
+    await bounded(client.drain())
+    assert not peer.open_sessions, (
+        ending,
+        peer.open_sessions,
+        client._sessions,
+        peer.closed_sessions,
+    )
+
+
+async def test_a_late_returned_request_handle_is_cancelled_exactly() -> None:
+    """CAP-015: a Request handle learned after abandonment still needs its exact Close."""
+    peer = FakePortalPeer()
+    returned = "/org/example/request/actual"
+    peer.handle_override["CreateSession"] = returned
+    peer.hold("CreateSession")
+    client = PortalClient(peer=peer, deadline=0.02)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await peer.wait_for("CreateSession")
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await bounded(client.drain())
+    peer.release_hold("CreateSession")
+    await settle(24)
+    await bounded(client.drain())
+    assert not client._replies
+    assert returned in peer.closed_requests, (returned, peer.closed_requests, client._orphaned)
+
+
+@pytest.mark.parametrize("loss", ["connection", "service_owner"])
+async def test_provider_rejects_a_session_after_connection_or_service_loss(loss: str) -> None:
+    """CAP-012: a dead bus connection or portal owner must invalidate the lease."""
+    peer = FakePortalPeer()
+    client = PortalClient(peer=peer)
+    provider = PhysicalCaptureProvider(client, _physical_inventory, _PhysicalFeatures())
+    task = asyncio.create_task(provider.select("DP-1"))
+    await peer.wait_for("CreateSession")
+    await settle()
+    peer.respond_create()
+    await peer.wait_for("SelectSources")
+    await settle()
+    peer.respond("SelectSources", 0, {})
+    await peer.wait_for("Start")
+    await settle()
+    peer.respond_start("DP-1")
+    selected = await bounded(task)
+    assert isinstance(selected, Ok)
+    assert isinstance(await provider.verify(selected.value), Ok)
+    peer.open_sessions.clear()
+    if loss == "connection":
+        peer.disconnect()
+        assert not peer.connected
+    else:
+        lost = Message(
+            message_type=MessageType.SIGNAL,
+            path="/org/freedesktop/DBus",
+            interface="org.freedesktop.DBus",
+            member="NameOwnerChanged",
+            signature="sss",
+            body=[PORTAL_DESTINATION, ":1.77", ""],
+            sender="org.freedesktop.DBus",
+        )
+        for handler in tuple(peer.handlers):
+            handler(lost)
+    actual = await provider.verify(selected.value)
+    await client.close()
+    assert isinstance(actual, Err), (loss, actual)
+
+
+async def test_a_connection_in_progress_cannot_open_requests_after_confirmed_close() -> None:
+    """CAP-013: connection setup is part of the shutdown barrier, not outside it."""
+    peer = FakePortalPeer()
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        started.set()
+        await release.wait()
+        return peer
+
+    client = PortalClient(connect=connect, deadline=0.02)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    await bounded(started.wait())
+    closing = await bounded(client.close())
+    assert isinstance(closing, Ok)
+    release.set()
+    await settle(24)
+    calls_after_close = [c.member for c in peer.calls]
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    await bounded(client.drain())
+    assert calls_after_close == [], (closing, calls_after_close, len(peer.handlers))
+
+
+@pytest.mark.parametrize("configured_deadline", [0.02, 5.0])
+async def test_connection_setup_obeys_the_control_deadline(configured_deadline: float) -> None:
+    """CAP-014: the initial session-bus connect is bounded like every control call."""
+    release = asyncio.Event()
+
+    async def connect() -> FakePortalPeer:
+        await release.wait()
+        return FakePortalPeer()
+
+    client = PortalClient(connect=connect, deadline=configured_deadline)
+    task = asyncio.create_task(client.select_monitor("DP-1", None))
+    done, _ = await asyncio.wait({task}, timeout=configured_deadline + 0.10)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert done, f"connection setup outlasted the {configured_deadline}s control deadline"
