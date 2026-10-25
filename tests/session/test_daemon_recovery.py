@@ -1,4 +1,4 @@
-"""Shared daemon recovery must spend one manager budget, never one per TV."""
+"""Shared daemon recovery delegates admission to the registry."""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +7,7 @@ from uuid import UUID
 
 import pytest
 
+from airplay_linux.backend.contract import BackendFeatures
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     DiscoveryEvent, FailurePayload, Retry, Start, Stop, TransportEventKind,
@@ -16,11 +17,11 @@ from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import (
     AudioPolicy, DisplayState, Err, ErrorCode, Mode, Ok, SessionPhase, StartRequest, TransportState,
 )
-from airplay_linux.session.reconnect import DaemonRecovery, RestartBudget
+from airplay_linux.process.daemon_registry import DaemonRegistry
+from airplay_linux.session.reconnect import DaemonRecovery
 from airplay_linux.session.testing import SessionRig
 from airplay_linux.testing.adapters import Deferred
 from airplay_linux.testing.builders import target
-from airplay_linux.testing.time import FakeClock
 from test_reconnect import advance_retry, recovery_rig, start_session, starts
 from virtual_scenarios import decision, settle, stream_event
 
@@ -53,25 +54,69 @@ class Restart:
         return result
 
 
-def test_restart_budget_uses_sliding_monotonic_window_and_counts_only_claims():
-    clock = FakeClock()
-    budget = RestartBudget(clock)
-    assert [budget.claim() for _ in range(4)] == [True, True, True, False]
-    clock.advance(59.999)
-    assert not budget.claim()
-    clock.advance(0.001)
-    assert budget.claim()
-    assert budget.claim()
-    assert budget.claim()
-    assert not budget.claim()
-    clock.advance(20)
-    assert not budget.claim()
-    clock.advance(40)
-    assert budget.claim()
+@pytest.mark.asyncio
+async def test_recovery_delegates_budget_to_registry_and_registry_refusal_is_terminal(tmp_path):
+    class Subscription:
+        def close(self):
+            return None
+
+    class Process:
+        def subscribe(self, callback):
+            del callback
+            return Subscription()
+
+    features = BackendFeatures(
+        profile="test", version="test", foreground_control=True, owner_handshake=True,
+        multi_target=True, target_bound_pairing=True, physical_source=True,
+        virtual_source=True, audio_probe=True, audio_restart=True, target_mute=True,
+        keyring=True, provisional_commit=True, cancel_pairing=True,
+        revoke_pairing=True, query_modes=True,
+    )
+    rig = SessionRig()
+    registry = DaemonRegistry(
+        process=Process(), store=object(), control_factory=lambda record: None,
+        features=features, runtime_directory=tmp_path / "runtime",
+        app=ProcessIdentity(pid=1, start_ticks=1), clock=rig.clock,
+    )
+    registry._has_launched = True
+    registry._restarts.extend([rig.clock.now()] * registry._restart_limit)
+    launches = 0
+
+    async def reconcile():
+        return Ok(value=None)
+
+    async def launch():
+        nonlocal launches
+        launches += 1
+        return Ok(value=record(900 + launches))
+
+    registry._reconcile = reconcile
+    registry._launch = launch
+    calls = 0
+
+    async def restart():
+        nonlocal calls
+        calls += 1
+        return await registry.restart()
+
+    recovery = DaemonRecovery(replace(rig.deps, restart_daemon=restart))
+    instance = InstanceId(UUID(int=901))
+    refused = await recovery.recover(instance)
+    assert isinstance(refused, Err)
+    assert refused.error.code is ErrorCode.daemon_failed
+    assert calls == 1
+    assert launches == 0
+
+    rig.clock.advance(60)
+    recovery.retry(instance)
+    admitted = await recovery.recover(instance)
+    assert isinstance(admitted, Ok)
+    assert calls == 2
+    assert launches == 1
 
 
 @pytest.mark.asyncio
-async def test_simultaneous_recovery_waiters_share_one_launch_and_one_budget_claim():
+async def test_simultaneous_recovery_waiters_share_one_restart_transaction():
     gate = Deferred()
     restart = Restart(gate=gate)
     rig = SessionRig()
@@ -85,7 +130,18 @@ async def test_simultaneous_recovery_waiters_share_one_launch_and_one_budget_cla
     assert all(result == Ok(value=record(101)) for result in results)
     assert isinstance(await recovery.request_restart(), Ok)
     assert isinstance(await recovery.request_restart(), Ok)
-    assert isinstance(await recovery.request_restart(), Err)
+    assert isinstance(await recovery.request_restart(), Ok)
+    assert restart.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_repeated_restart_transactions_are_admitted_until_registry_refuses():
+    restart = Restart()
+    rig = SessionRig()
+    recovery = DaemonRecovery(replace(rig.deps, restart_daemon=restart))
+    assert isinstance(await recovery.request_restart(), Ok)
+    assert isinstance(await recovery.request_restart(), Ok)
+    assert isinstance(await recovery.request_restart(), Ok)
     assert restart.calls == 3
 
 
@@ -165,16 +221,19 @@ async def test_daemon_exit_does_not_touch_a_stream_from_another_instance():
 
 @pytest.mark.asyncio
 async def test_local_restart_exhaustion_retains_output_and_explicit_retry_uses_same_intent():
-    failures = [Err(error=diagnostic(ErrorCode.daemon_failed)) for _ in range(3)]
-    restart = Restart(outcomes=failures)
+    restart = Restart(outcomes=[
+        Err(error=diagnostic(ErrorCode.daemon_failed)),
+        Ok(value=record(302)),
+    ])
     rig = recovery_rig(restart=restart)
     restart.rig = rig
     before = await start_session(rig)
     rig.transport.emit(stream_event(rig, TransportEventKind.daemon_exit))
     await settle(rig)
-    # Local failure consumes the shared 3-in-60 budget; no network counter is involved.
+    # The registry refusal is terminal for this incident; the manager does not
+    # spend a second restart budget before reporting the retained session.
     failed = rig.manager.snapshot(before.receiver_id)
-    assert restart.calls == 3
+    assert restart.calls == 1
     assert failed.phase is SessionPhase.Failed
     assert failed.transport is TransportState.Failed
     assert failed.intent_active
@@ -184,13 +243,8 @@ async def test_local_restart_exhaustion_retains_output_and_explicit_retry_uses_s
     assert not rig.scheduler.pending()
     await rig.manager.dispatch(Retry(receiver_id=before.receiver_id))
     await settle(rig)
-    assert restart.calls == 3
-    rig.scheduler.advance(60)
-    assert rig.manager.snapshot(before.receiver_id).phase is SessionPhase.Failed
-    await rig.manager.dispatch(Retry(receiver_id=before.receiver_id))
-    await settle(rig)
+    assert restart.calls == 2
     after = rig.manager.snapshot(before.receiver_id)
-    assert restart.calls == 4
     assert after.transport is TransportState.Streaming
     assert after.session_generation == before.session_generation
     assert after.display_handle == before.display_handle
@@ -281,8 +335,11 @@ async def test_after_shared_restart_one_receiver_rejection_does_not_fail_the_oth
 
 
 @pytest.mark.asyncio
-async def test_repeated_successful_restarts_spend_budget_again_on_a_new_failure():
-    restart = Restart()
+async def test_repeated_successful_restarts_follow_registry_results():
+    restart = Restart(outcomes=[
+        Ok(value=record(301)), Ok(value=record(302)), Ok(value=record(303)),
+        Err(error=diagnostic(ErrorCode.daemon_failed)),
+    ])
     rig = recovery_rig(restart=restart)
     restart.rig = rig
     # The transport cannot initially acquire a local daemon.
@@ -307,7 +364,7 @@ async def test_repeated_successful_restarts_spend_budget_again_on_a_new_failure(
     rig.transport.queue_result("start_stream", Err(error=diagnostic(ErrorCode.daemon_failed)))
     await advance_retry(rig)
     failed = rig.manager.snapshot(before.receiver_id)
-    assert restart.calls == 3
+    assert restart.calls == 4
     assert failed.transport is TransportState.Failed
     assert failed.display_handle == before.display_handle
     assert failed.intent_active
@@ -327,7 +384,7 @@ async def test_refresh_notice_during_local_failure_does_not_silently_retry():
     rig.discovery.emit(DiscoveryEvent(kind="updated", receiver=view, diagnostic=None))
     await settle(rig)
     assert rig.manager.snapshot(before.receiver_id) == failed
-    assert restart.calls == 3
+    assert restart.calls == 1
 
 
 @pytest.mark.asyncio
@@ -354,8 +411,11 @@ async def test_unconfirmed_daemon_death_keeps_stream_owned_until_reconciliation(
 
 
 @pytest.mark.asyncio
-async def test_failed_first_connect_after_each_successful_restart_still_consumes_budget():
-    restart = Restart()
+async def test_failed_first_connect_after_each_successful_restart_stops_on_registry_refusal():
+    restart = Restart(outcomes=[
+        Ok(value=record(401)), Ok(value=record(402)),
+        Err(error=diagnostic(ErrorCode.daemon_failed)),
+    ])
     rig = recovery_rig(restart=restart)
     restart.rig = rig
     for _ in range(6):
@@ -372,7 +432,7 @@ async def test_failed_first_connect_after_each_successful_restart_still_consumes
         if state.transport is TransportState.Failed:
             break
     assert restart.calls == 3
-    assert len(starts(rig)) == 4
+    assert len(starts(rig)) == 3
     assert state.transport is TransportState.Failed
     assert state.display is DisplayState.Owned
     assert state.intent_active

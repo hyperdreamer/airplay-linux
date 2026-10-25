@@ -8,7 +8,7 @@ import pytest
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     DiscoveryEvent, EmptyPayload, FailurePayload, Pair, Retry, RetryCleanup, SetMuted,
-    Start, Stop, SubmitPairing, TransportEvent, TransportEventKind,
+    Start, Stop, SubmitPairing, TimerEvent, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import SensitiveText
 from airplay_linux.domain.resources import (
@@ -180,6 +180,75 @@ async def test_failed_network_attempts_keep_intent_and_source_until_a_later_succ
     assert rig.manager.snapshot(target().receiver_id).transport is TransportState.Streaming
     assert not rig.display.removed
     assert not rig.capture.released
+
+
+@pytest.mark.asyncio
+async def test_timer_attempt_refreshes_offline_authority_before_starting():
+    rig = recovery_rig()
+    await start_session(rig)
+    rig.transport.emit(stream_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    current = target(endpoint_generation=2, address="192.0.2.23")
+    # Discovery has changed, but its notice is deliberately withheld. The
+    # scheduled attempt must refresh authority before choosing a start path.
+    rig.discovery.views[current.receiver_id] = rig.discovery.build_view(current, False)
+    await advance_retry(rig)
+    after = rig.manager.snapshot(current.receiver_id)
+    assert after.target is None
+    assert not after.online
+    assert after.transport is TransportState.Reconnecting
+    assert after.next_retry_at == rig.clock.now() + 2
+    assert len(starts(rig)) == 1
+
+
+@pytest.mark.asyncio
+async def test_timer_refreshes_authority_before_inactive_attempt_guard():
+    rig = recovery_rig()
+    destination = target()
+    await start_session(rig, destination)
+    await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+    await settle(rig)
+    rig.discovery.views[destination.receiver_id] = rig.discovery.build_view(destination, False)
+    context = rig.manager._contexts[destination.receiver_id]._context(
+        rig.manager._contexts[destination.receiver_id].state.operation_id,
+    )
+    rig.manager.ingest(TimerEvent(
+        receiver_id=destination.receiver_id, kind="reconnect", context=context,
+    ))
+    await settle(rig)
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.target is None
+    assert not after.online
+    assert not after.intent_active
+
+
+@pytest.mark.asyncio
+async def test_stop_retires_terminal_error_before_a_later_intent_reconnects():
+    gate = Deferred()
+    rig = recovery_rig()
+    first = await start_session(rig)
+    rig.transport.queue_result("stop_stream", gate)
+    rig.transport.emit(stream_event(rig, TransportEventKind.failed, payload=FailurePayload(
+        diagnostic=diagnostic(ErrorCode.receiver_rejected),
+    )))
+    await settle(rig)
+    await rig.manager.dispatch(Stop(receiver_id=first.receiver_id))
+    await settle(rig)
+    gate.resolve(Ok(value=None))
+    await settle(rig)
+    stopped = rig.manager.snapshot(first.receiver_id)
+    assert not stopped.intent_active
+    assert stopped.stream is None
+    assert stopped.display is DisplayState.None_
+    fresh = await start_session(rig)
+    assert fresh.session_generation > first.session_generation
+    assert fresh.transport is TransportState.Streaming
+    rig.transport.emit(stream_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    after = rig.manager.snapshot(first.receiver_id)
+    assert after.transport is TransportState.Reconnecting
+    assert after.next_retry_at == rig.clock.now() + 1
+    assert after.last_error is None
 
 
 @pytest.mark.asyncio

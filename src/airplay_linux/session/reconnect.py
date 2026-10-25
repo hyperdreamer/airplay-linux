@@ -1,4 +1,4 @@
-"""Manager-owned network retries and shared, bounded daemon recovery.
+"""Manager-owned network retries and registry-bounded daemon recovery.
 
 Compose these handlers with ``compose_reconnect_handlers`` after the Mirror and
 Virtual factories. As with Virtual composition, the shared continuations must
@@ -8,7 +8,6 @@ never acquires permission to tear down a retained source.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
@@ -19,7 +18,6 @@ from airplay_linux.domain.messages import (
     Retry, RetryCleanup, SetMuted, Start, Stop, TimerEvent, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import InstanceId, StreamHandle
-from airplay_linux.domain.ports import Clock
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import (
     AudioState, Diagnostic, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, Result,
@@ -42,43 +40,21 @@ def network_delay(attempt: int) -> float:
     return float(2 ** attempt) if attempt < 5 else 30.0
 
 
-class RestartBudget:
-    """A sliding window measured exclusively by the injected monotonic clock."""
-
-    def __init__(self, clock: Clock, limit: int = 3, window: float = 60) -> None:
-        if type(limit) is not int or limit < 1:
-            raise ValueError("limit must be a positive integer")
-        if window <= 0:
-            raise ValueError("window must be positive")
-        self.clock, self.limit, self.window = clock, limit, window
-        self._claims: deque[float] = deque()
-
-    def claim(self) -> bool:
-        now = self.clock.now()
-        while self._claims and self._claims[0] <= now - self.window:
-            self._claims.popleft()
-        if len(self._claims) >= self.limit:
-            return False
-        self._claims.append(now)
-        return True
-
-
 class DaemonRecovery:
     """One recovery authority per manager, shared by all receiver actors.
 
-    ``request_restart`` coalesces concurrent callers and charges one claim for
-    an actual launch. Incident tasks also remember completed recovery for an
-    exact dead instance, so a delayed notice cannot restart its replacement.
-    Cancellation of a receiver's waiter does not cancel the shared transaction.
+    ``request_restart`` coalesces concurrent callers and delegates restart
+    admission to the daemon registry. Incident tasks also remember completed
+    recovery for an exact dead instance, so a delayed notice cannot restart its
+    replacement. Cancellation of a receiver's waiter does not cancel the shared
+    transaction.
     """
 
     def __init__(self, deps: ManagerDeps) -> None:
         self.deps = deps
-        self.budget = RestartBudget(deps.clock)
         self._inflight: asyncio.Task | None = None
         self._incidents: dict[InstanceId | None, asyncio.Task] = {}
         self._blocked: Err | None = None
-        self._budget_denied = False
 
     async def request_restart(self) -> Result[DaemonRecord]:
         if self._blocked is not None:
@@ -88,9 +64,6 @@ class DaemonRecovery:
         return await asyncio.shield(self._inflight)
 
     async def _restart(self) -> Result[DaemonRecord]:
-        self._budget_denied = not self.budget.claim()
-        if self._budget_denied:
-            return Err(error=diagnostic(ErrorCode.daemon_failed))
         try:
             result = await self.deps.restart_daemon()
         except Exception:  # never expose adapter exception text
@@ -111,13 +84,10 @@ class DaemonRecovery:
         return await asyncio.shield(task)
 
     async def _recover(self) -> Result[DaemonRecord]:
-        # Local startup failures have a bounded budget. Network failure never
-        # enters this loop or spends these claims. No receiver owns this loop.
-        for _ in range(self.budget.limit):
-            result = await self.request_restart()
-            if isinstance(result, Ok) or self._blocked is not None or self._budget_denied:
-                return result
-        return result
+        # The registry owns restart admission and its rolling budget. A failed
+        # registry transaction is terminal for this incident; an explicit Retry
+        # retires the incident cache and asks the registry again.
+        return await self.request_restart()
 
     def retry(self, instance: InstanceId | None) -> None:
         task = self._incidents.get(instance)
@@ -224,12 +194,17 @@ class ReconnectLifecycle(VirtualLifecycle):
     def _refresh_discovery(self, ctx):
         ctx.launch(Route.reconnect, "discovery_refresh", _current_context(ctx), self.deps.discovery.refresh)
 
+    def _retire_terminal_error(self, ctx):
+        _runtime(ctx).failure_after_stop = None
+        ctx.apply(last_error=None)
+
     def _start(self, ctx, message, *, supersede=True):
         self._sync_target(ctx)
         if ctx.state.target is None or not ctx.state.online:
             self._refresh_discovery(ctx)
             ctx.apply(last_error=diagnostic(ErrorCode.stale_target, ctx.state.receiver_id))
             return
+        self._retire_terminal_error(ctx)
         super()._start(ctx, message, supersede=supersede)
 
     def reconnect(self, ctx, message):
@@ -521,6 +496,7 @@ class ReconnectLifecycle(VirtualLifecycle):
 
     def cleanup_route(self, ctx, message):
         if isinstance(message, (Stop, Cancel)) or isinstance(message, ConfirmSwitch) and message.confirmed:
+            self._retire_terminal_error(ctx)
             ctx.cancel_timers()
             _runtime(ctx).local_required = False
             ctx.apply(next_retry_at=None, reconnect_attempt=0)
@@ -620,6 +596,6 @@ def compose_reconnect_handlers(
 
 
 __all__ = [
-    "DaemonRecovery", "RestartBudget", "build_reconnect_handlers",
+    "DaemonRecovery", "build_reconnect_handlers",
     "compose_reconnect_handlers", "network_delay",
 ]
