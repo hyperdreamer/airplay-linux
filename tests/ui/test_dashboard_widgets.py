@@ -360,3 +360,632 @@ def test_receiver_model_reports_labels_verbatim_without_inventing_state() -> Non
     ] == ["Mystery Box", "Sideways", "Quantum flux", "1x1"]
     assert model.flags(model.index(0, 0)) & Qt.ItemFlag.ItemIsSelectable
     assert not model.flags(model.index(0, 0)) & Qt.ItemFlag.ItemIsEditable
+# --------------------------------------------------------------------------- window
+
+
+def test_dashboard_has_text_commands(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    assert window.findChild(QPushButton, "scanButton").text() == "Scan"
+    assert window.findChild(QPushButton, "startButton").text() == "Start"
+    assert window.findChild(QPushButton, "stopButton").text() == "Stop"
+
+
+def test_receiver_table_and_selected_pane_coexist(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton, QSplitter, QTableView, QWidget
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    table = window.findChild(QTableView, "receiverTable")
+    selected = window.findChild(QWidget, "selectedPane")
+    activity = window.findChild(QWidget, "activityView")
+
+    assert table is not None and selected is not None and activity is not None
+    assert table.model().columnCount() == 4
+    splitter = window.findChild(QSplitter, "dashboardSplitter")
+    assert splitter is not None
+    panel = window.findChild(QWidget, "receiverPanel")
+    assert splitter.indexOf(panel) >= 0
+    assert splitter.indexOf(selected) >= 0
+    assert panel.isAncestorOf(table)
+    # The bottom activity strip sits outside the splitter, under both panes.
+    assert window.findChild(QPushButton, "scanButton").text() == "Scan"
+
+
+def test_render_receivers_shows_rows_and_an_empty_state(qtbot) -> None:
+    from PySide6.QtWidgets import QLabel, QTableView
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    table = window.findChild(QTableView, "receiverTable")
+    empty = window.findChild(QLabel, "emptyStateLabel")
+
+    window.render_receivers((receiver_row(), receiver_row(name="Office TV", receiver="b")))
+    assert table.model().rowCount() == 2
+    assert not empty.isVisibleTo(window)
+
+    window.render_receivers(())
+    assert table.model().rowCount() == 0
+    assert empty.isVisibleTo(window)
+    assert "No receivers" in empty.text()
+
+
+def test_window_renders_an_actual_projection_verbatim(qtbot) -> None:
+    """End to end through ``project``/``project_row``: no widget-side decisions."""
+    from PySide6.QtWidgets import QLabel, QTableView, QWidget
+
+    from airplay_linux.ui.window import MainWindow
+
+    snapshot = idle_snapshot()
+    inputs = view_inputs()
+    row = project_row(snapshot, inputs)
+    pane_state = project(snapshot, inputs)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_receivers((row,))
+    window.render_selected(pane_state)
+
+    table = window.findChild(QTableView, "receiverTable")
+    assert table.model().data(table.model().index(0, 2), Qt.ItemDataRole.DisplayRole) == (
+        pane_state.phase_label
+    )
+    assert window.findChild(QLabel, "paneTitle").text() == pane_state.title
+    assert window.findChild(QLabel, "phaseLabel").text() == pane_state.phase_label
+    if pane_state.notice is not None:
+        assert window.findChild(QLabel, "noticeLabel").text() == pane_state.notice
+
+    badges_row = window.findChild(QWidget, "badgesRow")
+    assert badges_row is not None
+    rendered = {
+        label.accessibleName(): label.text()
+        for label in badges_row.findChildren(QLabel)
+    }
+    for badge in pane_state.badges:
+        assert rendered[f"{badge.resource} badge"] == badge.label
+
+
+def test_only_the_visible_modes_editor_is_shown(qtbot) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    source = window.findChild(QComboBox, "sourceCombo")
+    resolution = window.findChild(QComboBox, "resolutionCombo")
+
+    window.render_selected(pane(visible_mode=Mode.MIRROR, source_enabled=True))
+    assert source.isVisibleTo(window)
+    assert not resolution.isVisibleTo(window)
+
+    window.render_selected(pane(visible_mode=Mode.VIRTUAL, resolution_enabled=True))
+    assert resolution.isVisibleTo(window)
+    assert not source.isVisibleTo(window)
+
+
+def test_mode_segments_stay_exclusive_and_disabled_means_disabled(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    mirror = window.findChild(QPushButton, "modeMirror")
+    virtual = window.findChild(QPushButton, "modeVirtual")
+    requested: list[str] = []
+    window.mode_requested.connect(requested.append)
+
+    window.render_selected(pane(visible_mode=Mode.MIRROR, mode_enabled=True))
+    assert mirror.isChecked()
+    assert not virtual.isChecked()
+
+    mirror.click()  # already the rendered mode: no redundant request
+    assert requested == []
+    virtual.click()
+    assert requested == ["virtual"]
+    assert virtual.isChecked() and not mirror.isChecked()
+
+    window.render_selected(pane(visible_mode=Mode.VIRTUAL, mode_enabled=False))
+    assert virtual.isChecked() and not mirror.isChecked()
+    assert not mirror.isEnabled() and not virtual.isEnabled()
+    mirror.click()
+    virtual.click()
+    assert requested == ["virtual"]
+
+
+def test_stop_is_enabled_only_because_the_projection_says_so(qtbot) -> None:
+    """A phase label that *looks* active must not switch a control on by itself."""
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    start = window.findChild(QPushButton, "startButton")
+    stop = window.findChild(QPushButton, "stopButton")
+
+    window.render_selected(
+        pane(phase_label="Mirroring", actions=frozenset({Action.start}))
+    )
+    assert start.isEnabled()
+    assert not stop.isEnabled()
+
+    window.render_selected(
+        pane(phase_label="Available", actions=frozenset({Action.stop}))
+    )
+    assert stop.isEnabled()
+    assert not start.isEnabled()
+
+
+def test_start_button_label_follows_the_projection_primary_label(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    start = window.findChild(QPushButton, "startButton")
+
+    window.render_selected(
+        pane(
+            actions=frozenset({Action.start}),
+            visible_mode=Mode.VIRTUAL,
+            primary_label="Create display",
+        )
+    )
+    assert start.text() == "Create display"
+
+    # An unrelated primary label does not rename the start command.
+    window.render_selected(
+        pane(
+            actions=frozenset({Action.choose_resolution, Action.cancel}),
+            primary_label="Choose",
+        )
+    )
+    assert start.text() == "Start"
+    assert not start.isEnabled()
+
+
+def test_scan_is_offered_by_the_fresh_window_and_the_projection(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    scan = window.findChild(QPushButton, "scanButton")
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+
+    assert scan.isEnabled()  # nothing rendered yet: scanning is still allowed
+    scan.click()
+    assert requested == ["scan"]
+
+    window.render_selected(pane(actions=frozenset({Action.stop})))
+    assert not scan.isEnabled()
+
+    window.render_selected(pane(actions=frozenset({Action.scan})))
+    assert scan.isEnabled()
+
+
+def test_audio_decision_prompt_is_explicit_and_pane_local(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    retry = window.findChild(QPushButton, "audioRetryButton")
+    video_only = window.findChild(QPushButton, "videoOnlyButton")
+    cancel = window.findChild(QPushButton, "cancelButton")
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+
+    window.render_selected(
+        pane(actions=frozenset({Action.retry_audio, Action.video_only, Action.cancel}))
+    )
+    for button, label in (
+        (retry, "Retry audio"),
+        (video_only, "Start video only"),
+        (cancel, "Cancel"),
+    ):
+        assert button.isVisibleTo(window)
+        assert button.isEnabled()
+        assert button.text() == label
+        assert button.toolTip()
+
+    retry.click()
+    video_only.click()
+    cancel.click()
+    assert requested == ["retry_audio", "video_only", "cancel"]
+
+    window.render_selected(pane(actions=frozenset({Action.stop})))
+    for button in (retry, video_only, cancel):
+        assert not button.isVisibleTo(window)
+        assert not button.isEnabled()
+
+
+def test_cleanup_and_orphan_choices_are_explicit(qtbot) -> None:
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+
+    window.render_selected(
+        pane(
+            phase_label="Cleanup required",
+            actions=frozenset(
+                {Action.retry_cleanup, Action.keep_cleanup, Action.stop}
+            ),
+        )
+    )
+    retry = window.findChild(QPushButton, "retryCleanupButton")
+    keep = window.findChild(QPushButton, "keepCleanupButton")
+    assert retry.isVisibleTo(window) and retry.isEnabled()
+    assert keep.isVisibleTo(window) and keep.isEnabled()
+    retry.click()
+    keep.click()
+
+    window.render_selected(
+        pane(
+            phase_label="Available",
+            actions=frozenset({Action.confirm_orphan, Action.keep_orphan}),
+        )
+    )
+    assert not window.findChild(QPushButton, "retryCleanupButton").isVisibleTo(window)
+    confirm = window.findChild(QPushButton, "confirmOrphanButton")
+    keep_orphan = window.findChild(QPushButton, "keepOrphanButton")
+    assert confirm.isVisibleTo(window) and keep_orphan.isVisibleTo(window)
+    confirm.click()
+    keep_orphan.click()
+
+    assert requested == [
+        "retry_cleanup",
+        "keep_cleanup",
+        "confirm_orphan",
+        "keep_orphan",
+    ]
+
+
+ACTION_CONTROLS: tuple[tuple[Action, str], ...] = (
+    (Action.start, "startButton"),
+    (Action.stop, "stopButton"),
+    (Action.pair, "pairButton"),
+    (Action.scan, "scanButton"),
+    (Action.submit_pairing, "submitPairingButton"),
+    (Action.cancel, "cancelButton"),
+    (Action.remove_metadata, "removeMetadataButton"),
+    (Action.retry, "retryButton"),
+    (Action.choose_resolution, "chooseResolutionButton"),
+    (Action.change_resolution, "changeResolutionButton"),
+    (Action.recreate, "recreateButton"),
+    (Action.retry_audio, "audioRetryButton"),
+    (Action.video_only, "videoOnlyButton"),
+    (Action.retry_cleanup, "retryCleanupButton"),
+    (Action.keep_cleanup, "keepCleanupButton"),
+    (Action.retry_revocation, "retryRevocationButton"),
+    (Action.keep_blocked, "keepBlockedButton"),
+    (Action.confirm_orphan, "confirmOrphanButton"),
+    (Action.keep_orphan, "keepOrphanButton"),
+)
+
+CONTEXTUAL_ACTIONS: frozenset[Action] = frozenset(
+    action for action, _ in ACTION_CONTROLS
+) - {
+    Action.start,
+    Action.stop,
+    Action.pair,
+    Action.scan,
+}
+
+
+@pytest.mark.parametrize(("action", "object_name"), ACTION_CONTROLS)
+def test_every_projected_action_has_exactly_one_enabled_control(
+    qtbot, action: Action, object_name: str
+) -> None:
+    """Each Action in the projection enables its own control and hides the rest."""
+    from PySide6.QtWidgets import QAbstractButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+    window.render_selected(pane(actions=frozenset({action})))
+
+    control = window.findChild(QAbstractButton, object_name)
+    assert control is not None, object_name
+    assert control.isVisibleTo(window), object_name
+    assert control.isEnabled(), object_name
+    assert control.text(), object_name
+
+    for other, other_name in ACTION_CONTROLS:
+        if other in CONTEXTUAL_ACTIONS and other is not action:
+            hidden = window.findChild(QAbstractButton, other_name)
+            assert not hidden.isVisibleTo(window), other_name
+
+    control.click()
+    assert requested == [action.value]
+
+
+def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
+    from PySide6.QtWidgets import QToolButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    mute = window.findChild(QToolButton, "muteToggle")
+    assert mute is not None
+    assert mute.text() == ""  # icon-only: the tooltip and name carry the meaning
+    assert not mute.icon().isNull()
+    assert mute.toolTip()
+    assert mute.accessibleName() == "Mute receiver audio"
+
+    requests: list[bool] = []
+    window.mute_requested.connect(requests.append)
+
+    window.render_selected(pane(mute_enabled=True, muted=False))
+    assert mute.isEnabled()
+    assert not mute.isChecked()
+    assert requests == []  # rendering never emits a mute request
+
+    mute.click()
+    assert requests == [True]
+    assert mute.isChecked()
+
+    window.render_selected(pane(mute_enabled=True, muted=True))
+    assert mute.isChecked()
+    mute.click()
+    assert requests == [True, False]
+
+    window.render_selected(pane(mute_enabled=False, muted=True))
+    assert not mute.isEnabled()
+    mute.click()
+    assert requests == [True, False]
+
+
+def test_notice_and_error_labels_render_the_projection_and_hide_when_empty(qtbot) -> None:
+    from PySide6.QtWidgets import QLabel
+
+    from airplay_linux.diagnostics import diagnostic
+    from airplay_linux.domain.resources import ErrorCode
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    notice = window.findChild(QLabel, "noticeLabel")
+    error = window.findChild(QLabel, "errorLabel")
+
+    window.render_selected(pane(notice=None, diagnostic=None))
+    assert not notice.isVisibleTo(window)
+    assert not error.isVisibleTo(window)
+
+    failure = diagnostic(ErrorCode.cleanup_timeout, RECEIVER)
+    window.render_selected(
+        pane(notice="Retained output is still owned.", diagnostic=failure)
+    )
+    assert notice.isVisibleTo(window)
+    assert notice.text() == "Retained output is still owned."
+    assert error.isVisibleTo(window)
+    assert error.text() == failure.message
+
+
+def test_summary_reports_counts_and_environment(qtbot) -> None:
+    from PySide6.QtWidgets import QLabel
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.set_summary(available=3, sessions=2, environment="KDE Wayland")
+
+    summary = window.findChild(QLabel, "summaryLabel")
+    environment = window.findChild(QLabel, "environmentLabel")
+    assert summary.text() == "3 TVs available  2 sessions"
+    assert summary.accessibleName()
+    assert environment.text() == "KDE Wayland"
+
+    window.set_summary(available=1, sessions=1, environment="KDE Plasma 6 Wayland")
+    assert summary.text() == "1 TV available  1 session"
+    assert environment.text() == "KDE Plasma 6 Wayland"
+
+
+def test_activity_view_is_read_only_and_replaces_its_events(qtbot) -> None:
+    from PySide6.QtWidgets import QPlainTextEdit
+
+    from airplay_linux.domain.records import ActivityEvent
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    activity = window.findChild(QPlainTextEdit, "activityView")
+    assert activity.isReadOnly()
+    assert activity.accessibleName() == "Activity log"
+
+    events = (
+        ActivityEvent(
+            utc="2026-10-17T10:00:00Z",
+            code="pairing_completed",
+            receiver_id=RECEIVER,
+            message="Pairing completed; receiver is ready",
+            fields={},
+        ),
+        ActivityEvent(
+            utc="2026-10-17T10:00:05Z",
+            code="display_published",
+            receiver_id=RECEIVER,
+            message="Virtual output published",
+            fields={},
+        ),
+    )
+    window.set_activity(events)
+    text = activity.toPlainText()
+    assert "Pairing completed; receiver is ready" in text
+    assert "Virtual output published" in text
+    assert text.index("Pairing completed") < text.index("Virtual output published")
+
+    window.set_activity(events)
+    assert activity.toPlainText().count("Pairing completed; receiver is ready") == 1
+
+
+def focus_chain(start: object) -> list[object]:
+    """Every widget reachable from ``start`` by following the focus chain once."""
+    chain: list[object] = []
+    current = start.nextInFocusChain()
+    while current is not start and len(chain) < 500:
+        chain.append(current)
+        current = current.nextInFocusChain()
+    return chain
+
+
+def test_keyboard_navigation_reaches_every_enabled_command(qtbot) -> None:
+    from PySide6.QtWidgets import QAbstractButton, QComboBox
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.render_receivers((receiver_row(),))
+    window.render_selected(
+        pane(
+            actions=frozenset({action for action, _ in ACTION_CONTROLS}),
+            mode_enabled=True,
+            source_enabled=True,
+            resolution_enabled=True,
+            mute_enabled=True,
+        )
+    )
+
+    chain = focus_chain(window)
+    for button in window.findChildren(QAbstractButton):
+        if not button.isVisibleTo(window) or not button.isEnabled():
+            continue
+        assert button.focusPolicy() != Qt.FocusPolicy.NoFocus, button.objectName()
+        assert button in chain, button.objectName()
+        if not button.text():
+            # Icon-only controls must still be describable and learnable.
+            assert button.accessibleName(), button.objectName()
+            assert button.toolTip(), button.objectName()
+    for combo in window.findChildren(QComboBox):
+        if not combo.isVisibleTo(window) or not combo.isEnabled():
+            continue
+        assert combo.focusPolicy() != Qt.FocusPolicy.NoFocus, combo.objectName()
+        assert combo in chain, combo.objectName()
+        assert combo.accessibleName(), combo.objectName()
+
+
+def test_receiver_selection_is_reported_as_receiver_id_text(qtbot) -> None:
+    from PySide6.QtCore import QItemSelectionModel
+    from PySide6.QtWidgets import QTableView
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    table = window.findChild(QTableView, "receiverTable")
+    window.render_receivers(
+        (receiver_row(), receiver_row(name="Office TV", receiver="b"))
+    )
+    selected: list[str] = []
+    window.receiver_selected.connect(selected.append)
+
+    table.selectionModel().setCurrentIndex(
+        table.model().index(0, 0),
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    assert selected == ["airplay-device:a"]
+
+    # Presenter-driven selection is silent, so rendering cannot echo a request.
+    window.select_receiver(OTHER_RECEIVER)
+    assert selected == ["airplay-device:a"]
+    assert table.currentIndex().row() == 1
+
+    # A re-render keeps the presenter's selection instead of inventing a new one.
+    window.render_receivers(
+        (receiver_row(), receiver_row(name="Office TV", receiver="b"))
+    )
+    assert table.currentIndex().row() == 1
+    assert selected == ["airplay-device:a"]
+
+
+def test_close_is_emitted_once_and_deferred_to_the_presenter(qtbot) -> None:
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    closing: list[bool] = []
+    window.closing_requested.connect(lambda: closing.append(True))
+
+    assert window.close() is False  # deferred: cleanup has not been confirmed
+    assert closing == [True]
+    assert window.isVisible()
+
+    assert window.close() is False  # idempotent: no second shutdown future
+    assert closing == [True]
+
+    window.allow_close()
+    assert window.close() is True
+    assert not window.isVisible()
+    assert closing == [True]
+
+
+def test_sources_and_resolutions_are_populated_without_emitting_requests(qtbot) -> None:
+    """Populating choices is rendering, not intent: no signal may fire."""
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    source = window.findChild(QComboBox, "sourceCombo")
+    resolution = window.findChild(QComboBox, "resolutionCombo")
+    sources: list[str] = []
+    sizes: list[tuple[int, int]] = []
+    window.source_selected.connect(sources.append)
+    window.resolution_selected.connect(lambda w, h: sizes.append((w, h)))
+
+    window.set_sources((physical("DP-1"), physical("HDMI-A-1")))
+    window.set_resolutions((HD, SMALL))
+    assert [source.itemText(i) for i in range(source.count())] == ["DP-1", "HDMI-A-1"]
+    assert [resolution.itemText(i) for i in range(resolution.count())] == [
+        "1920x1080",
+        "1280x720",
+    ]
+    assert sources == [] and sizes == []
+
+    source.setCurrentIndex(1)
+    resolution.setCurrentIndex(1)
+    assert sources == ["HDMI-A-1"]
+    assert sizes == [(1280, 720)]
+
+
+def test_choice_controls_explain_themselves(qtbot) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    for name in ("sourceCombo", "resolutionCombo"):
+        combo = window.findChild(QComboBox, name)
+        assert combo is not None
+        assert combo.accessibleName()
+        assert combo.toolTip()
