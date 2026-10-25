@@ -16,7 +16,7 @@ from uuid import UUID
 
 import pytest
 
-from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QObject, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -1364,6 +1364,193 @@ def test_pairing_modal_offers_exactly_the_projection_actions(qtbot) -> None:
         offered = pairing_inventory(dialogue)
         assert offered == pane_state.actions
         assert len(dialogue.findChildren(QPushButton)) == len(pane_state.actions)
+
+
+class WindowModalityRecorder(QObject):
+    """Count the window-blocking notifications Qt delivers to one window."""
+
+    def __init__(self, window: QWidget) -> None:
+        super().__init__(window)
+        self.blocked = 0
+        self.unblocked = 0
+        window.installEventFilter(self)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt
+        if event.type() is QEvent.Type.WindowBlocked:
+            self.blocked += 1
+        elif event.type() is QEvent.Type.WindowUnblocked:
+            self.unblocked += 1
+        return False
+
+
+def pairing_projection() -> PaneState:
+    """The real no-retained-output pairing projection and its offered actions."""
+    snapshot = idle_snapshot(
+        phase=SessionPhase.Pairing,
+        trust=TrustState.Pairing,
+        transport=TransportState.Pairing,
+        challenge=challenge("pin"),
+    )
+    state = project(snapshot, view_inputs())
+    assert state.actions == frozenset(
+        {Action.submit_pairing, Action.cancel, Action.retry}
+    )
+    return state
+
+
+@pytest.mark.parametrize("present", ("open", "show"))
+def test_dashboard_retry_stays_reachable_while_the_pairing_prompt_is_open(
+    qtbot, present: str
+) -> None:
+    """An open pairing prompt must not block the dashboard control it projects."""
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    window.show()
+    QApplication.processEvents()
+
+    events = WindowModalityRecorder(window)
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(dialogue)
+    getattr(dialogue, present)()
+    QApplication.processEvents()
+
+    # Still an explicit modal window that offers exactly the projected choices...
+    assert QApplication.activeModalWidget() is dialogue
+    assert dialogue.isModal()
+    assert dialogue.windowModality() == Qt.WindowModality.WindowModal
+    assert pairing_inventory(dialogue) == state.actions
+    # ...but because it does not own the dashboard, Qt never blocks the dashboard.
+    assert events.blocked == 0
+    retry = window.findChild(QPushButton, "retryButton")
+    assert retry.isEnabled() and retry.isVisibleTo(window)
+    QTest.mouseClick(retry, Qt.MouseButton.LeftButton)
+    assert requested == ["retry"]
+
+    dialogue.reject()
+    QApplication.processEvents()
+    assert events.blocked == 0
+    assert not dialogue.isVisible()
+
+
+@pytest.mark.parametrize("kind", ("stop", "resolution", "orphan"))
+def test_destructive_confirmation_prompts_still_block_the_dashboard(
+    qtbot, kind: str
+) -> None:
+    """Only pairing is owner-less; a destructive decision keeps the lockout."""
+    from airplay_linux.ui.dialogs import ConfirmStopDialog, OrphanDialog, ResolutionDialog
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    QApplication.processEvents()
+    if kind == "stop":
+        dialogue = ConfirmStopDialog(Mode.VIRTUAL, parent=window)
+    elif kind == "resolution":
+        dialogue = ResolutionDialog((HD, SMALL), parent=window)
+    else:
+        dialogue = OrphanDialog(
+            RecoveryItem(
+                kind="orphan", record=ownership(helper=None), handle=None, diagnostic=None
+            ),
+            parent=window,
+        )
+    qtbot.addWidget(dialogue)
+    events = WindowModalityRecorder(window)
+
+    dialogue.open()
+    QApplication.processEvents()
+    assert QApplication.activeModalWidget() is dialogue
+    assert events.blocked >= 1
+
+    dialogue.reject()
+    QApplication.processEvents()
+    assert events.unblocked >= 1
+
+
+def test_a_dashboard_command_dismisses_the_pairing_prompt_before_signalling(qtbot) -> None:
+    """A command supersedes the attempt, so the typed secret is gone before it emits."""
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    # Opening the prompt on the dashboard tracks it automatically, so no command
+    # can be issued while a typed PIN is still sitting in the field.
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(dialogue)
+    dialogue.open()
+    QApplication.processEvents()
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("dismiss-before-signal-sentinel-3307")
+
+    observed: list[tuple[str, str, bool]] = []
+    window.action_requested.connect(
+        lambda action: observed.append((action, field.text(), dialogue.isVisible()))
+    )
+    window.findChild(QPushButton, "retryButton").click()
+
+    assert observed == [("retry", "", False)]
+    assert not field.isUndoAvailable()
+    assert dialogue.take_input() is None
+
+
+def test_closing_the_dashboard_also_wipes_an_open_pairing_prompt(qtbot) -> None:
+    """A deferred window close must still drop the typed secret immediately."""
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(dialogue)
+    dialogue.open()
+    QApplication.processEvents()
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("close-dashboard-sentinel-4471")
+
+    window.close()  # deferred to the presenter, but the prompt is not deferred
+    QApplication.processEvents()
+
+    assert not dialogue.isVisible()
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    assert dialogue.take_input() is None
+
+
+def test_pairing_prompt_ends_with_the_dashboard_that_owns_it(qtbot) -> None:
+    """Without a Qt parent the prompt must still not outlive the dashboard."""
+    import shiboken6
+
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()  # deliberately not registered: this test destroys it
+    dialogue = PairingDialog(challenge("pin"), parent=window)
+    qtbot.addWidget(dialogue)
+    dialogue.open()
+    QApplication.processEvents()
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("owner-lifetime-sentinel-9182")
+
+    shiboken6.delete(window)
+    QApplication.processEvents()
+
+    assert not dialogue.isVisible()
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
 
 
 def test_pairing_retry_abandons_the_secret_and_asks_for_a_new_challenge(qtbot) -> None:

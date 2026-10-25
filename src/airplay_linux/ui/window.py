@@ -27,6 +27,11 @@ Rendering (GUI thread only): :meth:`MainWindow.render_receivers`,
 Silent selection restore (never a user request): :meth:`MainWindow.select_receiver`,
 :meth:`MainWindow.select_source`, :meth:`MainWindow.select_resolution`.
 
+Prompt ownership (a transient prompt a dashboard command must dismiss first):
+:meth:`MainWindow.track_prompt`.  A torn-down window and every command it emits
+end a tracked prompt, so a pairing secret never outlives the command that
+superseded the attempt.
+
 User intent leaves through the signals ``receiver_selected``, ``action_requested``,
 ``mode_requested``, ``source_selected``, ``resolution_selected``,
 ``mute_requested`` and ``closing_requested``.  The presenter owns which receiver
@@ -47,6 +52,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QComboBox,
+    QDialog,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -195,6 +201,7 @@ class MainWindow(QMainWindow):
         self._quiet = False
         self._closing_emitted = False
         self._close_allowed = False
+        self._tracked_prompt: QDialog | None = None
         self._buttons: dict[Action, QPushButton] = {}
 
         central = QWidget(self)
@@ -455,9 +462,7 @@ class MainWindow(QMainWindow):
     def _wire(self) -> None:
         for action, button in self._buttons.items():
             button.clicked.connect(
-                lambda _checked=False, requested=action: self.action_requested.emit(
-                    requested.value
-                )
+                lambda _checked=False, requested=action: self._request_action(requested)
             )
         self._mirror.clicked.connect(lambda: self._request_mode(Mode.MIRROR))
         self._virtual.clicked.connect(lambda: self._request_mode(Mode.VIRTUAL))
@@ -584,7 +589,39 @@ class MainWindow(QMainWindow):
         """Let the next ``closeEvent`` through, after the presenter's cleanup."""
         self._close_allowed = True
 
+    # --------------------------------------------------------------- prompt path
+
+    def track_prompt(self, prompt: QDialog) -> None:
+        """Adopt a transient prompt so a dashboard command dismisses it first.
+
+        The pairing prompt deliberately leaves this window usable (the pairing
+        projection keeps ``Retry`` reachable), so a typed secret could otherwise
+        survive the command that supersedes the attempt.  Any command signal
+        from this window therefore closes a tracked prompt - which wipes the
+        secret - before it is emitted.  This window never shows the prompt and
+        keeps only a non-owning reference; a prompt that closes or is destroyed
+        on its own is simply forgotten.
+        """
+        if not isinstance(prompt, QDialog):
+            raise TypeError("track_prompt requires a QDialog")
+        if prompt is self._tracked_prompt:
+            return
+        # One prompt at a time: a dashboard prompt replaces (and wipes) any
+        # previous one before taking over the dismissal hook.
+        self._dismiss_tracked_prompt()
+        self._tracked_prompt = prompt
+        prompt.destroyed.connect(self._forget_prompt)
+
+    def _forget_prompt(self, *_args: object) -> None:
+        self._tracked_prompt = None
+
+    def _dismiss_tracked_prompt(self) -> None:
+        prompt, self._tracked_prompt = self._tracked_prompt, None
+        if prompt is not None:
+            prompt.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        self._dismiss_tracked_prompt()
         if self._close_allowed:
             event.accept()
             return
@@ -696,14 +733,20 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------- signals
 
+    def _request_action(self, action: Action) -> None:
+        self._dismiss_tracked_prompt()
+        self.action_requested.emit(action.value)
+
     def _request_mode(self, mode: Mode) -> None:
         if not self._mode_selectable:
             return
         if self._pane is not None and mode is self._pane.visible_mode:
             return
+        self._dismiss_tracked_prompt()
         self.mode_requested.emit(mode.value)
 
     def _request_mute(self, muted: bool) -> None:
+        self._dismiss_tracked_prompt()
         self.mute_requested.emit(bool(muted))
 
     def _source_changed(self, index: int) -> None:
@@ -711,6 +754,7 @@ class MainWindow(QMainWindow):
             return
         connector = self._source.itemData(index)
         if isinstance(connector, str) and connector:
+            self._dismiss_tracked_prompt()
             self.source_selected.emit(connector)
 
     def _resolution_changed(self, index: int) -> None:
@@ -718,6 +762,7 @@ class MainWindow(QMainWindow):
             return
         chosen = self._resolution.itemData(index)
         if isinstance(chosen, Size):
+            self._dismiss_tracked_prompt()
             self.resolution_selected.emit(chosen.width, chosen.height)
 
     def _row_changed(self, current: object, _previous: object) -> None:
@@ -726,6 +771,7 @@ class MainWindow(QMainWindow):
         receiver_id = self._model.receiver_id(current)
         if receiver_id is None or receiver_id == self._selected:
             return
+        self._dismiss_tracked_prompt()
         self._selected = receiver_id
         self.receiver_selected.emit(str(receiver_id))
 

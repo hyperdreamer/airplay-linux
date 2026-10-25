@@ -16,8 +16,15 @@ The safe answer is the default one everywhere it matters: ``Keep`` keeps the
 session, ``Keep`` keeps the orphan output, and the resolution prompt commits
 nothing until the user explicitly confirms it.
 
-Only decisions that need a *typed input* or a *destructive confirmation* are
-modal.  The design's state matrix presents the audio decision (``Retry audio`` /
+Decisions that need a *typed input* or a *destructive confirmation* are modal
+windows.  :class:`ConfirmStopDialog`, :class:`ResolutionDialog` and
+:class:`OrphanDialog` are also modal *to their owner*: while the user is deciding
+the dashboard must not accept another command.  :class:`PairingDialog` is the
+exception.  The design's pairing projection keeps ``Retry`` available on the
+dashboard, so the prompt must not be a window-modal child of it; it remains an
+explicit modal window (the active-modal slot) but does not own the dashboard.
+
+The design's state matrix presents the audio decision (``Retry audio`` /
 ``Start video only`` / ``Cancel``) and the cleanup recovery (``Retry cleanup`` /
 ``Keep for manual cleanup`` / ``Stop``) as explicit labelled choices inside the
 selected pane, so those live in :mod:`airplay_linux.ui.window` next to the notice
@@ -59,19 +66,61 @@ _PAIRING_ACTIONS: Final[frozenset[Action]] = frozenset(
 
 
 class _DecisionDialog(QDialog):
-    """Modal prompt scaffold: explanatory text plus explicit text buttons."""
+    """Prompt scaffold: explanatory text plus explicit text buttons.
 
-    def __init__(self, title: str, object_name: str, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
+    ``blocks_owner`` (the default) makes a destructive confirmation modal to the
+    window that opened it: Qt blocks that window and delivers ``WindowBlocked``
+    to it while the decision is pending.  ``blocks_owner=False`` keeps the prompt
+    an explicit modal window but drops the Qt parent relation, so the owner stays
+    usable.  Only the pairing prompt needs that; see :class:`PairingDialog`.
+    """
+
+    def __init__(
+        self,
+        title: str,
+        object_name: str,
+        parent: QWidget | None = None,
+        *,
+        blocks_owner: bool = True,
+    ) -> None:
+        # Qt blocks every window in a modal dialog's parent chain, so a prompt
+        # that must leave its owner usable cannot be parented to it.  The owner
+        # is still used for iconography and lifetime below.
+        super().__init__(parent if blocks_owner else None)
         self.setObjectName(object_name)
         self.setWindowTitle(title)
-        self.setModal(True)
+        if blocks_owner:
+            self.setModal(True)
+        else:
+            # Window-modal, not application-modal: the prompt takes the active
+            # modal slot but only ever blocks its own transient children (none),
+            # so the dashboard keeps receiving input.  This must stay the last
+            # modality statement: ``setModal(True)`` would promote a NonModal
+            # prompt to ApplicationModal and block every window again.
+            self.setWindowModality(Qt.WindowModality.WindowModal)
+            if parent is not None:
+                self.setWindowIcon(parent.windowIcon())
+                # Without a Qt parent the prompt is not closed or destroyed with
+                # the dashboard; end it explicitly so a typed secret never
+                # outlives the window that opened it.
+                parent.destroyed.connect(self._owner_destroyed)
+                # Leave a dashboard usable only in a way that also keeps its
+                # secrets transient: the owner closes this prompt (wiping the
+                # field) before it emits any command, so the command supersedes
+                # the attempt instead of leaving a PIN behind.
+                track = getattr(parent, "track_prompt", None)
+                if callable(track):
+                    track(self)
         # Prompts carry several explanatory sentences; keep them readable.
         self.setMinimumWidth(420)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(16, 12, 16, 12)
         self._layout.setSpacing(8)
         self._layout.addWidget(self._heading(title))
+
+    def _owner_destroyed(self, *_args: object) -> None:
+        """The window that opened a non-owning prompt went away; wipe and close."""
+        self.close()
 
     def _heading(self, text: str) -> QLabel:
         heading = QLabel(text, self)
@@ -131,6 +180,16 @@ class PairingDialog(_DecisionDialog):
     projection may pass ``actions`` explicitly instead of relying on that
     derivation.
 
+    The prompt is an explicit modal window, but it deliberately does not own the
+    dashboard: Qt blocks a modal dialog's owner window, and the pairing
+    projection keeps ``Retry`` available on the dashboard while a challenge is
+    open.  Pass ``parent`` for the window icon and so the prompt ends when that
+    window goes away; the dashboard stays usable.  A caller that acts on a
+    dashboard command while this prompt is open closes the prompt first
+    (:meth:`~airplay_linux.ui.window.MainWindow.track_prompt`), so the typed
+    secret never outlives the command that superseded the attempt.  A dashboard
+    parent that exposes that hook adopts the prompt automatically.
+
     Every way of leaving this prompt - accept, ``done``, reject, Escape, the
     window close button, or a programmatic close/hide - wipes the line edit and
     its undo history.  Only an explicit submit hands the secret to
@@ -149,7 +208,9 @@ class PairingDialog(_DecisionDialog):
     ) -> None:
         if not isinstance(challenge, ChallengeView):
             raise TypeError("PairingDialog requires a ChallengeView")
-        super().__init__("Pair with receiver", "pairingDialog", parent)
+        super().__init__(
+            "Pair with receiver", "pairingDialog", parent, blocks_owner=False
+        )
         self._challenge = challenge
         self._input: SensitiveText | None = None
         self._actions = self._pairing_actions(actions, retained_output)
