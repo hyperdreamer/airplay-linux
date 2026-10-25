@@ -7,7 +7,9 @@ from uuid import UUID
 import pytest
 
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.messages import ConfirmOrphanRemoval, KeepCleanup, Retry, Start
+from airplay_linux.domain.messages import (
+    ConfirmOrphanRemoval, KeepCleanup, Retry, Start, TransportEventKind,
+)
 from airplay_linux.domain.operations import InstanceId, LeaseId, OperationId, StreamHandle
 from airplay_linux.domain.records import RecoveryItem, SessionSnapshot
 from airplay_linux.domain.resources import (
@@ -18,7 +20,9 @@ from airplay_linux.session.engine import Route, SessionManager
 from airplay_linux.session.reconnect import build_reconnect_handlers, compose_reconnect_handlers
 from airplay_linux.testing.adapters import Deferred
 from airplay_linux.testing.builders import context, target
-from virtual_scenarios import decision, make_rig, production_display, settle, virtual_handlers
+from virtual_scenarios import (
+    decision, make_rig, production_display, settle, stream_event, virtual_handlers,
+)
 
 
 class Registry:
@@ -139,6 +143,55 @@ async def test_explicit_retry_uses_recovered_output_and_does_not_invent_pairing(
     assert state.transport is TransportState.Streaming
     assert state.display_handle == handle
     assert not rig.journal.calls("pairing.begin_pairing")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind, expected_trust", [
+    (TransportEventKind.credential_invalid, TrustState.Untrusted),
+    (TransportEventKind.pairing_required, TrustState.Pairing),
+])
+async def test_recovered_output_survives_backend_trust_events_without_inventing_challenges(
+    tmp_path, event_kind, expected_trust,
+):
+    rig, _, ownerships, handle = await prepared(tmp_path, online=True)
+    await recover(rig)
+    assert rig.manager.snapshot(rig.receiver_id).trust is TrustState.Unknown
+    assert not rig.journal.calls("pairing.begin_pairing")
+    await rig.manager.dispatch(Retry(receiver_id=rig.receiver_id))
+    await settle(rig)
+    rig.transport.emit(stream_event(rig, event_kind))
+    await settle(rig)
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert state.display_handle == handle
+    assert state.display is DisplayState.Owned
+    assert state.trust is expected_trust
+    challenged = event_kind is TransportEventKind.pairing_required
+    assert (state.challenge is not None) == challenged
+    assert len(rig.journal.calls("pairing.begin_pairing")) == int(challenged)
+    assert handle.owner_uuid in ownerships.records
+
+
+@pytest.mark.asyncio
+async def test_quarantined_session_metadata_blocks_replacement_without_discarding_ownership(tmp_path):
+    from airplay_linux.storage import AtomicFiles, JsonSessionStore
+
+    rig, _, ownerships, handle = await prepared(tmp_path, online=True)
+    files = AtomicFiles(tmp_path / "metadata")
+    files.write("sessions/unreadable.json", b"{truncated")
+    rig.sessions = JsonSessionStore(files)
+    rig.deps = replace(rig.deps, sessions=rig.sessions)
+    install_handlers(rig)
+    result = await recover(rig)
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.persistence_failed
+    assert rig.sessions.quarantined()
+    await rig.manager.dispatch(Start(receiver_id=rig.receiver_id, request=StartRequest(
+        mode=Mode.VIRTUAL, resolution=decision(), audio=AudioPolicy(enabled=False),
+    )))
+    await settle(rig)
+    assert handle.owner_uuid in ownerships.records
+    assert files.read("sessions/unreadable.json") == b"{truncated"
+    assert not rig.journal.calls("transport.start_stream")
 
 
 @pytest.mark.asyncio
@@ -301,10 +354,12 @@ async def test_persistence_serializes_same_receiver_while_other_receivers_progre
     manager, store = FakeManager(), MemorySessionStore()
     first, second = target().receiver_id, target("b").receiver_id
     entered, release = asyncio.Event(), asyncio.Event()
-    writes, active = [], set()
+    writes, active, overlaps = [], set(), []
     save = store.save
 
     async def gated(snapshot):
+        if snapshot.receiver_id in active:
+            overlaps.append((snapshot.receiver_id, snapshot.session_generation))
         assert snapshot.receiver_id not in active
         active.add(snapshot.receiver_id)
         writes.append((snapshot.receiver_id, snapshot.session_generation))
@@ -325,6 +380,9 @@ async def test_persistence_serializes_same_receiver_while_other_receivers_progre
     for _ in range(5):
         await asyncio.sleep(0)
     assert second in store.saved
+    # The writer catches adapter exceptions and flush retries failures. Observe
+    # overlap separately so those recovery paths cannot mask a broken queue.
+    assert not overlaps
     assert (first, 2) not in writes
     release.set()
     assert isinstance(await persistence.flush(), Ok)

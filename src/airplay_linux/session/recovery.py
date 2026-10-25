@@ -50,6 +50,22 @@ class RecoveryHandlers:
                 if handler is not None:
                     handler(ctx, Stop(receiver_id=ctx.state.receiver_id))
             return True
+        if kind == "shutdown_pending":
+            ctx.cancel_timers()
+            trust = ctx.state.trust
+            if trust in (TrustState.Pairing, TrustState.RevocationPending):
+                trust = TrustState.CleanupRequired
+            has_display = (ctx.state.display_handle is not None or ctx.state.ownership_uuid is not None
+                           or ctx.state.display is not DisplayState.None_)
+            from .cleanup import cleanup_complete
+            pending = not cleanup_complete(ctx.state, ctx.outstanding_acquisitions(),
+                                           ctx._manager.pending_resources(ctx.state.receiver_id))
+            ctx.apply(intent_active=False, queued_start=None, next_retry_at=None,
+                      challenge=None, trust=trust, cleanup_pending=pending,
+                      intent_stage=IntentStage.cleanup if pending else IntentStage.idle,
+                      display=DisplayState.CleanupRequired if has_display else ctx.state.display,
+                      last_error=diagnostic(ErrorCode.cleanup_timeout, ctx.state.receiver_id))
+            return True
         if kind == "persistence_failed":
             # Failure is a separate diagnostic; preserve every independent
             # resource fact (especially a still-owned stream or display).
@@ -154,6 +170,12 @@ class StartupRecovery:
         load_error = getattr(self.deps.sessions, "load_error", None)
         if isinstance(load_error, Err):
             return load_error
+        quarantined = getattr(self.deps.sessions, "quarantined", None)
+        failures = quarantined() if callable(quarantined) else ()
+        if failures:
+            # The tuple-only SessionStore contract uses this side channel for
+            # unreadable metadata. Missing trust/intent is unknown, not idle.
+            return Err(error=failures[0])
         preferences = await self.deps.receivers.all()
         if isinstance(preferences, Err):
             return preferences
