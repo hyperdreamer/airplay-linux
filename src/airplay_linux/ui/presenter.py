@@ -191,6 +191,9 @@ _STAGE_ORDER: Final[dict[str, int]] = {
 #: wrong: this copy says a completion was ignored, which is exactly what happened.
 _UNEXPECTED: Final[ErrorCode] = ErrorCode.stale_event
 
+_WINDOW_TITLE: Final[str] = "AirPlay Linux"
+_CLOSING_TITLE: Final[str] = "AirPlay Linux - closing; confirming cleanup"
+
 _DISABLED_REPORT: Final[CapabilityReport] = CapabilityReport(
     environment="Unknown",
     discovery=False,
@@ -330,6 +333,7 @@ class Presenter:
         self._pairing_pending: dict[ReceiverId, Any] = {}
         self._pairing_seen: dict[ReceiverId, Any] = {}
         self._switch_pending: set[ReceiverId] = set()
+        self._switch_queued: dict[ReceiverId, tuple[int, Mode]] = {}
         self._resolution_pending: set[ReceiverId] = set()
         self._orphan_pending: set[ReceiverId] = set()
 
@@ -784,7 +788,18 @@ class Presenter:
     def _snapshot_arrived(self, snapshot: object) -> None:
         if not isinstance(snapshot, SessionSnapshot):
             return
+        previous = self._snapshots.get(snapshot.receiver_id)
+        if (
+            previous is not None
+            and snapshot.session_generation < previous.session_generation
+        ):
+            # A superseded intent's snapshot must never overwrite newer state,
+            # even when it is delivered late.
+            return
         self._snapshots[snapshot.receiver_id] = snapshot
+        queued = self._switch_queued.get(snapshot.receiver_id)
+        if queued is not None and snapshot.mode is queued[1]:
+            del self._switch_queued[snapshot.receiver_id]
         # An authoritative state supersedes a receipt error for that receiver.
         self._rejections.pop(snapshot.receiver_id, None)
         self._request_render()
@@ -905,6 +920,11 @@ class Presenter:
         if _owns_anything(snapshot) and _switch_allowed(snapshot):
             if receiver_id in self._switch_pending:
                 return
+            queued = self._switch_queued.get(receiver_id)
+            if queued is not None and queued[0] == snapshot.session_generation:
+                # This exact session generation already has a queued switch; a
+                # second confirmation prompt would target the same teardown.
+                return
             self._schedule(self._confirmed_switch(receiver_id, mode))
             return
         # Stopping, cleanup, reconfiguration and uncertain trust: refuse the
@@ -992,6 +1012,8 @@ class Presenter:
                 return
             if not _switch_allowed(self._snapshot(receiver_id)):
                 return
+            snapshot = self._snapshot(receiver_id)
+            self._switch_queued[receiver_id] = (snapshot.session_generation, mode)
             await self._dispatch(
                 ConfirmSwitch(receiver_id=receiver_id, request=request, confirmed=True)
             )
@@ -1175,6 +1197,9 @@ class Presenter:
         if self._shutdown_task is not None and not self._shutdown_task.done():
             return self._shutdown_task
         self._shutting_down = True
+        # Bounded progress stays legible: the window is not hidden or blocked while
+        # the composition root stops sessions and confirms cleanup.
+        self._window.setWindowTitle(_CLOSING_TITLE)
         task = asyncio.ensure_future(self._shutdown())
         self._shutdown_task = task
         self._tasks.add(task)
@@ -1207,6 +1232,7 @@ class Presenter:
             # catalog-only diagnostic. Closing again starts a fresh attempt.
             self._shutting_down = False
             self._shutdown_task = None
+            self._window.setWindowTitle(_WINDOW_TITLE)
             error = result.error if isinstance(result, Err) else None
             self._reject(self._selected, error)
             self._request_render()
