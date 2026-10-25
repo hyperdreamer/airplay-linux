@@ -49,6 +49,8 @@ class _DecisionDialog(QDialog):
         self.setObjectName(object_name)
         self.setWindowTitle(title)
         self.setModal(True)
+        # Prompts carry several explanatory sentences; keep them readable.
+        self.setMinimumWidth(420)
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(16, 12, 16, 12)
         self._layout.setSpacing(8)

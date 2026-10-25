@@ -759,6 +759,44 @@ def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
     assert requests == [True, False]
 
 
+def test_badges_are_replaced_in_place_on_every_render(qtbot) -> None:
+    """Re-rendering must never stack a stale badge on top of a fresh one."""
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    window.render_selected(
+        pane(
+            badges=(
+                Badge(resource="transport", label="Streaming", severity="ok"),
+                Badge(resource="display", label="Output owned", severity="ok"),
+            )
+        )
+    )
+    strip = window.findChild(QWidget, "badgesRow")
+    visible = [label for label in strip.findChildren(QLabel) if label.isVisibleTo(window)]
+    assert [label.text() for label in visible] == ["Streaming", "Output owned"]
+    assert [label.accessibleName() for label in visible] == [
+        "transport badge",
+        "display badge",
+    ]
+
+    window.render_selected(
+        pane(
+            badges=(Badge(resource="transport", label="Idle", severity="info"),),
+            phase_label="Available",
+        )
+    )
+    visible = [label for label in strip.findChildren(QLabel) if label.isVisibleTo(window)]
+    assert [label.text() for label in visible] == ["Idle"]
+
+    window.render_selected(pane(badges=()))
+    assert [
+        label for label in strip.findChildren(QLabel) if label.isVisibleTo(window)
+    ] == []
+
+
 def test_notice_and_error_labels_render_the_projection_and_hide_when_empty(qtbot) -> None:
     from PySide6.QtWidgets import QLabel
 

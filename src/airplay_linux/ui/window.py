@@ -136,6 +136,17 @@ _PERSISTENT: Final[frozenset[Action]] = frozenset(
     {Action.start, Action.stop, Action.pair, Action.scan, Action.mute}
 )
 
+#: Context-only prompts, grouped in reading order so related choices sit together
+#: and a hidden prompt leaves no ragged hole in the pane.
+_ACTION_ROWS: Final[tuple[tuple[Action, ...], ...]] = (
+    (Action.retry_audio, Action.video_only, Action.cancel),
+    (Action.retry_cleanup, Action.keep_cleanup),
+    (Action.retry_revocation, Action.keep_blocked, Action.remove_metadata),
+    (Action.choose_resolution, Action.change_resolution, Action.recreate),
+    (Action.retry, Action.submit_pairing),
+    (Action.confirm_orphan, Action.keep_orphan),
+)
+
 #: Primary labels the projection uses for the start command.
 _START_LABELS: Final[frozenset[str]] = frozenset({"Start", "Create display"})
 
@@ -201,6 +212,10 @@ class MainWindow(QMainWindow):
         toolbar = QToolBar("Operations", self)
         toolbar.setObjectName("mainToolbar")
         toolbar.setMovable(False)
+        toolbar.setContentsMargins(6, 4, 6, 4)
+        # QToolBar stacks widget items with no spacing of its own; keep the dense
+        # toolbar readable instead of letting its labels touch.
+        toolbar.setStyleSheet("QToolBar { spacing: 10px; }")
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
         self._buttons[Action.scan] = self._button(Action.scan, toolbar)
@@ -210,11 +225,13 @@ class MainWindow(QMainWindow):
         self._summary = QLabel("0 TVs available  0 sessions", toolbar)
         self._summary.setObjectName("summaryLabel")
         self._summary.setAccessibleName("Receiver summary")
+        self._summary.setContentsMargins(8, 0, 8, 0)
         toolbar.addWidget(self._summary)
 
         self._environment = QLabel("Environment unknown", toolbar)
         self._environment.setObjectName("environmentLabel")
         self._environment.setAccessibleName("Environment")
+        self._environment.setContentsMargins(0, 0, 8, 0)
         toolbar.addWidget(self._environment)
 
         spacer = QWidget(toolbar)
@@ -290,6 +307,7 @@ class MainWindow(QMainWindow):
         self._badges_layout.setContentsMargins(0, 0, 0, 0)
         self._badges_layout.setSpacing(4)
         self._badges_layout.addStretch(1)
+        self._badge_labels: dict[str, QLabel] = {}
         layout.addWidget(self._badges_row)
 
         self._mode_selector = QWidget(pane)
@@ -381,13 +399,12 @@ class MainWindow(QMainWindow):
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setHorizontalSpacing(4)
         actions.setVerticalSpacing(4)
-        contextual = [
-            action for action in _COMMAND_LABELS if action not in _PERSISTENT
-        ]
-        for position, action in enumerate(contextual):
-            button = self._button(action, pane)
-            self._buttons[action] = button
-            actions.addWidget(button, position // 3, position % 3)
+        for row, grouped in enumerate(_ACTION_ROWS):
+            for column, action in enumerate(grouped):
+                button = self._button(action, pane)
+                self._buttons[action] = button
+                actions.addWidget(button, row, column)
+        actions.setColumnStretch(3, 1)  # keep prompt buttons compact, not full-width
         layout.addLayout(actions)
         layout.addStretch(1)
         return pane
@@ -564,25 +581,28 @@ class MainWindow(QMainWindow):
             button.setVisible(action is not Action.mute and action in _PERSISTENT)
 
     def _render_badges(self, badges: tuple[Badge, ...]) -> None:
-        while self._badges_layout.count():
-            item = self._badges_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        for badge in badges:
-            label = QLabel(badge.label, self._badges_row)
-            label.setObjectName(f"badge_{badge.resource}")
-            label.setAccessibleName(f"{badge.resource} badge")
-            label.setToolTip(f"{badge.resource} status: {badge.label}")
+        """Update the badge strip in place so a re-render never stacks labels."""
+        for label in self._badge_labels.values():
+            self._badges_layout.removeWidget(label)
+            label.setVisible(False)
+        for position, badge in enumerate(badges):
+            label = self._badge_labels.get(badge.resource)
+            if label is None:
+                label = QLabel(self._badges_row)
+                label.setObjectName(f"badge_{badge.resource}")
+                label.setAccessibleName(f"{badge.resource} badge")
+                self._badge_labels[badge.resource] = label
             foreground, background = _BADGE_COLORS.get(
                 badge.severity, _BADGE_COLORS[SEVERITY_WARNING]
             )
+            label.setText(badge.label)
+            label.setToolTip(f"{badge.resource} status: {badge.label}")
             label.setStyleSheet(
                 f"color: {foreground}; background: {background}; border-radius: 6px;"
                 " padding: 2px 8px;"
             )
-            self._badges_layout.addWidget(label)
-        self._badges_layout.addStretch(1)
+            self._badges_layout.insertWidget(position, label)
+            label.setVisible(True)
 
     def _render_mode(self, pane: PaneState) -> None:
         target = self._mirror if pane.visible_mode is Mode.MIRROR else self._virtual
