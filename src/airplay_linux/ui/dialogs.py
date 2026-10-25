@@ -26,7 +26,10 @@ that explains them instead of hiding behind another dialog.
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from typing import Final
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QCloseEvent, QHideEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -41,11 +44,18 @@ from PySide6.QtWidgets import (
 from airplay_linux.domain.operations import ChallengeView, SensitiveText
 from airplay_linux.domain.records import RecoveryItem
 from airplay_linux.domain.resources import Mode, Size
+from airplay_linux.ui.state import Action
 
 _MODE_LABELS: dict[Mode, str] = {
     Mode.MIRROR: "Mirror",
     Mode.VIRTUAL: "Virtual display",
 }
+
+#: The only choices a pairing prompt may render.  The projection decides whether
+#: each one is offered; the dialog never invents an extra command.
+_PAIRING_ACTIONS: Final[frozenset[Action]] = frozenset(
+    {Action.submit_pairing, Action.cancel, Action.retry}
+)
 
 
 class _DecisionDialog(QDialog):
@@ -112,13 +122,29 @@ class _DecisionDialog(QDialog):
 
 
 class PairingDialog(_DecisionDialog):
-    """Transient PIN or password entry for one receiver's pairing challenge."""
+    """Transient PIN or password entry for one receiver's pairing challenge.
+
+    The prompt renders exactly the pairing choices its projection offered.  A
+    pairing that has not retained an output may be retried blindly; one that
+    already owns an output may only submit the challenge or cancel (which
+    removes the output), so Retry is absent there.  Callers that hold the
+    projection may pass ``actions`` explicitly instead of relying on that
+    derivation.
+
+    Every way of leaving this prompt - accept, ``done``, reject, Escape, the
+    window close button, or a programmatic close/hide - wipes the line edit and
+    its undo history.  Only an explicit submit hands the secret to
+    :meth:`take_input`, exactly once.
+    """
+
+    retry_requested = Signal()
 
     def __init__(
         self,
         challenge: ChallengeView,
         receiver_label: str | None = None,
         retained_output: str | None = None,
+        actions: frozenset[Action] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         if not isinstance(challenge, ChallengeView):
@@ -126,6 +152,8 @@ class PairingDialog(_DecisionDialog):
         super().__init__("Pair with receiver", "pairingDialog", parent)
         self._challenge = challenge
         self._input: SensitiveText | None = None
+        self._actions = self._pairing_actions(actions, retained_output)
+        self._submit: QPushButton | None = None
         self._pin = challenge.credential_kind == "pin"
         noun = "PIN" if self._pin else "password"
 
@@ -157,13 +185,7 @@ class PairingDialog(_DecisionDialog):
         self._field.textChanged.connect(self._sync_submit)
         self._layout.addWidget(self._field)
 
-        self._submit = self._button_row(
-            confirm_text=f"Submit {noun}",
-            confirm_name="pairingSubmitButton",
-            confirm_slot=self.confirm_input,
-            cancel_text="Cancel",
-            cancel_name="pairingCancelButton",
-        )
+        self._build_actions(noun)
         self._sync_submit(self._field.text())
 
     # ------------------------------------------------------------------ public API
@@ -182,15 +204,119 @@ class PairingDialog(_DecisionDialog):
         self._clear_field()
         self.accept()
 
+    # ---------------------------------------------------- completion lifecycle
+
+    def accept(self) -> None:  # noqa: D102 - Qt override
+        # A direct accept completes the prompt without a submitted secret, so the
+        # typed text must not survive the close.
+        self._clear_field()
+        super().accept()
+
     def reject(self) -> None:  # noqa: D102 - Qt override
         self._input = None
         self._clear_field()
         super().reject()
 
+    def done(self, result: int) -> None:  # noqa: D102 - Qt override
+        # Inherited completion paths (``done(Accepted)``/``done(Rejected)``) bypass
+        # accept/reject entirely; clear there too so no exit retains the secret.
+        # Only an explicit submit may leave its one-shot value pending.
+        if int(result) != int(QDialog.DialogCode.Accepted):
+            self._input = None
+        self._clear_field()
+        super().done(result)
+
+    def close(self) -> bool:  # noqa: D102 - Qt override
+        # ``QWidget.close`` on a dialog that has never been shown does not deliver
+        # a close event, so clear before delegating rather than only in closeEvent.
+        # Closing also abandons any submit that was never taken.
+        self._input = None
+        self._clear_field()
+        return super().close()
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+        self._input = None
+        self._clear_field()
+        super().closeEvent(event)
+
+    def hideEvent(self, event: QHideEvent) -> None:  # noqa: N802 - Qt override
+        # A presenter may hide the prompt instead of closing it.  The one-shot
+        # handoff from an explicit submit survives, because accepting the dialog
+        # hides it before the presenter calls take_input.
+        self._clear_field()
+        super().hideEvent(event)
+
     # ---------------------------------------------------------------- internals
 
+    def _build_actions(self, noun: str) -> None:
+        """Render exactly the offered pairing choices, in reading order."""
+        row = QHBoxLayout()
+        row.addStretch(1)
+        first: QPushButton | None = None
+        if Action.submit_pairing in self._actions:
+            submit = QPushButton(f"Submit {noun}", self)
+            submit.setObjectName("pairingSubmitButton")
+            submit.setAccessibleName(f"Submit {noun}")
+            submit.setDefault(True)
+            submit.setAutoDefault(True)
+            submit.clicked.connect(self.confirm_input)
+            row.addWidget(submit)
+            self._submit = submit
+            first = submit
+        if Action.cancel in self._actions:
+            cancel = QPushButton("Cancel", self)
+            cancel.setObjectName("pairingCancelButton")
+            cancel.setAccessibleName("Cancel")
+            cancel.setDefault(False)
+            cancel.setAutoDefault(False)
+            cancel.clicked.connect(self.reject)
+            row.addWidget(cancel)
+            if first is None:
+                first = cancel
+        if Action.retry in self._actions:
+            retry = QPushButton("Retry", self)
+            retry.setObjectName("pairingRetryButton")
+            retry.setAccessibleName("Retry pairing")
+            retry.setToolTip("Retry pairing with a fresh PIN or password")
+            retry.setDefault(False)
+            retry.setAutoDefault(False)
+            retry.clicked.connect(self._retry)
+            row.addWidget(retry)
+            if first is None:
+                first = retry
+        self._layout.addLayout(row)
+        if first is not None:
+            first.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _retry(self) -> None:
+        """Abandon this attempt and ask the presenter for a fresh challenge."""
+        self.reject()
+        self.retry_requested.emit()
+
+    @staticmethod
+    def _pairing_actions(
+        actions: frozenset[Action] | None, retained_output: str | None
+    ) -> frozenset[Action]:
+        if actions is None:
+            # Mirrors the projection's pairing branch: a blind retry is not the
+            # design's action while an output is still owned.
+            if retained_output is None:
+                return frozenset(
+                    {Action.submit_pairing, Action.cancel, Action.retry}
+                )
+            return frozenset({Action.submit_pairing, Action.cancel})
+        resolved = frozenset(actions)
+        if not resolved:
+            raise ValueError("PairingDialog needs at least one action")
+        unknown = resolved - _PAIRING_ACTIONS
+        if unknown:
+            names = ", ".join(sorted(action.value for action in unknown))
+            raise ValueError(f"PairingDialog cannot offer {names}")
+        return resolved
+
     def _sync_submit(self, text: str) -> None:
-        self._submit.setEnabled(bool(text.strip()))
+        if self._submit is not None:
+            self._submit.setEnabled(bool(text.strip()))
 
     def _clear_field(self) -> None:
         # ``setReadOnly`` also drops the widget's undo/redo history, so Ctrl+Z in a
@@ -199,7 +325,8 @@ class PairingDialog(_DecisionDialog):
         self._field.setReadOnly(True)
         self._field.clear()
         self._field.blockSignals(False)
-        self._submit.setEnabled(False)
+        if self._submit is not None:
+            self._submit.setEnabled(False)
 
     @staticmethod
     def _expiry_text(challenge: ChallengeView) -> str:

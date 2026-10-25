@@ -17,9 +17,12 @@ from uuid import UUID
 import pytest
 
 from PySide6.QtCore import QModelIndex, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractButton,
+    QApplication,
     QComboBox,
+    QDialog,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -40,12 +43,14 @@ from airplay_linux.domain.records import (
 )
 from airplay_linux.domain.resources import (
     CapabilityReport,
+    DisplayState,
     Mode,
     SessionPhase,
     Size,
+    TransportState,
     TrustState,
 )
-from airplay_linux.testing.builders import physical, service, target
+from airplay_linux.testing.builders import physical, service, target, virtual_handle
 from airplay_linux.ui.state import (
     Action,
     Badge,
@@ -375,6 +380,71 @@ def test_dashboard_has_text_commands(qtbot) -> None:
     assert window.findChild(QPushButton, "stopButton").text() == "Stop"
 
 
+def test_window_constructs_and_updates_without_showing_or_touching_the_host(
+    qtbot, monkeypatch
+) -> None:
+    """Construction and rendering are inert: no window, process, socket or bus."""
+    import asyncio
+    import os
+    import socket
+    import subprocess
+
+    import dbus_next.aio
+    from PySide6.QtCore import QProcess
+
+    from airplay_linux.domain.records import RecoveryItem
+    from airplay_linux.ui.dialogs import (
+        ConfirmStopDialog,
+        OrphanDialog,
+        PairingDialog,
+        ResolutionDialog,
+    )
+    from airplay_linux.ui.window import MainWindow
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("UI crossed a show/process/network/bus boundary")
+
+    for target, names in (
+        (subprocess, ("Popen", "run", "call", "check_call", "check_output")),
+        (os, ("system", "posix_spawn", "posix_spawnp")),
+        (asyncio, ("create_subprocess_exec", "create_subprocess_shell")),
+        (QProcess, ("start", "startDetached")),
+        (socket, ("create_connection",)),
+        (socket.socket, ("connect", "connect_ex")),
+        (dbus_next.aio.MessageBus, ("connect",)),
+        (QWidget, ("show",)),
+    ):
+        for name in names:
+            if hasattr(target, name):
+                monkeypatch.setattr(target, name, forbidden)
+
+    inputs = view_inputs()
+    snapshot = idle_snapshot()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    assert not window.isVisible()
+
+    window.render_receivers((project_row(snapshot, inputs),))
+    window.render_selected(project(snapshot, inputs))
+    window.set_sources(inputs.physical_sources)
+    window.set_resolutions(inputs.resolution_choices)
+    window.set_summary(1, 0, "Headless construction")
+    window.set_activity(())
+    assert not window.isVisible()
+
+    item = RecoveryItem(
+        kind="orphan", record=ownership(), handle=None, diagnostic=None
+    )
+    for dialogue in (
+        PairingDialog(challenge("pin")),
+        ConfirmStopDialog(Mode.VIRTUAL),
+        ResolutionDialog((HD, SMALL)),
+        OrphanDialog(item),
+    ):
+        qtbot.addWidget(dialogue)
+        assert not dialogue.isVisible()
+
+
 def test_receiver_table_and_selected_pane_coexist(qtbot) -> None:
     from PySide6.QtWidgets import QPushButton, QSplitter, QTableView, QWidget
 
@@ -451,6 +521,25 @@ def test_window_renders_an_actual_projection_verbatim(qtbot) -> None:
     }
     for badge in pane_state.badges:
         assert rendered[f"{badge.resource} badge"] == badge.label
+
+
+def test_phase_label_renders_the_projection_even_when_it_is_not_available(qtbot) -> None:
+    """The phase is an opaque projected label, never a widget-side constant."""
+    from PySide6.QtWidgets import QLabel
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    for label in (
+        "Mirroring",
+        "Cleanup required",
+        "Receiver supplied a phase I cannot infer",
+    ):
+        window.render_selected(
+            pane(phase_label=label, actions=frozenset({Action.stop}))
+        )
+        assert window.findChild(QLabel, "phaseLabel").text() == label
 
 
 def test_only_the_visible_modes_editor_is_shown(qtbot) -> None:
@@ -720,6 +809,38 @@ def test_every_projected_action_has_exactly_one_enabled_control(
 
     control.click()
     assert requested == [action.value]
+
+
+def test_every_disabled_command_refuses_click_and_keyboard_activation(qtbot) -> None:
+    """A disabled control must never reach the presenter, however it is activated."""
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    actions: list[str] = []
+    modes: list[str] = []
+    mute: list[bool] = []
+    window.action_requested.connect(actions.append)
+    window.mode_requested.connect(modes.append)
+    window.mute_requested.connect(mute.append)
+
+    window.render_selected(
+        pane(actions=frozenset(), mode_enabled=False, mute_enabled=False)
+    )
+    for _, object_name in ACTION_CONTROLS:
+        control = window.findChild(QAbstractButton, object_name)
+        assert control is not None and not control.isEnabled(), object_name
+        control.click()
+        QTest.keyClick(control, Qt.Key.Key_Space)
+    for object_name in ("modeMirror", "modeVirtual", "muteToggle"):
+        control = window.findChild(QAbstractButton, object_name)
+        assert control is not None and not control.isEnabled(), object_name
+        control.click()
+        QTest.keyClick(control, Qt.Key.Key_Space)
+
+    assert actions == []
+    assert modes == []
+    assert mute == []
 
 
 def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
@@ -1179,6 +1300,180 @@ def test_pairing_prompt_shows_identity_retained_output_and_expiry(qtbot) -> None
     notice = " ".join(label.text() for label in retained.findChildren(QLabel))
     assert "Virtual-v1" in notice
     assert "removed" in notice.lower()
+
+
+def pairing_inventory(dialogue) -> set[Action]:
+    """Map a pairing prompt's real buttons back to the actions they represent."""
+    offered: set[Action] = set()
+    for button in dialogue.findChildren(QPushButton):
+        if button.objectName() == "pairingSubmitButton":
+            offered.add(Action.submit_pairing)
+        elif button.objectName() == "pairingCancelButton":
+            offered.add(Action.cancel)
+        elif button.text().strip() == "Retry":
+            offered.add(Action.retry)
+        else:
+            pytest.fail(f"unprojected pairing control {button.objectName()}")
+    return offered
+
+
+def test_pairing_modal_offers_exactly_the_projection_actions(qtbot) -> None:
+    """Both real pairing projections expose their choices inside the prompt."""
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    plain_inputs = view_inputs()
+    plain = idle_snapshot(
+        phase=SessionPhase.Pairing,
+        trust=TrustState.Pairing,
+        transport=TransportState.Pairing,
+        challenge=challenge("pin"),
+    )
+    retained_inputs = view_inputs(selected_mode=Mode.VIRTUAL, ownership=ownership())
+    retained = idle_snapshot(
+        phase=SessionPhase.Pairing,
+        trust=TrustState.Pairing,
+        transport=TransportState.Idle,
+        mode=Mode.VIRTUAL,
+        intent_active=True,
+        display=DisplayState.Owned,
+        display_handle=virtual_handle(),
+        ownership_uuid=OwnerId(UUID(int=1)),
+        observed_resolution=HD,
+        challenge=challenge("pin"),
+    )
+
+    plain_pane = project(plain, plain_inputs)
+    retained_pane = project(retained, retained_inputs)
+    assert plain_pane.actions == frozenset(
+        {Action.submit_pairing, Action.cancel, Action.retry}
+    )
+    assert retained_pane.actions == frozenset(
+        {Action.submit_pairing, Action.cancel}
+    )
+
+    cases = (
+        (plain_pane, PairingDialog(plain_pane.challenge)),
+        (
+            retained_pane,
+            PairingDialog(retained_pane.challenge, retained_output="Virtual-v1"),
+        ),
+    )
+    for pane_state, dialogue in cases:
+        qtbot.addWidget(dialogue)
+        assert dialogue.isModal()
+        offered = pairing_inventory(dialogue)
+        assert offered == pane_state.actions
+        assert len(dialogue.findChildren(QPushButton)) == len(pane_state.actions)
+
+
+def test_pairing_retry_abandons_the_secret_and_asks_for_a_new_challenge(qtbot) -> None:
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("password"))
+    qtbot.addWidget(dialogue)
+    retry = dialogue.findChild(QPushButton, "pairingRetryButton")
+    assert retry is not None and retry.text() == "Retry"
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("retry-sentinel-8821")
+    requested: list[bool] = []
+    dialogue.retry_requested.connect(lambda: requested.append(True))
+
+    retry.click()
+
+    assert requested == [True]
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    assert dialogue.take_input() is None
+
+
+PAIRING_COMPLETION_EXITS: tuple[tuple[bool, str], ...] = (
+    (False, "accept"),
+    (False, "reject"),
+    (False, "close"),
+    (False, "done_accepted"),
+    (False, "done_rejected"),
+    (True, "accept"),
+    (True, "reject"),
+    (True, "close"),
+    (True, "done_accepted"),
+    (True, "done_rejected"),
+    (True, "cancel_button"),
+    (True, "escape"),
+    (True, "hide"),
+)
+
+
+@pytest.mark.parametrize(("shown", "exit_path"), PAIRING_COMPLETION_EXITS)
+def test_pairing_completion_always_wipes_the_secret_and_its_undo(
+    qtbot, shown: bool, exit_path: str
+) -> None:
+    """Every exit - including inherited done/accept and programmatic close."""
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    if shown:
+        dialogue.show()
+        QApplication.processEvents()
+    field = dialogue.findChild(QLineEdit, "secretField")
+    secret = f"completion-sentinel-{exit_path}-739102"
+    field.insert(secret)
+    assert field.text() == secret
+
+    if exit_path == "accept":
+        dialogue.accept()
+    elif exit_path == "reject":
+        dialogue.reject()
+    elif exit_path == "close":
+        dialogue.close()
+    elif exit_path == "hide":
+        dialogue.hide()
+    elif exit_path == "cancel_button":
+        dialogue.findChild(QPushButton, "pairingCancelButton").click()
+    elif exit_path == "escape":
+        QTest.keyClick(dialogue, Qt.Key.Key_Escape)
+    else:
+        result = (
+            QDialog.DialogCode.Accepted
+            if exit_path == "done_accepted"
+            else QDialog.DialogCode.Rejected
+        )
+        dialogue.done(result)
+    QApplication.processEvents()
+
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    field.undo()
+    field.undo()
+    assert field.text() == ""
+    assert dialogue.take_input() is None
+    assert secret not in repr(vars(dialogue))
+    if shown:
+        assert not dialogue.isVisible()
+
+
+@pytest.mark.parametrize("exit_path", ("reject", "close", "done_rejected"))
+def test_a_late_cancellation_after_submit_drops_the_pending_secret(
+    qtbot, exit_path: str
+) -> None:
+    """A submitted value still needs an immediate take; a later cancel drops it."""
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("pending-submit-sentinel-5514")
+    dialogue.confirm_input()
+    assert field.text() == ""
+
+    if exit_path == "reject":
+        dialogue.reject()
+    elif exit_path == "close":
+        dialogue.close()
+    else:
+        dialogue.done(QDialog.DialogCode.Rejected)
+
+    assert dialogue.take_input() is None
 
 
 def test_confirm_stop_dialog_requires_an_explicit_choice(qtbot) -> None:
