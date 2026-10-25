@@ -443,7 +443,7 @@ def test_window_renders_an_actual_projection_verbatim(qtbot) -> None:
     if pane_state.notice is not None:
         assert window.findChild(QLabel, "noticeLabel").text() == pane_state.notice
 
-    badges_row = window.findChild(QWidget, "badgesRow")
+    badges_row = window.findChild(QWidget, "resourceBadges")
     assert badges_row is not None
     rendered = {
         label.accessibleName(): label.text()
@@ -774,7 +774,7 @@ def test_badges_are_replaced_in_place_on_every_render(qtbot) -> None:
             )
         )
     )
-    strip = window.findChild(QWidget, "badgesRow")
+    strip = window.findChild(QWidget, "resourceBadges")
     visible = [label for label in strip.findChildren(QLabel) if label.isVisibleTo(window)]
     assert [label.text() for label in visible] == ["Streaming", "Output owned"]
     assert [label.accessibleName() for label in visible] == [
@@ -1013,6 +1013,35 @@ def test_sources_and_resolutions_are_populated_without_emitting_requests(qtbot) 
     resolution.setCurrentIndex(1)
     assert sources == ["HDMI-A-1"]
     assert sizes == [(1280, 720)]
+
+
+def test_presenter_selection_of_choices_is_silent(qtbot) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    source = window.findChild(QComboBox, "sourceCombo")
+    resolution = window.findChild(QComboBox, "resolutionCombo")
+    emitted: list[object] = []
+    window.source_selected.connect(emitted.append)
+    window.resolution_selected.connect(lambda w, h: emitted.append((w, h)))
+    window.set_sources((physical("DP-1"), physical("HDMI-A-1")))
+    window.set_resolutions((HD, SMALL))
+
+    window.select_source("HDMI-A-1")
+    window.select_resolution(SMALL)
+    assert source.currentIndex() == 1
+    assert resolution.currentData() == SMALL
+    assert emitted == []
+
+    # An unknown choice is ignored instead of inventing an entry.
+    window.select_source("DP-9")
+    window.select_resolution(Size(width=640, height=480))
+    assert source.currentIndex() == 1
+    assert resolution.currentData() == SMALL
+    assert emitted == []
 
 
 def test_choice_controls_explain_themselves(qtbot) -> None:

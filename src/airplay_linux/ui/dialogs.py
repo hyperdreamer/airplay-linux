@@ -15,6 +15,13 @@ input methods do not keep a prediction history of it.
 The safe answer is the default one everywhere it matters: ``Keep`` keeps the
 session, ``Keep`` keeps the orphan output, and the resolution prompt commits
 nothing until the user explicitly confirms it.
+
+Only decisions that need a *typed input* or a *destructive confirmation* are
+modal.  The design's state matrix presents the audio decision (``Retry audio`` /
+``Start video only`` / ``Cancel``) and the cleanup recovery (``Retry cleanup`` /
+``Keep for manual cleanup`` / ``Stop``) as explicit labelled choices inside the
+selected pane, so those live in :mod:`airplay_linux.ui.window` next to the notice
+that explains them instead of hiding behind another dialog.
 """
 
 from __future__ import annotations

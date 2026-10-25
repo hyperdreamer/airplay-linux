@@ -17,9 +17,21 @@ Three presentation rules are load-bearing for the design:
 * the destructive-free defaults stay safe: a fresh window offers nothing but
   ``Scan``, and closing is deferred to the presenter until cleanup confirmed.
 
-The presenter owns which receiver is selected and when the window really closes;
-:meth:`MainWindow.select_receiver` is silent and :meth:`MainWindow.allow_close`
-is the only way to let ``closeEvent`` through.
+Presenter contract
+-------------------
+Rendering (GUI thread only): :meth:`MainWindow.render_receivers`,
+:meth:`MainWindow.render_selected`, :meth:`MainWindow.set_activity`,
+:meth:`MainWindow.set_summary`, :meth:`MainWindow.set_sources`,
+:meth:`MainWindow.set_resolutions`.
+
+Silent selection restore (never a user request): :meth:`MainWindow.select_receiver`,
+:meth:`MainWindow.select_source`, :meth:`MainWindow.select_resolution`.
+
+User intent leaves through the signals ``receiver_selected``, ``action_requested``,
+``mode_requested``, ``source_selected``, ``resolution_selected``,
+``mute_requested`` and ``closing_requested``.  The presenter owns which receiver
+is selected and when the window really closes; :meth:`MainWindow.allow_close` is
+the only way to let ``closeEvent`` through.
 """
 
 from __future__ import annotations
@@ -241,7 +253,10 @@ class MainWindow(QMainWindow):
         self._settings = QPushButton("Settings", toolbar)
         self._settings.setObjectName("settingsButton")
         self._settings.setAccessibleName("Settings")
-        self._settings.setToolTip("Open settings for this application")
+        self._settings.setToolTip(
+            "Application settings are not available yet; this window only exposes "
+            "the operations dashboard"
+        )
         self._settings.setEnabled(False)  # settings land with the presenter
         toolbar.addWidget(self._settings)
 
@@ -302,7 +317,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(title_row)
 
         self._badges_row = QWidget(pane)
-        self._badges_row.setObjectName("badgesRow")
+        self._badges_row.setObjectName("resourceBadges")
         self._badges_layout = QHBoxLayout(self._badges_row)
         self._badges_layout.setContentsMargins(0, 0, 0, 0)
         self._badges_layout.setSpacing(4)
@@ -528,6 +543,26 @@ class MainWindow(QMainWindow):
             for size in choices:
                 self._resolution.addItem(f"{size.width}x{size.height}", size)
         self._resolution.setPlaceholderText("No reliable size reported")
+
+    def select_source(self, connector: str) -> None:
+        """Show the presenter's chosen physical monitor without reporting it back."""
+        if not isinstance(connector, str):
+            raise TypeError("connector must be text")
+        with QSignalBlocker(self._source):
+            for index in range(self._source.count()):
+                if self._source.itemData(index) == connector:
+                    self._source.setCurrentIndex(index)
+                    return
+
+    def select_resolution(self, size: Size) -> None:
+        """Show the presenter's chosen output size without reporting it back."""
+        if not isinstance(size, Size):
+            raise TypeError("size must be a Size")
+        with QSignalBlocker(self._resolution):
+            for index in range(self._resolution.count()):
+                if self._resolution.itemData(index) == size:
+                    self._resolution.setCurrentIndex(index)
+                    return
 
     def select_receiver(self, receiver_id: ReceiverId) -> None:
         """Highlight the presenter's selected receiver without reporting it back."""
