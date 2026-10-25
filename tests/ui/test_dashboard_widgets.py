@@ -989,3 +989,260 @@ def test_choice_controls_explain_themselves(qtbot) -> None:
         assert combo is not None
         assert combo.accessibleName()
         assert combo.toolTip()
+# --------------------------------------------------------------------------- dialogs
+
+
+def test_pairing_prompt_masks_a_pin_and_returns_it_transiently(qtbot, caplog) -> None:
+    import logging
+
+    from PySide6.QtWidgets import QLineEdit
+
+    from airplay_linux.domain.operations import SensitiveText
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    submit = dialogue.findChild(QPushButton, "pairingSubmitButton")
+    assert field is not None and submit is not None
+    assert dialogue.isModal()
+    assert field.echoMode() == QLineEdit.EchoMode.Password
+    assert field.inputMethodHints() & Qt.InputMethodHint.ImhSensitiveData
+    assert "PIN" in field.placeholderText() or "PIN" in field.accessibleName()
+
+    with caplog.at_level(logging.DEBUG):
+        qtbot.keyClicks(field, "482913")
+        submit.click()
+
+    taken = dialogue.take_input()
+    assert isinstance(taken, SensitiveText)
+    assert taken.reveal_for_backend() == "482913"
+    # The widget keeps no copy once the value has been handed over.
+    assert field.text() == ""
+    assert dialogue.take_input() is None
+    # Nothing about the secret is echoed, titled, labelled, or logged.
+    assert "482913" not in caplog.text
+    assert "482913" not in dialogue.windowTitle()
+    for label in dialogue.findChildren(QLabel):
+        assert "482913" not in label.text()
+    assert "482913" not in repr(taken)
+
+
+def test_pairing_prompt_accepts_an_unrestricted_password(qtbot) -> None:
+    from PySide6.QtWidgets import QLineEdit
+
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("password"))
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    assert field.echoMode() == QLineEdit.EchoMode.Password
+    assert field.maxLength() == 32767  # default: no arbitrary password cap
+    # A password must not be typed through a numeric-only keypad.
+    assert not field.inputMethodHints() & Qt.InputMethodHint.ImhDigitsOnly
+    assert dialogue.windowTitle().lower().startswith("pair")
+
+    secret = "correct horse battery staple!"
+    field.setText(secret)
+    dialogue.confirm_input()
+
+    taken = dialogue.take_input()
+    assert taken is not None
+    assert taken.reveal_for_backend() == secret
+    assert field.text() == ""
+
+
+def test_cancelled_pairing_prompt_clears_the_field_and_returns_nothing(qtbot) -> None:
+    from PySide6.QtWidgets import QLineEdit
+
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.setText("111111")
+
+    dialogue.reject()
+
+    assert dialogue.take_input() is None
+    assert field.text() == ""
+
+
+def test_pairing_prompt_forgets_the_secret_from_its_undo_history(qtbot) -> None:
+    """A closed prompt must not replay the typed secret through Ctrl+Z."""
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.setText("482913")
+    dialogue.reject()
+
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    field.undo()
+    field.undo()
+    assert field.text() == ""
+
+
+def test_pairing_prompt_does_not_submit_an_empty_secret(qtbot) -> None:
+    from PySide6.QtWidgets import QLineEdit
+
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"))
+    qtbot.addWidget(dialogue)
+    dialogue.findChild(QLineEdit, "secretField").setText("   ")
+    dialogue.confirm_input()
+
+    assert dialogue.take_input() is None
+
+
+def test_pairing_prompt_shows_identity_retained_output_and_expiry(qtbot) -> None:
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("pin"), receiver_label="Living Room")
+    qtbot.addWidget(dialogue)
+    texts = " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    assert "Living Room" in texts
+    assert "120" in texts  # the pairing expiry, in seconds of the design budget
+
+    retained = PairingDialog(challenge("pin"), retained_output="Virtual-v1")
+    qtbot.addWidget(retained)
+    notice = " ".join(label.text() for label in retained.findChildren(QLabel))
+    assert "Virtual-v1" in notice
+    assert "removed" in notice.lower()
+
+
+def test_confirm_stop_dialog_requires_an_explicit_choice(qtbot) -> None:
+    from airplay_linux.ui.dialogs import ConfirmStopDialog
+
+    dialogue = ConfirmStopDialog(Mode.VIRTUAL)
+    qtbot.addWidget(dialogue)
+    assert dialogue.confirmed() is False
+    assert "Stop" in dialogue.windowTitle()
+    texts = " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    assert "Virtual display" in texts
+    assert "cleanup" in texts.lower() or "remove" in texts.lower()
+
+    confirm = dialogue.findChild(QPushButton, "confirmStopButton")
+    keep = dialogue.findChild(QPushButton, "keepSessionButton")
+    assert confirm.text() and keep.text()
+    confirm.click()
+    assert dialogue.confirmed() is True
+
+
+def test_confirm_stop_dialog_default_answer_keeps_the_session(qtbot) -> None:
+    from airplay_linux.ui.dialogs import ConfirmStopDialog
+
+    dialogue = ConfirmStopDialog(Mode.MIRROR)
+    qtbot.addWidget(dialogue)
+    dialogue.reject()
+    assert dialogue.confirmed() is False
+
+
+def test_resolution_prompt_never_guesses(qtbot) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.dialogs import ResolutionDialog
+
+    dialogue = ResolutionDialog((HD, SMALL))
+    qtbot.addWidget(dialogue)
+    combo = dialogue.findChild(QComboBox, "resolutionChoice")
+    assert combo.count() == 2
+    assert combo.itemText(0) == "1920x1080"
+    assert combo.itemText(1) == "1280x720"
+    # No preselected guess about the receiver's resolution.
+    assert dialogue.decision() is None
+
+    texts = " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    assert "layout" in texts.lower()
+
+    confirm = dialogue.findChild(QPushButton, "confirmResolutionButton")
+    confirm.click()
+    assert dialogue.decision() == HD
+
+
+def test_resolution_prompt_cancel_returns_no_decision(qtbot) -> None:
+    from PySide6.QtWidgets import QComboBox
+
+    from airplay_linux.ui.dialogs import ResolutionDialog
+
+    dialogue = ResolutionDialog((HD,))
+    qtbot.addWidget(dialogue)
+    dialogue.findChild(QComboBox, "resolutionChoice").setCurrentIndex(0)
+    dialogue.reject()
+    assert dialogue.decision() is None
+
+
+def test_orphan_prompt_shows_evidence_and_requires_confirmation(qtbot) -> None:
+    from airplay_linux.ui.dialogs import OrphanDialog
+
+    record = ownership(stage="published")
+    item = RecoveryItem(kind="orphan", record=record, handle=None, diagnostic=None)
+    dialogue = OrphanDialog(item)
+    qtbot.addWidget(dialogue)
+
+    assert dialogue.confirmed() is False
+    texts = " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    assert "Virtual-v1" in texts
+    assert "v1" in texts
+    assert str(record.owner_uuid) in texts
+    assert "not confirmed" in texts.lower() or "unconfirmed" in texts.lower()
+
+    confirm = dialogue.findChild(QPushButton, "confirmOrphanButton")
+    keep = dialogue.findChild(QPushButton, "keepOrphanButton")
+    assert "Keep" in keep.text()
+    assert "Remove" in confirm.text()
+    dialogue.reject()
+    assert dialogue.confirmed() is False
+
+    kept = OrphanDialog(item)
+    qtbot.addWidget(kept)
+    kept.findChild(QPushButton, "confirmOrphanButton").click()
+    assert kept.confirmed() is True
+
+
+def test_orphan_prompt_reports_a_missing_helper_instead_of_implying_one(qtbot) -> None:
+    from airplay_linux.ui.dialogs import OrphanDialog
+
+    item = RecoveryItem(
+        kind="orphan", record=ownership(helper=None), handle=None, diagnostic=None
+    )
+    dialogue = OrphanDialog(item)
+    qtbot.addWidget(dialogue)
+    texts = " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    assert "helper" in texts.lower()
+
+
+def test_every_dialog_button_is_text_and_every_icon_control_has_a_tooltip(qtbot) -> None:
+    from airplay_linux.domain.records import RecoveryItem
+    from airplay_linux.ui.dialogs import (
+        ConfirmStopDialog,
+        OrphanDialog,
+        PairingDialog,
+        ResolutionDialog,
+    )
+
+    dialogues = (
+        PairingDialog(challenge("pin")),
+        ConfirmStopDialog(Mode.MIRROR),
+        ResolutionDialog((HD,)),
+        OrphanDialog(
+            RecoveryItem(
+                kind="orphan",
+                record=ownership(helper=None),
+                handle=None,
+                diagnostic=None,
+            )
+        ),
+    )
+    for dialogue in dialogues:
+        qtbot.addWidget(dialogue)
+        for button in dialogue.findChildren(QAbstractButton):
+            if button.objectName() == "iconButton":
+                assert button.toolTip()
+            else:
+                assert button.text().strip(), button.objectName()
+        for field in dialogue.findChildren(QLineEdit):
+            assert field.accessibleName()
