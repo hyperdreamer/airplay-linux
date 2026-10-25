@@ -1663,6 +1663,153 @@ def test_a_late_cancellation_after_submit_drops_the_pending_secret(
     assert dialogue.take_input() is None
 
 
+RETIRED_PROMPT_CLEANUPS: tuple[str, ...] = (
+    "finished_delete_later",
+    "delete_on_close",
+    "delete",
+    "delete_later",
+)
+
+
+@pytest.mark.parametrize("cleanup", RETIRED_PROMPT_CLEANUPS)
+def test_retiring_a_replaced_prompt_keeps_the_current_prompt_dismissable(
+    qtbot, cleanup: str
+) -> None:
+    """Ordinary Qt disposal of an old prompt must not untrack the new one.
+
+    ``track_prompt`` replaces (and wipes) the previous prompt when a new one is
+    adopted, but it only *closes* the old prompt: Qt may delete its C++ object
+    much later.  That stale teardown must not forget the prompt tracked now, or
+    the next dashboard command would emit while the current secret and its undo
+    history are still alive in an open prompt.
+    """
+    import shiboken6
+
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    window.show()
+    QApplication.processEvents()
+    events = WindowModalityRecorder(window)
+
+    retired = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    # This prompt is disposed of by the test itself (naturally by Qt cleanup and,
+    # for the destruction variants, explicitly), so it is deliberately not
+    # registered with qtbot: closing a deleted wrapper at teardown is not the
+    # behaviour under test.
+    if cleanup == "finished_delete_later":
+        retired.finished.connect(retired.deleteLater)
+    elif cleanup == "delete_on_close":
+        retired.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    retired.open()
+    QApplication.processEvents()
+    retired_field = retired.findChild(QLineEdit, "secretField")
+    retired_field.insert("retired-prompt-sentinel-6203")
+
+    # Adopting the second prompt retires the first one: it is wiped and closed,
+    # and the window now tracks only the replacement.
+    current = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(current)
+    assert window._tracked_prompt is current
+    assert retired_field.text() == ""
+    assert not retired_field.isUndoAvailable()
+
+    current.open()
+    QApplication.processEvents()
+    current_field = current.findChild(QLineEdit, "secretField")
+    current_field.insert("current-prompt-sentinel-9417")
+
+    # Deliver whatever ordinary Qt cleanup the old prompt still had pending.
+    if cleanup == "delete":
+        shiboken6.delete(retired)
+    else:
+        if cleanup == "delete_later":
+            retired.deleteLater()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    QApplication.processEvents()
+
+    assert not shiboken6.isValid(retired)
+    # The retirement of the old prompt is not evidence about the current one.
+    assert window._tracked_prompt is current
+    assert current.isVisible()
+    assert current_field.text() == "current-prompt-sentinel-9417"
+
+    observed: list[tuple[str, str, bool, bool, object]] = []
+    window.action_requested.connect(
+        lambda action: observed.append(
+            (
+                action,
+                current_field.text(),
+                current_field.isUndoAvailable(),
+                current.isVisible(),
+                current.take_input(),
+            )
+        )
+    )
+    QTest.mouseClick(
+        window.findChild(QPushButton, "retryButton"), Qt.MouseButton.LeftButton
+    )
+    QApplication.processEvents()
+
+    # Wiped, closed and untaken *before* the command reaches the presenter.
+    assert observed == [("retry", "", False, False, None)]
+    assert not current.isVisible()
+    assert events.blocked == 0
+
+
+@pytest.mark.parametrize(
+    "retirement", ("close_then_delete", "delete_on_close", "delete_while_open")
+)
+def test_the_tracked_prompt_still_clears_its_own_tracking(
+    qtbot, retirement: str
+) -> None:
+    """The identity fence must not stop a prompt from retiring itself."""
+    import shiboken6
+
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    window.show()
+    QApplication.processEvents()
+
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(dialogue)
+    if retirement == "delete_on_close":
+        dialogue.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    dialogue.open()
+    QApplication.processEvents()
+    assert window._tracked_prompt is dialogue
+
+    if retirement == "close_then_delete":
+        dialogue.reject()
+        QApplication.processEvents()
+        assert not dialogue.isVisible()
+        shiboken6.delete(dialogue)
+    elif retirement == "delete_on_close":
+        dialogue.reject()
+        QApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        QApplication.processEvents()
+        assert not shiboken6.isValid(dialogue)
+    else:
+        shiboken6.delete(dialogue)
+    QApplication.processEvents()
+
+    assert window._tracked_prompt is None
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+    window.findChild(QPushButton, "retryButton").click()
+    assert requested == ["retry"]
+    assert window._tracked_prompt is None
+
+
 def test_confirm_stop_dialog_requires_an_explicit_choice(qtbot) -> None:
     from airplay_linux.ui.dialogs import ConfirmStopDialog
 

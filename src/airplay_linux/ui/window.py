@@ -30,7 +30,9 @@ Silent selection restore (never a user request): :meth:`MainWindow.select_receiv
 Prompt ownership (a transient prompt a dashboard command must dismiss first):
 :meth:`MainWindow.track_prompt`.  A torn-down window and every command it emits
 end a tracked prompt, so a pairing secret never outlives the command that
-superseded the attempt.
+superseded the attempt.  Ownership is per adoption: replacing a prompt retires
+only that adoption, and the replaced prompt's own (possibly much later)
+destruction never retires the prompt that superseded it.
 
 User intent leaves through the signals ``receiver_selected``, ``action_requested``,
 ``mode_requested``, ``source_selected``, ``resolution_selected``,
@@ -202,6 +204,7 @@ class MainWindow(QMainWindow):
         self._closing_emitted = False
         self._close_allowed = False
         self._tracked_prompt: QDialog | None = None
+        self._prompt_registration: object | None = None
         self._buttons: dict[Action, QPushButton] = {}
 
         central = QWidget(self)
@@ -609,14 +612,38 @@ class MainWindow(QMainWindow):
         # One prompt at a time: a dashboard prompt replaces (and wipes) any
         # previous one before taking over the dismissal hook.
         self._dismiss_tracked_prompt()
+        # Each adoption gets its own registration ticket, and retirement is
+        # fenced on that ticket being the current one - the same identity check
+        # as comparing the prompt itself.  A replaced prompt is only *closed*
+        # here, so Qt may delete its C++ object much later (ordinary
+        # ``deleteLater``/``WA_DeleteOnClose`` cleanup); that stale teardown must
+        # not forget the newer prompt the next command still has to dismiss.  The
+        # ticket is captured instead of the prompt so a prompt's own signal
+        # connection cannot keep the prompt object alive after it is abandoned.
+        registration = object()
+        self._prompt_registration = registration
         self._tracked_prompt = prompt
-        prompt.destroyed.connect(self._forget_prompt)
+        prompt.destroyed.connect(
+            lambda *_args, registration=registration: self._forget_prompt(
+                registration
+            )
+        )
 
-    def _forget_prompt(self, *_args: object) -> None:
+    def _forget_prompt(self, registration: object) -> None:
+        """Retire the tracked prompt only if ``registration`` still owns it.
+
+        Teardown of a superseded prompt is not evidence that the prompt tracked
+        *now* is gone: the tracked prompt is the only one whose lifetime this
+        window's wipe-before-command guarantee depends on.
+        """
+        if registration is not self._prompt_registration:
+            return
+        self._prompt_registration = None
         self._tracked_prompt = None
 
     def _dismiss_tracked_prompt(self) -> None:
         prompt, self._tracked_prompt = self._tracked_prompt, None
+        self._prompt_registration = None
         if prompt is not None:
             prompt.close()
 
