@@ -602,8 +602,8 @@ class MainWindow(QMainWindow):
         survive the command that supersedes the attempt.  Any command signal
         from this window therefore closes a tracked prompt - which wipes the
         secret - before it is emitted.  This window never shows the prompt and
-        keeps only a non-owning reference; a prompt that closes or is destroyed
-        on its own is simply forgotten.
+        keeps only a non-owning reference; a prompt that completes, closes or is
+        destroyed on its own is simply forgotten.
         """
         if not isinstance(prompt, QDialog):
             raise TypeError("track_prompt requires a QDialog")
@@ -616,13 +616,18 @@ class MainWindow(QMainWindow):
         # fenced on that ticket being the current one - the same identity check
         # as comparing the prompt itself.  A replaced prompt is only *closed*
         # here, so Qt may delete its C++ object much later (ordinary
-        # ``deleteLater``/``WA_DeleteOnClose`` cleanup); that stale teardown must
-        # not forget the newer prompt the next command still has to dismiss.  The
-        # ticket is captured instead of the prompt so a prompt's own signal
+        # ``finished``/``deleteLater``/``WA_DeleteOnClose`` cleanup); that stale
+        # teardown must not forget the newer prompt the next command still has to
+        # dismiss.  The ticket is captured instead of the prompt so a prompt's
         # connection cannot keep the prompt object alive after it is abandoned.
         registration = object()
         self._prompt_registration = registration
         self._tracked_prompt = prompt
+        prompt.finished.connect(
+            lambda *_args, registration=registration: self._forget_prompt(
+                registration
+            )
+        )
         prompt.destroyed.connect(
             lambda *_args, registration=registration: self._forget_prompt(
                 registration

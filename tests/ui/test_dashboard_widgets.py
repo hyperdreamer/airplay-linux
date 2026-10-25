@@ -12,6 +12,8 @@ No test needs a visible desktop: ``QT_QPA_PLATFORM=offscreen`` is enough.
 
 from __future__ import annotations
 
+import gc
+import weakref
 from uuid import UUID
 
 import pytest
@@ -1661,6 +1663,132 @@ def test_a_late_cancellation_after_submit_drops_the_pending_secret(
         dialogue.done(QDialog.DialogCode.Rejected)
 
     assert dialogue.take_input() is None
+
+
+@pytest.mark.parametrize(
+    "exit_path",
+    (
+        "close",
+        "reject",
+        "accept",
+        "done_accepted",
+        "done_rejected",
+        "cancel_button",
+        "retry_button",
+        "escape",
+    ),
+)
+def test_normal_completion_retires_dashboard_prompt_tracking(
+    qtbot, exit_path: str
+) -> None:
+    """Completion retires the current adoption without requiring destruction."""
+    import shiboken6
+
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    state = pairing_projection()
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(state)
+    window.show()
+    QApplication.processEvents()
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    qtbot.addWidget(dialogue)
+    dialogue.open()
+    QApplication.processEvents()
+    assert window._tracked_prompt is dialogue
+    assert not dialogue.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("normal-completion-tracking-sentinel-5514")
+    finished: list[int] = []
+    dialogue.finished.connect(finished.append)
+    if exit_path.startswith("done_"):
+        result = (
+            QDialog.DialogCode.Accepted
+            if exit_path == "done_accepted"
+            else QDialog.DialogCode.Rejected
+        )
+        dialogue.done(result)
+    elif exit_path.endswith("_button"):
+        button_name = (
+            "pairingCancelButton" if exit_path == "cancel_button" else "pairingRetryButton"
+        )
+        dialogue.findChild(QPushButton, button_name).click()
+    elif exit_path == "escape":
+        QTest.keyClick(dialogue, Qt.Key.Key_Escape)
+    else:
+        getattr(dialogue, exit_path)()
+    QApplication.processEvents()
+
+    assert shiboken6.isValid(dialogue)
+    assert finished
+    assert not dialogue.isVisible()
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    assert not field.isRedoAvailable()
+    assert dialogue.take_input() is None
+    assert window._tracked_prompt is None
+    assert window._prompt_registration is None
+
+
+def test_completed_prompt_is_reclaimed_when_caller_drops_last_reference(qtbot) -> None:
+    """A completed top-level prompt is not retained by its dashboard."""
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    state = pairing_projection()
+    window.render_selected(state)
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    assert dialogue.parentWidget() is None
+    dialogue.open()
+    QApplication.processEvents()
+    dialogue.findChild(QLineEdit, "secretField").insert(
+        "normal-completion-reclaim-sentinel-5514"
+    )
+    dialogue.close()
+    assert not dialogue.isVisible()
+    reference = weakref.ref(dialogue)
+    del dialogue
+    gc.collect()
+    QApplication.processEvents()
+    gc.collect()
+
+    assert reference() is None
+
+
+def test_abandoned_completed_submission_drops_untaken_handoff(qtbot) -> None:
+    """Cleared dashboard tracking lets an abandoned submitted secret be reclaimed."""
+    from airplay_linux.ui.dialogs import PairingDialog
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    state = pairing_projection()
+    window.render_selected(state)
+    dialogue = PairingDialog(state.challenge, actions=state.actions, parent=window)
+    dialogue.open()
+    QApplication.processEvents()
+    field = dialogue.findChild(QLineEdit, "secretField")
+    field.insert("abandoned-handoff-sentinel-5514")
+    dialogue.findChild(QPushButton, "pairingSubmitButton").click()
+    assert not dialogue.isVisible()
+    assert field.text() == ""
+    assert not field.isUndoAvailable()
+    assert dialogue._input is not None
+
+    reference = weakref.ref(dialogue)
+    del field, dialogue
+    gc.collect()
+    QApplication.processEvents()
+    gc.collect()
+
+    assert reference() is None
 
 
 RETIRED_PROMPT_CLEANUPS: tuple[str, ...] = (
