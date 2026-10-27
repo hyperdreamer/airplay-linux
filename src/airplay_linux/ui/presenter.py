@@ -84,7 +84,6 @@ from airplay_linux.domain.messages import (
 )
 from airplay_linux.domain.operations import ChallengeView, SensitiveText
 from airplay_linux.domain.records import (
-    ActivityEvent,
     OwnershipRecord,
     RecoveryItem,
     SavedReceiver,
@@ -319,7 +318,6 @@ class Presenter:
         self._last_report: CapabilityReport | None = None
 
         # -- request tokens ------------------------------------------------
-        self._saved_epoch = 0
         self._saved_loading = False
         self._saved_loaded = False
         self._ownership_epoch = 0
@@ -393,10 +391,10 @@ class Presenter:
 
     # ----------------------------------------------------------- render inputs
 
-    def _subscribe(self, subscribe: Callable[[Any], Subscription], emit: Callable[[Any], None]) -> None:
-        callback = _Forward(emit)
-        subscription = subscribe(callback)
-        self._subscriptions.append(subscription)
+    def _subscribe(
+        self, subscribe: Callable[[Any], Subscription], emit: Callable[[Any], None],
+    ) -> None:
+        self._subscriptions.append(subscribe(emit))
 
     def _report(self) -> CapabilityReport:
         """Frozen capability evidence, cached if the probe itself fails."""
@@ -701,14 +699,13 @@ class Presenter:
         self._schedule(self._load_saved())
 
     async def _load_saved(self) -> None:
-        epoch = self._saved_epoch
         try:
             result = await self._receivers.all()
         except Exception:  # noqa: BLE001 - a store failure is a typed diagnostic
             result = Err(error=diagnostic(ErrorCode.persistence_failed))
         finally:
             self._saved_loading = False
-        if epoch != self._saved_epoch or self._disposed:
+        if self._disposed:
             return
         self._saved_loaded = True
         if isinstance(result, Ok):
@@ -786,7 +783,7 @@ class Presenter:
     # -------------------------------------------------------- subscription in
 
     def _snapshot_arrived(self, snapshot: object) -> None:
-        if not isinstance(snapshot, SessionSnapshot):
+        if self._disposed or not isinstance(snapshot, SessionSnapshot):
             return
         previous = self._snapshots.get(snapshot.receiver_id)
         if (
@@ -805,6 +802,8 @@ class Presenter:
         self._request_render()
 
     def _discovery_arrived(self, event: object) -> None:
+        if self._disposed:
+            return
         kind = getattr(event, "kind", None)
         view = getattr(event, "receiver", None)
         if view is not None:
@@ -816,7 +815,8 @@ class Presenter:
         self._request_render()
 
     def _activity_arrived(self, _event: object) -> None:
-        self._request_render()
+        if not self._disposed:
+            self._request_render()
 
     # -------------------------------------------------------------- selection
 
@@ -1137,7 +1137,6 @@ class Presenter:
         if isinstance(result, Err):
             self._reject(receiver_id, result.error)
             return
-        self._saved_epoch += 1
         self._saved.pop(receiver_id, None)
         self._request_render()
 
@@ -1279,23 +1278,6 @@ class Presenter:
 
 
 # --------------------------------------------------------------------- helpers
-
-
-class _Forward:
-    """Adapt one port subscription callback onto a Qt bridge signal.
-
-    Kept as a small object so the subscription's callback identity is stable and
-    no bound method of the presenter (which is not a QObject) is ever connected
-    to a cross-thread signal directly.
-    """
-
-    __slots__ = ("_emit",)
-
-    def __init__(self, emit: Callable[[Any], None]) -> None:
-        self._emit = emit
-
-    def __call__(self, value: Any) -> None:
-        self._emit(value)
 
 
 def _owns_anything(snapshot: SessionSnapshot) -> bool:

@@ -27,16 +27,10 @@ from uuid import UUID
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QDialog, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QWidget
 
 from airplay_linux.diagnostics import ActivityLog, diagnostic, safe_activity
-from airplay_linux.domain.identity import (
-    ReceiverId,
-    ReceiverRecordSet,
-    ReceiverTarget,
-    ReceiverView,
-    ServiceRecord,
-)
+from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.messages import (
     Cancel,
     ChangeResolution,
@@ -64,7 +58,6 @@ from airplay_linux.domain.operations import (
     ChallengeView,
     InstanceId,
     LeaseId,
-    OperationContext,
     OperationId,
     OwnerId,
     ProcessIdentity,
@@ -72,7 +65,6 @@ from airplay_linux.domain.operations import (
     StreamHandle,
 )
 from airplay_linux.domain.records import (
-    ActivityEvent,
     LayoutSnapshot,
     OwnershipRecord,
     RecoveryItem,
@@ -89,7 +81,6 @@ from airplay_linux.domain.resources import (
     IntentStage,
     Mode,
     Ok,
-    PhysicalMonitorSource,
     RecoveryAction,
     ResolutionDecision,
     ResolutionEvidence,
