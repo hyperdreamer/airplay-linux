@@ -1304,12 +1304,102 @@ async def test_a_resolution_choice_for_a_replaced_endpoint_is_dropped(
 ) -> None:
     rig.discover("a")
     prepared = await started(rig)
+    opened = virtual_snapshot(prepared)
+    await prepared.settle()
+    assert opened.session_generation == 3
+    assert opened.target is not None and opened.target.endpoint_generation == 1
+    gate = prepared.dialogs.gate("resolution")
+
+    prepared.click(Action.change_resolution)
+    await prepared.settle()
+    # The same session re-announces itself at a replacement endpoint while the
+    # picker is open: ``session_generation`` is deliberately unchanged, so only
+    # the endpoint fingerprint/generation half of the fence can reject the answer.
+    prepared.snapshot(
+        "a",
+        mode=Mode.VIRTUAL,
+        intent_active=True,
+        intent_stage=IntentStage.active,
+        phase=SessionPhase.VirtualDisplay,
+        transport=TransportState.Streaming,
+        display=DisplayState.Owned,
+        display_handle=virtual_handle(owner=5, output="v1"),
+        ownership_uuid=OwnerId(UUID(int=5)),
+        audio=AudioState.Enabled,
+        trust=TrustState.Trusted,
+        observed_resolution=HD,
+        session_generation=3,
+        generation=2,
+    )
+    await prepared.settle()
+    current = prepared.presenter._snapshot(RECEIVER_A)
+    assert current.session_generation == opened.session_generation
+    assert current.target == target("a", 2)
+    assert current.target.endpoint_fingerprint != opened.target.endpoint_fingerprint
+    gate.set_result(HD)
+    await prepared.settle()
+
+    assert prepared.commands_of(ChangeResolution) == []
+    assert prepared.commands_of(ChooseResolution) == []
+
+
+async def test_a_resolution_choice_for_a_bumped_endpoint_generation_is_dropped(
+    rig: PresenterRig,
+) -> None:
+    rig.discover("a")
+    prepared = await started(rig)
+    opened = virtual_snapshot(prepared)
+    await prepared.settle()
+    assert opened.target is not None
+    gate = prepared.dialogs.gate("resolution")
+
+    prepared.click(Action.change_resolution)
+    await prepared.settle()
+    # The endpoint generation is a high-water mark: re-verifying saved evidence
+    # advances it while the fingerprint stays the same. The session does not
+    # advance, so only the endpoint-generation comparison can reject the answer.
+    prepared.snapshot(
+        "a",
+        mode=Mode.VIRTUAL,
+        intent_active=True,
+        intent_stage=IntentStage.active,
+        phase=SessionPhase.VirtualDisplay,
+        transport=TransportState.Streaming,
+        display=DisplayState.Owned,
+        display_handle=virtual_handle(owner=5, output="v1"),
+        ownership_uuid=OwnerId(UUID(int=5)),
+        audio=AudioState.Enabled,
+        trust=TrustState.Trusted,
+        observed_resolution=HD,
+        session_generation=3,
+        target=replace(opened.target, endpoint_generation=2),
+    )
+    await prepared.settle()
+    current = prepared.presenter._snapshot(RECEIVER_A)
+    assert current.session_generation == opened.session_generation
+    assert current.target is not None
+    assert current.target.endpoint_generation == 2
+    assert current.target.endpoint_fingerprint == opened.target.endpoint_fingerprint
+    gate.set_result(HD)
+    await prepared.settle()
+
+    assert prepared.commands_of(ChangeResolution) == []
+    assert prepared.commands_of(ChooseResolution) == []
+
+
+async def test_a_resolution_choice_for_a_superseded_session_is_dropped(
+    rig: PresenterRig,
+) -> None:
+    rig.discover("a")
+    prepared = await started(rig)
     virtual_snapshot(prepared)
     await prepared.settle()
     gate = prepared.dialogs.gate("resolution")
 
     prepared.click(Action.change_resolution)
     await prepared.settle()
+    # A newer session generation arrived while the picker was open; the endpoint
+    # itself is unchanged, so only the generation fence can reject the answer.
     prepared.snapshot(
         "a",
         mode=Mode.VIRTUAL,
@@ -1324,18 +1414,17 @@ async def test_a_resolution_choice_for_a_replaced_endpoint_is_dropped(
         trust=TrustState.Trusted,
         observed_resolution=HD,
         session_generation=4,
+        generation=1,
     )
     await prepared.settle()
-    # The endpoint generation advanced while the picker was open.
-    prepared.manager.snapshots[RECEIVER_A] = replace(
-        prepared.manager.snapshots[RECEIVER_A],
-        target=target("a", 2),
-        session_generation=4,
-    )
+    current = prepared.presenter._snapshot(RECEIVER_A)
+    assert current.session_generation == 4
+    assert current.target == target("a", 1)
     gate.set_result(HD)
     await prepared.settle()
 
     assert prepared.commands_of(ChangeResolution) == []
+    assert prepared.commands_of(ChooseResolution) == []
 
 
 # -------------------------------------------------------------------- pairing
