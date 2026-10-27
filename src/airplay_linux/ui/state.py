@@ -150,6 +150,10 @@ class PaneState:
     challenge: ChallengeView | None
     notice: str | None
     diagnostic: Diagnostic | None
+    # Presentation evidence for a live pairing challenge.  This is deliberately
+    # part of the projection so the prompt cannot reconstruct ownership from a
+    # second, potentially different snapshot.
+    retained_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -344,6 +348,7 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         challenge=_actionable_challenge(snapshot),
         notice=decision.notice,
         diagnostic=_diagnostic(snapshot, inputs, decision, orphans),
+        retained_output=_retained_output(snapshot, ownership),
     )
 
 
@@ -685,6 +690,22 @@ def _display_owned(state: SessionSnapshot) -> bool:
         or state.display_handle is not None
         or state.ownership_uuid is not None
     )
+
+
+def _retained_output(
+    state: SessionSnapshot, ownership: OwnershipRecord | None,
+) -> str | None:
+    """Expose the exact retained output label used by the pairing prompt.
+
+    The prompt must not infer this from a generic "owned" badge: a handle is the
+    authoritative live identity, while a durable ownership record is the
+    fallback evidence when the snapshot no longer carries that handle.
+    """
+    if state.display_handle is not None:
+        return state.display_handle.source.connector
+    if ownership is not None:
+        return ownership.connector
+    return None
 
 
 def _has_ownership_evidence(

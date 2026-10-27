@@ -33,6 +33,7 @@ that explains them instead of hiding behind another dialog.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Final
 
 from PySide6.QtCore import Qt, Signal
@@ -63,6 +64,21 @@ _MODE_LABELS: dict[Mode, str] = {
 _PAIRING_ACTIONS: Final[frozenset[Action]] = frozenset(
     {Action.submit_pairing, Action.cancel, Action.retry}
 )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PairingAnswer:
+    """One explicit pairing choice and its one-shot secret, if any.
+
+    ``None`` from a dialog factory still means ordinary dismissal or
+    invalidation.  An explicit Cancel/Retry must remain distinguishable from
+    that safe no-op, so the concrete factory returns this value for every
+    button-driven choice.  The secret is excluded from the representation even
+    though :class:`SensitiveText` is itself redacted.
+    """
+
+    action: Action
+    value: SensitiveText | None = field(default=None, repr=False)
 
 
 class _DecisionDialog(QDialog):
@@ -213,6 +229,7 @@ class PairingDialog(_DecisionDialog):
         )
         self._challenge = challenge
         self._input: SensitiveText | None = None
+        self._action: Action | None = None
         self._actions = self._pairing_actions(actions, retained_output)
         self._submit: QPushButton | None = None
         self._pin = challenge.credential_kind == "pin"
@@ -256,11 +273,20 @@ class PairingDialog(_DecisionDialog):
         value, self._input = self._input, None
         return value
 
+    def take_result(self) -> PairingAnswer | None:
+        """Hand back one explicit action, consuming any submitted secret."""
+        action, self._action = self._action, None
+        if action is None:
+            self._input = None
+            return None
+        return PairingAnswer(action=action, value=self.take_input())
+
     def confirm_input(self) -> None:
         """Accept the typed secret if there is one; blank input is not submitted."""
         text = self._field.text()
         if not text.strip():
             return
+        self._action = Action.submit_pairing
         self._input = SensitiveText(text)
         self._clear_field()
         self.accept()
@@ -330,7 +356,7 @@ class PairingDialog(_DecisionDialog):
             cancel.setAccessibleName("Cancel")
             cancel.setDefault(False)
             cancel.setAutoDefault(False)
-            cancel.clicked.connect(self.reject)
+            cancel.clicked.connect(self._cancel)
             row.addWidget(cancel)
             if first is None:
                 first = cancel
@@ -349,8 +375,14 @@ class PairingDialog(_DecisionDialog):
         if first is not None:
             first.setFocus(Qt.FocusReason.OtherFocusReason)
 
+    def _cancel(self) -> None:
+        """Preserve an explicit Cancel for the presenter after closing."""
+        self._action = Action.cancel
+        self.reject()
+
     def _retry(self) -> None:
         """Abandon this attempt and ask the presenter for a fresh challenge."""
+        self._action = Action.retry
         self.reject()
         self.retry_requested.emit()
 
@@ -566,6 +598,7 @@ def _helper_text(item: RecoveryItem) -> str:
 __all__ = [
     "ConfirmStopDialog",
     "OrphanDialog",
+    "PairingAnswer",
     "PairingDialog",
     "ResolutionDialog",
 ]
