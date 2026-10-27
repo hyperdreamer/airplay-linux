@@ -111,6 +111,7 @@ from airplay_linux.domain.resources import (
 from airplay_linux.ui.dialogs import (
     ConfirmStopDialog,
     OrphanDialog,
+    PairingAnswer,
     PairingDialog,
     ResolutionDialog,
 )
@@ -140,7 +141,15 @@ class DialogFactory(Protocol):
     invalidated.
     """
 
-    async def pairing(self, challenge: ChallengeView) -> SensitiveText | None: ...
+    async def pairing(
+        self,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action],
+        retained_output: str | None,
+    ) -> PairingAnswer | None: ...
+
+    def invalidate_pairing(self, challenge: ChallengeView) -> None: ...
 
     async def confirm_stop(self, mode: Mode) -> bool: ...
 
@@ -289,7 +298,9 @@ class Presenter:
         ):
             if not callable(value):
                 raise TypeError(f"{name} must be callable")
-        for name in ("pairing", "confirm_stop", "resolution", "orphan"):
+        for name in (
+            "pairing", "invalidate_pairing", "confirm_stop", "resolution", "orphan",
+        ):
             if not callable(getattr(dialogs, name, None)):
                 raise TypeError(f"dialogs.{name} must be callable")
         self._window = window
@@ -328,8 +339,8 @@ class Presenter:
         self._sources_loading_for: ReceiverId | None = None
 
         # -- prompt tracking (no secret is ever stored) --------------------
-        self._pairing_pending: dict[ReceiverId, Any] = {}
-        self._pairing_seen: dict[ReceiverId, Any] = {}
+        self._pairing_pending: dict[ReceiverId, ChallengeView] = {}
+        self._pairing_seen: dict[ReceiverId, ChallengeView] = {}
         self._switch_pending: set[ReceiverId] = set()
         self._switch_queued: dict[ReceiverId, tuple[int, Mode]] = {}
         self._resolution_pending: set[ReceiverId] = set()
@@ -341,6 +352,9 @@ class Presenter:
         self._disposed = False
         self._shutdown_task: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._task_fences: dict[
+            asyncio.Task[Any], tuple[Any, tuple[Any, ...] | None]
+        ] = {}
         self._subscriptions: list[Subscription] = []
         self._render_pending = False
         self._bridge = _Bridge(
@@ -794,6 +808,13 @@ class Presenter:
             # even when it is delivered late.
             return
         self._snapshots[snapshot.receiver_id] = snapshot
+        pairing = self._pairing_pending.get(snapshot.receiver_id)
+        if pairing is not None and self._pane(snapshot.receiver_id).challenge != pairing:
+            # Snapshot publication is authoritative even when this receiver is
+            # no longer selected.  Expiry, cancellation, and replacement must
+            # close the old real prompt before a typed secret can linger there.
+            self._pairing_pending.pop(snapshot.receiver_id, None)
+            self._invalidate_pairing(pairing)
         queued = self._switch_queued.get(snapshot.receiver_id)
         if queued is not None and snapshot.mode is queued[1]:
             del self._switch_queued[snapshot.receiver_id]
@@ -870,10 +891,16 @@ class Presenter:
                     diagnostic(ErrorCode.unsupported_source, receiver_id),
                 )
                 return
-            self._schedule(self._dispatch(Start(receiver_id=receiver_id, request=request)))
+            self._schedule(
+                self._dispatch(Start(receiver_id=receiver_id, request=request)),
+                receiver_id=receiver_id,
+            )
             return
         if action is Action.pair:
-            self._schedule(self._dispatch(Pair(receiver_id=receiver_id)))
+            self._schedule(
+                self._dispatch(Pair(receiver_id=receiver_id)),
+                receiver_id=receiver_id,
+            )
             return
         if action is Action.submit_pairing:
             if pane.challenge is not None:
@@ -881,7 +908,10 @@ class Presenter:
             return
         factory = _COMMAND_FACTORIES.get(action)
         if factory is not None:
-            self._schedule(self._dispatch(factory(receiver_id=receiver_id)))
+            self._schedule(
+                self._dispatch(factory(receiver_id=receiver_id)),
+                receiver_id=receiver_id,
+            )
             return
         if action in (Action.keep_blocked, Action.keep_orphan):
             # Both are explicit acknowledgements of an already-safe state: the
@@ -889,16 +919,22 @@ class Presenter:
             # removed automatically, so no command exists (or is invented).
             return
         if action is Action.remove_metadata:
-            self._schedule(self._remove_metadata(receiver_id))
+            self._schedule(self._remove_metadata(receiver_id), receiver_id=receiver_id)
             return
         if action is Action.choose_resolution:
-            self._schedule(self._resolution_prompt(receiver_id, change=False))
+            self._schedule(
+                self._resolution_prompt(receiver_id, change=False),
+                receiver_id=receiver_id,
+            )
             return
         if action is Action.change_resolution:
-            self._schedule(self._resolution_prompt(receiver_id, change=True))
+            self._schedule(
+                self._resolution_prompt(receiver_id, change=True),
+                receiver_id=receiver_id,
+            )
             return
         if action is Action.confirm_orphan:
-            self._schedule(self._orphan_prompt(receiver_id))
+            self._schedule(self._orphan_prompt(receiver_id), receiver_id=receiver_id)
 
     def _on_mode_requested(self, value: str) -> None:
         if self._shutting_down or self._disposed:
@@ -925,7 +961,9 @@ class Presenter:
                 # This exact session generation already has a queued switch; a
                 # second confirmation prompt would target the same teardown.
                 return
-            self._schedule(self._confirmed_switch(receiver_id, mode))
+            self._schedule(
+                self._confirmed_switch(receiver_id, mode), receiver_id=receiver_id,
+            )
             return
         # Stopping, cleanup, reconfiguration and uncertain trust: refuse the
         # requested switch outright instead of prompting for an impossible one.
@@ -984,7 +1022,8 @@ class Presenter:
             # Unavailable audio disables mute; a stale toggle must not command it.
             return
         self._schedule(
-            self._dispatch(SetMuted(receiver_id=receiver_id, muted=bool(muted)))
+            self._dispatch(SetMuted(receiver_id=receiver_id, muted=bool(muted))),
+            receiver_id=receiver_id,
         )
 
     # ------------------------------------------------------------ confirmations
@@ -1020,51 +1059,107 @@ class Presenter:
         finally:
             self._switch_pending.discard(receiver_id)
 
-    def _open_pairing(self, receiver_id: ReceiverId, challenge: ChallengeView) -> None:
-        if self._pairing_pending.get(receiver_id) == challenge.challenge_id:
+    def _open_pairing(
+        self,
+        receiver_id: ReceiverId,
+        challenge: ChallengeView,
+        pane: PaneState | None = None,
+    ) -> None:
+        if self._pairing_pending.get(receiver_id) == challenge:
             return
-        self._pairing_seen[receiver_id] = challenge.challenge_id
-        self._pairing_pending[receiver_id] = challenge.challenge_id
-        self._schedule(self._pairing_prompt(receiver_id, challenge))
+        previous = self._pairing_pending.get(receiver_id)
+        if previous is not None:
+            self._invalidate_pairing(previous)
+        current = pane if pane is not None else self._pane(receiver_id)
+        if current.challenge != challenge:
+            return
+        self._pairing_seen[receiver_id] = challenge
+        self._pairing_pending[receiver_id] = challenge
+        self._schedule(
+            self._pairing_prompt(
+                receiver_id,
+                challenge,
+                actions=current.actions,
+                retained_output=current.retained_output,
+            ),
+            receiver_id=receiver_id,
+        )
 
     def _maybe_open_pairing(self, receiver_id: ReceiverId, pane: PaneState) -> None:
         challenge = pane.challenge
         if challenge is None:
+            previous = self._pairing_pending.pop(receiver_id, None)
+            if previous is not None:
+                self._invalidate_pairing(previous)
             self._pairing_seen.pop(receiver_id, None)
             return
         if receiver_id != self._selected:
             return
-        if self._pairing_seen.get(receiver_id) == challenge.challenge_id:
+        if self._pairing_seen.get(receiver_id) == challenge:
             return
-        self._open_pairing(receiver_id, challenge)
+        self._open_pairing(receiver_id, challenge, pane)
+
+    def _invalidate_pairing(self, challenge: ChallengeView) -> None:
+        """Close and wipe one prompt without cancelling a caller's fake answer."""
+        try:
+            self._dialogs.invalidate_pairing(challenge)
+        except Exception:  # noqa: BLE001 - invalidation is a safe best effort
+            return
 
     async def _pairing_prompt(
-        self, receiver_id: ReceiverId, challenge: ChallengeView,
+        self,
+        receiver_id: ReceiverId,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action],
+        retained_output: str | None,
     ) -> None:
-        """Ask for one secret, then submit it to the captured receiver only."""
+        """Read one explicit choice, then dispatch it only if still authorized."""
         answer: object = None
         try:
-            answer = await self._dialogs.pairing(challenge)
+            answer = await self._dialogs.pairing(
+                challenge,
+                actions=actions,
+                retained_output=retained_output,
+            )
         except Exception:  # noqa: BLE001 - a broken prompt is a non-answer
             answer = None
         finally:
-            if self._pairing_pending.get(receiver_id) == challenge.challenge_id:
+            if self._pairing_pending.get(receiver_id) == challenge:
                 del self._pairing_pending[receiver_id]
-        if not isinstance(answer, SensitiveText):
-            # Dismissal never mutates trust: the challenge simply stays live until
-            # the user submits, retries, cancels or the receiver expires it.
+
+        action: Action | None
+        value: SensitiveText | None
+        if isinstance(answer, PairingAnswer):
+            action, value = answer.action, answer.value
+        elif isinstance(answer, SensitiveText):
+            # Keep deterministic/fake factories from the original presenter
+            # contract usable: a bare secret is an explicit submit answer.
+            action, value = Action.submit_pairing, answer
+        else:
+            action, value = None, None
+        if action is None:
+            # Ordinary dismissal never mutates trust: the challenge stays live
+            # until the user submits, retries, cancels or it expires.
             return
-        if self._pane(receiver_id).challenge != challenge:
-            # Receiver, challenge id, operation, session/trust generation or
-            # endpoint changed while the prompt was open: drop the secret.
+        current = self._pane(receiver_id)
+        if current.challenge != challenge or action not in current.actions:
+            # Receiver, challenge identity or the projection changed while the
+            # prompt was open.  Do not let a stale button become a command.
             return
-        await self._dispatch(
-            SubmitPairing(
+        if action is Action.submit_pairing:
+            if not isinstance(value, SensitiveText):
+                return
+            command: Command = SubmitPairing(
                 receiver_id=receiver_id,
                 challenge_id=challenge.challenge_id,
-                value=answer,
+                value=value,
             )
-        )
+        elif action in (Action.cancel, Action.retry):
+            command = _COMMAND_FACTORIES[action](receiver_id=receiver_id)
+        else:
+            return
+        await self._dispatch(command)
 
     async def _resolution_prompt(self, receiver_id: ReceiverId, *, change: bool) -> None:
         if receiver_id in self._resolution_pending:
@@ -1145,10 +1240,24 @@ class Presenter:
     async def _dispatch(self, command: Command) -> None:
         """Dispatch one fresh command and apply only a still-current rejection."""
         receiver_id = getattr(command, "receiver_id", None)
-        fence = self._fence(receiver_id) if receiver_id is not None else None
+        task = asyncio.current_task()
+        registered = self._task_fences.get(task) if task is not None else None
+        if registered is not None and registered[0] == receiver_id:
+            # _schedule captured the fence before this coroutine was allowed to
+            # run.  Do not replace that admission fence with a newer one merely
+            # because the event loop delayed starting the coroutine.
+            fence = registered[1]
+        else:
+            fence = self._fence(receiver_id) if receiver_id is not None else None
+            if task is not None:
+                self._task_fences[task] = (receiver_id, fence)
         try:
             receipt = await self._manager.dispatch(command)
         except Exception:  # noqa: BLE001 - never surface port exception text
+            if fence is not None and fence != self._fence(receiver_id):
+                # An exception from a superseded operation is just as stale as a
+                # rejected receipt; it must not diagnose the newer intent.
+                return
             self._reject(receiver_id, None)
             return
         if bool(getattr(receipt, "accepted", False)):
@@ -1259,21 +1368,36 @@ class Presenter:
 
     # ------------------------------------------------------------------ helpers
 
-    def _schedule(self, awaitable: Awaitable[Any]) -> asyncio.Task[Any]:
+    def _schedule(
+        self,
+        awaitable: Awaitable[Any],
+        *,
+        receiver_id: ReceiverId | None = None,
+    ) -> asyncio.Task[Any]:
         task = asyncio.ensure_future(awaitable)
+        if receiver_id is not None:
+            self._task_fences[task] = (receiver_id, self._fence(receiver_id))
         self._tasks.add(task)
         task.add_done_callback(self._finished)
         return task
 
     def _finished(self, task: asyncio.Task[Any]) -> None:
         self._tasks.discard(task)
+        task_fence = self._task_fences.pop(task, None)
         if task.cancelled():
             return
         error = task.exception()
         if error is None:
             return
         # A presenter task must never surface a raw exception string (it could
-        # quote a prompt answer). Render the fixed generic copy instead.
+        # quote a prompt answer). Receiver-scoped tasks retain their original
+        # fence, so a late exception cannot diagnose newer selected state.
+        if task_fence is not None:
+            receiver_id, fence = task_fence
+            if fence is not None and fence != self._fence(receiver_id):
+                return
+            self._reject(receiver_id, None)
+            return
         self._reject(self._selected, None)
 
 
@@ -1377,12 +1501,36 @@ class QtDialogFactory:
 
     def __init__(self, window: QWidget | None = None) -> None:
         self._window = window
+        self._pairing_prompts: dict[ChallengeView, PairingDialog] = {}
 
-    async def pairing(self, challenge: ChallengeView) -> SensitiveText | None:
+    async def pairing(
+        self,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action] | None = None,
+        retained_output: str | None = None,
+    ) -> PairingAnswer | None:
         if not isinstance(challenge, ChallengeView):
             raise TypeError("pairing requires a ChallengeView")
-        dialog = self._pairing_dialog(challenge)
-        return await _resolve_dialog(dialog, dialog.take_input, None)
+        dialog = self._pairing_dialog(
+            challenge, actions=actions, retained_output=retained_output,
+        )
+        self._pairing_prompts[challenge] = dialog
+        try:
+            return await _resolve_dialog(dialog, dialog.take_result, None)
+        finally:
+            if self._pairing_prompts.get(challenge) is dialog:
+                del self._pairing_prompts[challenge]
+
+    def invalidate_pairing(self, challenge: ChallengeView) -> None:
+        """Close the exact live prompt for an invalidated challenge."""
+        dialog = self._pairing_prompts.get(challenge)
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except RuntimeError:  # pragma: no cover - already destroyed by Qt
+            pass
 
     async def confirm_stop(self, mode: Mode) -> bool:
         if not isinstance(mode, Mode):
@@ -1402,10 +1550,18 @@ class QtDialogFactory:
 
     # -- overridable construction hooks (tests capture the dialogs) ---------
 
-    def _pairing_dialog(self, challenge: ChallengeView) -> PairingDialog:
+    def _pairing_dialog(
+        self,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action] | None = None,
+        retained_output: str | None = None,
+    ) -> PairingDialog:
         return PairingDialog(
             challenge,
             receiver_label=str(challenge.receiver_id),
+            retained_output=retained_output,
+            actions=actions,
             parent=self._window,
         )
 

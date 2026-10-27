@@ -100,6 +100,7 @@ from airplay_linux.testing.adapters import (
 )
 from airplay_linux.testing.builders import physical, service, target, virtual_handle
 
+from airplay_linux.ui.dialogs import PairingAnswer
 from airplay_linux.ui.presenter import Presenter, QtDialogFactory
 from airplay_linux.ui.state import Action
 from airplay_linux.ui.window import MainWindow
@@ -240,6 +241,8 @@ class FakeDialogs:
 
     def __init__(self) -> None:
         self.pairing_calls: list[ChallengeView] = []
+        self.pairing_contexts: list[tuple[frozenset[Action], str | None]] = []
+        self.invalidated_pairings: list[ChallengeView] = []
         self.stop_calls: list[Mode] = []
         self.resolution_calls: list[tuple[Size, ...]] = []
         self.orphan_calls: list[RecoveryItem] = []
@@ -257,12 +260,22 @@ class FakeDialogs:
         setattr(self, f"{name}_gate", future)
         return future
 
-    async def pairing(self, challenge: ChallengeView) -> SensitiveText | None:
+    async def pairing(
+        self,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action] | None = None,
+        retained_output: str | None = None,
+    ) -> SensitiveText | PairingAnswer | None:
         self.pairing_calls.append(challenge)
+        self.pairing_contexts.append((actions or frozenset(), retained_output))
         gate, self.pairing_gate = self.pairing_gate, None
         if gate is not None:
             return await gate
         return self.pairing_answer
+
+    def invalidate_pairing(self, challenge: ChallengeView) -> None:
+        self.invalidated_pairings.append(challenge)
 
     async def confirm_stop(self, mode: Mode) -> bool:
         self.stop_calls.append(mode)
@@ -1805,8 +1818,16 @@ class CapturingFactory(QtDialogFactory):
         super().__init__(window)
         self.created: list[Any] = []
 
-    def _pairing_dialog(self, challenge: ChallengeView) -> Any:
-        dialog = super()._pairing_dialog(challenge)
+    def _pairing_dialog(
+        self,
+        challenge: ChallengeView,
+        *,
+        actions: frozenset[Action] | None = None,
+        retained_output: str | None = None,
+    ) -> Any:
+        dialog = super()._pairing_dialog(
+            challenge, actions=actions, retained_output=retained_output,
+        )
         self.created.append(dialog)
         return dialog
 
@@ -1859,9 +1880,11 @@ async def test_qt_pairing_prompt_is_nonmodal_and_returns_the_secret(
     assert field.isUndoAvailable() is False
 
     answer = await task
-    assert isinstance(answer, SensitiveText)
-    assert answer.reveal_for_backend() == "8642"
-    assert repr(answer) == "SensitiveText(<redacted>)"
+    assert isinstance(answer, PairingAnswer)
+    assert answer.action is Action.submit_pairing
+    assert isinstance(answer.value, SensitiveText)
+    assert answer.value.reveal_for_backend() == "8642"
+    assert "8642" not in repr(answer)
 
 
 async def test_qt_pairing_prompt_dismissal_answers_none_and_wipes(
@@ -1876,7 +1899,10 @@ async def test_qt_pairing_prompt_dismissal_answers_none_and_wipes(
 
     dialog.findChild(QPushButton, "pairingCancelButton").click()
 
-    assert await task is None
+    answer = await task
+    assert isinstance(answer, PairingAnswer)
+    assert answer.action is Action.cancel
+    assert answer.value is None
     assert field.text() == ""
     assert dialog.take_input() is None
 
