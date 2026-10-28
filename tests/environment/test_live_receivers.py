@@ -26,8 +26,15 @@ What the marked tests check when opted in:
   own precise gate reason when the composition cannot associate an output with
   the helper (the current production composition reports that as
   ``virtual_display: helper/output association verifier not supplied``).  They
-  also require an already paired, currently discoverable receiver: a live
-  scenario never types a credential.
+  also require an already paired receiver that discovery currently announces at a
+  configured address, and the backend credential adapter must resolve a committed
+  reference for it through ``CredentialStore.load_credential_ref`` (application
+  metadata never carries one): a live scenario never types a credential.  The
+  accepted-mode scenario requests ``AIRPLAY_LINUX_LIVE_RESOLUTION`` (default
+  ``1920x1080``) and delivers a genuinely different accepted mode, because equal
+  sizes are a correct no-op with no mismatch.  Both scenarios start the runtime
+  with ``runtime.start()``, the production path that runs startup recovery (which
+  is what admits any command) before the scenario dispatches one.
 
 Manual commands::
 
@@ -49,6 +56,7 @@ import shutil
 import time
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import pytest
@@ -463,53 +471,56 @@ async def test_live_composition_reports_the_virtual_display_gate(tmp_path):
 #
 # Both scenarios are ordinary opt-in live checks: without every prerequisite they
 # skip with the exact missing reason.  The body uses the production provider, the
-# production transport and the production session manager; only the reconnect /
-# accepted-mode *stimulus* is delivered through the transport's documented event
-# subscription, because a test cannot make a physical receiver drop on cue.
+# production transport and the runtime's own production session manager; only the
+# reconnect / accepted-mode *stimulus* is synthetic, delivered to the same
+# ``SessionManager.ingest`` callback the transport subscription calls, because a
+# test cannot make a physical receiver drop or renegotiate on cue.
 # ---------------------------------------------------------------------------
 
 _SMALL = Size(width=1280, height=720)
+_STANDARD = Size(width=1920, height=1080)
 
 
-class _Detach:
-    def __init__(self, action):
-        self._action = action
+def _accepted_mode(requested: Size) -> Size:
+    """A size the receiver accepts that genuinely differs from the request.
 
-    def close(self):
-        action, self._action = self._action, None
-        if action is not None:
-            action()
+    The scenario proves that an accepted-mode mismatch stops the transport and
+    retains the output, so the accepted mode has to differ from the requested
+    decision: an identical size is a correct no-op that leaves ``last_error``
+    unset and would make the body assert against a ``None`` diagnostic.
+    """
+    return _STANDARD if requested == _SMALL else _SMALL
 
 
-class _EventInjectingTransport:
-    """Forward every real transport call and add typed test event delivery.
+@dataclass(frozen=True, kw_only=True)
+class _LiveSession:
+    """One live scenario over the runtime that owns its single manager.
 
-    Production events still arrive through the real transport subscription; the
-    wrapper only adds ``emit`` so a live test can deliver the one event a physical
-    receiver cannot be asked to produce deterministically.
+    The scenario never composes a manager of its own: ``runtime.manager`` is the
+    object ``runtime.shutdown_coordinator`` and ``runtime.persistence`` are bound
+    to, so acquisition, stimulus and teardown share exactly one authority.
     """
 
-    def __init__(self, inner):
-        self._inner = inner
-        self._callbacks: list = []
+    runtime: Any
+    receiver_id: Any
+    view: Any
 
-    def subscribe(self, callback):
-        self._callbacks.append(callback)
-        inner = self._inner.subscribe(callback)
+    @property
+    def manager(self):
+        return self.runtime.manager
 
-        def detach():
-            if callback in self._callbacks:
-                self._callbacks.remove(callback)
-            inner.close()
+    def deliver(self, kind: TransportEventKind, *, payload=None) -> None:
+        """Deliver one typed transport event to the runtime's own manager.
 
-        return _Detach(detach)
-
-    def emit(self, event) -> None:
-        for callback in tuple(self._callbacks):
-            callback(event)
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+        Production delivers ``TransportEvent`` through ``TransportPort.subscribe``,
+        which is wired to ``SessionManager.ingest``. A physical receiver cannot be
+        asked to drop a stream or renegotiate a mode on cue, so the scenario calls
+        that same resource-event ingress with the same typed event; only the event
+        *source* is synthetic.
+        """
+        self.manager.ingest(
+            _stream_event(self.manager, self.receiver_id, kind, payload=payload)
+        )
 
 
 def _requested_resolution() -> Size:
@@ -572,11 +583,61 @@ def _stream_event(manager, receiver_id, kind, *, payload=None) -> TransportEvent
     )
 
 
+async def _remembered_reference(runtime, receiver_id):
+    """Resolve committed trust through the credential adapter that owns it.
+
+    Receiver metadata deliberately decodes with ``credential_ref=None``
+    (``storage/codecs.py``: the committed reference is adapter-owned state and is
+    never persisted into application metadata). The composition root constructs
+    the credential adapter and hands it to the transport, whose pairing
+    coordinator owns it, and the runtime exposes no other credential port; ask
+    that adapter through its documented ``CredentialStore.load_credential_ref``
+    lookup instead of requiring a field storage refuses to write.
+    """
+    credentials = getattr(
+        getattr(runtime.deps.transport, "_pairing", None), "_credentials", None
+    )
+    assert credentials is not None and hasattr(credentials, "load_credential_ref"), (
+        "the composed transport exposes no credential adapter; the live scenario "
+        "cannot prove remembered trust"
+    )
+    return await credentials.load_credential_ref(receiver_id)
+
+
+async def _discovery_views(runtime) -> tuple:
+    """Every receiver view discovery announces from the runtime start on.
+
+    ``runtime.start()`` is the production start path: it runs startup recovery,
+    which is what admits commands at all (a start issued before recovery finishes
+    is refused as an ownership mismatch), and it starts discovery. The
+    subscription is installed first so announcements published during start are
+    not missed.
+    """
+    announced: dict = {}
+
+    def remember(event) -> None:
+        # A removal carries the last-known offline view, so the newest wins.
+        announced[event.receiver.record_set.receiver_id] = event.receiver
+
+    subscription = runtime.deps.discovery.subscribe(remember)
+    try:
+        started = await runtime.start()
+        assert isinstance(started, Ok), started.error.message
+        refreshed = await runtime.deps.discovery.refresh()
+        assert isinstance(refreshed, Ok), refreshed.error.message
+        await _until(lambda: any(view.online for view in announced.values()), 5.0)
+    except BaseException:
+        await runtime.shutdown()
+        raise
+    finally:
+        subscription.close()
+    return tuple(announced.values())
+
+
 async def _live_virtual_session(tmp_path):
     """Compose the live scenario or skip with the exact missing prerequisite.
 
-    Returns ``(runtime, manager, transport, receiver_id, view)``.  The caller owns
-    ``runtime.shutdown()``.
+    Returns a :class:`_LiveSession`; the caller owns ``runtime.shutdown()``.
     """
     config = _require_live()
     if os.environ.get(LIVE_VIRTUAL_ENV) != "1":
@@ -585,7 +646,7 @@ async def _live_virtual_session(tmp_path):
             "to allow these reconnect/recreation scenarios to own exactly one "
             "test output"
         )
-    from airplay_linux.runtime import RuntimeConfig, build_runtime, compose_manager
+    from airplay_linux.runtime import RuntimeConfig, build_runtime
 
     state = tmp_path / "state"
     runtime_root = tmp_path / "runtime"
@@ -604,41 +665,40 @@ async def _live_virtual_session(tmp_path):
             f"{gate}; these scenarios run once an association authority exists"
         )
 
-    # Only an already trusted, currently visible receiver is a valid subject.
-    saved = await runtime.deps.receivers.all()
-    assert isinstance(saved, Ok), saved
+    # Only a receiver that discovery currently announces at a configured address
+    # and that the backend credential adapter already remembers is a subject.
     addresses = {receiver.address for receiver in config.receivers}
-    candidates = [
-        record for record in saved.value
-        if record.credential_ref is not None
-        and record.last_endpoint is not None
-        and record.last_endpoint.canonical_host in addresses
+    views = [
+        view for view in await _discovery_views(runtime)
+        if view.online and view.record_set.canonical_address in addresses
     ]
-    if not candidates:
+    if not views:
         await runtime.shutdown()
         pytest.skip(
-            "no remembered-trust receiver matching the live configuration; a live "
-            "scenario never types a credential, pair the receiver first"
+            f"no configured receiver is currently announced by discovery at "
+            f"{sorted(addresses)}; start the receiver and re-run"
         )
-    receiver_id = candidates[0].receiver_id
-    await runtime.deps.discovery.start()
-    await runtime.deps.discovery.refresh()
-    await _until(
-        lambda: runtime.deps.discovery.current(receiver_id) is not None
-        and runtime.deps.discovery.current(receiver_id).online,
-        5.0,
+    for view in views:
+        remembered = await _remembered_reference(runtime, view.record_set.receiver_id)
+        if isinstance(remembered, Err):
+            await runtime.shutdown()
+            pytest.skip(
+                "the backend credential adapter cannot resolve remembered trust: "
+                f"{remembered.error.code.value}; a live scenario never types a "
+                "credential"
+            )
+        if remembered.value is not None:
+            return _LiveSession(
+                runtime=runtime,
+                receiver_id=view.record_set.receiver_id,
+                view=view,
+            )
+    await runtime.shutdown()
+    pytest.skip(
+        "the backend credential adapter remembers no credential for the "
+        f"discoverable receiver(s) at {sorted(addresses)}; pair the receiver "
+        "before running, a live scenario never types a credential"
     )
-    view = runtime.deps.discovery.current(receiver_id)
-    if view is None or not view.online:
-        await runtime.shutdown()
-        pytest.skip(
-            "the configured receiver is not currently announced by discovery; "
-            "start the receiver and re-run"
-        )
-
-    transport = _EventInjectingTransport(runtime.deps.transport)
-    manager = compose_manager(replace(runtime.deps, transport=transport))
-    return runtime, manager, transport, receiver_id, view
 
 
 @pytest.mark.live_hardware
@@ -651,7 +711,8 @@ async def test_live_reconnect_retains_the_owned_output_until_a_retry_succeeds(
     ``network_lost`` event then pauses it.  The retry reconnects the *same*
     display handle: one creation, no second output, no teardown.
     """
-    runtime, manager, transport, receiver_id, view = await _live_virtual_session(tmp_path)
+    session = await _live_virtual_session(tmp_path)
+    manager, receiver_id, view = session.manager, session.receiver_id, session.view
     size = _requested_resolution()
     try:
         receipt = await manager.dispatch(Start(
@@ -673,9 +734,7 @@ async def test_live_reconnect_retains_the_owned_output_until_a_retry_succeeds(
         before = started.display_handle
         assert before.source.size == size
 
-        transport.emit(_stream_event(
-            manager, receiver_id, TransportEventKind.network_lost,
-        ))
+        session.deliver(TransportEventKind.network_lost)
         await _live_settle(manager)
         paused = manager.snapshot(receiver_id)
         assert paused.stream is None
@@ -694,7 +753,7 @@ async def test_live_reconnect_retains_the_owned_output_until_a_retry_succeeds(
         assert resumed.display_handle == before
         assert resumed.display is DisplayState.Owned
     finally:
-        await runtime.shutdown()
+        await session.runtime.shutdown()
 
 
 @pytest.mark.live_hardware
@@ -703,9 +762,10 @@ async def test_live_accepted_mode_change_recreates_only_on_explicit_acceptance(
 ):
     """An accepted-mode mismatch stops transport, keeps the output, and recreates
     only when the accepted resolution is explicitly applied."""
-    runtime, manager, transport, receiver_id, view = await _live_virtual_session(tmp_path)
+    session = await _live_virtual_session(tmp_path)
+    manager, receiver_id, view = session.manager, session.receiver_id, session.view
     size = _requested_resolution()
-    accepted = size if size != _SMALL else Size(width=1920, height=1080)
+    accepted = _accepted_mode(size)
     try:
         receipt = await manager.dispatch(Start(
             receiver_id=receiver_id,
@@ -724,12 +784,10 @@ async def test_live_accepted_mode_change_recreates_only_on_explicit_acceptance(
         before = started.display_handle
         assert before is not None and started.stream is not None
 
-        transport.emit(_stream_event(
-            manager,
-            receiver_id,
+        session.deliver(
             TransportEventKind.accepted_mode,
             payload=ModePayload(size=accepted, reliable=True),
-        ))
+        )
         await _live_settle(manager)
         mismatch = manager.snapshot(receiver_id)
         assert mismatch.last_error.code is ErrorCode.resolution_mismatch
@@ -749,4 +807,4 @@ async def test_live_accepted_mode_change_recreates_only_on_explicit_acceptance(
         assert after.display_handle.source.size == accepted
         assert after.stream is not None
     finally:
-        await runtime.shutdown()
+        await session.runtime.shutdown()
