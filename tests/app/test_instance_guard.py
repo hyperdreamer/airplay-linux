@@ -17,6 +17,14 @@ from airplay_linux.domain.resources import Err, Ok
 from airplay_linux.process import LinuxProcessRunner
 from airplay_linux.process.instance import InstanceGuard
 
+# Children must import this tree regardless of the parent's current directory. The
+# suite inherits PYTHONPATH=src, which is only correct while cwd happens to be the
+# repository root; a child started from anywhere else imported an unrelated
+# `airplay_linux` and died with ModuleNotFoundError. Pin both the source path and the
+# child's cwd to this checkout, derived from the test file itself.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_SRC_ROOT = _REPO_ROOT / 'src'
+
 
 GUARDED_CHILD = """
 import sys
@@ -53,6 +61,8 @@ def child(script, *arguments):
 
     proc = subprocess.Popen(
         [sys.executable, '-c', script, *map(str, arguments)],
+        cwd=str(_REPO_ROOT),
+        env={**os.environ, 'PYTHONPATH': str(_SRC_ROOT)},
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
