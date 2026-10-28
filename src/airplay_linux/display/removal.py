@@ -103,6 +103,35 @@ class _Subscription:
             self._callbacks.remove(self._callback)
 
 
+class ConfirmedReleases:
+    """One deletion receipt and per-owner journal for creation and removal.
+
+    Callers must prove exact resource release, then call delete_confirmed while
+    holding journal(owner_uuid). Missing disk evidence alone is never a receipt;
+    even a deletion that became visible but returned Err remains unconfirmed.
+    Receipts are local to this provider lifetime, not inferred across restart.
+    """
+
+    def __init__(self, store: OwnershipStore) -> None:
+        self.store = store
+        self._journals: dict[OwnerId, asyncio.Lock] = {}
+        self._released: set[OwnerId] = set()
+
+    def journal(self, owner_uuid: OwnerId) -> asyncio.Lock:
+        return self._journals.setdefault(owner_uuid, asyncio.Lock())
+
+    def contains(self, owner_uuid: OwnerId) -> bool:
+        return owner_uuid in self._released
+
+    async def delete_confirmed(self, owner_uuid: OwnerId) -> Result[None]:
+        if self.contains(owner_uuid):
+            return Ok(value=None)
+        deleted = await self.store.delete(owner_uuid)
+        if isinstance(deleted, Ok):
+            self._released.add(owner_uuid)
+        return deleted
+
+
 class DisplayRemover:
     """A cleanup attempt never erases uncertain process/compositor evidence."""
     def __init__(
@@ -119,9 +148,8 @@ class DisplayRemover:
         self._transport_released = transport_released
         self._identity_probe = identity_probe
         self._projections: dict[OwnerId, DisplayEvent] = {}
-        self._journals: dict[OwnerId, asyncio.Lock] = {}
+        self.release_authority = ConfirmedReleases(ownership_store)
         self._removing: set[OwnerId] = set()
-        self._removed: set[OwnerId] = set()
         self._known: dict[OwnerId, OwnershipRecord] = {}
         self._callbacks: list[Callable[[DisplayEvent], None]] = []
         self._background: set[asyncio.Task] = set()
@@ -145,7 +173,7 @@ class DisplayRemover:
 
     def journal(self, owner_uuid: OwnerId) -> asyncio.Lock:
         """Recovery and removal serialize active writes/removal admission here."""
-        return self._journals.setdefault(owner_uuid, asyncio.Lock())
+        return self.release_authority.journal(owner_uuid)
 
     def subscribe(self, callback: Callable[[DisplayEvent], None]) -> _Subscription:
         self._callbacks.append(callback)
@@ -330,7 +358,7 @@ class DisplayRemover:
             if isinstance(found, Err):
                 return found
             if found.value is None:
-                return Ok(value=None) if owner_uuid in self._removed else _failure(ErrorCode.ownership_mismatch)
+                return Ok(value=None) if self.release_authority.contains(owner_uuid) else _failure(ErrorCode.ownership_mismatch)
             record = replace(found.value, desired_state="removing", stage="removing", last_configuration_step="removing")
             try:
                 # Rewrite even an already-visible removing record: a previous
@@ -353,7 +381,7 @@ class DisplayRemover:
         admitted = await self.mark_removing(owner_uuid)
         if isinstance(admitted, Err):
             return admitted
-        if owner_uuid in self._removed:
+        if self.release_authority.contains(owner_uuid):
             return Ok(value=None)
         # Admission is outside this lock, so recovery/configuration cannot delay
         # fencing. The lock serializes actual compositor mutation with creation.
@@ -362,7 +390,7 @@ class DisplayRemover:
             if isinstance(found, Err):
                 return found
             if found.value is None:
-                return Ok(value=None) if owner_uuid in self._removed else _failure(ErrorCode.ownership_mismatch)
+                return Ok(value=None) if self.release_authority.contains(owner_uuid) else _failure(ErrorCode.ownership_mismatch)
             record = found.value
             try:
                 result = await self._remove_record(record, context)
@@ -467,10 +495,9 @@ class DisplayRemover:
                 return _failure(ErrorCode.configuration_failed, record)
             if self.helper_evidence(record)[0] != "dead":
                 return _failure(ErrorCode.ownership_mismatch, record)
-            deleted = await self.store.delete(record.owner_uuid)
+            deleted = await self.release_authority.delete_confirmed(record.owner_uuid)
             if isinstance(deleted, Err):
                 return deleted
-            self._removed.add(record.owner_uuid)
             self._known.pop(record.owner_uuid, None)
             self._projections.pop(record.owner_uuid, None)
         self.emit("removed", record)

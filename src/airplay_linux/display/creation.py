@@ -38,6 +38,7 @@ from airplay_linux.domain.resources import (
 from airplay_linux.process import OwnedProcessScan
 
 from .locking import CreationLock
+from .removal import ConfirmedReleases
 
 
 CREATION_TIMEOUT = 5.0
@@ -48,9 +49,9 @@ HELPER_STOP_TIMEOUT = 5.0
 class CreationProgress:
     """Safe progress projection for one creation reservation.
 
-    It intentionally contains ownership and layout evidence only.  Receiver
-    credentials, helper command output, and endpoint fingerprints never enter
-    this event.
+    It contains ownership/layout evidence and a fixed failure code only.
+    Receiver credentials, helper command output, and endpoint fingerprints
+    never enter this event.
     """
 
     receiver_id: ReceiverId
@@ -62,6 +63,7 @@ class CreationProgress:
     connector: str | None
     output_id: str | None
     handle: DisplayHandle | None
+    failure_code: ErrorCode | None = None
 
 
 @dataclass(eq=False)
@@ -75,7 +77,6 @@ class _Creation:
     helper: ProcessIdentity | None = None
     output: OutputInfo | None = None
     launch_attempted: bool = False
-    cleanup_complete: bool = False
     fenced: bool = False
 
 
@@ -203,8 +204,19 @@ class DisplayCreator:
         self._creations: list[_Creation] = []
         self._teardown_gates: set[ReceiverId] = set()
         self._removing_owners: set[OwnerId] = set()
-        self._journals: dict[OwnerId, asyncio.Lock] = {}
+        self._release_authority = ConfirmedReleases(self._ownership)
         self._background: set[asyncio.Task] = set()
+
+    def bind_release_authority(self, authority: ConfirmedReleases) -> None:
+        """Compose with the remover before creation starts, sharing its journal.
+
+        Standalone creators keep the same receipt contract. A provider binds its
+        single authority so rollback and later removal cannot disagree, or
+        rewrite a removed reservation while a deletion is awaiting durability.
+        """
+        if authority.store is not self._ownership or self._creations or self._background:
+            raise ValueError("release authority must share the idle creator's ownership store")
+        self._release_authority = authority
 
     def subscribe(self, callback: Callable[[CreationProgress], None]) -> _Subscription:
         self._callbacks.append(callback)
@@ -285,11 +297,7 @@ class DisplayCreator:
             cleanup.add_done_callback(self._discard_background)
 
     def _journal(self, owner_uuid: OwnerId) -> asyncio.Lock:
-        journal = self._journals.get(owner_uuid)
-        if journal is None:
-            journal = asyncio.Lock()
-            self._journals[owner_uuid] = journal
-        return journal
+        return self._release_authority.journal(owner_uuid)
 
     def _is_fenced(self, state: _Creation) -> bool:
         return (
@@ -725,12 +733,14 @@ class DisplayCreator:
         )
 
     async def _finish_failure(self, state: _Creation, failure: Err) -> Result[DisplayHandle]:
-        cleanup = await self._cleanup(state)
+        cleanup = await self._cleanup(state, failure_code=failure.error.code)
         if isinstance(cleanup, Err):
             return cleanup
         return failure
 
-    async def _mark_removing(self, state: _Creation) -> Result[None]:
+    async def _mark_removing(
+        self, state: _Creation, *, failure_code: ErrorCode | None = None,
+    ) -> Result[None]:
         owner_uuid = state.owner_uuid
         state.fenced = True
         if owner_uuid is None:
@@ -740,7 +750,7 @@ class DisplayCreator:
         self._removing_owners.add(owner_uuid)
         try:
             async with self._journal(owner_uuid):
-                if state.cleanup_complete:
+                if self._release_authority.contains(owner_uuid):
                     return Ok(value=None)
                 records = await self._ownership.all()
                 if isinstance(records, Err):
@@ -765,17 +775,19 @@ class DisplayCreator:
                 state.record = removing
         except Exception:
             return _failure(ErrorCode.persistence_failed, state.receiver_id)
-        self._emit_progress(state, removing)
+        self._emit_progress(state, removing, failure_code=failure_code)
         return Ok(value=None)
 
-    async def _cleanup(self, state: _Creation) -> Result[None]:
+    async def _cleanup(
+        self, state: _Creation, *, failure_code: ErrorCode | None = None,
+    ) -> Result[None]:
         owner_uuid = state.owner_uuid
         if owner_uuid is None or state.record is None:
             return Ok(value=None)
-        written = await self._mark_removing(state)
+        written = await self._mark_removing(state, failure_code=failure_code)
         if isinstance(written, Err):
             return written
-        if state.cleanup_complete:
+        if self._release_authority.contains(owner_uuid):
             return Ok(value=None)
 
         if state.launch_attempted:
@@ -848,10 +860,7 @@ class DisplayCreator:
                     scan = self._owned_scan(state)
                     if not scan.complete or scan.matches:
                         return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
-                deleted = await self._ownership.delete(owner_uuid)
-                if isinstance(deleted, Ok):
-                    state.cleanup_complete = True
-                return deleted
+                return await self._release_authority.delete_confirmed(owner_uuid)
         except Exception:
             return _failure(ErrorCode.persistence_failed, state.receiver_id)
 
@@ -909,6 +918,8 @@ class DisplayCreator:
                     last_configuration_step="removing",
                 )
                 async with self._journal(record.owner_uuid):
+                    if self._release_authority.contains(record.owner_uuid):
+                        continue
                     current_result = await self._ownership.all()
                     if isinstance(current_result, Err):
                         return current_result
@@ -949,6 +960,7 @@ class DisplayCreator:
         state: _Creation,
         record: OwnershipRecord,
         handle: DisplayHandle | None = None,
+        *, failure_code: ErrorCode | None = None,
     ) -> None:
         event = CreationProgress(
             receiver_id=state.receiver_id,
@@ -960,6 +972,7 @@ class DisplayCreator:
             connector=record.connector,
             output_id=record.output_id,
             handle=handle,
+            failure_code=failure_code,
         )
         self._notify(event, record.requested_size)
 
