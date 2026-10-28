@@ -84,9 +84,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.check_environment:
+        from airplay_linux.display.helper import VirtualHelper
         from airplay_linux.policy.capabilities import EnvironmentProbe
+        from airplay_linux.process.linux import LinuxProcessRunner
 
-        report = EnvironmentProbe.from_environment().check()
+        process = LinuxProcessRunner()
+        helper = VirtualHelper(process)
+        probe = EnvironmentProbe.from_environment(process=process, helper=helper)
+        report = asyncio.run(probe.check())
         print(report)
         return 0
 
@@ -143,10 +148,17 @@ async def _run(config: RuntimeConfig) -> int:
     runtime = result.value
     for capability, reason in runtime.gated_capabilities.items():
         print(f"capability gated: {capability} - {reason}", file=sys.stderr)
-    try:
-        return 0
-    finally:
-        await runtime.shutdown()
+
+    status = 0
+    started = await runtime.start()
+    if isinstance(started, Err):
+        print(f"the application cannot start: {started.error.message}", file=sys.stderr)
+        status = 2
+    shutdown = await runtime.shutdown()
+    if isinstance(shutdown, Err):
+        print(f"the application could not shut down cleanly: {shutdown.error.message}", file=sys.stderr)
+        status = max(status, 1)
+    return status
 
 
 if __name__ == "__main__":  # pragma: no cover
