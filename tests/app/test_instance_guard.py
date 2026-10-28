@@ -43,17 +43,33 @@ q.unlock()
 
 
 def child(script, *arguments):
+    """Start a child and read the single line it publishes about the lock.
+
+    A child that dies during import publishes nothing. Reporting that as an empty
+    outcome makes the test fail as `assert '' == 'acquired'`, which hides the child's
+    own traceback; the failure then looks like a scheduling flake in the guard. Surface
+    the child's stderr instead so the real cause is always visible.
+    """
+
     proc = subprocess.Popen(
         [sys.executable, '-c', script, *map(str, arguments)],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True,
     )
-    ready, _, _ = select.select([proc.stdout], [], [], 10)
+    ready, _, _ = select.select([proc.stdout], [], [], 30)
     if not ready:
         proc.kill()
         proc.communicate(timeout=5)
-        pytest.fail('child did not publish lock result')
-    return proc, proc.stdout.readline().strip()
+        pytest.fail('child did not publish lock result within 30s')
+    outcome = proc.stdout.readline().strip()
+    if not outcome:
+        proc.wait(timeout=10)
+        detail = (proc.stderr.read() or '<no stderr>').strip()
+        pytest.fail(
+            'child published no lock result (exit %s); child stderr:\n%s'
+            % (proc.returncode, detail)
+        )
+    return proc, outcome
 
 
 def finish(proc, *, crash=False):
