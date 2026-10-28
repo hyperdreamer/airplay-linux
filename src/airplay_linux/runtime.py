@@ -139,12 +139,34 @@ class RuntimeConfig:
 def compose_handlers(deps: ManagerDeps) -> Mapping[Route, Handler]:
     """Compose the production handler map: exactly one owner per :class:`Route`."""
 
-    handlers: Mapping[Route, Handler] = compose_virtual_handlers(
-        build_lifecycle_handlers(deps), build_virtual_handlers(deps)
+    # Reconnect and audio explicitly replace their lifecycle continuations. Every
+    # other factory claim must be disjoint, including claims made by an earlier
+    # factory for a route that a later factory will own. Validate before any of
+    # the specialized composers can overwrite a route or obscure its provenance.
+    factories = (
+        ("build_lifecycle_handlers", build_lifecycle_handlers, ()),
+        ("build_virtual_handlers", build_virtual_handlers, ()),
+        ("build_reconnect_handlers", build_reconnect_handlers, (Route.reconnect,)),
+        ("build_audio_handlers", build_audio_handlers, (Route.audio,)),
+        ("build_recovery_handlers", build_recovery_handlers, ()),
     )
-    handlers = compose_reconnect_handlers(handlers, build_reconnect_handlers(deps))
-    handlers = compose_audio_handlers(handlers, build_audio_handlers(deps))
-    handlers = {**handlers, **build_recovery_handlers(deps)}
+    owners: dict[Route, str] = {}
+    maps: list[Mapping[Route, Handler]] = []
+    for name, factory, rebindings in factories:
+        claims = factory(deps)
+        for route in claims:
+            if route in owners and route not in rebindings:
+                raise ValueError(
+                    f"session route {route.value!r} collision: {owners[route]} and {name}"
+                )
+            owners[route] = name
+        maps.append(claims)
+
+    lifecycle, virtual, reconnect, audio, recovery = maps
+    handlers = compose_virtual_handlers(lifecycle, virtual)
+    handlers = compose_reconnect_handlers(handlers, reconnect)
+    handlers = compose_audio_handlers(handlers, audio)
+    handlers = {**handlers, **recovery}
 
     missing = set(Route) - set(handlers)
     if missing:  # pragma: no cover - defensive: a missing route is a wiring bug
@@ -417,6 +439,7 @@ class Runtime:
     _shutdown_task: asyncio.Task[Result[None]] | None = field(default=None, init=False, repr=False)
     _started: bool = field(default=False, init=False)
     _closed: bool = field(default=False, init=False)
+    _window_closed: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
 
     @property
     def gated_capabilities(self) -> Mapping[str, str]:
@@ -442,6 +465,8 @@ class Runtime:
             return refreshed
         if self.presenter is not None:
             await self.presenter.start()
+        if self.window is not None:
+            self.window.show()
         self._started = True
         return Ok(value=None)
 
@@ -451,6 +476,15 @@ class Runtime:
         if self._start_task is None:
             self._start_task = asyncio.create_task(self._start_once())
         return await asyncio.shield(self._start_task)
+
+    async def wait_closed(self) -> None:
+        """Keep the live application alive until the dashboard accepts its close.
+
+        A close request is deferred by the presenter while bounded shutdown runs;
+        failed cleanup leaves the window visible and does not end this wait.
+        """
+
+        await self._window_closed.wait()
 
     async def _shutdown_once(self) -> Result[None]:
         if self._shutdown_hook is not None:
@@ -487,6 +521,7 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
 
     qt_app = QApplication.instance() or QApplication([])
     window = MainWindow()
+    window.closed.connect(runtime._window_closed.set)
     dialogs = QtDialogFactory(window)
     presenter = Presenter(
         window,

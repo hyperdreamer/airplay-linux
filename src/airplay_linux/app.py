@@ -118,7 +118,21 @@ def _run_guarded(config: RuntimeConfig) -> int:
         print("another instance already owns this runtime root", file=sys.stderr)
         return 1
     try:
-        return asyncio.run(_run(config))
+        if not config.live:
+            return asyncio.run(_run(config))
+
+        from PySide6.QtWidgets import QApplication
+        from qasync import QEventLoop
+
+        qt_app = QApplication.instance() or QApplication([])
+        quit_on_last_window = qt_app.quitOnLastWindowClosed()
+        # The runtime's accepted-close signal ends _run only after cleanup. Qt
+        # must not stop the loop first, before its final shutdown join completes.
+        qt_app.setQuitOnLastWindowClosed(False)
+        try:
+            return asyncio.run(_run(config), loop_factory=lambda: QEventLoop(qt_app))
+        finally:
+            qt_app.setQuitOnLastWindowClosed(quit_on_last_window)
     finally:
         guard.release()
 
@@ -150,14 +164,18 @@ async def _run(config: RuntimeConfig) -> int:
         print(f"capability gated: {capability} - {reason}", file=sys.stderr)
 
     status = 0
-    started = await runtime.start()
-    if isinstance(started, Err):
-        print(f"the application cannot start: {started.error.message}", file=sys.stderr)
-        status = 2
-    shutdown = await runtime.shutdown()
-    if isinstance(shutdown, Err):
-        print(f"the application could not shut down cleanly: {shutdown.error.message}", file=sys.stderr)
-        status = max(status, 1)
+    try:
+        started = await runtime.start()
+        if isinstance(started, Err):
+            print(f"the application cannot start: {started.error.message}", file=sys.stderr)
+            status = 2
+        elif config.live:
+            await runtime.wait_closed()
+    finally:
+        shutdown = await runtime.shutdown()
+        if isinstance(shutdown, Err):
+            print(f"the application could not shut down cleanly: {shutdown.error.message}", file=sys.stderr)
+            status = max(status, 1)
     return status
 
 

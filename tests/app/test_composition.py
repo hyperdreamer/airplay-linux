@@ -28,6 +28,38 @@ def test_compose_handlers_owns_every_session_route_once() -> None:
     assert all(callable(handler) for handler in handlers.values())
 
 
+@pytest.mark.parametrize(
+    ("factory", "route", "other_owner"),
+    [
+        ("build_lifecycle_handlers", Route.recovery, "build_recovery_handlers"),
+        ("build_virtual_handlers", Route.trust, "build_lifecycle_handlers"),
+        ("build_reconnect_handlers", Route.trust, "build_lifecycle_handlers"),
+        ("build_audio_handlers", Route.trust, "build_lifecycle_handlers"),
+        ("build_recovery_handlers", Route.trust, "build_lifecycle_handlers"),
+    ],
+)
+def test_compose_handlers_rejects_factory_route_collision(
+    monkeypatch: pytest.MonkeyPatch, factory: str, route: Route, other_owner: str,
+) -> None:
+    """An extra route from any factory must not silently displace its owner."""
+    from airplay_linux import runtime
+
+    original = getattr(runtime, factory)
+
+    def colliding(deps):
+        return {**original(deps), route: lambda *_args: True}
+
+    monkeypatch.setattr(runtime, factory, colliding)
+
+    with pytest.raises((RuntimeError, ValueError)) as caught:
+        compose_handlers(SessionRig().deps)
+
+    message = str(caught.value)
+    assert route.value in message
+    assert factory in message
+    assert other_owner in message
+
+
 def test_compose_manager_uses_production_handler_composition() -> None:
     rig = SessionRig()
     manager = compose_manager(rig.deps)
