@@ -18,25 +18,36 @@ What the marked tests check when opted in:
 * replacing a receiver at the same endpoint address fences the old stream so the
   replacement is never told to disconnect, and shutdown releases both.
 
-Reconnect output retention and accepted-mode recreation additionally require a
-helper/output association authority, which this composition deliberately does not
-supply; :func:`airplay_linux.runtime.build_runtime` reports that as the
-``virtual_display`` gate.  They are *not* claimed here.  Manual commands::
+* the owned virtual output survives a real reconnect (the same display handle is
+  retained across the stream loss and retry) and is recreated only on an explicit
+  accepted-mode change, through the production provider and the production
+  session manager.  Both scenarios create an output, so they require the extra
+  ``AIRPLAY_LINUX_LIVE_VIRTUAL=1`` permission and are skipped with the runtime's
+  own precise gate reason when the composition cannot associate an output with
+  the helper (the current production composition reports that as
+  ``virtual_display: helper/output association verifier not supplied``).  They
+  also require an already paired, currently discoverable receiver: a live
+  scenario never types a credential.
+
+Manual commands::
 
     AIRPLAY_LINUX_LIVE_HARDWARE=1 AIRPLAY_LINUX_LIVE_CONFIG=/path/live.json \\
         python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
 
-    # manual reconnect/recreation review on a configured desktop:
-    airplay-linux  # connect target A, connect target B, mute A, unmute A, quit
+    # reconnect output retention + accepted-mode recreation (creates one output):
+    AIRPLAY_LINUX_LIVE_HARDWARE=1 AIRPLAY_LINUX_LIVE_CONFIG=/path/live.json \\
+        AIRPLAY_LINUX_LIVE_VIRTUAL=1 \\
+        python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -45,12 +56,27 @@ import pytest
 from airplay_linux.backend.contract import probe_backend
 from airplay_linux.capture.physical import KscreenConnectorInventory, PhysicalCaptureProvider
 from airplay_linux.capture.portal import PortalClient
+from airplay_linux.domain.messages import (
+    EmptyPayload,
+    ModePayload,
+    RecreateAccepted,
+    Retry,
+    Start,
+    TransportEvent,
+    TransportEventKind,
+)
 from airplay_linux.domain.resources import (
     AudioPolicy,
+    DisplayState,
     Err,
     ErrorCode,
+    Mode,
     Ok,
     PhysicalMonitorSource,
+    ResolutionDecision,
+    ResolutionEvidence,
+    StartRequest,
+    TransportState,
     VirtualOutputSource,
 )
 from airplay_linux.domain.resources import Size
@@ -64,6 +90,8 @@ from airplay_linux.trust.keyring import BackendKeyringStore
 
 LIVE_HARDWARE_ENV = "AIRPLAY_LINUX_LIVE_HARDWARE"
 LIVE_CONFIG_ENV = "AIRPLAY_LINUX_LIVE_CONFIG"
+LIVE_VIRTUAL_ENV = "AIRPLAY_LINUX_LIVE_VIRTUAL"
+LIVE_RESOLUTION_ENV = "AIRPLAY_LINUX_LIVE_RESOLUTION"
 
 #: The complete, non-secret configuration schema this loader accepts.
 CONFIG_KEYS = frozenset({"schema", "receivers", "connectors", "notes"})
@@ -428,3 +456,297 @@ async def test_live_composition_reports_the_virtual_display_gate(tmp_path):
     assert "virtual_display" in gated
     assert "association" in gated["virtual_display"].casefold()
     await built.value.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Step 4 reconnect retention and accepted-mode recreation.
+#
+# Both scenarios are ordinary opt-in live checks: without every prerequisite they
+# skip with the exact missing reason.  The body uses the production provider, the
+# production transport and the production session manager; only the reconnect /
+# accepted-mode *stimulus* is delivered through the transport's documented event
+# subscription, because a test cannot make a physical receiver drop on cue.
+# ---------------------------------------------------------------------------
+
+_SMALL = Size(width=1280, height=720)
+
+
+class _Detach:
+    def __init__(self, action):
+        self._action = action
+
+    def close(self):
+        action, self._action = self._action, None
+        if action is not None:
+            action()
+
+
+class _EventInjectingTransport:
+    """Forward every real transport call and add typed test event delivery.
+
+    Production events still arrive through the real transport subscription; the
+    wrapper only adds ``emit`` so a live test can deliver the one event a physical
+    receiver cannot be asked to produce deterministically.
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+        self._callbacks: list = []
+
+    def subscribe(self, callback):
+        self._callbacks.append(callback)
+        inner = self._inner.subscribe(callback)
+
+        def detach():
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+            inner.close()
+
+        return _Detach(detach)
+
+    def emit(self, event) -> None:
+        for callback in tuple(self._callbacks):
+            callback(event)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _requested_resolution() -> Size:
+    text = os.environ.get(LIVE_RESOLUTION_ENV, "1920x1080").strip().lower()
+    try:
+        width, height = (int(part) for part in text.split("x", 1))
+        return Size(width=width, height=height)
+    except (TypeError, ValueError):
+        pytest.fail(f"{LIVE_RESOLUTION_ENV} must look like 1920x1080, got {text!r}")
+
+
+async def _until(predicate, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.05)
+    return predicate()
+
+
+async def _live_settle(manager) -> None:
+    for _ in range(12):
+        await manager.drain()
+        await asyncio.sleep(0)
+
+
+def _decision(receiver_id, fingerprint: str, size: Size) -> ResolutionDecision:
+    return ResolutionDecision(
+        size=size,
+        source="user",
+        evidence=ResolutionEvidence(
+            origin="picker",
+            reliable=True,
+            receiver_id=receiver_id,
+            endpoint_fingerprint=fingerprint,
+        ),
+    )
+
+
+def _stream_event(manager, receiver_id, kind, *, payload=None) -> TransportEvent:
+    state = manager.snapshot(receiver_id)
+    handle = state.stream
+    assert handle is not None, "no live stream to bind the event to"
+    operation = replace(
+        manager.context(receiver_id).operation(),
+        operation_id=handle.start_operation_id,
+        session_generation=state.session_generation,
+        endpoint_generation=handle.endpoint_generation,
+        transport_lease_id=handle.lease_id,
+    )
+    return TransportEvent(
+        kind=kind,
+        receiver_id=receiver_id,
+        stream=handle,
+        endpoint_fingerprint=handle.endpoint_fingerprint,
+        endpoint_generation=handle.endpoint_generation,
+        daemon_instance_uuid=handle.daemon_instance_uuid,
+        context=operation,
+        payload=payload if payload is not None else EmptyPayload(),
+    )
+
+
+async def _live_virtual_session(tmp_path):
+    """Compose the live scenario or skip with the exact missing prerequisite.
+
+    Returns ``(runtime, manager, transport, receiver_id, view)``.  The caller owns
+    ``runtime.shutdown()``.
+    """
+    config = _require_live()
+    if os.environ.get(LIVE_VIRTUAL_ENV) != "1":
+        pytest.skip(
+            f"creating a live virtual output is opt-in; set {LIVE_VIRTUAL_ENV}=1 "
+            "to allow these reconnect/recreation scenarios to own exactly one "
+            "test output"
+        )
+    from airplay_linux.runtime import RuntimeConfig, build_runtime, compose_manager
+
+    state = tmp_path / "state"
+    runtime_root = tmp_path / "runtime"
+    state.mkdir(mode=0o700)
+    runtime_root.mkdir(mode=0o700)
+    built = await build_runtime(
+        RuntimeConfig(state_root=state, runtime_root=runtime_root, live=False),
+    )
+    assert isinstance(built, Ok), built
+    runtime = built.value
+    gate = runtime.gated_capabilities.get("virtual_display")
+    if gate is not None:
+        await runtime.shutdown()
+        pytest.skip(
+            "the live composition cannot own a virtual output: "
+            f"{gate}; these scenarios run once an association authority exists"
+        )
+
+    # Only an already trusted, currently visible receiver is a valid subject.
+    saved = await runtime.deps.receivers.all()
+    assert isinstance(saved, Ok), saved
+    addresses = {receiver.address for receiver in config.receivers}
+    candidates = [
+        record for record in saved.value
+        if record.credential_ref is not None
+        and record.last_endpoint is not None
+        and record.last_endpoint.canonical_host in addresses
+    ]
+    if not candidates:
+        await runtime.shutdown()
+        pytest.skip(
+            "no remembered-trust receiver matching the live configuration; a live "
+            "scenario never types a credential, pair the receiver first"
+        )
+    receiver_id = candidates[0].receiver_id
+    await runtime.deps.discovery.start()
+    await runtime.deps.discovery.refresh()
+    await _until(
+        lambda: runtime.deps.discovery.current(receiver_id) is not None
+        and runtime.deps.discovery.current(receiver_id).online,
+        5.0,
+    )
+    view = runtime.deps.discovery.current(receiver_id)
+    if view is None or not view.online:
+        await runtime.shutdown()
+        pytest.skip(
+            "the configured receiver is not currently announced by discovery; "
+            "start the receiver and re-run"
+        )
+
+    transport = _EventInjectingTransport(runtime.deps.transport)
+    manager = compose_manager(replace(runtime.deps, transport=transport))
+    return runtime, manager, transport, receiver_id, view
+
+
+@pytest.mark.live_hardware
+async def test_live_reconnect_retains_the_owned_output_until_a_retry_succeeds(
+    tmp_path,
+):
+    """A real reconnect must not recreate the virtual output.
+
+    The session reaches an owned output and a streaming transport; a real
+    ``network_lost`` event then pauses it.  The retry reconnects the *same*
+    display handle: one creation, no second output, no teardown.
+    """
+    runtime, manager, transport, receiver_id, view = await _live_virtual_session(tmp_path)
+    size = _requested_resolution()
+    try:
+        receipt = await manager.dispatch(Start(
+            receiver_id=receiver_id,
+            request=StartRequest(
+                mode=Mode.VIRTUAL,
+                resolution=_decision(
+                    receiver_id, view.record_set.endpoint_fingerprint, size,
+                ),
+                audio=AudioPolicy(enabled=False),
+            ),
+        ))
+        assert receipt.accepted, receipt.diagnostic
+        await _live_settle(manager)
+        started = manager.snapshot(receiver_id)
+        assert started.display is DisplayState.Owned, started.last_error
+        assert started.display_handle is not None
+        assert started.stream is not None
+        before = started.display_handle
+        assert before.source.size == size
+
+        transport.emit(_stream_event(
+            manager, receiver_id, TransportEventKind.network_lost,
+        ))
+        await _live_settle(manager)
+        paused = manager.snapshot(receiver_id)
+        assert paused.stream is None
+        assert paused.transport is TransportState.Reconnecting
+        # The output is retained, never torn down by the reconnect path.
+        assert paused.display is DisplayState.Owned
+        assert paused.display_handle == before
+        assert manager.pending_resources(receiver_id) == ()
+
+        retried = await manager.dispatch(Retry(receiver_id=receiver_id))
+        assert retried.accepted, retried.diagnostic
+        await _live_settle(manager)
+        resumed = manager.snapshot(receiver_id)
+        assert resumed.transport is TransportState.Streaming, resumed.last_error
+        assert resumed.stream is not None
+        assert resumed.display_handle == before
+        assert resumed.display is DisplayState.Owned
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.live_hardware
+async def test_live_accepted_mode_change_recreates_only_on_explicit_acceptance(
+    tmp_path,
+):
+    """An accepted-mode mismatch stops transport, keeps the output, and recreates
+    only when the accepted resolution is explicitly applied."""
+    runtime, manager, transport, receiver_id, view = await _live_virtual_session(tmp_path)
+    size = _requested_resolution()
+    accepted = size if size != _SMALL else Size(width=1920, height=1080)
+    try:
+        receipt = await manager.dispatch(Start(
+            receiver_id=receiver_id,
+            request=StartRequest(
+                mode=Mode.VIRTUAL,
+                resolution=_decision(
+                    receiver_id, view.record_set.endpoint_fingerprint, size,
+                ),
+                audio=AudioPolicy(enabled=False),
+            ),
+        ))
+        assert receipt.accepted, receipt.diagnostic
+        await _live_settle(manager)
+        started = manager.snapshot(receiver_id)
+        assert started.display is DisplayState.Owned, started.last_error
+        before = started.display_handle
+        assert before is not None and started.stream is not None
+
+        transport.emit(_stream_event(
+            manager,
+            receiver_id,
+            TransportEventKind.accepted_mode,
+            payload=ModePayload(size=accepted, reliable=True),
+        ))
+        await _live_settle(manager)
+        mismatch = manager.snapshot(receiver_id)
+        assert mismatch.last_error.code is ErrorCode.resolution_mismatch
+        assert mismatch.accepted_resolution == accepted
+        assert mismatch.transport is TransportState.Idle
+        assert mismatch.stream is None
+        assert mismatch.display is DisplayState.Owned
+        assert mismatch.display_handle == before
+
+        recreated = await manager.dispatch(RecreateAccepted(receiver_id=receiver_id))
+        assert recreated.accepted, recreated.diagnostic
+        await _live_settle(manager)
+        after = manager.snapshot(receiver_id)
+        assert after.display is DisplayState.Owned, after.last_error
+        assert after.display_handle is not None
+        assert after.display_handle != before
+        assert after.display_handle.source.size == accepted
+        assert after.stream is not None
+    finally:
+        await runtime.shutdown()

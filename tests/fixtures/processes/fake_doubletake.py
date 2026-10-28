@@ -24,7 +24,11 @@ production import path:
 
 The journal contains request metadata only -- never payload values, argv secrets
 or environment values -- so tests can assert that a typed PIN never left the
-application.
+application.  A test that must inspect the real boundary itself explicitly
+opts in with ``AIRPLAY_FAKE_CTL_CAPTURE`` (ctl argv and environment values, plus
+the exact request bytes it sends) and ``AIRPLAY_FAKE_DAEMON_CAPTURE`` (the exact
+request bytes the daemon receives).  Those capture directories are private test
+fixtures as well: nothing is recorded unless a test names one.
 
 The module is importable (add ``tests/fixtures/processes`` to ``sys.path``) and is
 also executed as a real process through the generated shims.
@@ -58,8 +62,18 @@ DAEMON_STALE_REPLY_ENV = "AIRPLAY_FAKE_DAEMON_STALE_REPLY"
 DAEMON_STALE_REPLY_OP_ENV = "AIRPLAY_FAKE_DAEMON_STALE_REPLY_OP"
 DAEMON_DENY_PAIRING_ENV = "AIRPLAY_FAKE_DAEMON_DENY_PAIRING"
 DAEMON_FOREIGN_MUTE_ENV = "AIRPLAY_FAKE_DAEMON_FOREIGN_MUTE_TARGET"
+DAEMON_CREDENTIAL_KIND_ENV = "AIRPLAY_FAKE_DAEMON_CREDENTIAL_KIND"
+DAEMON_BEGIN_NO_PROMPT_ENV = "AIRPLAY_FAKE_DAEMON_BEGIN_NO_PROMPT"
 CTL_MODE_ENV = "AIRPLAY_FAKE_CTL_MODE"
 CTL_PID_FILE_ENV = "AIRPLAY_FAKE_CTL_PID_FILE"
+
+#: Opt-in boundary capture.  Each variable names a private directory in which the
+#: real child records the values only it can observe: the exact ``argv`` and
+#: environment of the ctl process, and the raw bytes it sends over / receives
+#: from the private socket.  Nothing is captured unless a test asks for it, so
+#: normal journals stay metadata-only.
+CTL_CAPTURE_ENV = "AIRPLAY_FAKE_CTL_CAPTURE"
+DAEMON_CAPTURE_ENV = "AIRPLAY_FAKE_DAEMON_CAPTURE"
 
 JOURNAL_NAME = "fake-doubletake.jsonl"
 TOKEN_NAME = "fake-owner-token"
@@ -187,12 +201,30 @@ def _start_ticks(pid: int | None = None) -> int:
 
 
 def _append(path: Path, record: dict) -> None:
+    _append_raw(path, (json.dumps(record, sort_keys=True) + "\n").encode())
+
+
+def _append_raw(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(descriptor, (json.dumps(record, sort_keys=True) + "\n").encode())
+        os.write(descriptor, data)
     finally:
         os.close(descriptor)
+
+
+def _capture_record(directory: str, name: str, record: dict) -> None:
+    """Append one opt-in private boundary record (argv/environment values)."""
+    if not directory:
+        return
+    _append(Path(directory) / name, record)
+
+
+def _capture_raw(directory: str, name: str, data: bytes) -> None:
+    """Append exact bytes observed at the socket boundary."""
+    if not directory:
+        return
+    _append_raw(Path(directory) / name, data)
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -442,6 +474,9 @@ class _Daemon:
         self.stopping = False
         self.stale_reply_sent = False
         self.foreign_mute_target = os.environ.get(DAEMON_FOREIGN_MUTE_ENV)
+        self.credential_kind = os.environ.get(DAEMON_CREDENTIAL_KIND_ENV, "pin")
+        self.begin_no_prompt = os.environ.get(DAEMON_BEGIN_NO_PROMPT_ENV) == "1"
+        self.capture_directory = os.environ.get(DAEMON_CAPTURE_ENV, "")
 
     # -- reply construction ------------------------------------------------
 
@@ -456,7 +491,7 @@ class _Daemon:
         if waiting:
             state = "pin_required"
             device, device_ip = waiting[0]["device"], waiting[0]["device_ip"]
-            credential = "pin"
+            credential = self.credential_kind
         elif streaming:
             state = "streaming"
             device, device_ip = streaming[0]["device"], streaming[0]["device_ip"]
@@ -481,7 +516,10 @@ class _Daemon:
             "streams": streaming + waiting,
         }
         if credential is not None:
-            reply["needs_pin"] = True
+            if credential == "pin":
+                # ``needs_pin`` is the legacy PIN-only projection; the published
+                # decoder refuses it for any other credential kind.
+                reply["needs_pin"] = True
             reply["needs_credential"] = True
             reply["credential_kind"] = credential
         return reply
@@ -499,7 +537,7 @@ class _Daemon:
             entry["has_audio"] = bool(stream.get("has_audio", True))
             entry["audio_muted"] = bool(stream.get("audio_muted", False))
         else:
-            entry["credential_kind"] = "pin"
+            entry["credential_kind"] = self.credential_kind
         return entry
 
     def _ack(self, state: str = "idle") -> dict:
@@ -556,7 +594,8 @@ class _Daemon:
                 return {"ok": False, "state": "idle"}, False
             if target is None:
                 return self._reject("invalid_request"), False
-            self.pending.add(target)
+            if not self.begin_no_prompt:
+                self.pending.add(target)
             return self._ack("pin_required"), False
         if operation in {"submit_pairing", "prepare_pairing", "commit_pairing"}:
             return self._ack("pin_required" if target in self.pending else "idle"), False
@@ -618,6 +657,7 @@ class _Daemon:
                 return
             buffer += chunk
         line = buffer.split(b"\n", 1)[0]
+        _capture_raw(self.capture_directory, "daemon-requests.jsonl", line + b"\n")
         try:
             request = json.loads(line)
         except ValueError:
@@ -709,6 +749,14 @@ def _ctl(argv: list[str]) -> int:
             "process": "ctl", "outcome": "start", "operation": operation,
             "request_id": request_id, "argv": argv, "env_keys": sorted(os.environ),
         })
+        _capture_record(
+            os.environ.get(CTL_CAPTURE_ENV, ""), "ctl-argv-env.jsonl",
+            {
+                "process": "ctl", "operation": operation,
+                "request_id": request_id, "argv": argv,
+                "env": dict(os.environ),
+            },
+        )
         if mode == "crash":
             _append(journal_path, {
                 "process": "ctl", "outcome": "crash", "operation": operation,
@@ -745,10 +793,14 @@ def _ctl(argv: list[str]) -> int:
             "operation": operation,
             "target": target,
         }
+        body_bytes = (json.dumps(payload) + "\n").encode()
+        _capture_raw(
+            os.environ.get(CTL_CAPTURE_ENV, ""), "ctl-requests.jsonl", body_bytes,
+        )
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(5.0)
             client.connect(socket_path)
-            client.sendall((json.dumps(payload) + "\n").encode())
+            client.sendall(body_bytes)
             buffer = b""
             while b"\n" not in buffer:
                 chunk = client.recv(65536)

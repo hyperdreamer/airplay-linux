@@ -9,7 +9,19 @@ inside ``tmp_path`` (``AIRPLAY_FAKE_KSCREEN_STATE``).
 Two modes exist so failure windows are explicit:
 
 * ``AIRPLAY_FAKE_KSCREEN_MODE=malformed`` prints a document that is not JSON;
-* ``AIRPLAY_FAKE_KSCREEN_MODE=fail`` exits non-zero without changing anything.
+* ``AIRPLAY_FAKE_KSCREEN_MODE=fail`` exits non-zero without changing anything;
+* ``AIRPLAY_FAKE_KSCREEN_MODE=reject-config`` accepts reads but refuses every
+  configuration command with a non-zero exit and no change;
+* ``AIRPLAY_FAKE_KSCREEN_MODE=ignore-config`` accepts configuration commands with
+  exit zero but applies none of the tokens (an exit code is not evidence);
+* ``AIRPLAY_FAKE_KSCREEN_MODE=drift-final-readback`` applies every token, then
+  answers exactly the second ``-j`` read after a position token with a drifted
+  copy (one-shot, never persisted), which targets only the creator's final
+  readback window.
+
+When ``AIRPLAY_FAKE_KSCREEN_JOURNAL`` names a path, every invocation appends its
+argv there, so a test can prove the real command tokens were issued rather than
+inferred from the resulting document.
 
 The module is also importable (``sys.path`` entry ``tests/fixtures/processes``) so
 tests can build layouts and read them back with the same helpers.
@@ -25,6 +37,7 @@ from pathlib import Path
 
 STATE_ENV = "AIRPLAY_FAKE_KSCREEN_STATE"
 MODE_ENV = "AIRPLAY_FAKE_KSCREEN_MODE"
+JOURNAL_ENV = "AIRPLAY_FAKE_KSCREEN_JOURNAL"
 
 PHYSICAL_TYPE = 14
 UNKNOWN_TYPE = 0
@@ -93,6 +106,70 @@ def read_layout(path: str | os.PathLike[str]) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def invocations(path: str | os.PathLike[str]) -> list[list[str]]:
+    """Every recorded argv of this fixture, oldest first."""
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, FileNotFoundError):
+        return []
+    recorded = []
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, list):
+            recorded.append(entry)
+    return recorded
+
+
+def _journal(path: str | os.PathLike[str] | None, arguments: list[str]) -> None:
+    if not path:
+        return
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, (json.dumps(arguments) + "\n").encode())
+    finally:
+        os.close(descriptor)
+
+
+def _drifted(layout: dict) -> dict:
+    """A one-shot read that no longer proves the requested configuration."""
+    copy = json.loads(json.dumps(layout))
+    for entry in copy.get("outputs", []):
+        if isinstance(entry.get("pos"), dict):
+            entry["pos"] = {"x": 1, "y": 0}
+    return copy
+
+
+def _drifting_read(state: str) -> bool:
+    """Whether this ``-j`` read is the creator's final readback.
+
+    The first read after the position token is the adapter's own readback inside
+    ``configure``; the second one is the creator's independent final check.  Only
+    that second read is corrupted, and only once.
+    """
+    marker = Path(state + ".position-applied")
+    counter = Path(state + ".reads-after-position")
+    if not marker.exists():
+        return False
+    reads = 0
+    if counter.exists():
+        try:
+            reads = int(counter.read_text(encoding="utf-8").strip() or "0")
+        except (OSError, ValueError):
+            reads = 0
+    reads += 1
+    counter.write_text(str(reads), encoding="utf-8")
+    if reads < 2:
+        return False
+    marker.unlink(missing_ok=True)
+    counter.unlink(missing_ok=True)
+    return True
+
+
 def write_layout(path: str | os.PathLike[str], layout: dict) -> None:
     """Atomically replace the whole simulated compositor document."""
     target = Path(path)
@@ -154,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     if not state:
         print("private test fixture: missing state path", file=sys.stderr)
         return 64
+    _journal(os.environ.get(JOURNAL_ENV), arguments)
     mode = os.environ.get(MODE_ENV, "normal")
     if mode == "malformed":
         sys.stdout.write("{not json")
@@ -162,11 +240,20 @@ def main(argv: list[str] | None = None) -> int:
         print("private test fixture: simulated kscreen failure", file=sys.stderr)
         return 3
     if arguments == ["-j"]:
-        sys.stdout.write(json.dumps(read_layout(state), sort_keys=True))
+        layout = read_layout(state)
+        if mode == "drift-final-readback" and _drifting_read(state):
+            layout = _drifted(layout)
+        sys.stdout.write(json.dumps(layout, sort_keys=True))
         return 0
     if not arguments:
         print("private test fixture: no operation", file=sys.stderr)
         return 64
+    if mode == "reject-config":
+        print("private test fixture: simulated configuration refusal", file=sys.stderr)
+        return 3
+    if mode == "ignore-config":
+        # A successful exit that applies nothing: exit status alone is not proof.
+        return 0
     layout = read_layout(state)
     try:
         apply_tokens(layout, arguments)
@@ -174,6 +261,11 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return 64
     write_layout(state, layout)
+    if mode == "drift-final-readback" and any(
+        argument.split(".")[2:3] == ["position"] for argument in arguments
+    ):
+        Path(state + ".position-applied").write_text("1", encoding="utf-8")
+        Path(state + ".reads-after-position").write_text("0", encoding="utf-8")
     return 0
 
 

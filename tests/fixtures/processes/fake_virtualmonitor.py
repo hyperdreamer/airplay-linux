@@ -20,6 +20,10 @@ Failure windows are selectable with ``AIRPLAY_FAKE_HELPER_MODE``:
     it (an orphan that a later live helper cannot clean).
 ``duplicate-output``
     Append two new outputs of the requested size, so selection is ambiguous.
+``unconfigured``
+    Append exactly one output of the requested size but leave it disabled and at a
+    non-zero position, so the creator must genuinely reconfigure it (the enable
+    and position commands change state and their readback is evidence).
 
 The module is importable so tests can share the environment/association helpers.
 """
@@ -139,8 +143,8 @@ def main(argv: list[str] | None = None) -> int:
             "name": connector,
             "type": fake_kscreen.UNKNOWN_TYPE,
             "connected": True,
-            "enabled": True,
-            "pos": {"x": 0, "y": 0},
+            "enabled": mode != "unconfigured",
+            "pos": {"x": 640, "y": 480} if mode == "unconfigured" else {"x": 0, "y": 0},
             "scale": 1,
             "currentModeId": str(2000 + output_id),
             "size": {"width": width, "height": height},

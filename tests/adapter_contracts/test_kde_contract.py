@@ -16,6 +16,12 @@ association record.  The contracts pinned here:
 
 * one creation publishes exactly one owned, verified output and removal restores
   the baseline exactly;
+* an owned output that is disabled and offset must genuinely be reconfigured by
+  real ``output.<id>`` commands, and the readback (not the exit code) is the
+  evidence;
+* a refused configuration, an accepted command that changes nothing, and drift
+  after the last successful configuration all publish nothing and restore the
+  exact baseline;
 * a crash before persistence invents no output, and a crash after persistence
   never publishes a handle (the orphan is retained as cleanup intent);
 * ambiguous new outputs are refused, and an active creation blocks a second one;
@@ -86,12 +92,25 @@ class World:
     state: Path
     pids: Path
     runtime: Path
+    journal: Path
+    observer: KScreenObserver
 
     def layout(self):
         return fake_kscreen.read_layout(self.state)
 
     def helper_records(self):
         return json.loads(self.pids.read_text()) if self.pids.exists() else []
+
+    def kscreen_calls(self) -> list[list[str]]:
+        return fake_kscreen.invocations(self.journal)
+
+    def configuration_tokens(self) -> list[str]:
+        return [
+            argument
+            for call in self.kscreen_calls()
+            for argument in call
+            if argument.startswith("output.")
+        ]
 
     async def records(self):
         found = await self.ownership.all()
@@ -139,14 +158,21 @@ def _confined_owner_scan(owner_uuid, runtime_directory, proc_root=Path("/proc"))
     )
 
 
-async def kde_world(tmp_path, monkeypatch, *, helper_mode="normal") -> World:
+async def kde_world(
+    tmp_path, monkeypatch, *, helper_mode="normal", kscreen_mode="normal",
+) -> World:
     state = tmp_path / "fake-kscreen.json"
     pids = tmp_path / "fake-helper-pids.json"
+    journal = tmp_path / "kscreen-journal.jsonl"
     fake_kscreen.write_layout(state, fake_kscreen.baseline_layout())
     installed = fake_doubletake.install(
         tmp_path / "bin",
         env={
-            "kscreen-doctor": {"AIRPLAY_FAKE_KSCREEN_STATE": str(state)},
+            "kscreen-doctor": {
+                fake_kscreen.STATE_ENV: str(state),
+                fake_kscreen.MODE_ENV: kscreen_mode,
+                fake_kscreen.JOURNAL_ENV: str(journal),
+            },
             "krfb-virtualmonitor": fake_virtualmonitor.helper_env(
                 state, pids, mode=helper_mode,
             ),
@@ -208,7 +234,7 @@ async def kde_world(tmp_path, monkeypatch, *, helper_mode="normal") -> World:
         output_verifier=verifier,
     )
     provider = KdeVirtualDisplayProvider(creator, recovery, remover, observer, helper)
-    return World(runner, provider, ownership, state, pids, runtime)
+    return World(runner, provider, ownership, state, pids, runtime, journal, observer)
 
 
 async def test_create_publishes_one_owned_output_and_remove_restores_baseline(
@@ -366,5 +392,170 @@ async def test_a_remove_then_create_cycle_yields_a_distinct_output(tmp_path, mon
             await world.provider.remove(second.value.owner_uuid, _context()), Ok,
         )
         assert fake_kscreen.read_layout(world.state) == baseline
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
+
+
+# ---------------------------------------------------------------------------
+# Adverse configuration and readback: the exit code is not the evidence.
+# ---------------------------------------------------------------------------
+
+
+def _added_outputs(world: World, baseline: dict) -> list[dict]:
+    return [
+        entry for entry in world.layout()["outputs"]
+        if entry not in baseline["outputs"]
+    ]
+
+
+async def test_creation_reconfigures_an_owned_output_with_command_evidence(
+    tmp_path, monkeypatch,
+):
+    """A disabled, offset owned output must really be reconfigured.
+
+    The helper starts the output at a state that does not satisfy the request, so
+    the creator's mode/enable/position branches have to run.  The test records the
+    real layout at the exact moment each configuration call is made, then requires
+    the real command tokens and the readback to prove the change.
+    """
+    world = await kde_world(tmp_path, monkeypatch, helper_mode="unconfigured")
+    baseline = world.layout()
+    original = world.observer.configure
+    evidence: list[tuple[object, dict, dict]] = []
+
+    async def recording_configure(target, values, **kwargs):
+        evidence.append((target, dict(values), world.layout()))
+        return await original(target, values, **kwargs)
+
+    world.observer.configure = recording_configure
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Ok), created
+        handle = created.value
+
+        # The stimulus was real: before the first command the owned output was
+        # disabled and offset, not already in the requested state.
+        assert evidence, "the creator never configured the owned output"
+        first_state = evidence[0][2]
+        initial = [
+            entry for entry in first_state["outputs"]
+            if entry not in baseline["outputs"]
+        ]
+        assert len(initial) == 1
+        assert initial[0]["enabled"] is False
+        assert initial[0]["pos"] == {"x": 640, "y": 480}
+        assert [sorted(values) for _, values, _ in evidence] == [
+            ["size"], ["enabled"], ["position"],
+        ]
+
+        # The real compositor command carried the mode/enable/position tokens.
+        output_id = handle.source.kscreen_output_id
+        tokens = world.configuration_tokens()
+        assert f"output.{output_id}.enable" in tokens
+        assert any(
+            token.startswith(f"output.{output_id}.mode.") for token in tokens
+        )
+        assert f"output.{output_id}.position.0,0" in tokens
+
+        # The readback, not the command's exit status, is the publication proof.
+        added = _added_outputs(world, baseline)
+        assert len(added) == 1
+        assert added[0]["enabled"] is True
+        assert added[0]["size"] == {"width": 1920, "height": 1080}
+        assert added[0]["pos"] == {"x": 0, "y": 0}
+        assert [record.stage for record in await world.records()] == ["published"]
+        assert (await world.records())[0].last_applied
+
+        assert isinstance(
+            await world.provider.remove(handle.owner_uuid, _context()), Ok,
+        )
+        assert world.layout() == baseline
+        assert world.helper_records() == []
+        assert await world.records() == ()
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
+
+
+async def test_a_refused_configuration_publishes_nothing_and_cleans_up(
+    tmp_path, monkeypatch,
+):
+    world = await kde_world(
+        tmp_path, monkeypatch,
+        helper_mode="unconfigured", kscreen_mode="reject-config",
+    )
+    baseline = world.layout()
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Err), created
+        assert created.error.code is ErrorCode.configuration_failed
+        assert not [
+            record for record in await world.records() if record.stage == "published"
+        ]
+        assert world.layout() == baseline
+        assert world.helper_records() == []
+        assert await world.records() == ()
+        # The refusal happened at a real configuration command, not before one.
+        assert world.configuration_tokens(), "no configuration command was issued"
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
+
+
+async def test_a_configuration_accepted_without_effect_publishes_nothing(
+    tmp_path, monkeypatch,
+):
+    """Exit zero is not evidence: a no-op compositor must not publish."""
+    world = await kde_world(
+        tmp_path, monkeypatch,
+        helper_mode="unconfigured", kscreen_mode="ignore-config",
+    )
+    baseline = world.layout()
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Err), created
+        assert created.error.code is ErrorCode.configuration_failed
+        assert not [
+            record for record in await world.records() if record.stage == "published"
+        ]
+        assert world.layout() == baseline
+        assert world.helper_records() == []
+        assert await world.records() == ()
+        assert world.configuration_tokens()
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
+
+
+async def test_drift_after_the_last_successful_configuration_publishes_nothing(
+    tmp_path, monkeypatch,
+):
+    """The creator's final independent readback still gates publication.
+
+    Every configuration command is applied and its own readback passes, then the
+    compositor drifts on the creator's last read.  A returned handle here would
+    mean the creator trusted earlier evidence instead of re-reading.
+    """
+    world = await kde_world(
+        tmp_path, monkeypatch,
+        helper_mode="unconfigured", kscreen_mode="drift-final-readback",
+    )
+    baseline = world.layout()
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Err), created
+        assert created.error.code is ErrorCode.configuration_failed
+        assert not [
+            record for record in await world.records() if record.stage == "published"
+        ]
+        assert world.layout() == baseline
+        assert world.helper_records() == []
+        assert await world.records() == ()
+        assert world.configuration_tokens()
     finally:
         fake_doubletake.reap_private(str(tmp_path))
