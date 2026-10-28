@@ -4,6 +4,9 @@ The manager closes command acceptance and sends each actor one Stop. Its hook
 joins the existing ordered transactions; receiver effects run concurrently.
 The final three seconds are reserved for registry/supervisor escalation and
 safe metadata flushing, inside (never after) the whole-application deadline.
+An acquisition that is still in flight gets one short, bounded window to land
+before Stop is dispatched: a fenced acquisition is rolled back by its provider,
+and the teardown would then be refused for a resource that no longer exists.
 """
 from __future__ import annotations
 
@@ -95,6 +98,14 @@ class ShutdownCoordinator:
             loop.call_later(self.deadline_seconds - reserve, fire, self._grace),
             loop.call_later(self.deadline_seconds, fire, self._final),
         ]
+        # An acquisition still in flight when Stop is dispatched is fenced by
+        # the ordered teardown: the provider compensates by rolling back the very
+        # reservation the teardown then wants to release, so that release is
+        # refused for a resource which is already gone and the whole shutdown
+        # reports unconfirmed cleanup for work that did complete.  Give bounded
+        # acquisitions their own short window to land first, so the teardown can
+        # own and confirm the release of the exact handle they produced.
+        await self._await_acquisitions(reserve)
         self._manager_task = self._spawn(self._result(self.manager.shutdown))
         try:
             done, _ = await asyncio.wait((self._manager_task, self._final), return_when=asyncio.FIRST_COMPLETED)
@@ -115,6 +126,50 @@ class ShutdownCoordinator:
             for subscription in tuple(self.manager._subscriptions):
                 subscription.close()
             self.manager._subscriptions.clear()
+
+    def _pending_acquisitions(self) -> tuple[asyncio.Task[object], ...]:
+        """Effect tasks that are still acquiring a resource from a provider.
+
+        Only acquisitions need to settle before teardown starts: a release, a
+        diagnosis or a persistence write is already ordered by the transaction.
+        A task which has completed is not pending even if its result has not
+        been delivered yet - the manager drains that delivery before it
+        dispatches Stop.
+        """
+        return tuple(
+            task for task, effect in tuple(self.manager._effects.items())
+            if effect.acquisition and not task.done()
+        )
+
+    async def _await_acquisitions(self, window: float) -> None:
+        """Let bounded acquisitions settle inside their own short window.
+
+        The whole-application deadline still owns the budget: an acquisition
+        which does not settle here is rolled back by its provider under the
+        ordered teardown, and every remaining stage still fails closed.
+        """
+        loop = asyncio.get_running_loop()
+        expiry: asyncio.Future[None] = loop.create_future()
+
+        def fire(future: asyncio.Future[None]) -> None:
+            if not future.done():
+                future.set_result(None)
+
+        timer = loop.call_later(window, fire, expiry)
+        try:
+            while True:
+                pending = self._pending_acquisitions()
+                if not pending:
+                    return
+                await asyncio.wait(
+                    (*pending, expiry, self._grace, self._final),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if expiry.done() or self._grace.done() or self._final.done():
+                    return
+                await self.manager.drain()
+        finally:
+            timer.cancel()
 
     def _resources_complete(self):
         return all(
@@ -147,11 +202,21 @@ class ShutdownCoordinator:
                     break
                 effects = tuple(self.manager._effects)
                 if not effects:
-                    # An explicit refused release is terminal until RetryCleanup;
-                    # spinning or waiting until the deadline cannot confirm it.
-                    self._failure = Err(error=diagnostic(ErrorCode.cleanup_timeout))
-                    self._mark_pending()
-                    break
+                    # Nothing is in flight *right now*.  That is a gap, not a
+                    # refusal: the actor may still hold a queued continuation at
+                    # an ordered stage boundary.  Give the manager its turn and
+                    # only a still-idle, still-incomplete transaction is final.
+                    await self.manager.drain()
+                    if self._resources_complete():
+                        break
+                    effects = tuple(self.manager._effects)
+                    if not effects:
+                        # An explicit refused release is terminal until
+                        # RetryCleanup; spinning or waiting until the deadline
+                        # cannot confirm it.  Fail closed and keep the evidence.
+                        self._failure = Err(error=diagnostic(ErrorCode.cleanup_timeout))
+                        self._mark_pending()
+                        break
                 changed.clear()
                 wake = asyncio.create_task(changed.wait())
                 try:
