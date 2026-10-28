@@ -22,15 +22,20 @@ What the marked tests check when opted in:
   retained across the stream loss and retry) and is recreated only on an explicit
   accepted-mode change, through the production provider and the production
   session manager.  Both scenarios create an output, so they require the extra
-  ``AIRPLAY_LINUX_LIVE_VIRTUAL=1`` permission and are skipped with the runtime's
-  own precise gate reason when the composition cannot associate an output with
-  the helper (the current production composition reports that as
-  ``virtual_display: helper/output association verifier not supplied``).  They
-  also require an already paired receiver that discovery currently announces at a
-  configured address, and the backend credential adapter must resolve a committed
-  reference for it through ``CredentialStore.load_credential_ref`` (application
-  metadata never carries one): a live scenario never types a credential.  The
-  accepted-mode scenario requests ``AIRPLAY_LINUX_LIVE_RESOLUTION`` (default
+  ``AIRPLAY_LINUX_LIVE_VIRTUAL=1`` permission.  Live execution is gated on both a
+  helper/output association authority and a remembered credential committed in
+  the same runtime's backend credential adapter.  The association gate skips
+  first, preserving the runtime's precise reason verbatim (currently
+  ``virtual_display: helper/output association verifier not supplied``).  A
+  configured receiver must also be announced by discovery, and its committed
+  reference must resolve through ``CredentialStore.load_credential_ref``
+  (application metadata never carries one).  Each invocation composes a fresh
+  runtime whose credential adapter starts empty; this helper never pairs in it.
+  Pairing in another process does not satisfy that lookup, so lifting the
+  association gate alone still leaves live execution blocked on same-runtime
+  remembered trust.  These conditional bodies are implemented and falsifiable;
+  they do not establish live acceptance while either prerequisite is absent.
+  The accepted-mode scenario requests ``AIRPLAY_LINUX_LIVE_RESOLUTION`` (default
   ``1920x1080``) and delivers a genuinely different accepted mode, because equal
   sizes are a correct no-op with no mismatch.  Both scenarios start the runtime
   with ``runtime.start()``, the production path that runs startup recovery (which
@@ -41,7 +46,9 @@ Manual commands::
     AIRPLAY_LINUX_LIVE_HARDWARE=1 AIRPLAY_LINUX_LIVE_CONFIG=/path/live.json \\
         python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
 
-    # reconnect output retention + accepted-mode recreation (creates one output):
+    # Conditional reconnect/recreation checks (creates one output if eligible).
+    # Association authority and same-runtime remembered trust are both required;
+    # the current fresh-runtime helper does not establish that trust.
     AIRPLAY_LINUX_LIVE_HARDWARE=1 AIRPLAY_LINUX_LIVE_CONFIG=/path/live.json \\
         AIRPLAY_LINUX_LIVE_VIRTUAL=1 \\
         python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
@@ -469,8 +476,11 @@ async def test_live_composition_reports_the_virtual_display_gate(tmp_path):
 # ---------------------------------------------------------------------------
 # Step 4 reconnect retention and accepted-mode recreation.
 #
-# Both scenarios are ordinary opt-in live checks: without every prerequisite they
-# skip with the exact missing reason.  The body uses the production provider, the
+# Both scenarios are conditional opt-in live checks: they require both an output
+# association authority and a credential committed in the same runtime.  The
+# fresh-runtime helper never pairs, so lifting the association gate alone still
+# leaves the remembered-trust prerequisite unsatisfied.  Missing prerequisites
+# skip with their exact reason.  The body uses the production provider, the
 # production transport and the runtime's own production session manager; only the
 # reconnect / accepted-mode *stimulus* is synthetic, delivered to the same
 # ``SessionManager.ingest`` callback the transport subscription calls, because a
@@ -592,7 +602,9 @@ async def _remembered_reference(runtime, receiver_id):
     the credential adapter and hands it to the transport, whose pairing
     coordinator owns it, and the runtime exposes no other credential port; ask
     that adapter through its documented ``CredentialStore.load_credential_ref``
-    lookup instead of requiring a field storage refuses to write.
+    lookup instead of requiring a field storage refuses to write.  The adapter
+    starts empty in a fresh runtime and only same-adapter ``commit_pairing``
+    writes a remembered reference; pairing in another process cannot supply it.
     """
     credentials = getattr(
         getattr(runtime.deps.transport, "_pairing", None), "_credentials", None
@@ -637,6 +649,9 @@ async def _discovery_views(runtime) -> tuple:
 async def _live_virtual_session(tmp_path):
     """Compose the live scenario or skip with the exact missing prerequisite.
 
+    The association gate is checked first; same-runtime remembered trust is an
+    independent prerequisite.  This helper creates a fresh credential adapter and
+    never pairs in it, so clearing the association gate alone is insufficient.
     Returns a :class:`_LiveSession`; the caller owns ``runtime.shutdown()``.
     """
     config = _require_live()
@@ -662,11 +677,14 @@ async def _live_virtual_session(tmp_path):
         await runtime.shutdown()
         pytest.skip(
             "the live composition cannot own a virtual output: "
-            f"{gate}; these scenarios run once an association authority exists"
+            f"{gate}; these scenarios also require a remembered credential "
+            "committed in this same runtime; the fresh-runtime helper never pairs"
         )
 
     # Only a receiver that discovery currently announces at a configured address
-    # and that the backend credential adapter already remembers is a subject.
+    # and that this runtime's credential adapter already remembers is a subject.
+    # This fresh runtime has no pairing setup; external pairing cannot supply the
+    # same-runtime reference, even if the association gate above is cleared.
     addresses = {receiver.address for receiver in config.receivers}
     views = [
         view for view in await _discovery_views(runtime)
@@ -683,9 +701,10 @@ async def _live_virtual_session(tmp_path):
         if isinstance(remembered, Err):
             await runtime.shutdown()
             pytest.skip(
-                "the backend credential adapter cannot resolve remembered trust: "
-                f"{remembered.error.code.value}; a live scenario never types a "
-                "credential"
+                "the backend credential adapter cannot resolve same-runtime "
+                f"remembered trust: {remembered.error.code.value}; association "
+                "authority and same-runtime remembered trust are both required; "
+                "the fresh-runtime helper never pairs"
             )
         if remembered.value is not None:
             return _LiveSession(
@@ -695,9 +714,11 @@ async def _live_virtual_session(tmp_path):
             )
     await runtime.shutdown()
     pytest.skip(
-        "the backend credential adapter remembers no credential for the "
-        f"discoverable receiver(s) at {sorted(addresses)}; pair the receiver "
-        "before running, a live scenario never types a credential"
+        "the backend credential adapter remembers no credential in this runtime "
+        f"for the discoverable receiver(s) at {sorted(addresses)}; association "
+        "authority and same-runtime remembered trust are both required; the "
+        "fresh-runtime helper never pairs, and pairing in another process "
+        "cannot satisfy this prerequisite"
     )
 
 
