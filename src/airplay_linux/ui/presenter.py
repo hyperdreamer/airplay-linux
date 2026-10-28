@@ -26,7 +26,13 @@ a confirmed mode switch against the captured session generation and endpoint, a
 resolution answer against the endpoint fingerprint, an orphan removal against the
 exact owner UUID, a host source list or ownership load against a selected-receiver
 request token, and stored metadata against the epoch its read started in.  A
-stale result is dropped, never applied over newer state.
+stale result is dropped, never applied over newer state.  Durable ownership
+evidence is reconciled on every snapshot too: once a receiver's own session
+confirms the release of an owner it had claimed, the cached record is retired,
+so a completed release is never re-offered as unconfirmed cleanup.  That
+reconciliation is subject-scoped - a record this receiver never claimed (the
+orphan the recovery controls exist for) and another receiver's record are never
+touched.
 
 *The UI never blocks.*  Dispatch, discovery refresh, prompt answers and store
 reads are all scheduled on the running loop; ``start`` and ``close`` return
@@ -91,6 +97,7 @@ from airplay_linux.domain.records import (
 )
 from airplay_linux.domain.resources import (
     AudioPolicy,
+    AudioState,
     CapabilityReport,
     Diagnostic,
     DisplayState,
@@ -319,6 +326,12 @@ class Presenter:
         self._snapshots: dict[ReceiverId, SessionSnapshot] = {}
         self._saved: dict[ReceiverId, SavedReceiver] = {}
         self._records: dict[Any, OwnershipRecord] = {}
+        # Ownership evidence this dashboard has seen a session claim, and the
+        # records it has seen that same session confirm released.  Both are
+        # per receiver: a receiver's snapshot may only ever retire its own
+        # evidence, never a durable record another receiver still owns.
+        self._claimed_owners: dict[ReceiverId, set[Any]] = {}
+        self._released_owners: dict[ReceiverId, set[Any]] = {}
         self._sources: tuple[PhysicalMonitorSource, ...] = ()
         self._selected_source: dict[ReceiverId, PhysicalMonitorSource] = {}
         self._selected_resolution: dict[ReceiverId, Size] = {}
@@ -475,6 +488,37 @@ class Presenter:
     def _ownership_for(self, receiver_id: ReceiverId) -> OwnershipRecord | None:
         records = self._records_for(receiver_id)
         return records[0] if records else None
+
+    def _reconcile_ownership(self, snapshot: SessionSnapshot) -> None:
+        """Retire cached ownership evidence the session has confirmed released.
+
+        The durable store is the provider's authority, but the pane also caches
+        its last answer.  Once the receiver's own session has claimed an owner
+        and then published the *completed* release, that cached copy is stale:
+        keeping it would offer Retry / Keep / Remove for a resource that no
+        longer exists while the phase already says the receiver is Available.
+
+        Only evidence this receiver's session actually claimed is retired, so an
+        unreflected durable record - the orphan the recovery controls exist for -
+        is left exactly as the store reported it.  Nothing here ever inspects or
+        drops another receiver's record: a snapshot applies only to its subject.
+        """
+        receiver_id = snapshot.receiver_id
+        claimed = self._claimed_owners.setdefault(receiver_id, set())
+        claimed.update(_named_owners(snapshot))
+        if not claimed or not _cleanup_confirmed(snapshot):
+            return
+        released = self._released_owners.setdefault(receiver_id, set())
+        for owner_uuid in tuple(claimed):
+            claimed.discard(owner_uuid)
+            released.add(owner_uuid)
+            record = self._records.get(owner_uuid)
+            if record is not None and record.receiver_id == receiver_id:
+                del self._records[owner_uuid]
+
+    def _is_released(self, record: OwnershipRecord) -> bool:
+        """Whether this record's own receiver already confirmed its release."""
+        return record.owner_uuid in self._released_owners.get(record.receiver_id, ())
 
     def _orphans_for(self, receiver_id: ReceiverId) -> tuple[RecoveryItem, ...]:
         """Durable records the session snapshot does not reflect.
@@ -748,9 +792,12 @@ class Presenter:
         if token != self._ownership_epoch or self._disposed:
             return
         if isinstance(result, Ok):
+            # A load issued before a confirmed release can land after it.  The
+            # answer belongs to the subject that issued it, so a record whose
+            # receiver already confirmed the release is not resurrected.
             self._records = {
                 record.owner_uuid: record for record in result.value
-                if isinstance(record, OwnershipRecord)
+                if isinstance(record, OwnershipRecord) and not self._is_released(record)
             }
         else:
             self._reject(self._selected, result.error)
@@ -820,6 +867,9 @@ class Presenter:
             del self._switch_queued[snapshot.receiver_id]
         # An authoritative state supersedes a receipt error for that receiver.
         self._rejections.pop(snapshot.receiver_id, None)
+        # Reconcile durable ownership evidence on every publication: a confirmed
+        # release must clear the cached record, not linger as phantom cleanup.
+        self._reconcile_ownership(snapshot)
         self._request_render()
 
     def _discovery_arrived(self, event: object) -> None:
@@ -1436,6 +1486,36 @@ def _switch_allowed(snapshot: SessionSnapshot) -> bool:
         and not _uncertain_trust(snapshot)
         and snapshot.phase not in _SWITCH_BLOCKED_PHASES
         and snapshot.transport is not TransportState.Stopping
+    )
+
+
+def _named_owners(snapshot: SessionSnapshot) -> set[Any]:
+    """The exact owners this authoritative state says the session holds."""
+    handle = snapshot.display_handle
+    return {
+        value for value in (
+            snapshot.ownership_uuid,
+            handle.owner_uuid if handle is not None else None,
+        ) if value is not None
+    }
+
+
+def _cleanup_confirmed(snapshot: SessionSnapshot) -> bool:
+    """Whether every resource of this session is confirmed released.
+
+    A failed or partially released state is not evidence of release: the
+    provider only reports ``DisplayState.None_`` with no handle, owner, stream,
+    capture source or audio control once it has acknowledged the release.
+    """
+    return (
+        snapshot.display is DisplayState.None_
+        and snapshot.display_handle is None
+        and snapshot.ownership_uuid is None
+        and snapshot.stream is None
+        and snapshot.physical_source is None
+        and snapshot.transport is TransportState.Idle
+        and snapshot.audio is AudioState.Disabled
+        and not snapshot.cleanup_pending
     )
 
 
