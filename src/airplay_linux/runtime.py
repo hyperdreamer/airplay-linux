@@ -208,6 +208,7 @@ class _NoopRegistry:
 @dataclass
 class _ProductionGraph:
     deps: ManagerDeps
+    manager: SessionManager
     registry: DaemonRegistry
     startup: StartupRecovery
     persistence: SessionPersistence
@@ -414,7 +415,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     persistence = SessionPersistence(manager, sessions)
     startup = StartupRecovery(manager, deps, registry)
     gated = _capability_gates(report)
-    return _ProductionGraph(deps, registry, startup, persistence, report, gated)
+    return _ProductionGraph(deps, manager, registry, startup, persistence, report, gated)
 
 
 @dataclass
@@ -589,7 +590,7 @@ async def build_runtime(
             ),
         }
 
-    manager = compose_manager(deps) if deps_override is None else manager_for_persistence
+    manager = graph.manager if deps_override is None else manager_for_persistence
     coordinator = ShutdownCoordinator(manager, deps, registry, persistence, deadline_seconds=15)
     presenter = provided["presenter"] if "presenter" in provided else None
     runtime = Runtime(
