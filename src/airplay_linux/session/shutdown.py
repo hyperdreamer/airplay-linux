@@ -17,7 +17,7 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result, TrustStat
 
 from .cleanup import cleanup_complete
 from .engine import Route, SessionManager
-from .recovery import build_recovery_handlers
+from .recovery import RecoveryHandlers, build_recovery_handlers
 
 
 class ShutdownCoordinator:
@@ -35,7 +35,12 @@ class ShutdownCoordinator:
         self._grace = None
         self._final = None
         self._background: set[asyncio.Task] = set()
-        manager.handlers.setdefault(Route.recovery, build_recovery_handlers(deps)[Route.recovery])
+        existing = manager.handlers.get(Route.recovery)
+        recovery = build_recovery_handlers(deps)[Route.recovery]
+        if existing is None:
+            manager.handlers[Route.recovery] = recovery
+        elif not isinstance(existing, RecoveryHandlers) or existing.deps is not deps:
+            raise RuntimeError("recovery route collision")
         manager.set_shutdown_hook(self._finish_ordered)
 
     async def run(self) -> Result[None]:

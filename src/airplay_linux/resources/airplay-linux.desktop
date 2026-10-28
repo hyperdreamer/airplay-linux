@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=AirPlay Linux
+GenericName=AirPlay Mirroring
+Comment=Mirror a physical monitor to AirPlay receivers, or give a TV its own virtual display
+Exec=airplay-linux
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Network;
+Keywords=airplay;mirroring;cast;display;

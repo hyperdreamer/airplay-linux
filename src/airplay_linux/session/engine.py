@@ -335,6 +335,7 @@ class SessionManager:
         self._commands_accepted = False
         self._installed: set[ReceiverId] = set()
         self._shutdown = False
+        self._shutdown_task: asyncio.Task[Result[None]] | None = None
 
         self._subscriptions.append(deps.discovery.subscribe(self.ingest))
         self._subscriptions.append(deps.transport.subscribe(self.ingest))
@@ -384,8 +385,12 @@ class SessionManager:
         return _ClosedSubscription(lambda: self._subscribers.remove(callback) if callback in self._subscribers else None)
 
     async def shutdown(self) -> Result[None]:
-        if self._shutdown:
-            return Ok(value=None)
+        """Join the one shutdown transaction and replay its exact result."""
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(self._shutdown_once())
+        return await asyncio.shield(self._shutdown_task)
+
+    async def _shutdown_once(self) -> Result[None]:
         self._shutdown = True
         self._subscribers.clear()
         for state in tuple(self._states.values()):
