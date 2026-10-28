@@ -190,7 +190,6 @@ class MainWindow(QMainWindow):
     resolution_selected = Signal(int, int)
     mute_requested = Signal(bool)
     closing_requested = Signal()
-    closed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -657,7 +656,6 @@ class MainWindow(QMainWindow):
         self._dismiss_tracked_prompt()
         if self._close_allowed:
             event.accept()
-            self.closed.emit()
             return
         event.ignore()
         if not self._closing_emitted:

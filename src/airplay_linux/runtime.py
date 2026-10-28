@@ -514,14 +514,20 @@ def _with_overrides(deps: ManagerDeps, provided: Mapping[str, Any]) -> ManagerDe
 
 
 def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) -> None:
+    from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication
 
     from airplay_linux.ui.presenter import Presenter, QtDialogFactory
     from airplay_linux.ui.window import MainWindow
 
+    class ApplicationWindow(MainWindow):
+        def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
+            super().closeEvent(event)
+            if event.isAccepted():
+                runtime._window_closed.set()
+
     qt_app = QApplication.instance() or QApplication([])
-    window = MainWindow()
-    window.closed.connect(runtime._window_closed.set)
+    window = ApplicationWindow()
     dialogs = QtDialogFactory(window)
     presenter = Presenter(
         window,
