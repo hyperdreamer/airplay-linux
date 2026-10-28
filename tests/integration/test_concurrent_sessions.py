@@ -244,6 +244,55 @@ async def test_old_resource_events_cannot_revive_or_destroy_new_session(app_fact
     assert not app.journal.calls("transport.stop_stream") and not app.journal.calls("display.remove")
 
 
+@pytest.mark.parametrize("envelope", ["genuine-A-stream", "B-stream-under-A-envelope"])
+async def test_cross_receiver_transport_delivery_cannot_mutate_either_session(
+    app_factory, monkeypatch, envelope,
+):
+    """Wrong-actor delivery must be fenced independently of stream identity.
+
+    Removing accept_transport's receiver check kills the B-stream-under-A-envelope
+    case. The genuine delayed A event also pins the complete cross-subject fence.
+    """
+    app = await app_factory()
+    a = await app.start(audio=True)
+    delayed_a = event(app, TransportEventKind.network_lost)
+    b = await app.start(destination=B, audio=True)
+    assert delayed_a.stream == a.stream and delayed_a.receiver_id == a.receiver_id
+    assert a.stream != b.stream
+    notice = delayed_a
+    if envelope == "B-stream-under-A-envelope":
+        # A corrupt envelope can carry B's otherwise completely current resource
+        # identity. This leaves receiver_id as the ONLY mismatching fence.
+        notice = replace(event(app, TransportEventKind.network_lost, B), receiver_id=a.receiver_id)
+    streams = dict(app.transport.streams)
+    outputs = dict(app.display.outputs)
+    ownerships = dict(app.ownerships.records)
+    pending_a = app.manager.pending_resources(a.receiver_id)
+    pending_b = app.manager.pending_resources(b.receiver_id)
+    app.journal.clear()
+    route = app.manager._receiver_of
+    # Normal ingest routes by receiver_id and would hide the explicit guard.
+    # Inject a wrong broker route for only this message; keep real admission,
+    # actors, handlers and effects. No receiver snapshot is fabricated.
+    with monkeypatch.context() as routing:
+        routing.setattr(app.manager, "_receiver_of",
+                        lambda message: b.receiver_id if message is notice else route(message))
+        app.transport.emit(notice)
+    await app.settle()
+    assert app.state(B) == b
+    assert app.state() == a
+    assert app.transport.streams == streams
+    assert app.display.outputs == outputs and app.ownerships.records == ownerships
+    assert app.manager.pending_resources(a.receiver_id) == pending_a
+    assert app.manager.pending_resources(b.receiver_id) == pending_b
+    assert not app.journal.calls("transport.stop_stream") and not app.journal.calls("display.remove")
+    # Positive control: the held A event is genuinely current, not an event
+    # rejected everywhere. Restored normal routing changes only A.
+    app.transport.emit(delayed_a)
+    await app.settle()
+    assert app.state() != a and app.state(B) == b
+
+
 async def test_stale_reconnect_error_cannot_make_later_network_loss_terminal(app_factory):
     app = await app_factory()
     before = await app.start()

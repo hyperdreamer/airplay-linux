@@ -262,6 +262,10 @@ async def test_lifecycle_transition(case, app_factory):
         from test_crash_recovery import partial_creation_transition
         await partial_creation_transition(app_factory)
         return
+    if case == "publish_output":
+        from test_crash_recovery import output_publication_transition
+        await output_publication_transition(app_factory)
+        return
     if case in {"adopt_recovering", "recovery_offline"}:
         from test_crash_recovery import recovery_transition
         await recovery_transition(case, app_factory)
@@ -274,7 +278,7 @@ async def test_lifecycle_transition(case, app_factory):
         return
     app = await app_factory(transport=AcceptanceTransport(ready=case != "stream_ready"))
     receiver = target().receiver_id
-    if case in {"idle_mirror", "idle_virtual", "publish_output", "stream_ready"}:
+    if case in {"idle_mirror", "idle_virtual", "stream_ready"}:
         await app.online()
         assert resources(app.state()) == (TransportState.Idle, DisplayState.None_, AudioState.Disabled,
                                           TrustState.Unknown, False)

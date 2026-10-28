@@ -271,6 +271,173 @@ async def recovered_app(app_factory, world, *, online=True, destination=None):
     return app
 
 
+async def output_publication_transition(app_factory):
+    """An observed output is not usable until the final publication is durable."""
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory(prefix="la-publish-") as directory:
+        world = World(Path(directory))
+        app = await app_factory(configure=world.configure, directory=world.directory)
+        publish = Deferred()
+        write = world.store.write
+
+        async def held_publication(record):
+            if record.stage == "published":
+                await publish.wait()
+            return await write(record)
+
+        world.store.write = held_publication
+        try:
+            await app.start()
+            before = app.state()
+            assert before.display is DisplayState.Creating and before.display_handle is None
+            assert before.transport is TransportState.Idle and before.stream is None
+            durable, = await world.records()
+            assert durable.stage == "output_observed"
+            assert durable.last_configuration_step == "position"
+            assert world.process.alive(durable.helper) and len(world.process.entries) == 2
+            assert not app.transport.streams and not app.journal.calls("transport.start_stream")
+            publish.resolve(None)
+            await app.settle()
+            after = app.state()
+            published, = await world.records()
+            assert published.stage == "published" and published.desired_state == "active"
+            assert after.display is DisplayState.Owned and after.transport is TransportState.Streaming
+            assert after.display_handle.owner_uuid == published.owner_uuid == durable.owner_uuid
+            assert after.display_handle.helper == published.helper == durable.helper
+            assert after.display_handle.source.kscreen_output_id == published.output_id
+            assert len(app.journal.calls("transport.start_stream")) == 1
+        finally:
+            if not publish.resolved:
+                publish.resolve(None)
+            await app.settle()
+            await app.runtime.shutdown()
+
+
+async def test_creator_rollback_and_late_removal_share_a_confirmed_release(app_factory, tmp_path):
+    world = World(tmp_path)
+    app = await app_factory(configure=world.configure, directory=tmp_path)
+    write = world.store.write
+
+    async def reject_publication(record):
+        if record.stage == "published":
+            return Err(error=diagnostic(ErrorCode.persistence_failed))
+        return await write(record)
+
+    world.store.write = reject_publication
+    events = []
+    subscription = world.provider.subscribe(events.append)
+    try:
+        await app.start()
+    finally:
+        subscription.close()
+    owner = world.writes[0][0].owner_uuid
+    assert not await world.records()
+    assert len(world.process.entries) == 1 and len(world.process.terminated) == 1
+    operation = app.manager.context(target().receiver_id).operation()
+    for _ in range(2):
+        assert isinstance(await world.provider.mark_removing(owner), Ok)
+        assert isinstance(await world.provider.remove(owner, operation), Ok)
+    assert not await world.records()
+    assert len(world.process.terminated) == 1
+    assert app.state().display is DisplayState.None_ and not app.state().cleanup_pending
+    assert any(event.kind == "cleanup_required" and event.diagnostic is not None
+               and event.diagnostic.code is ErrorCode.persistence_failed for event in events)
+    # A fresh provider lifetime cannot infer the old provider's receipt from an
+    # empty store, even when it uses the exact same store and resource ports.
+    original = world.provider.remover
+    fresh = DisplayRemover(original.helper, original.observer, original.store,
+                           original.creation_lock, original.clock)
+    missing = await fresh.mark_removing(owner)
+    assert isinstance(missing, Err) and missing.error.code is ErrorCode.ownership_mismatch
+
+
+async def test_late_removal_waits_for_creator_deletion_acknowledgement(app_factory, tmp_path):
+    import asyncio
+
+    world = World(tmp_path)
+    app = await app_factory(configure=world.configure, directory=tmp_path)
+    write, delete = world.store.write, world.store.delete
+    acknowledgement = Deferred()
+
+    async def reject_publication(record):
+        if record.stage == "published":
+            return Err(error=diagnostic(ErrorCode.persistence_failed))
+        return await write(record)
+
+    async def held_deletion(owner):
+        result = await delete(owner)
+        await acknowledgement.wait()
+        return result
+
+    world.store.write, world.store.delete = reject_publication, held_deletion
+    late_removal = None
+    try:
+        await app.start()
+        owner = world.writes[0][0].owner_uuid
+        assert not await world.records()  # unlink visible; no acknowledgement yet
+        late_removal = asyncio.create_task(world.provider.mark_removing(owner))
+        await app.settle()
+        assert not late_removal.done()
+        acknowledgement.resolve(None)
+        await app.settle()
+        assert isinstance(await late_removal, Ok)
+        assert not await world.records()
+        assert app.state().display is DisplayState.None_ and not app.state().cleanup_pending
+    finally:
+        if not acknowledgement.resolved:
+            acknowledgement.resolve(None)
+        await app.settle()
+        if late_removal is not None:
+            await late_removal
+
+
+@pytest.mark.parametrize("previous_record", [False, True], ids=["never-owned", "externally-deleted"])
+async def test_absent_display_record_without_release_receipt_fails_closed(
+    app_factory, tmp_path, previous_record,
+):
+    world = World(tmp_path)
+    app = await app_factory(configure=world.configure, directory=tmp_path)
+    if previous_record:
+        await world.seed(stage="reserved", helper="dead", output=False)
+        # Even a remembered reservation is not a release receipt.
+        assert (await world.provider.remover.lookup(OWNER)).value is not None
+        assert isinstance(await world.store.delete(OWNER), Ok)
+    operation = app.manager.context(target().receiver_id).operation()
+    for result in (await world.provider.mark_removing(OWNER),
+                   await world.provider.remove(OWNER, operation)):
+        assert isinstance(result, Err) and result.error.code is ErrorCode.ownership_mismatch
+    assert not world.process.terminated and not await world.records()
+
+
+async def test_failed_creator_deletion_cannot_certify_an_absent_record(app_factory, tmp_path):
+    world = World(tmp_path)
+    app = await app_factory(configure=world.configure, directory=tmp_path)
+    write, delete = world.store.write, world.store.delete
+
+    async def reject_publication(record):
+        if record.stage == "published":
+            return Err(error=diagnostic(ErrorCode.persistence_failed))
+        return await write(record)
+
+    async def unconfirmed_deletion(owner):
+        # Model unlink becoming visible but its durability acknowledgement
+        # failing: absence alone must never mint a confirmed-release receipt.
+        assert isinstance(await delete(owner), Ok)
+        return Err(error=diagnostic(ErrorCode.persistence_failed))
+
+    world.store.write, world.store.delete = reject_publication, unconfirmed_deletion
+    await app.start()
+    owner = world.writes[0][0].owner_uuid
+    assert not await world.records() and len(world.process.entries) == 1
+    operation = app.manager.context(target().receiver_id).operation()
+    for result in (await world.provider.mark_removing(owner),
+                   await world.provider.remove(owner, operation)):
+        assert isinstance(result, Err) and result.error.code is ErrorCode.ownership_mismatch
+    assert app.state().display is DisplayState.CleanupRequired and app.state().cleanup_pending
+
+
 async def partial_creation_transition(app_factory):
     import tempfile
     from pathlib import Path

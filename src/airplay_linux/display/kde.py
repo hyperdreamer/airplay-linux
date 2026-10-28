@@ -23,6 +23,7 @@ class KdeVirtualDisplayProvider:
     def __init__(self, creator: DisplayCreator, recovery: DisplayRecovery, remover: DisplayRemover,
                  observer: KScreenObserver, helper: VirtualHelper):
         self.creator, self.recovery, self.remover = creator, recovery, remover
+        creator.bind_release_authority(remover.release_authority)
         self.observer, self.helper = observer, helper
         self._callbacks: list[Callable[[DisplayEvent], None]] = []
         self._progress: dict[OwnerId, DisplayEvent] = {}
@@ -56,7 +57,11 @@ class KdeVirtualDisplayProvider:
         event = DisplayEvent(
             kind=kind, receiver_id=progress.receiver_id, creation_operation_id=progress.creation_operation_id,
             owner_uuid=progress.owner_uuid, connector=progress.connector, output_id=progress.output_id,
-            helper=progress.helper, handle=progress.handle if kind == "published" else None, diagnostic=None,
+            helper=progress.helper, handle=progress.handle if kind == "published" else None,
+            # Rollback is not a spontaneous helper death. Preserve the fixed
+            # cause when progress can retire the creation before its Err result.
+            diagnostic=(diagnostic(progress.failure_code, progress.receiver_id)
+                        if progress.failure_code is not None else None),
         )
         self._progress[event.owner_uuid] = event
         self.remover.track_event(event)
@@ -120,8 +125,8 @@ class KdeVirtualDisplayProvider:
         if isinstance(found, Err):
             return found
         if found.value is not None:
-            # Creator owns a separate per-owner journal and the in-flight start
-            # gate. Close both before allowing the remover to signal anything.
+            # Close the in-flight start gate before removal. Creator and
+            # remover serialize all owner writes and release receipts together.
             context = OperationContext(operation_id=OperationId(uuid4()), session_generation=0, endpoint_generation=0)
             prepared = await self.creator.prepare_teardown(found.value.receiver_id, None, context)
             if isinstance(prepared, Err):

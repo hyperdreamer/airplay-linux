@@ -10,7 +10,7 @@ from airplay_linux.backend.control import AckReply, BackendOperation
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     Cancel, FailurePayload, Forget, KeepCleanup, Pair, RetryAudio, RetryRevocation,
-    SetMuted, StartVideoOnly, Stop, SubmitPairing, TransportEventKind,
+    SetMuted, StartVideoOnly, Stop, SubmitPairing, TimerEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import OpaqueBackendToken, SensitiveText
 from airplay_linux.domain.resources import (
@@ -258,6 +258,7 @@ async def test_pairing_canaries_cross_real_coordinator_and_never_enter_exports_o
 
 
 async def test_audio_retry_completion_for_old_stream_cannot_enable_new_stream(app_factory):
+    """Pins public effect admission, not the redundant _stream_current helper."""
     app = await app_factory()
     before = await app.start(audio=True)
     app.transport.emit(event(app, TransportEventKind.audio_failed))
@@ -281,6 +282,11 @@ async def test_audio_retry_completion_for_old_stream_cannot_enable_new_stream(ap
 
 
 async def test_new_challenge_rejects_old_prompt_submission_before_pairing_port(app_factory):
+    """Public submit admission checks the message ID before accept_challenge.
+
+    accept_challenge revalidates the current view's full snapshot fence; this
+    old-ID test intentionally does not claim to kill that redundant helper.
+    """
     app = await app_factory()
     await app.online()
     await app.send(Pair(receiver_id=target().receiver_id))
@@ -294,3 +300,44 @@ async def test_new_challenge_rejects_old_prompt_submission_before_pairing_port(a
                                  value=SensitiveText(PIN_CANARY)))
     assert app.state().challenge == current.challenge and app.state().trust is TrustState.Pairing
     assert not app.journal.calls("pairing.submit_pairing")
+
+
+async def test_stale_pairing_expiry_cannot_retire_a_replacement_challenge(app_factory):
+    """A cancelled timer's queued callback cannot cancel the newer prompt.
+
+    Timer context and current-view validation are separate public admission
+    checks. This probes the former, not accept_challenge in isolation.
+    """
+    app = await app_factory()
+    receiver = target().receiver_id
+    await app.online()
+    await app.send(Pair(receiver_id=receiver))
+    first = app.state().challenge
+    assert first is not None
+    old_expiry = TimerEvent(receiver_id=receiver, kind="pairing_expiry", context=replace(
+        app.manager.context(receiver).operation(), operation_id=first.operation_id,
+        session_generation=first.session_generation, endpoint_generation=first.endpoint_generation,
+        trust_generation=first.trust_generation,
+    ))
+    await app.send(Cancel(receiver_id=receiver))
+    await app.send(Pair(receiver_id=receiver))
+    current = app.state()
+    assert current.challenge.challenge_id != first.challenge_id
+    assert current.challenge.operation_id != first.operation_id
+    assert current.challenge.trust_generation != first.trust_generation
+    app.journal.clear()
+    app.manager.ingest(old_expiry)
+    await app.settle()
+    assert app.state() == current
+    assert not app.journal.calls("pairing.cancel_pairing")
+    assert not app.journal.calls("pairing.submit_pairing")
+    assert current.challenge.challenge_id in app.pairing.challenges
+    # Positive control: the real current timer still expires and retires exactly
+    # that challenge, without wall-clock sleeps or direct handler calls.
+    app.scheduler.advance(current.challenge.expires_at - app.clock.now())
+    await app.settle()
+    assert app.state().challenge is None and app.state().trust is TrustState.Untrusted
+    assert app.state().last_error.code is ErrorCode.pairing_expired
+    cancelled, = app.journal.calls("pairing.cancel_pairing")
+    assert cancelled["receiver_id"] == receiver
+    assert cancelled["challenge_id"] == current.challenge.challenge_id
