@@ -108,6 +108,41 @@ ways forward exist and both are decisions rather than implementation tasks:
 Until one of those is chosen, `foreground_control` and `owner_handshake` stay false, admission refuses, and the shipped
 application does not stream. That is the correct fail-closed behaviour, not a defect to work around.
 
+## Why Mirror mode cannot be delivered by this backend
+
+Mirror mode's promise is specific: send **a chosen physical monitor**, and never a virtual or helper-created output. The
+design treats that restriction as a safety property (HR-03), not a preference, because mirroring an inferred source would
+send the wrong screen or a display the application itself created.
+
+The installed backend cannot express that request:
+
+- `doubletake` has **no source, monitor or output selector**. Its capture is the desktop as a whole on Wayland.
+- The only source-adjacent flags are `-x11-window-id` / `-x11-window-name` (X11 windows, not Wayland outputs) and
+  `-synthetic` (a `videotestsrc` test pattern).
+- Consequently the application's `physical_source` affirmation cannot be proven: the backend cannot be told which monitor
+  to send, and it does not report which one it captured.
+
+This is independent of the daemon-ownership question. Even with a fully owned, correctly terminated, private-socket daemon
+(the proposed `owned_daemon_control` model), Mirror-as-specified would still be refused, because the source gate is a
+separate gate and it is unprovable.
+
+Three independent prerequisites therefore stand between this codebase and a working Mirror, and this backend satisfies
+none of them:
+
+| Prerequisite | Status on `doubletake` 0.5.0 |
+| --- | --- |
+| owned daemon control (`owned_daemon_control`) | achievable by the proposed evidence model, cooperative same-user scope |
+| physical source selection (`physical_source`) | **not expressible** - no monitor/output selector, no report of what was captured |
+| credential service (`keyring`) and pairing transactions | unproven - `-cred-backend keyring` selects storage, not a proven Secret Service path |
+
+Virtual mode is separately blocked on the absent `krfb-virtualmonitor` helper and its association verifier.
+
+### What this means
+The application, as specified, cannot stream with this backend. That is a backend capability boundary, not a defect to be
+worked around: any "fix" would have to infer the source, and inference is exactly what this design forbids. A working
+product needs a backend that can be told which output to send and can report which one it sent - or an explicit product
+decision to redefine Mirror as whole-screen sending, which is a different promise and would change HR-03.
+
 ## Application contract fixture
 
 `tests/fixtures/backend/contract-v1.json` is an application adapter-contract
