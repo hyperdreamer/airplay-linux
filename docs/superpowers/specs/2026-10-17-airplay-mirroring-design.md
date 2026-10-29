@@ -470,6 +470,41 @@ The app reports exact missing commands and keeps unrelated functionality enabled
 
 ### Capability-gated delivery (v1 scope)
 
+### Daemon ownership by evidence (v1 model)
+
+The backend offers two mutually exclusive shapes, verified against the installed `doubletake` 0.5.0:
+
+- **foreground without `-daemonize`**: the process streams immediately to a discovered device and exposes **no** control
+  socket. `-socket` is ignored.
+- **daemonised with `-daemonize`**: the process creates the control socket at the requested private path and idles
+  (`ctl status` reports `{"ok": true, "state": "idle"}`), waiting for target-scoped commands.
+
+Because a supervised foreground child cannot also expose a control channel, ownership is not established by supervising
+the backend process. It is established by **evidence about the process we started**:
+
+1. the application creates a per-instance runtime directory (`0700`) and starts its own daemonised backend on a socket
+   **inside** that directory, with its own credential path and the backend's keyring credential mode;
+2. it resolves the socket inode from the unix-socket table, maps that inode to the owning pid through `/proc/<pid>/fd`, and
+   requires that pid to be alive and its command line to name **that same socket path**;
+3. it never adopts a daemon it did not start: a socket outside the per-instance directory, an unresolvable inode, a pid
+   whose command line names a different path, or a socket with no live owner is refused;
+4. because a daemonised backend outlives the application, its pid is recorded and the application terminates exactly that
+   pid on Stop and on shutdown, and reconciles orphans from persisted records at startup.
+
+Under this model the backend capability flags gate as follows. `foreground_control` means "the application can start and
+then control its own backend process"; `owner_handshake` means "the application can prove the daemon it talks to is the one
+it started"; `keyring` means "the backend can hold credentials in the system keyring". All three are affirmed by this
+construction rather than by help-text advertisement, and the help-text probe is retained for **ambient** daemons, which
+remain refused. A composition that cannot satisfy all four evidence conditions above leaves these flags unproven and
+admission refuses.
+
+Verified by an isolated experiment (network namespace, loopback only, no receiver, temporary credentials): the socket is
+created at the requested private path, `ctl status` answers over it, the inode→pid mapping identifies the daemon with a
+matching command line, and killing that pid removes the socket. Not verified there: the keyring credential backend against a
+real Secret Service session, discovery/connect/pairing/mute against real receivers, orphan reconciliation after an
+application crash, and concurrent targets.
+
+
 The three sender-side operations this application performs — Mirror, Virtual display, and remembered pairing — require
 the installed backend to affirm specific capabilities. The application treats an unproven capability as absent; it never
 infers one from the presence of a command, a version string, or a prior success.
