@@ -468,6 +468,42 @@ At startup the application checks:
 
 The app reports exact missing commands and keeps unrelated functionality enabled where possible. It does not install system packages automatically.
 
+### Capability-gated delivery (v1 scope)
+
+The three sender-side operations this application performs — Mirror, Virtual display, and remembered pairing — require
+the installed backend to affirm specific capabilities. The application treats an unproven capability as absent; it never
+infers one from the presence of a command, a version string, or a prior success.
+
+Required backend affirmations, and what each gates:
+
+| Backend capability | Required for | Behaviour when unproven |
+| --- | --- | --- |
+| `foreground_control` | owning the daemon a command is sent to | every transport command is refused with `dependency_incompatible` |
+| `owner_handshake` | proving the daemon is ours before control | transport admission refuses; a daemon is never adopted |
+| `keyring` | remembered pairing and credential references | pairing and remembered trust are refused with `dependency_incompatible` |
+| `physical_source` | sending an existing monitor (Mirror) | Mirror is refused; no virtual output is created as a fallback |
+| `virtual_source` | creating an owned virtual output (Virtual) | Virtual is refused with `dependency_incompatible` |
+
+A backend that affirms none of these can be discovered on the network and displayed, but no session can start against
+it. That is the specified v1 behaviour, not a defect: the alternative is admitting transport whose ownership and
+credential authority cannot be proven, which this design forbids.
+
+Two further prerequisites are specified but not satisfiable on every host:
+
+- **Virtual display requires an association authority.** Publication needs proof that the observed output is the one the
+  helper we launched created. That proof is the owner-derived output name passed to the helper and matched exactly in the
+  display observation, combined with the launch-time temporal fence. Where the installed helper does not propagate that
+  name, Virtual refuses to publish rather than inferring ownership from size or appearance. The residual on such a host is
+  deliberate exact-name impersonation by a process already running as the same user.
+- **Remembered pairing requires the backend to retain committed credentials across processes.** The application consults
+  the credential adapter's load authority at startup and restores remembered trust only when that authority returns a
+  reference; a backend that keeps credentials in memory leaves trust `Unknown` after restart, and the pane says so.
+
+Where these prerequisites are unmet, the corresponding mode is reported as unavailable with the exact missing capability
+and the recovery hint, per the error-handling rules above. Acceptance for such a host is: the refusal is typed, it names
+the missing capability, unrelated modes remain available, and no ownership or credential claim is reported that the
+application cannot prove.
+
 ## Testing Strategy
 
 ### Deterministic seams
