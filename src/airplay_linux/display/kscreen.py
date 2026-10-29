@@ -110,6 +110,10 @@ class KScreenParseError(ValueError):
     """
 
 
+class _OutputNameUnavailable(KScreenParseError):
+    """The observation cannot supply one unambiguous KScreen JSON name."""
+
+
 @dataclass(frozen=True, kw_only=True)
 class OutputIdentity:
     """The captured KScreen identity required before a configuration command."""
@@ -356,9 +360,9 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
     """Parse one ``kscreen-doctor -j`` document into per-output evidence.
 
     The document shape is strict because a partial layout cannot serve as a
-    baseline: ``outputs`` must be a list. An entry that is not an object, or that
-    has no connector name, is unaddressable and skipped. Duplicate output ids or
-    connector names make the layout ambiguous and are refused outright.
+    baseline: ``outputs`` must be a list. An entry without a connector name
+    refuses the read: silently omitting it would hide missing authorship evidence
+    and make a partial layout look complete. Duplicate ids or names are refused.
     """
     if not isinstance(raw, Mapping):
         raise KScreenParseError("layout document is not an object")
@@ -373,9 +377,9 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
             continue
         connector = entry.get("name")
         if type(connector) is not str or not connector:
-            continue
+            raise _OutputNameUnavailable("KScreen output has no JSON name")
         if connector in seen_connectors:
-            raise KScreenParseError("duplicate KScreen connector name")
+            raise _OutputNameUnavailable("duplicate KScreen connector name")
         seen_connectors.add(connector)
         output_id = _id_token(entry.get("id"))
         if output_id is not None:
@@ -856,6 +860,8 @@ class KScreenObserver:
             return _failure(ErrorCode.configuration_failed)
         try:
             return Ok(value=_parse_records(raw))
+        except _OutputNameUnavailable:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch, command=KSCREEN_COMMAND))
         except (KScreenParseError, OverflowError):
             # A malformed number must leave as a failed read. Parsing already
             # refuses what it cannot represent; ``OverflowError`` stays caught as

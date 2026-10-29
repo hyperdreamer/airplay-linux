@@ -115,6 +115,17 @@ async def test_probe_rejects_help_that_does_not_document_resolution():
     assert result.error.code == ErrorCode.dependency_incompatible
 
 
+@pytest.mark.parametrize("name_flag", ["", "--namespace NAME", "--output-name NAME"])
+async def test_probe_refuses_helper_without_the_exact_name_flag(name_flag):
+    # A resolution-only profile cannot carry positive output authorship evidence.
+    process = FakeProcess()
+    process.queue_result("run", help_result(f"--resolution WxH\n{name_flag}\n"))
+    result = await VirtualHelper(process, FakeClock()).launch(OWNER, RUNTIME, SIZE)
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.dependency_incompatible
+    assert not process.spawned
+
+
 async def test_probe_rejects_a_help_exit_status_that_is_not_success():
     process = FakeProcess()
     process.queue_result("run", help_result(exit_code=1))
@@ -183,7 +194,10 @@ async def test_launch_carries_the_owner_environment_and_a_documented_resolution(
     assert isinstance(result, Ok)
     identity = result.value
     (spec,) = process.spawned
-    assert spec.argv == ("krfb-virtualmonitor", "--resolution", "1920x1080")
+    assert spec.argv == (
+        "krfb-virtualmonitor", "--resolution", "1920x1080", "--name",
+        "Virtual-airplay-b8f12ea8c9a95d4b4641b03d9fa5a71a",
+    )
     assert OWNER_TOKEN_ENV == "AIRPLAY_LINUX_OWNER_UUID"
     assert RUNTIME_DIRECTORY_ENV == "AIRPLAY_LINUX_RUNTIME_DIRECTORY"
     assert dict(spec.env) == {
@@ -202,9 +216,35 @@ async def test_launch_uses_the_requested_size_and_invents_no_extra_flags():
     result = await helper.launch(OWNER, RUNTIME, Size(width=2560, height=1440))
     assert isinstance(result, Ok)
     (spec,) = process.spawned
-    assert spec.argv == ("krfb-virtualmonitor", "--resolution", "2560x1440")
+    assert spec.argv == (
+        "krfb-virtualmonitor", "--resolution", "2560x1440", "--name",
+        "Virtual-airplay-b8f12ea8c9a95d4b4641b03d9fa5a71a",
+    )
     assert "--password" not in spec.argv
     assert "--port" not in spec.argv
+
+
+async def test_different_reservations_launch_with_distinct_bounded_nonsecret_names():
+    # A constant, raw owner token, or random per-launch name breaks later re-derivation.
+    process = FakeProcess()
+    helper = await probed(process)
+    first = await helper.launch(OWNER, RUNTIME, SIZE)
+    other = await helper.launch(OTHER_OWNER, RUNTIME, SIZE)
+    assert isinstance(first, Ok) and isinstance(other, Ok)
+    process.exit(first.value)
+    replacement = await helper.launch(UUID(str(OWNER)), RUNTIME, SIZE)
+    assert isinstance(replacement, Ok)
+    assert all("--name" in spec.argv for spec in process.spawned)
+    names = [spec.argv[spec.argv.index("--name") + 1] for spec in process.spawned]
+    assert names == [
+        "Virtual-airplay-b8f12ea8c9a95d4b4641b03d9fa5a71a",
+        "Virtual-airplay-3dc30fbac8417f76943e9c10e15eeacb",
+        "Virtual-airplay-b8f12ea8c9a95d4b4641b03d9fa5a71a",
+    ]
+    for name in names:
+        assert len(name) <= 63
+        assert all(character.isascii() and (character.isalnum() or character == "-") for character in name)
+        assert OWNER.hex not in name and OTHER_OWNER.hex not in name
 
 
 async def test_launch_never_spawns_without_a_supported_helper_profile():

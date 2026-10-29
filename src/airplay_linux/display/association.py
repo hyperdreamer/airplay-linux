@@ -1,11 +1,11 @@
 """Conservative process-to-output association for the KScreen-backed provider.
 
-KScreen does not expose a helper PID on an output. The strongest available
-production evidence is therefore temporal and fail-closed: the output must be a
-newly observed virtual connector selected after the exact owned helper launched,
-and both the helper identity and connector/output identity must remain current
-through an independent full observation. This does not claim an upstream
-``krfb-virtualmonitor`` association API that the platform does not provide.
+KScreen does not expose a helper PID on an output. Association therefore requires
+both the exact owner-derived name passed to ``krfb-virtualmonitor --name`` and
+launch-scoped evidence: a new virtual connector, a fresh observation after the
+launch boundary, and the exact live owned process. An installed compositor that
+does not report that name cannot prove authorship and is refused. Naming is
+correlation evidence, not an upstream PID-to-output attestation API.
 """
 
 from __future__ import annotations
@@ -19,8 +19,8 @@ from airplay_linux.domain.operations import OwnerId, ProcessIdentity
 from airplay_linux.domain.ports import OwnershipStore
 from airplay_linux.domain.records import LayoutSnapshot, OwnershipRecord
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
-from airplay_linux.display.helper import VirtualHelper
-from airplay_linux.display.kscreen import KScreenObserver, OutputInfo
+from airplay_linux.display.helper import VirtualHelper, owned_output_name
+from airplay_linux.display.kscreen import KSCREEN_COMMAND, KScreenObserver, OutputInfo
 
 
 def _refused() -> Err:
@@ -112,6 +112,11 @@ class KScreenOutputVerifier:
         ):
             return _refused()
 
+        # Re-derive from the durable owner on every call, including recovery and
+        # removal. A saved connector or a matching name prefix is not authority.
+        if type(candidate.connector) is not str or candidate.connector != owned_output_name(owner_uuid):
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch, command=KSCREEN_COMMAND))
+
         try:
             ownership_result = await self._ownerships.all()
         except Exception:
@@ -158,6 +163,10 @@ class KScreenOutputVerifier:
             observed = await self._observer.observation()
         except Exception:
             return _refused()
+        if isinstance(observed, Err) and observed.error.code is ErrorCode.ownership_mismatch:
+            # Preserve the observer's missing/ambiguous name classification with
+            # a fresh fixed diagnostic; never forward any rendered output data.
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch, command=KSCREEN_COMMAND))
         if not isinstance(observed, Ok) or type(observed.value) is not tuple or len(observed.value) != 2:
             return _refused()
         outputs, layout = observed.value

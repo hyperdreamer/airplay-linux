@@ -81,7 +81,7 @@ class Compositor(FakeProcess):
         self.runs.append((spec, timeout))
         self.journal.record("compositor.run", argv=spec.argv)
         if spec.argv[0] == "krfb-virtualmonitor":
-            text = "--resolution <WxH>" if "--help" in spec.argv else "krfb-virtualmonitor 24.08.2"
+            text = "--resolution <WxH> --name NAME" if "--help" in spec.argv else "krfb-virtualmonitor 24.08.2"
             return Ok(value=CommandOutput(exit_code=0, stdout=text.encode(), stderr=b""))
         assert spec.argv[0] == "kscreen-doctor", spec.argv
         if spec.argv[1:] == ("-j",):

@@ -15,11 +15,11 @@ by name or by "newest process":
   ownership-checked :class:`~airplay_linux.domain.ports.ProcessPort`, which
   re-validates immediately before each signal.
 
-The helper itself is absent on the reference machine, so the supported profile is
-the *published* argument contract (``--resolution WxH`` and the single virtual
-output it creates). Nothing beyond that contract is claimed: in particular,
-concurrent distinct outputs are not reported as supported until a helper profile
-demonstrates them.
+The supported profile requires the published ``--resolution WxH`` and ``--name``
+arguments for the single virtual output it creates. The name is derived from the
+reservation owner through a one-way digest, so it can be re-derived from durable
+ownership evidence without exposing the raw owner token on the command line.
+Concurrent distinct outputs remain unsupported until a helper profile proves them.
 """
 
 from __future__ import annotations
@@ -55,10 +55,10 @@ HELPER_COMMAND: Final[str] = "krfb-virtualmonitor"
 #: Helper appearance/termination bound from the design.
 HELPER_TIMEOUT: Final[float] = 5.0
 
-#: The one flag this adapter depends on in the published helper contract.
-REQUIRED_HELPER_FLAGS: Final[tuple[str, ...]] = ("--resolution",)
+#: Both geometry and a reservation-specific output name are required.
+REQUIRED_HELPER_FLAGS: Final[tuple[str, ...]] = ("--resolution", "--name")
 
-#: Arguments the published contract documents; only ``--resolution`` is used.
+#: Arguments the published contract documents; resolution and name are used.
 DOCUMENTED_HELPER_FLAGS: Final[tuple[str, ...]] = (
     "--help",
     "--resolution",
@@ -70,7 +70,7 @@ DOCUMENTED_HELPER_FLAGS: Final[tuple[str, ...]] = (
 )
 
 #: Identifies the documented argument contract this profile was built from.
-_HELPER_PROFILE: Final[str] = "krfb-virtualmonitor/documented/v1"
+_HELPER_PROFILE: Final[str] = "krfb-virtualmonitor/documented/v2"
 _VERSION_TOKEN: Final[re.Pattern[str]] = re.compile(r"\d+(?:\.\d+)+(?:[-+~][0-9A-Za-z.]+)?")
 _FLAG_TOKEN: Final[re.Pattern[str]] = re.compile(r"(?<![\w-])--[a-z][a-z0-9-]*")
 _SAFE_VERSION: Final[re.Pattern[str]] = re.compile(r"[0-9A-Za-z][0-9A-Za-z.+~_-]{0,63}")
@@ -87,10 +87,9 @@ class _MonotonicClock:
 class HelperFeatures:
     """Only capabilities this profile demonstrates, never an optimistic guess.
 
-    ``distinct_outputs`` is ``False`` for the documented helper contract because
-    it offers no per-instance output identity or concurrent-output guarantee. A
-    second virtual display is therefore a capability failure for the *new*
-    request, decided by the caller without disturbing an existing helper.
+    ``distinct_outputs`` is ``False`` because naming alone does not prove a
+    concurrent-output guarantee. A second virtual display therefore remains a
+    capability failure for the new request, without disturbing an existing helper.
     """
 
     version: str
@@ -108,6 +107,18 @@ def _help_failure(command: str) -> Err:
 
 def _valid_owner(owner_uuid: object) -> bool:
     return type(owner_uuid) is UUID
+
+
+def owned_output_name(owner_uuid: UUID) -> str:
+    """The stable, non-secret KScreen name for one persisted reservation owner.
+
+    The 48 ASCII letters/digits/dashes fit a connector name. A 128-bit digest
+    distinguishes reservations without placing the ownership token itself in
+    helper argv; neither runtime state nor a stored name is needed to re-derive it.
+    """
+    if not _valid_owner(owner_uuid):
+        raise ValueError("output names require an owner UUID")
+    return "Virtual-airplay-" + hashlib.sha256(owner_uuid.bytes).hexdigest()[:32]
 
 
 def _valid_runtime_directory(runtime_directory: object) -> bool:
@@ -185,8 +196,8 @@ class VirtualHelper:
         """Verify the installed helper documents the argument contract we need.
 
         A missing binary is ``dependency_missing`` naming the exact command. A
-        binary whose help does not document ``--resolution`` is
-        ``dependency_incompatible``. Successful profiles are cached; failures are
+        binary whose help does not document both ``--resolution`` and ``--name``
+        is ``dependency_incompatible``. Successful profiles are cached; failures are
         not, so installing the helper and retrying works without a restart.
         """
         if self._features is not None:
@@ -280,7 +291,10 @@ class VirtualHelper:
                 if type(boundary) is not Ok or boundary.value is not None:
                     return _failure(ErrorCode.ownership_mismatch)
             spec = CommandSpec(
-                argv=(self._command, "--resolution", f"{size.width}x{size.height}"),
+                argv=(
+                    self._command, "--resolution", f"{size.width}x{size.height}",
+                    "--name", owned_output_name(owner_uuid),
+                ),
                 env={
                     OWNER_TOKEN_ENV: str(owner_uuid),
                     RUNTIME_DIRECTORY_ENV: runtime_directory,
@@ -505,4 +519,5 @@ __all__ = [
     "HelperFeatures",
     "REQUIRED_HELPER_FLAGS",
     "VirtualHelper",
+    "owned_output_name",
 ]

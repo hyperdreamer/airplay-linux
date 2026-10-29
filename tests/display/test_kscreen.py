@@ -200,6 +200,31 @@ def test_duplicate_connector_names_are_rejected_as_ambiguous_layout():
         parse_outputs(raw)
 
 
+@pytest.mark.parametrize("name", [None, "", 17])
+async def test_missing_kscreen_output_name_refuses_authorship_with_precise_diagnostic(name):
+    # Omitting unaddressable outputs would disguise an incomplete baseline as success.
+    observed, process, _clock, _scheduler = observer()
+    raw = with_output(fixture(BASELINE), "1", name=name)
+    process.queue_result("run", command_output(raw))
+    result = await observed.observation()
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert "kscreen-doctor" in result.error.message
+    assert "'name'" in result.error.message
+    assert "authorship" in result.error.message.lower()
+
+
+async def test_absent_kscreen_name_property_is_not_invented():
+    observed, process, _clock, _scheduler = observer()
+    raw = fixture(BASELINE)
+    del raw["outputs"][0]["name"]
+    process.queue_result("run", command_output(raw))
+    result = await observed.snapshot()
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert "'name'" in result.error.message
+
+
 def test_non_object_document_is_rejected():
     with pytest.raises(KScreenParseError):
         parse_outputs([])

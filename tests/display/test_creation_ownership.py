@@ -100,7 +100,7 @@ class DesktopProcess(FakeProcess):
     async def run(self, spec, timeout, stdin=None):
         self.runs.append((spec,timeout))
         if spec.argv[0] == 'krfb-virtualmonitor':
-            text = '--resolution <WxH>' if '--help' in spec.argv else 'krfb-virtualmonitor 24.08.2'
+            text = '--resolution <WxH> --name NAME' if '--help' in spec.argv else 'krfb-virtualmonitor 24.08.2'
             return Ok(value=CommandOutput(exit_code=0, stdout=text.encode(), stderr=b''))
         assert spec.argv[0] == 'kscreen-doctor'
         if spec.argv[1:] == ('-j',):
@@ -167,7 +167,7 @@ class UnprovableLaunchProcess(FakeProcess):
         self.observer.current += (output('7','Virtual-live-unproven'),)
         return result
     async def run(self, spec, timeout, stdin=None):
-        text = '--resolution <WxH>' if '--help' in spec.argv else 'krfb-virtualmonitor 24.08.2'
+        text = '--resolution <WxH> --name NAME' if '--help' in spec.argv else 'krfb-virtualmonitor 24.08.2'
         return Ok(value=CommandOutput(exit_code=0,stdout=text.encode(),stderr=b''))
 
 

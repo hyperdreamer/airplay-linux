@@ -33,9 +33,11 @@ pytestmark = pytest.mark.asyncio
 
 
 def _audit_foreign_output():
+    # Even an exact owner-name match cannot replace the temporal fence. The
+    # deterministic fixture reserves UUID(int=2500) for its first creation.
     return dict(
         id=19,
-        name="Virtual-foreign",
+        name="Virtual-airplay-da1f0aef916590efb0292edbd28be5cd",
         type="Virtual",
         enabled=True,
         pos={"x": 0, "y": 0},

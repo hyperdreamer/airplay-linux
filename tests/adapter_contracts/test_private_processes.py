@@ -214,7 +214,7 @@ async def test_fake_helper_persists_one_owned_output_only_in_its_state_file(
     baseline = fake_kscreen.read_layout(state)
 
     spawned = await runner.spawn(CommandSpec(
-        argv=(str(installed["krfb-virtualmonitor"]), "--resolution", "1920x1080"),
+        argv=(str(installed["krfb-virtualmonitor"]), "--resolution", "1920x1080", "--name", "Virtual-requested-output"),
         env={
             fake_virtualmonitor.OWNER_ENV: str(owner),
             fake_virtualmonitor.RUNTIME_ENV: str(runtime),
@@ -229,7 +229,7 @@ async def test_fake_helper_persists_one_owned_output_only_in_its_state_file(
         created = fake_kscreen.read_layout(state)
         new = [entry for entry in created["outputs"] if entry not in baseline["outputs"]]
         assert len(new) == 1
-        assert new[0]["name"].lower().startswith("virtual")
+        assert new[0]["name"] == "Virtual-requested-output"
         assert new[0]["size"] == {"width": 1920, "height": 1080}
         records = json.loads(pids.read_text())
         assert [record["pid"] for record in records] == [identity.pid]

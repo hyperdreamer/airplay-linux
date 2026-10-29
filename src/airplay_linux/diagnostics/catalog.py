@@ -172,6 +172,10 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
                 "This output does not match this app's ownership evidence, so it is never "
                 "removed automatically. Confirm removal, or keep it for manual cleanup."
             ),
+            command_message=(
+                "{command} did not expose one unique, exact owner-derived output name "
+                "in JSON 'name'. Output authorship is unproven; keep it for manual cleanup."
+            ),
             recovery=(RecoveryAction.confirm_remove, RecoveryAction.keep),
         ),
         ErrorCode.helper_failed: CatalogEntry(

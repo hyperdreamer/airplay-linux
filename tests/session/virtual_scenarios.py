@@ -113,7 +113,7 @@ async def settle(rig):
         await rig.settle()
 
 
-def production_display(tmp_path, *, verifier, initial_entries=None, create_output=True):
+def production_display(tmp_path, *, verifier, initial_entries=None, create_output=True, ownerships=None):
     """Real provider with a private, deterministic process/KScreen world."""
     import json
 
@@ -139,7 +139,7 @@ def production_display(tmp_path, *, verifier, initial_entries=None, create_outpu
 
         async def run(self, spec, timeout, stdin=None):
             if spec.argv[0] == "krfb-virtualmonitor":
-                text = "--resolution <WxH>" if "--help" in spec.argv else "krfb-virtualmonitor 24.08.2"
+                text = "--resolution <WxH> --name NAME" if "--help" in spec.argv else "krfb-virtualmonitor 24.08.2"
                 return Ok(value=CommandOutput(exit_code=0, stdout=text.encode(), stderr=b""))
             assert spec.argv[0] == "kscreen-doctor"
             if spec.argv[1:] == ("-j",):
@@ -166,14 +166,15 @@ def production_display(tmp_path, *, verifier, initial_entries=None, create_outpu
             width, height = map(int, spec.argv[spec.argv.index("--resolution") + 1].split("x"))
             if not create_output:
                 return result
+            name = spec.argv[spec.argv.index("--name") + 1]
             self.entries.append(dict(
-                id=7, name="Virtual-owned", type="Virtual", enabled=True,
+                id=7, name=name, type="Virtual", enabled=True,
                 pos={"x": 0, "y": 0}, scale=1, currentModeId="1" if width == HD.width else "2",
                 size={"width": width, "height": height},
                 modes=[{"id": str(index), "size": {"width": size.width, "height": size.height}, "refreshRate": 60}
                        for index, size in enumerate((HD, SMALL), 1)],
             ))
-            self.associations[result.value] = ("7", "Virtual-owned")
+            self.associations[result.value] = ("7", name)
             return result
 
         def _forget(self, identity):
@@ -189,14 +190,17 @@ def production_display(tmp_path, *, verifier, initial_entries=None, create_outpu
 
         async def wait_for(self, predicate, deadline):
             result = await self.outputs()
-            if isinstance(result, Ok) and predicate(result.value):
+            if isinstance(result, Err):
+                return result
+            if predicate(result.value):
                 return result
             clock.advance(max(0, deadline - clock.now()))
             return Err(error=diagnostic(ErrorCode.cleanup_timeout))
 
     from airplay_linux.display.association import KScreenOutputVerifier
 
-    process, clock, store = Desktop(), FakeClock(), MemoryOwnershipStore()
+    process, clock = Desktop(), FakeClock()
+    store = ownerships if ownerships is not None else MemoryOwnershipStore()
     helper = VirtualHelper(process, clock)
     observer = Observer(process, clock, FakeScheduler(clock))
     process.observer = observer

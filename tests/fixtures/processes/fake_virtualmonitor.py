@@ -117,6 +117,7 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     resolution = arguments[arguments.index("--resolution") + 1]
     width, height = _size(resolution)
+    requested_name = arguments[arguments.index("--name") + 1] if "--name" in arguments else None
 
     owner = os.environ.get(OWNER_ENV)
     runtime = os.environ.get(RUNTIME_ENV)
@@ -135,9 +136,11 @@ def main(argv: list[str] | None = None) -> int:
     layout = fake_kscreen.read_layout(state_path)
     count = 2 if mode == "duplicate-output" else 1
     created: list[tuple[str, str]] = []
-    for _ in range(count):
+    for index in range(count):
         output_id = _next_id(layout)
-        connector = f"Virtual-{output_id}"
+        connector = requested_name or f"Virtual-{output_id}"
+        if index and requested_name:
+            connector += f"-{index + 1}"
         layout["outputs"].append({
             "id": output_id,
             "name": connector,
