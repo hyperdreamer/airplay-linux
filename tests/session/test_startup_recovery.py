@@ -10,7 +10,9 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     ConfirmOrphanRemoval, KeepCleanup, Retry, Start, TransportEventKind,
 )
-from airplay_linux.domain.operations import InstanceId, LeaseId, OperationId, StreamHandle
+from airplay_linux.domain.operations import (
+    ChallengeId, InstanceId, LeaseId, OpaqueCredentialRef, OperationId, StreamHandle,
+)
 from airplay_linux.domain.records import RecoveryItem, SessionSnapshot
 from airplay_linux.domain.resources import (
     AudioPolicy, AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
@@ -89,6 +91,123 @@ async def recover(rig, registry=None):
     result = await StartupRecovery(rig.manager, rig.deps, registry).run()
     await settle(rig)
     return result
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_restores_trust_only_from_credential_authority(tmp_path):
+    rig, _, _, _ = await prepared(tmp_path)
+    from airplay_linux.session.recovery import StartupRecovery
+
+    calls = []
+
+    async def load_credential_ref(receiver_id):
+        calls.append(receiver_id)
+        return Ok(value=OpaqueCredentialRef("backend-owned-reference"))
+
+    result = await StartupRecovery(
+        rig.manager, rig.deps, Registry([]),
+        credential_loader=load_credential_ref,
+    ).run()
+    await settle(rig)
+
+    state = rig.manager.snapshot(rig.receiver_id)
+    fence = rig.fences.get(rig.receiver_id)
+    assert isinstance(result, Ok)
+    assert calls == [rig.receiver_id]
+    assert state.trust is TrustState.Trusted
+    assert fence is not None
+    assert fence.session_generation == state.session_generation
+    assert fence.trust_generation == state.trust_generation
+    assert fence.active_challenge_id is None
+    assert fence.endpoint_fingerprint is None
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_does_not_synthesize_trust_without_credential_authority(tmp_path):
+    rig, _, _, _ = await prepared(tmp_path)
+    from airplay_linux.session.recovery import StartupRecovery
+
+    result = await StartupRecovery(rig.manager, rig.deps, Registry([])).run()
+    await settle(rig)
+
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert isinstance(result, Ok)
+    assert state.trust is TrustState.Unknown
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.keyring_unavailable
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_keeps_trust_unknown_when_authority_has_no_reference(tmp_path):
+    rig, _, _, _ = await prepared(tmp_path)
+    from airplay_linux.session.recovery import StartupRecovery
+
+    calls = []
+
+    async def load_credential_ref(receiver_id):
+        calls.append(receiver_id)
+        return Ok(value=None)
+
+    result = await StartupRecovery(
+        rig.manager, rig.deps, Registry([]), credential_loader=load_credential_ref,
+    ).run()
+    await settle(rig)
+
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert isinstance(result, Ok)
+    assert calls == [rig.receiver_id]
+    assert state.trust is TrustState.Unknown
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.keyring_unavailable
+
+
+@pytest.mark.asyncio
+async def test_startup_trust_restore_discards_reference_after_fence_changes(tmp_path):
+    rig, _, _, _ = await prepared(tmp_path)
+    from airplay_linux.session.recovery import StartupRecovery
+    from airplay_linux.trust.fences import TrustFence
+
+    async def stale_loader(receiver_id):
+        rig.fences.set(TrustFence(
+            receiver_id=receiver_id, endpoint_fingerprint="replacement-endpoint",
+            endpoint_generation=99, session_generation=7, trust_generation=99,
+            active_challenge_id=None,
+        ))
+        return Ok(value=OpaqueCredentialRef("backend-owned-reference"))
+
+    result = await StartupRecovery(
+        rig.manager, rig.deps, Registry([]), credential_loader=stale_loader,
+    ).run()
+    await settle(rig)
+
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert isinstance(result, Ok)
+    assert state.trust is TrustState.Unknown
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.stale_target
+
+
+@pytest.mark.asyncio
+async def test_startup_trust_restore_discards_reference_after_challenge_fence_changes(tmp_path):
+    rig, _, _, _ = await prepared(tmp_path)
+    from airplay_linux.session.recovery import StartupRecovery
+
+    async def stale_loader(receiver_id):
+        fence = rig.fences.get(receiver_id)
+        assert fence is not None
+        rig.fences.set(replace(fence, active_challenge_id=ChallengeId(UUID(int=31337))))
+        return Ok(value=OpaqueCredentialRef("backend-owned-reference"))
+
+    result = await StartupRecovery(
+        rig.manager, rig.deps, Registry([]), credential_loader=stale_loader,
+    ).run()
+    await settle(rig)
+
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert isinstance(result, Ok)
+    assert state.trust is TrustState.Unknown
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.stale_target
 
 
 @pytest.mark.asyncio
@@ -211,7 +330,7 @@ async def test_removing_record_wins_over_stored_streaming_intent(tmp_path):
 @pytest.mark.asyncio
 async def test_uncertain_output_blocks_start_and_remains_durable(tmp_path):
     rig, process, store, handle = await prepared(tmp_path, online=True)
-    process.associations.clear()  # no proof that this helper owns that connector
+    process._environments.pop(handle.helper.pid)  # owner evidence no longer matches
     await recover(rig)
     await rig.manager.dispatch(Retry(receiver_id=rig.receiver_id))
     await rig.manager.dispatch(Start(receiver_id=rig.receiver_id, request=StartRequest(mode=Mode.VIRTUAL)))
@@ -297,7 +416,7 @@ async def test_trust_tombstone_survives_restart_and_retries_revocation_without_c
 @pytest.mark.asyncio
 async def test_unproven_persisted_handle_is_never_owned_without_provider_evidence(tmp_path):
     rig, process, store, handle = await prepared(tmp_path)
-    process.associations.clear()
+    process._environments.pop(handle.helper.pid)
     await recover(rig)
     state = rig.manager.snapshot(rig.receiver_id)
     assert state.display_handle is None

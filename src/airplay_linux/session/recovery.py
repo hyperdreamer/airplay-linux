@@ -7,24 +7,33 @@ only projects its reconciliation results into actors and rejoins ordered cleanup
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, replace
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     Cancel, ConfirmOrphanRemoval, ConfirmSwitch, EffectEvent, KeepCleanup,
     Pair, Retry, RetryCleanup, RetryRevocation, Start, Stop,
 )
-from airplay_linux.domain.operations import OperationId
+from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
+from airplay_linux.domain.operations import OpaqueCredentialRef, OperationId
 from airplay_linux.domain.records import RecoveryItem, SessionSnapshot
 from airplay_linux.domain.resources import (
     DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, Result, TrustState,
 )
 from airplay_linux.storage.codecs import is_ambiguous_identity
 from airplay_linux.storage.repositories import PreferenceAccess
+from airplay_linux.trust.fences import TrustFence
 
 from .engine import Handler, ManagerDeps, Route, SessionContext, SessionManager
 from .reconnect import _runtime as reconnect_runtime
+
+
+@dataclass(frozen=True)
+class _CredentialRestore:
+    expected_fence: TrustFence
+    target: ReceiverTarget | None
+    result: Result[OpaqueCredentialRef | None]
 
 
 class RecoveryHandlers:
@@ -49,6 +58,34 @@ class RecoveryHandlers:
                 handler = ctx._manager.handlers.get(Route.cleanup)
                 if handler is not None:
                     handler(ctx, Stop(receiver_id=ctx.state.receiver_id))
+            return True
+        if kind == "trust_restore":
+            if not isinstance(message.result, Ok) or type(message.result.value) is not _CredentialRestore:
+                return True
+            restore = message.result.value
+            state = ctx.state
+            target = state.target if state.online else None
+            if (
+                self.deps.fences.get(state.receiver_id) != restore.expected_fence
+                or message.session_generation != state.session_generation
+                or state.session_generation != restore.expected_fence.session_generation
+                or state.trust_generation != restore.expected_fence.trust_generation
+                or state.challenge is not None
+                or state.trust is not TrustState.Unknown
+                or target != restore.target
+                or restore.expected_fence.receiver_id != state.receiver_id
+            ):
+                if state.trust is TrustState.Unknown and state.challenge is None:
+                    ctx.apply(last_error=diagnostic(ErrorCode.stale_target, state.receiver_id))
+                return True
+            if isinstance(restore.result, Ok) and type(restore.result.value) is OpaqueCredentialRef:
+                ctx.apply(trust=TrustState.Trusted, last_error=None)
+            else:
+                error = (
+                    restore.result.error if isinstance(restore.result, Err)
+                    else diagnostic(ErrorCode.keyring_unavailable, state.receiver_id)
+                )
+                ctx.apply(last_error=error)
             return True
         if kind == "shutdown_pending":
             ctx.cancel_timers()
@@ -128,8 +165,16 @@ class StartupRecovery:
     The cleanup route needs one small adapter for orphan commands, since the
     frozen manager routes those commands to cleanup rather than recovery.
     """
-    def __init__(self, manager: SessionManager, deps: ManagerDeps, registry) -> None:
+    def __init__(
+        self,
+        manager: SessionManager,
+        deps: ManagerDeps,
+        registry,
+        *,
+        credential_loader: Callable[[ReceiverId], Awaitable[Result[OpaqueCredentialRef | None]]] | None = None,
+    ) -> None:
         self.manager, self.deps, self.registry = manager, deps, registry
+        self._credential_loader = credential_loader
         handler = manager.handlers.get(Route.recovery)
         if handler is None:
             handler = RecoveryHandlers(deps)
@@ -220,7 +265,20 @@ class StartupRecovery:
                                  and view.record_set.replacement_of is None
                                  and (view.record_set.identity_kind == "device" or view.record_set.continuity_verified))
             )
-            tombstone = old.trust in (TrustState.Pairing, TrustState.RevocationPending, TrustState.CleanupRequired)
+            tombstone = old.trust in (
+                TrustState.Pairing, TrustState.RevocationPending, TrustState.CleanupRequired,
+            )
+            trust_intent_safe = (
+                not old.cleanup_pending
+                and old.intent_stage not in (IntentStage.stopping, IntentStage.cleanup)
+            )
+            should_restore_trust = (
+                not tombstone
+                and receiver_id not in removing_receivers
+                and trust_intent_safe
+                and not candidates
+            )
+            trust_error = diagnostic(ErrorCode.stale_target, receiver_id) if not continuous and should_restore_trust else None
             # Construct from the idle defaults: no stale capture/stream/audio
             # token, challenge, mute, backoff or queued mode switch survives.
             state = replace(
@@ -230,6 +288,7 @@ class StartupRecovery:
                 audio_policy=old.audio_policy,
                 session_generation=old.session_generation, trust_generation=old.trust_generation + 1,
                 trust=TrustState.CleanupRequired if tombstone else TrustState.Unknown,
+                last_error=trust_error,
                 resolution=(preference.remembered_resolution if preference else old.resolution) if continuous else None,
             )
             if len(candidates) == 1:
@@ -243,6 +302,9 @@ class StartupRecovery:
                          and item.handle.source.connector == record.connector
                          and item.handle.source.kscreen_output_id == record.output_id
                          and item.handle.source.size == record.observed_size == record.requested_size)
+                should_restore_trust = (
+                    should_restore_trust or (exact and not tombstone and trust_intent_safe)
+                )
                 state = replace(state, mode=Mode.VIRTUAL, ownership_uuid=record.owner_uuid,
                                 display_handle=item.handle if exact else None,
                                 display=DisplayState.Owned if exact else DisplayState.CleanupRequired,
@@ -251,7 +313,7 @@ class StartupRecovery:
                                     IntentStage.recovering if exact else IntentStage.cleanup),
                                 cleanup_pending=not exact,
                                 observed_resolution=record.observed_size,
-                                last_error=item.diagnostic if not exact else None)
+                                last_error=item.diagnostic if not exact else trust_error)
             elif candidates:
                 state = replace(state, mode=Mode.VIRTUAL, intent_stage=IntentStage.cleanup,
                                 display=DisplayState.CleanupRequired, cleanup_pending=True,
@@ -260,9 +322,45 @@ class StartupRecovery:
                 # Prior daemon release and the provider's empty durable set are
                 # both confirmed, so stale stream/display references can clear.
                 state = replace(state, intent_active=False, intent_stage=IntentStage.idle)
+            if trust_error is not None and state.last_error is None:
+                state = replace(state, last_error=trust_error)
             self.manager.install(state)
             self.manager._fence_receiver(state)
             self.deps.transport.update_target(destination, receiver_id)
+            if should_restore_trust and continuous:
+                credential_loader = self._credential_loader
+                if credential_loader is None:
+                    credential_loader = getattr(self.deps.pairing, "load_credential_ref", None)
+                expected_fence = self.deps.fences.get(receiver_id)
+                if expected_fence is None:
+                    expected_fence = TrustFence(
+                        receiver_id=receiver_id,
+                        endpoint_fingerprint=destination.endpoint_fingerprint if destination else None,
+                        endpoint_generation=destination.endpoint_generation if destination else 0,
+                        session_generation=state.session_generation,
+                        trust_generation=state.trust_generation,
+                        active_challenge_id=None,
+                    )
+                    loaded = Err(error=diagnostic(ErrorCode.stale_target, receiver_id))
+                elif not callable(credential_loader):
+                    loaded = Err(error=diagnostic(ErrorCode.keyring_unavailable, receiver_id))
+                else:
+                    try:
+                        loaded = await credential_loader(receiver_id)
+                    except Exception:
+                        loaded = Err(error=diagnostic(ErrorCode.keyring_unavailable, receiver_id))
+                self.manager.ingest(EffectEvent(
+                    receiver_id=receiver_id,
+                    operation_id=OperationId(self.deps.ids.new()),
+                    session_generation=state.session_generation,
+                    kind="recovery:trust_restore",
+                    result=Ok(value=_CredentialRestore(
+                        expected_fence=expected_fence,
+                        target=destination,
+                        result=loaded,
+                    )),
+                    resource=None,
+                ))
         self._blocked = False
         for receiver_id in receivers:
             state = self.manager.snapshot(receiver_id)

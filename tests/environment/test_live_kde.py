@@ -13,9 +13,9 @@ The live checks are deliberately limited to what KDE can actually prove:
 * a launched helper appears as exactly one new virtual output of the requested
   size, carries this process's ownership environment, and disappears again after
   the exact owned helper is stopped;
-* the production composition still refuses to *publish* a display it cannot
-  associate with a helper (no output association authority exists), so a live
-  run cannot claim virtual-display creation support that was never proven;
+* a provider without an explicitly configured output verifier fails closed. The
+  production composition supplies a KScreen verifier, but this standalone check
+  intentionally does not exercise production association evidence;
 * without ``AIRPLAY_LINUX_LIVE_KDE_CREATE=1`` every live check here is read-only.
 
 Manual commands::
@@ -197,12 +197,12 @@ async def test_live_owned_output_appears_and_disappears_exactly(live_kde):
             )
 
 
-async def test_live_composition_cannot_publish_without_association_evidence(
+async def test_live_provider_without_verifier_refuses_publication(
     live_kde, tmp_path,
 ):
-    """The production wiring has no output-association authority: it must refuse.
+    """A provider without an explicitly configured verifier must refuse.
 
-    This check still *launches* a real helper as part of the transaction, so it is
+    This check launches a real helper as part of the transaction, so it is
     gated by the same explicit create permission as the mutation test above.
     """
     if os.environ.get(LIVE_KDE_CREATE_ENV) != "1":

@@ -646,6 +646,22 @@ async def test_owned_scan_keeps_a_complete_exact_match(tmp_path: Path):
     assert scan.complete is True
 
 
+def test_verifies_owned_identity_binds_start_time_and_owner_environment():
+    process = model()
+    helper = VirtualHelper(process, FakeClock())
+    identity = ProcessIdentity(pid=5001, start_ticks=100)
+
+    assert helper.verifies_owned_identity(identity, OWNER, RUNTIME)
+    assert not helper.verifies_owned_identity(identity, OTHER_OWNER, RUNTIME)
+    assert not helper.verifies_owned_identity(identity, OWNER, OTHER_RUNTIME)
+
+    recycled = ProcessIdentity(pid=5001, start_ticks=101)
+    process.register(recycled, {
+        OWNER_TOKEN_ENV: str(OWNER), RUNTIME_DIRECTORY_ENV: RUNTIME,
+    })
+    assert not helper.verifies_owned_identity(identity, OWNER, RUNTIME)
+
+
 class UncertainLaunchProcess(CorruptingRecheckProcess):
     """The corrupting recheck plus a spawn boundary that records the request."""
 

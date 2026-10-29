@@ -113,7 +113,7 @@ async def settle(rig):
         await rig.settle()
 
 
-def production_display(tmp_path, *, verifier):
+def production_display(tmp_path, *, verifier, initial_entries=None, create_output=True):
     """Real provider with a private, deterministic process/KScreen world."""
     import json
 
@@ -134,7 +134,7 @@ def production_display(tmp_path, *, verifier):
     class Desktop(FakeProcess):
         def __init__(self):
             super().__init__()
-            self.entries = []
+            self.entries = list(initial_entries or ())
             self.associations = {}
 
         async def run(self, spec, timeout, stdin=None):
@@ -164,6 +164,8 @@ def production_display(tmp_path, *, verifier):
         async def spawn(self, spec):
             result = await super().spawn(spec)
             width, height = map(int, spec.argv[spec.argv.index("--resolution") + 1].split("x"))
+            if not create_output:
+                return result
             self.entries.append(dict(
                 id=7, name="Virtual-owned", type="Virtual", enabled=True,
                 pos={"x": 0, "y": 0}, scale=1, currentModeId="1" if width == HD.width else "2",
@@ -173,11 +175,6 @@ def production_display(tmp_path, *, verifier):
             ))
             self.associations[result.value] = ("7", "Virtual-owned")
             return result
-
-        async def verify_output(self, owner, runtime, identity, candidate):
-            if self.owned(identity, owner, runtime) and self.associations.get(identity) == (candidate.output_id, candidate.connector):
-                return Ok(value=None)
-            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
 
         def _forget(self, identity):
             pair = self.associations.pop(identity, None)
@@ -197,11 +194,15 @@ def production_display(tmp_path, *, verifier):
             clock.advance(max(0, deadline - clock.now()))
             return Err(error=diagnostic(ErrorCode.cleanup_timeout))
 
+    from airplay_linux.display.association import KScreenOutputVerifier
+
     process, clock, store = Desktop(), FakeClock(), MemoryOwnershipStore()
     helper = VirtualHelper(process, clock)
     observer = Observer(process, clock, FakeScheduler(clock))
+    process.observer = observer
+    verify = KScreenOutputVerifier(helper, observer, store) if verifier else None
+    process.output_verifier = verify
     lock = CreationLock(tmp_path / "runtime")
-    verify = process.verify_output if verifier else None
 
     async def released(record, operation):
         return Ok(value=None)

@@ -717,6 +717,58 @@ async def test_remembered_mode_contradicted_by_reliable_query_requires_picker():
     assert not rig.display.created
 
 
+async def test_production_association_verifier_rejects_kscreen_mismatch_after_selection(tmp_path, monkeypatch):
+    pytest.importorskip("airplay_linux.display.kde", reason="display lane is not present in this standalone checkout")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    provider, desktop, store = production_display(tmp_path, verifier=True)
+    rig = make_rig(display=provider, ownerships=store)
+    observer = desktop.observer
+    original_observation = observer.observation
+    reads = 0
+
+    async def observation_with_contradiction():
+        nonlocal reads
+        reads += 1
+        if reads == 5:
+            desktop.entries[-1]["name"] = "MYSTERY-9"
+            desktop.entries[-1]["type"] = "Unknown"
+        return await original_observation()
+
+    observer.observation = observation_with_contradiction
+    state = await start_virtual(rig)
+
+    assert reads >= 5
+    assert state.stream is None
+    assert state.display is not DisplayState.Owned
+    assert state.last_error is not None
+    assert state.last_error.code is ErrorCode.ownership_mismatch
+    assert all(record.stage != "published" for record in store.records.values())
+
+
+@pytest.mark.asyncio
+async def test_preexisting_exact_size_output_is_not_adopted_without_helper_output(tmp_path, monkeypatch):
+    pytest.importorskip("airplay_linux.display.kde", reason="display lane is not present in this standalone checkout")
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    existing = dict(
+        id=3, name="DP-1", type="Physical", enabled=True, pos={"x": 0, "y": 0},
+        scale=1, currentModeId="1", size={"width": HD.width, "height": HD.height},
+        modes=[{"id": "1", "size": {"width": HD.width, "height": HD.height}, "refreshRate": 60}],
+    )
+    provider, desktop, store = production_display(
+        tmp_path, verifier=True, initial_entries=[existing], create_output=False,
+    )
+    rig = make_rig(display=provider, ownerships=store)
+
+    state = await start_virtual(rig)
+
+    assert state.stream is None
+    assert state.display is not DisplayState.Owned
+    assert all(record.stage != "published" for record in store.records.values())
+    assert [entry["name"] for entry in desktop.entries] == ["DP-1"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("verifier", [True, False])
 async def test_production_display_provider_requires_association_verifier(tmp_path, monkeypatch, verifier):

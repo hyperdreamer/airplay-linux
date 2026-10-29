@@ -22,19 +22,17 @@ What the marked tests check when opted in:
   retained across the stream loss and retry) and is recreated only on an explicit
   accepted-mode change, through the production provider and the production
   session manager.  Both scenarios create an output, so they require the extra
-  ``AIRPLAY_LINUX_LIVE_VIRTUAL=1`` permission.  Live execution is gated on both a
-  helper/output association authority and a remembered credential committed in
-  the same runtime's backend credential adapter.  The association gate skips
-  first, preserving the runtime's precise reason verbatim (currently
-  ``virtual_display: helper/output association verifier not supplied``).  A
-  configured receiver must also be announced by discovery, and its committed
-  reference must resolve through ``CredentialStore.load_credential_ref``
-  (application metadata never carries one).  Each invocation composes a fresh
-  runtime whose credential adapter starts empty; this helper never pairs in it.
-  Pairing in another process does not satisfy that lookup, so lifting the
-  association gate alone still leaves live execution blocked on same-runtime
-  remembered trust.  These conditional bodies are implemented and falsifiable;
-  they do not establish live acceptance while either prerequisite is absent.
+  ``AIRPLAY_LINUX_LIVE_VIRTUAL=1`` permission. The production capability report
+  must affirm virtual-display support, and a credential must be committed in the
+  same runtime's backend credential adapter. Creation independently fails closed
+  unless fresh KScreen observations identify one new virtual output while the
+  exact launched helper identity remains current. A configured receiver must
+  also be announced by discovery, and its committed reference must resolve through
+  ``CredentialStore.load_credential_ref`` (application metadata never carries
+  one). Each invocation composes a fresh runtime whose credential adapter starts
+  empty; this helper never pairs in it. Pairing in another process does not satisfy
+  that lookup. These conditional bodies are implemented and falsifiable; they do
+  not establish live acceptance while either prerequisite is absent.
   The accepted-mode scenario requests ``AIRPLAY_LINUX_LIVE_RESOLUTION`` (default
   ``1920x1080``) and delivers a genuinely different accepted mode, because equal
   sizes are a correct no-op with no mismatch.  Both scenarios start the runtime
@@ -47,8 +45,8 @@ Manual commands::
         python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
 
     # Conditional reconnect/recreation checks (creates one output if eligible).
-    # Association authority and same-runtime remembered trust are both required;
-    # the current fresh-runtime helper does not establish that trust.
+    # Virtual-display capability evidence and same-runtime remembered trust are
+    # required; the fresh-runtime helper does not establish that trust.
     AIRPLAY_LINUX_LIVE_HARDWARE=1 AIRPLAY_LINUX_LIVE_CONFIG=/path/live.json \\
         AIRPLAY_LINUX_LIVE_VIRTUAL=1 \\
         python -m pytest -q -m live_hardware tests/environment/test_live_receivers.py
@@ -468,23 +466,26 @@ async def test_live_composition_reports_the_virtual_display_gate(tmp_path):
     )
     assert isinstance(built, Ok), built
     gated = built.value.gated_capabilities
-    assert "virtual_display" in gated
-    assert "association" in gated["virtual_display"].casefold()
+    report = built.value.diagnostics()
+    if report.virtual_display is True:
+        assert "virtual_display" not in gated
+    else:
+        assert "virtual_display" in gated
+        assert gated["virtual_display"]
     await built.value.shutdown()
 
 
 # ---------------------------------------------------------------------------
 # Step 4 reconnect retention and accepted-mode recreation.
 #
-# Both scenarios are conditional opt-in live checks: they require both an output
-# association authority and a credential committed in the same runtime.  The
-# fresh-runtime helper never pairs, so lifting the association gate alone still
-# leaves the remembered-trust prerequisite unsatisfied.  Missing prerequisites
-# skip with their exact reason.  The body uses the production provider, the
-# production transport and the runtime's own production session manager; only the
-# reconnect / accepted-mode *stimulus* is synthetic, delivered to the same
-# ``SessionManager.ingest`` callback the transport subscription calls, because a
-# test cannot make a physical receiver drop or renegotiate on cue.
+# Both scenarios are conditional opt-in live checks: they require virtual-display
+# capability evidence and a credential committed in the same runtime. The fresh-
+# runtime helper never pairs, so it cannot establish the remembered-trust
+# prerequisite. Creation validates helper/output association against fresh KScreen
+# observations before publishing. The body uses the production provider, production
+# transport and session manager; only the reconnect / accepted-mode *stimulus* is
+# synthetic, delivered to the same ``SessionManager.ingest`` callback the transport
+# subscription calls because a test cannot make a physical receiver drop on cue.
 # ---------------------------------------------------------------------------
 
 _SMALL = Size(width=1280, height=720)
@@ -649,10 +650,10 @@ async def _discovery_views(runtime) -> tuple:
 async def _live_virtual_session(tmp_path):
     """Compose the live scenario or skip with the exact missing prerequisite.
 
-    The association gate is checked first; same-runtime remembered trust is an
-    independent prerequisite.  This helper creates a fresh credential adapter and
-    never pairs in it, so clearing the association gate alone is insufficient.
-    Returns a :class:`_LiveSession`; the caller owns ``runtime.shutdown()``.
+    Unsupported virtual-display environments are gated by the runtime capability
+    report. The production verifier separately requires fresh helper and KScreen
+    evidence before publishing an output. Same-runtime remembered trust is
+    independent. Returns a :class:`_LiveSession`; the caller owns shutdown.
     """
     config = _require_live()
     if os.environ.get(LIVE_VIRTUAL_ENV) != "1":
@@ -676,7 +677,7 @@ async def _live_virtual_session(tmp_path):
     if gate is not None:
         await runtime.shutdown()
         pytest.skip(
-            "the live composition cannot own a virtual output: "
+            "the live composition does not affirm virtual-display support: "
             f"{gate}; these scenarios also require a remembered credential "
             "committed in this same runtime; the fresh-runtime helper never pairs"
         )
@@ -684,7 +685,7 @@ async def _live_virtual_session(tmp_path):
     # Only a receiver that discovery currently announces at a configured address
     # and that this runtime's credential adapter already remembers is a subject.
     # This fresh runtime has no pairing setup; external pairing cannot supply the
-    # same-runtime reference, even if the association gate above is cleared.
+    # same-runtime reference, even when virtual-display capability is affirmed.
     addresses = {receiver.address for receiver in config.receivers}
     views = [
         view for view in await _discovery_views(runtime)
@@ -702,7 +703,7 @@ async def _live_virtual_session(tmp_path):
             await runtime.shutdown()
             pytest.skip(
                 "the backend credential adapter cannot resolve same-runtime "
-                f"remembered trust: {remembered.error.code.value}; association "
+                f"remembered trust: {remembered.error.code.value}; virtual-display "
                 "authority and same-runtime remembered trust are both required; "
                 "the fresh-runtime helper never pairs"
             )
@@ -715,7 +716,7 @@ async def _live_virtual_session(tmp_path):
     await runtime.shutdown()
     pytest.skip(
         "the backend credential adapter remembers no credential in this runtime "
-        f"for the discoverable receiver(s) at {sorted(addresses)}; association "
+        f"for the discoverable receiver(s) at {sorted(addresses)}; virtual-display "
         "authority and same-runtime remembered trust are both required; the "
         "fresh-runtime helper never pairs, and pairing in another process "
         "cannot satisfy this prerequisite"

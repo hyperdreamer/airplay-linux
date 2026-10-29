@@ -313,6 +313,30 @@ class VirtualHelper:
 
     # -- ownership scan -----------------------------------------------------
 
+    def verifies_owned_identity(
+        self, identity: ProcessIdentity, owner_uuid: UUID, runtime_directory: str,
+    ) -> bool:
+        """Re-prove one launched process without a global procfs completeness claim.
+
+        The exact PID/start-time and its owner environment are checked directly.
+        This is suitable for association with the identity returned by ``start``;
+        it does not claim that an unrestricted scan of every desktop process is
+        complete.
+        """
+        if (
+            type(identity) is not ProcessIdentity
+            or not _valid_owner(owner_uuid)
+            or not _valid_runtime_directory(runtime_directory)
+        ):
+            return False
+        try:
+            current = self._process.identity(identity.pid)
+            return current == identity and self._process.owned(
+                identity, owner_uuid, runtime_directory,
+            )
+        except Exception:  # noqa: BLE001 - failed evidence is not ownership
+            return False
+
     def find_owned(
         self, owner_uuid: UUID, runtime_directory: str,
     ) -> tuple[ProcessIdentity, ...]:

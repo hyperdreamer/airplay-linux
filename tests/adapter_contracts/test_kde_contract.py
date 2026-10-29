@@ -9,10 +9,9 @@ adapters.  The two external commands they spawn are private fakes:
   asked to crash before or after that persistence;
 * ``kscreen-doctor`` -- reads/applies settings only in the same private JSON file.
 
-Association between a helper process and a compositor output is deliberately
-*not* claimed by KDE: the tests supply an explicit verifier that re-proves process
-ownership through the real runner and matches the helper's own persisted
-association record.  The contracts pinned here:
+The production verifier uses the exact launched helper identity and fresh KScreen
+observations. It does not rely on the fake helper's private persisted association
+record, which is not an API exposed by the real helper. The contracts pinned here:
 
 * one creation publishes exactly one owned, verified output and removal restores
   the baseline exactly;
@@ -43,6 +42,7 @@ from uuid import uuid4
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.display.creation import DisplayCreator
+from airplay_linux.display.association import KScreenOutputVerifier
 from airplay_linux.display.helper import VirtualHelper
 from airplay_linux.display.kde import KdeVirtualDisplayProvider
 from airplay_linux.display.kscreen import KScreenObserver
@@ -94,6 +94,8 @@ class World:
     runtime: Path
     journal: Path
     observer: KScreenObserver
+    output_verifier: KScreenOutputVerifier
+    helper: VirtualHelper
 
     def layout(self):
         return fake_kscreen.read_layout(self.state)
@@ -160,11 +162,14 @@ def _confined_owner_scan(owner_uuid, runtime_directory, proc_root=Path("/proc"))
 
 async def kde_world(
     tmp_path, monkeypatch, *, helper_mode="normal", kscreen_mode="normal",
+    initial_layout=None,
 ) -> World:
     state = tmp_path / "fake-kscreen.json"
     pids = tmp_path / "fake-helper-pids.json"
     journal = tmp_path / "kscreen-journal.jsonl"
-    fake_kscreen.write_layout(state, fake_kscreen.baseline_layout())
+    fake_kscreen.write_layout(
+        state, initial_layout if initial_layout is not None else fake_kscreen.baseline_layout(),
+    )
     installed = fake_doubletake.install(
         tmp_path / "bin",
         env={
@@ -195,27 +200,10 @@ async def kde_world(
     clock, scheduler, ids = _Clock(), _Scheduler(), _Ids()
     observer = KScreenObserver(runner, clock, scheduler, poll_interval=0.02)
     helper = VirtualHelper(runner, clock)
+    verifier = KScreenOutputVerifier(helper, observer, ownership)
     lock = CreationLock(runtime)
 
     async def transport_released(record, context):
-        return Ok(value=None)
-
-    async def verifier(owner_uuid, runtime_directory, identity, candidate):
-        """The only association authority here: helper-persisted, re-proved."""
-        records = json.loads(pids.read_text()) if pids.exists() else []
-        match = [
-            record for record in records
-            if record["pid"] == identity.pid and record["owner_uuid"] == str(owner_uuid)
-        ]
-        if len(match) != 1:
-            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
-        current = runner.identity(identity.pid)
-        if current != identity or not runner.owned(identity, owner_uuid, runtime_directory):
-            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
-        if (match[0]["connector"], match[0]["output_id"]) != (
-            candidate.connector, candidate.output_id,
-        ):
-            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
         return Ok(value=None)
 
     remover = DisplayRemover(
@@ -234,7 +222,83 @@ async def kde_world(
         output_verifier=verifier,
     )
     provider = KdeVirtualDisplayProvider(creator, recovery, remover, observer, helper)
-    return World(runner, provider, ownership, state, pids, runtime, journal, observer)
+    return World(
+        runner, provider, ownership, state, pids, runtime, journal, observer, verifier,
+        helper,
+    )
+
+
+async def test_production_association_verifier_refuses_disappeared_or_ambiguous_observation(
+    tmp_path, monkeypatch,
+):
+    world = await kde_world(tmp_path, monkeypatch)
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Ok), created
+        handle = created.value
+        observed = await world.observer.observation()
+        assert isinstance(observed, Ok)
+        outputs, layout = observed.value
+        candidate = next(item for item in outputs if item.output_id == handle.source.kscreen_output_id)
+        original_observation = world.observer.observation
+
+        async def missing_output():
+            return Ok(value=((), layout.__class__(outputs={}, baseline_hash="empty")))
+
+        world.observer.observation = missing_output
+        refused = await world.output_verifier(
+            handle.owner_uuid, str(world.runtime), handle.helper, candidate,
+        )
+        assert isinstance(refused, Err)
+        assert refused.error.code is ErrorCode.ownership_mismatch
+
+        async def ambiguous_output():
+            return Ok(value=((candidate, candidate), layout))
+
+        world.observer.observation = ambiguous_output
+        refused = await world.output_verifier(
+            handle.owner_uuid, str(world.runtime), handle.helper, candidate,
+        )
+        assert isinstance(refused, Err)
+        assert refused.error.code is ErrorCode.ownership_mismatch
+        world.observer.observation = original_observation
+
+        original_identity_check = world.helper.verifies_owned_identity
+        world.helper.verifies_owned_identity = lambda *args: False
+        refused = await world.output_verifier(
+            handle.owner_uuid, str(world.runtime), handle.helper, candidate,
+        )
+        assert isinstance(refused, Err)
+        assert refused.error.code is ErrorCode.ownership_mismatch
+        world.helper.verifies_owned_identity = original_identity_check
+        removed = await world.provider.remove(handle.owner_uuid, _context())
+        assert isinstance(removed, Ok), removed
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
+
+
+async def test_preexisting_virtual_output_at_requested_size_is_not_adopted(
+    tmp_path, monkeypatch,
+):
+    layout = fake_kscreen.baseline_layout()
+    layout["outputs"].append(fake_kscreen.virtual_output(
+        "Virtual-existing", SIZE.width, SIZE.height, output_id=2,
+    ))
+    world = await kde_world(tmp_path, monkeypatch, initial_layout=layout)
+    baseline = world.layout()
+    try:
+        created = await world.provider.create(
+            ReceiverId("airplay-device:a"), "endpoint-a-v1", SIZE, _context(),
+        )
+        assert isinstance(created, Err)
+        assert created.error.code is ErrorCode.ownership_mismatch
+        assert world.layout() == baseline
+        assert world.helper_records() == []
+        assert await world.records() == ()
+    finally:
+        fake_doubletake.reap_private(str(tmp_path))
 
 
 async def test_create_publishes_one_owned_output_and_remove_restores_baseline(

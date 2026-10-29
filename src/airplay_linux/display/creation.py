@@ -344,6 +344,12 @@ class DisplayCreator:
                     for record in existing_result.value
                 ):
                     return _failure(ErrorCode.unsupported_operation, state.receiver_id)
+                if any(
+                    output.size == state.size and output.virtual is not False
+                    for output in baseline_outputs
+                    if type(output) is OutputInfo
+                ):
+                    return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
 
                 if self._is_fenced(state):
                     return _failure(ErrorCode.stale_event, state.receiver_id)

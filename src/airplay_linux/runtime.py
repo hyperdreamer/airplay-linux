@@ -31,6 +31,7 @@ from airplay_linux.diagnostics.activity import ActivityLog
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.discovery.identity import IdentityResolver
 from airplay_linux.discovery.zeroconf_adapter import AzcMdnsClient, ZeroconfDiscovery
+from airplay_linux.display.association import KScreenOutputVerifier
 from airplay_linux.display.creation import DisplayCreator
 from airplay_linux.display.helper import VirtualHelper
 from airplay_linux.display.kde import KdeVirtualDisplayProvider
@@ -243,6 +244,7 @@ def _capability_gates(report: Any) -> dict[str, str]:
         "environment": "desktop environment is not proven for the supported capability set",
         "discovery": "receiver discovery evidence is unavailable",
         "mirror": "physical-source transport capability is not proven",
+        "virtual_display": "virtual-display helper and output evidence are not proven",
         "audio": "PipeWire and portal audio evidence is unavailable",
         "remembered_pairing": "backend-owned keyring capability is not proven",
         "additional_virtual_outputs": "additional virtual outputs are not proven",
@@ -250,12 +252,10 @@ def _capability_gates(report: Any) -> dict[str, str]:
     for name, reason in labels.items():
         if name != "environment" and getattr(report, name, False) is not True:
             gated[name] = reason
-    # Association evidence is independent of helper availability. No composition
-    # adapter in this graph can prove that a compositor output belongs to us.
-    gated["virtual_display"] = (
-        "helper/output association verifier not supplied by this composition; "
-        "display creation refuses to publish without it"
-    )
+    # The production graph supplies a verifier that consumes fresh KScreen
+    # evidence and checks the exact launched helper identity against its owner
+    # environment. The environment report still gates virtual display when the
+    # helper or supporting environment evidence is unavailable.
     if getattr(report, "remembered_pairing", False) is not True:
         gated["remembered_trust"] = "keyring capability was not proven by the environment probe"
     return gated
@@ -302,6 +302,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
 
     helper = VirtualHelper(process, clock)
     observer = KScreenObserver(process, clock, scheduler)
+    output_verifier = KScreenOutputVerifier(helper, observer, ownerships)
     creation_lock = CreationLock(config.runtime_root)
     app_instance_uuid = InstanceId(uuid4())
 
@@ -326,6 +327,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
         creation_lock,
         clock,
         process=process,
+        output_verifier=output_verifier,
         transport_released=transport_released,
     )
     recovery = DisplayRecovery(
@@ -335,6 +337,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
         creation_lock,
         clock,
         remover,
+        output_verifier=output_verifier,
     )
     creator = DisplayCreator(
         helper,
@@ -346,6 +349,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
         clock=clock,
         scheduler=scheduler,
         ids=ids,
+        output_verifier=output_verifier,
     )
     display = KdeVirtualDisplayProvider(creator, recovery, remover, observer, helper)
 
@@ -413,7 +417,9 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
 
     manager = compose_manager(deps)
     persistence = SessionPersistence(manager, sessions)
-    startup = StartupRecovery(manager, deps, registry)
+    startup = StartupRecovery(
+        manager, deps, registry, credential_loader=credentials.load_credential_ref,
+    )
     gated = _capability_gates(report)
     return _ProductionGraph(deps, manager, registry, startup, persistence, report, gated)
 
