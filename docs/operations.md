@@ -26,12 +26,19 @@ success.
 
 ### What the shipped backend leaves unproven
 
-On this build the startup probe withholds all of `foreground_control`, `owner_handshake`, `multi_target`, `keyring`,
-`physical_source` and `virtual_source` for every profile the installed `doubletake` returns. The consequence is concrete:
+On this build the installed `doubletake` 0.5.0 resolves to the pinned profile `doubletake-0.5`. Its affirmations, as the
+startup probe reports them, are:
+
+| Affirmed | Withheld |
+| --- | --- |
+| `multi_target`, `audio_probe`, `target_mute` | `foreground_control`, `owner_handshake`, `keyring`, `physical_source`, `virtual_source`, `target_bound_pairing`, `provisional_commit`, `cancel_pairing`, `revoke_pairing`, `query_modes` |
+
+`multi_target` being affirmed is not sufficient: transport admission additionally requires `foreground_control`,
+`owner_handshake` and `keyring`, and all three are withheld. The consequence is concrete:
 
 - **no streaming session can start** through the shipped backend, in either Mirror or Virtual mode;
 - discovery, receiver listing and device inspection still work;
-- pairing is unavailable, so remembered trust is never established.
+- pairing is unavailable (`target_bound_pairing` and `keyring` withheld), so remembered trust is never established.
 
 This is the specified v1 behaviour, recorded in the design under "Capability-gated delivery (v1 scope)". The refusal is
 typed and boundary-appropriate; the structured capability report names the missing admission/start/source flags or the
@@ -65,8 +72,8 @@ Each item must be verified on a machine with the dependencies above; none of it 
   name and size, a matching ownership record, and the live owned helper before and after. A same-user process that copies
   this reservation's exact name while our helper is live can still cause a foreign output to be accepted.
 - **Remembered trust does not survive a restart** on the shipped adapter, as above.
-- **The one-turn-gap drain** in ordered shutdown is defensive redundancy that no test pins directly; its removal does not
-  currently fail the suite.
+- **The one-turn-gap drain** in ordered shutdown is defensive redundancy. Its mutation survives a selected 62-test
+  regression set; that is not whole-suite mutation evidence, and the drain should not be described as verified.
 
 
 `--check-environment` lists them. A gated capability is a **deliberate refusal**, not a bug:
