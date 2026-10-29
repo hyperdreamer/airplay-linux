@@ -228,9 +228,20 @@ Avahi or a Python zeroconf implementation may provide the first adapter. The dom
 
 `DoubleTakeTransport` owns one private `doubletake` daemon for the application and all receiver targets. It starts the daemon with a private socket under `$XDG_RUNTIME_DIR/airplay-linux/instances/<app_instance_uuid>/`, rather than attaching to an unrelated user daemon at the default socket. The app owns daemon startup, health monitoring, restart, and shutdown. The daemon's native multi-target support is used for concurrent streams.
 
-The daemon is launched through an app-owned `DaemonSupervisor`, not directly from the GUI. On Linux the supervisor is a long-lived child process that sets `PR_SET_PDEATHSIG=SIGTERM` before launching `doubletake` in the foreground (the app never uses `-daemonize`), forwards termination, and escalates to `SIGKILL` after a bounded deadline. The supervisor records the owner UUID and child PID/start time. The runtime record is written atomically as `starting` before launch, then `running` only after the owner-token and control-socket handshake succeeds; normal shutdown writes `stopping` before requesting termination. A daemon that cannot be proven to belong to the current supervisor is never reused.
+Delivered implementation: the app-owned `DaemonSupervisor` launches a foreground child with owner-death supervision; that
+composition remains gated where the installed backend cannot expose the required control socket. Proposed replacement, not
+yet implemented: the detached ownership-by-evidence model may replace the parent-lifetime mechanism only after its launch
+receipt, authenticated control binding, exact-process termination and every crash-window recovery contract are specified and
+proven. It preserves durable `starting` before spawn, `running` only after authenticated readiness and durable `stopping`
+before termination. It makes no immediate GUI-death termination guarantee for an independently detached daemon; unresolved
+survivors block replacement until safe reconciliation. No unproven daemon is reused.
 
-The GUI is single-instance. A `QLockFile` at `$XDG_RUNTIME_DIR/airplay-linux/airplay-linux.lock` contains an application instance UUID. Startup verifies the lock owner using PID liveness and `/proc/<pid>/stat` start time before reporting that another application instance is active. A stale lock is removed only after those checks. Each daemon instance has an owner token, supervisor PID/start time, daemon PID/start time when known, protocol version, private socket path, lifecycle state, and runtime directory record. A socket is accepted only after its path, owner record, PID/start time, and control handshake match the current app instance.
+The GUI is single-instance. A `QLockFile` at `$XDG_RUNTIME_DIR/airplay-linux/airplay-linux.lock` contains an application instance UUID. Startup verifies the lock owner using PID liveness and `/proc/<pid>/stat` start time before reporting that another application instance is active. A stale lock is removed only after those checks. Each daemon instance retains the existing ownership fields and additionally records the boot discriminator, launch-instance
+receipt/provenance, owner UID, runtime-directory device/inode and endpoint generation; partial records identify which proof
+is not yet durably published. Application, launch-helper/supervisor where applicable, and final daemon identities use PID
+plus `start_ticks`. A control connection is accepted only when the actual peer, persisted launch receipt, directory/endpoint
+generations, protocol and ownership proof all match this launch under the declared threat model. Unknown fields in a
+legacy/partial record do not become inferred proof.
 
 When a new GUI observes an old lock or runtime record, it first authenticates the exact prior owner UUID and supervisor/daemon PID-start pairs, requests shutdown, and waits for the private daemon and all of its streams to terminate before creating replacement streams. If the recorded owner is dead but a matching supervisor or daemon remains, it terminates that exact owned process using the owner token and verifies disappearance. A live mismatch or unresolvable prior owner is an ownership `CleanupRequired` condition; the new GUI does not attach, adopt streams, or start replacement streams. Records in `starting` or `stopping` are reconciled using the same process and socket evidence, including crashes around record publication. A stale socket or mismatched handshake is removed only after the recorded process is proven dead.
 
@@ -472,7 +483,9 @@ The app reports exact missing commands and keeps unrelated functionality enabled
 
 ### Daemon ownership by evidence (v1 model)
 
-The backend offers two mutually exclusive shapes, verified against the installed `doubletake` 0.5.0:
+An isolated, receiver-free spike recorded two observed launch behaviors for the tested `doubletake` 0.5.0 binary; this is
+not an exhaustive backend guarantee or evidence of target isolation, capture safety, keyring functionality, or crash
+recovery. The following observations describe that spike only:
 
 - **foreground without `-daemonize`**: the process streams immediately to a discovered device and exposes **no** control
   socket. `-socket` is ignored.
@@ -482,27 +495,58 @@ The backend offers two mutually exclusive shapes, verified against the installed
 Because a supervised foreground child cannot also expose a control channel, ownership is not established by supervising
 the backend process. It is established by **evidence about the process we started**:
 
-1. the application creates a per-instance runtime directory (`0700`) and starts its own daemonised backend on a socket
-   **inside** that directory, with its own credential path and the backend's keyring credential mode;
-2. it resolves the socket inode from the unix-socket table, maps that inode to the owning pid through `/proc/<pid>/fd`, and
-   requires that pid to be alive and its command line to name **that same socket path**;
-3. it never adopts a daemon it did not start: a socket outside the per-instance directory, an unresolvable inode, a pid
-   whose command line names a different path, or a socket with no live owner is refused;
-4. because a daemonised backend outlives the application, its pid is recorded and the application terminates exactly that
-   pid on Stop and on shutdown, and reconciles orphans from persisted records at startup.
+1. Before spawn, exclusively create a non-reused per-instance child of the verified runtime root, require its actual type,
+   UID and mode 0700, pin its device/inode, reject pre-existing endpoint entries, and durably publish a starting reservation.
+   The record binds boot ID, application/launch UUID, owner UID, app PID/start_ticks, runtime-directory identity and
+   intended endpoint. Filesystem operations reject symlinks and substitutions and remain dirfd-anchored. Keyring selection
+   and private credential configuration are not credential-service proof and permit no file fallback.
+2. Establish launch provenance for the final detached process using a launch-bound authenticated receipt that survives GUI
+   death before final PID publication. Persist its UID, PID/start_ticks, launch identity and endpoint generation before
+   admitting it. Correlating argv with a kernel socket inode is supplementary evidence only; distinguish that inode from the
+   filesystem endpoint's device/inode, and refuse ambiguous FD holders or unreadable evidence. Authenticate the peer on the
+   actual control connection against the receipt and exact process identity, including protocol/owner proof or an
+   explicitly equivalent mechanism. Bind mutations to that authenticated peer; a preflight followed by an independent
+   unchecked pathname lookup is insufficient.
+3. Every control and cleanup operation revalidates the relevant launch, directory, endpoint and exact-process generations.
+   Ambient/default sockets, squatters inside private directories, mismatched/absent receipts and replaced endpoints are
+   never adopted or signalled. There is no default-socket fallback or ownership inferred solely from path, UID, argv,
+   version or help text. A daemon lacking the required mechanism remains unproven.
+4. Per-receiver Stop disconnects and releases only that receiver's stream/lease; it does not terminate the shared daemon or
+   disrupt another target. Whole-daemon shutdown/restart is serialized with admission and requires durable stopping intent
+   and revalidated exact-process proof. Acquire a usable pidfd and validate the recorded identity after opening; signal only
+   through that descriptor, never a numeric-PID fallback. Confirm exact-process exit, all affected stream release and safe
+   endpoint cleanup before deleting records. Startup reconciles the old instance for cleanup only, before any replacement
+   streams; uncertainty retains CleanupRequired and blocks replacement.
 
-Under this model the backend capability flags gate as follows. `foreground_control` means "the application can start and
-then control its own backend process"; `owner_handshake` means "the application can prove the daemon it talks to is the one
-it started"; `keyring` means "the backend can hold credentials in the system keyring". All three are affirmed by this
-construction rather than by help-text advertisement, and the help-text probe is retained for **ambient** daemons, which
-remain refused. A composition that cannot satisfy all four evidence conditions above leaves these flags unproven and
-admission refuses.
+This construction assumes cooperative same-user processes and does not authenticate against an arbitrary malicious same-UID
+process able to rewrite evidence or interfere with launch/control. It still refuses collisions and generation mismatches.
+Supporting hostile same-UID processes requires a separately specified and enforced protection boundary; 0700, argv and
+same-UID-readable tokens alone do not supply one. This daemon-specific scope does not weaken any existing receiver, trust,
+provider or target fence.
+
+Backend operation support, safe launch eligibility, per-instance ownership proof and credential-service proof are separate.
+Introduce `owned_daemon_control` for the proposed launch-and-control capability; `foreground_control` remains the delivered
+foreground contract until an explicit API/gate migration is implemented. A narrowly scoped launch phase may create only an
+isolated idle candidate with no receiver, capture or credential side effects; stream admission and receiver mutations
+require completed ownership proof. `owner_handshake` is not satisfied by argv/socket correlation or synthesized status: it
+requires actual launch-bound peer authentication equivalent to or stronger than the current ownership predicate under the
+stated threat model. `keyring` requires independent real-service and backend credential-operation evidence, including
+refusal without file fallback; selection of keyring mode proves neither. No one construction or help/version result affirms
+all three. Help/version probing may inspect installed executable compatibility but never authorizes ambient adoption. Every
+command uses the explicit proven private endpoint. Missing proof leaves the relevant flag false and the existing gate
+closed. Existing physical/virtual source, trust, target-generation, pairing compensation and cleanup prerequisites remain
+unchanged.
 
 Verified by an isolated experiment (network namespace, loopback only, no receiver, temporary credentials): the socket is
 created at the requested private path, `ctl status` answers over it, the inode→pid mapping identifies the daemon with a
 matching command line, and killing that pid removes the socket. Not verified there: the keyring credential backend against a
 real Secret Service session, discovery/connect/pairing/mute against real receivers, orphan reconciliation after an
-application crash, and concurrent targets.
+application crash, and concurrent targets. The spike also did not verify credential fallback refusal, locked/denied/
+unavailable Secret Service behavior, prepare/commit/cancel/revoke transactions or cross-process credential load; source
+selection, capture isolation, negotiated modes or stream/audio lifecycle; path-squat/rebind, directory substitution, PID
+reuse, actual-peer authentication or concurrent app startups; or any crash window between durable reservation, detach,
+bind, final identity publication and stopping. Ordinary kill/socket disappearance is not evidence of those recovery cases.
+These remain independent design and acceptance obligations, not capabilities affirmed by the spike.
 
 
 The three sender-side operations this application performs — Mirror, Virtual display, and remembered pairing — require
