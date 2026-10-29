@@ -474,35 +474,58 @@ The three sender-side operations this application performs — Mirror, Virtual d
 the installed backend to affirm specific capabilities. The application treats an unproven capability as absent; it never
 infers one from the presence of a command, a version string, or a prior success.
 
-Required backend affirmations, and what each gates:
+Required backend affirmations are separate from desktop, provider, trust, cleanup, and ownership prerequisites; this table removes none of those requirements. The structured startup capability report uses `dependency_incompatible` and names missing admission/start/source flags in its diagnostic detail. Pairing transaction failures are currently reported as the `target_bound_pairing` prerequisite group. Runtime refusals use the error appropriate to their boundary, including `dependency_incompatible`, `unsupported_source`, `unsupported_operation`, `keyring_unavailable`, or `ownership_mismatch`; the pane and every runtime result are not guaranteed to identify an individual flag.
 
-| Backend capability | Required for | Behaviour when unproven |
+| Affirmation | Gates | Behaviour when unproven |
 | --- | --- | --- |
-| `foreground_control` | owning the daemon a command is sent to | every transport command is refused with `dependency_incompatible` |
-| `owner_handshake` | proving the daemon is ours before control | transport admission refuses; a daemon is never adopted |
-| `keyring` | remembered pairing and credential references | pairing and remembered trust are refused with `dependency_incompatible` |
-| `physical_source` | sending an existing monitor (Mirror) | Mirror is refused; no virtual output is created as a fallback |
-| `virtual_source` | creating an owned virtual output (Virtual) | Virtual is refused with `dependency_incompatible` |
+| `foreground_control` | new transport admission | admission refuses; no new daemon is started through that path |
+| `owner_handshake` | authenticated daemon ownership before admission/control | admission refuses; a foreign or unconfirmed daemon is never adopted |
+| `keyring` | new transport admission for both video modes and pairing; credential operations | both stream modes and pairing are unavailable; remembered trust cannot be restored through an unavailable credential store |
+| `multi_target` | every Mirror or Virtual stream start | both stream modes are unavailable; independently proven pairing/discovery can remain usable |
+| `physical_source` | sending an existing physical monitor (Mirror) | Mirror is unavailable; no virtual output is created as a fallback |
+| `virtual_source` | sending the owned virtual output (Virtual) | Virtual is unavailable; an affirmed flag alone does not authorize output association or publication |
+| `target_bound_pairing`, `provisional_commit`, `cancel_pairing`, `revoke_pairing` | pairing transactions and the credential adapter's availability, together with backend `keyring` | pairing is unavailable; the startup report names the transaction prerequisite group, while independently proven video modes can remain usable |
 
-A backend that affirms none of these can be discovered on the network and displayed, but no session can start against
-it. That is the specified v1 behaviour, not a defect: the alternative is admitting transport whose ownership and
-credential authority cannot be proven, which this design forbids.
+Receivers can still be discovered and displayed, where discovery is available, when the installed backend affirms none of
+these capabilities; no session can be started through that backend. The current production help-based probe withholds
+`foreground_control`, `owner_handshake`, `keyring`, `physical_source`, and `virtual_source` on every returned profile, so the
+shipped production composition currently admits no streaming session. Gated refusal and surviving discovery/device
+inspection are specified v1 behaviours. Successful sending remains conditional on an independently proven
+backend/provider composition with all existing admission, ownership, and credential requirements satisfied.
 
 Two further prerequisites are specified but not satisfiable on every host:
 
-- **Virtual display requires an association authority.** Publication needs proof that the observed output is the one the
-  helper we launched created. That proof is the owner-derived output name passed to the helper and matched exactly in the
-  display observation, combined with the launch-time temporal fence. Where the installed helper does not propagate that
-  name, Virtual refuses to publish rather than inferring ownership from size or appearance. The residual on such a host is
-  deliberate exact-name impersonation by a process already running as the same user.
-- **Remembered pairing requires the backend to retain committed credentials across processes.** The application consults
-  the credential adapter's load authority at startup and restores remembered trust only when that authority returns a
-  reference; a backend that keeps credentials in memory leaves trust `Unknown` after restart, and the pane says so.
+- **Virtual mode requires a separate association verifier.** The current verifier accepts correlation evidence: the exact
+  owner-derived name from the helper argv, absence from the launch baseline, a fresh KScreen observation, one new virtual
+  output with that exact name and requested size, a matching ownership record, and the exact live owned helper before and
+  after the observation. This is not a compositor attestation that the helper created the output. If the helper ignores the
+  name and no output satisfies those checks, Virtual refuses publication. A different-name or another-reservation output,
+  even at the same size, is refused. A same-user process that copies this reservation's exact name and satisfies the
+  temporal/uniqueness checks while our helper remains live can still cause a foreign output to be accepted. That residual
+  applies wherever this correlation method is used, including a host whose helper ignores the name; name propagation alone
+  does not remove it.
+- **Remembered trust requires both durable backend credentials and a proven credential-load authority.** Startup recovery
+  restores trust only from a reference returned by that authority while the identity/session/trust fences still match. The
+  current production `BackendKeyringStore` keeps references in its adapter-local map and implements no cross-process load
+  from the backend; a fresh adapter returns no reference even if the backend retained credentials. Ordinary restart
+  therefore leaves trust `Unknown`, with the pane showing "Trust unknown"; unresolved prior pairing or revocation remains a
+  cleanup state. Restoring remembered trust across processes requires a proven backend/adapter load path. Application
+  metadata must continue to contain no PIN, secret, or credential reference.
 
-Where these prerequisites are unmet, the corresponding mode is reported as unavailable with the exact missing capability
-and the recovery hint, per the error-handling rules above. Acceptance for such a host is: the refusal is typed, it names
-the missing capability, unrelated modes remain available, and no ownership or credential claim is reported that the
-application cannot prove.
+A failed startup prerequisite makes its affected operation unavailable. Output association is checked during creation
+before publication, and remembered trust is checked through the credential-load authority during recovery; neither is
+guaranteed to be known from the startup capability flags alone. Refusal must carry the typed error appropriate to the
+boundary reached. For operator acceptance, inspect the structured startup capability report for missing
+admission/start/source flag names or the pairing transaction prerequisite group; verify that the pane disables or refuses
+the affected operation and offers the available catalog recovery. The visible catalog message and exported capability
+codes need not include diagnostic detail. Functionality remains available only when its own prerequisites are proven,
+subject to trust and cleanup lockouts; a shared prerequisite can block both video modes while discovery/device inspection
+survives. Check trust, transport, display, and audio badges after refusal and ordinary restart: the application reports
+"Paired" only after a current fenced credential commit/load, and "Output owned" only under its accepted
+ownership/association contract, with the exact-name correlation residual stated above. Application metadata contains no
+credential reference. Deterministic negative-path tests establish the authority predicates; an operator checks their
+observable consequences. Successful streaming and persisted remembered trust require separate positive acceptance on a
+composition that proves their prerequisites.
 
 ## Testing Strategy
 
@@ -561,7 +584,7 @@ Each seam has a fake implementation with controllable events, delays, failures, 
 
 Qt tests cover every row in the UI matrix: pairing before and after output creation, mode-selector lockout, explicit stop-before-switch, resolution picker, portal cancellation, Offline and Recovering, reconnect presentation with retained output, Reconfiguring, resolution mismatch, dependency errors, orphan cleanup confirmation, CleanupRequired, audio-unavailable video retention and retry, stale pairing submission, forget/revoke flow, and per-session mute. Tests assert that text and controls never expose a conflicting mode action while resources are stopping or uncertain.
 
-Acceptance requires multiple independent receiver sessions, strict per-receiver mode exclusivity, physical-only Mirror source validation, serialized and recoverable virtual-output creation, exact crash adoption/cleanup behavior, virtual-output creation and cleanup, remembered pairing without plaintext metadata, actionable dependency errors, deterministic cancellation behavior, runtime audio failure without video loss, and isolation of one receiver's failure from another.
+On a composition with the required backend, capture, display-association, and credential-load evidence, positive acceptance requires multiple independent receiver sessions, strict per-receiver mode exclusivity, physical-only Mirror source validation, serialized and recoverable virtual-output creation, exact crash adoption/cleanup behavior, virtual-output creation and cleanup, remembered pairing without plaintext metadata, actionable dependency errors, deterministic cancellation behavior, runtime audio failure without video loss, and isolation of one receiver's failure from another. For a composition lacking a prerequisite, v1 refusal acceptance follows "Capability-gated delivery (v1 scope)". Passing refusal checks establishes the stated gated behaviour; successful-mode acceptance remains conditional and must be recorded separately.
 
 ## Risks and Boundaries
 
