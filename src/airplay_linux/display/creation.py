@@ -14,7 +14,7 @@ from uuid import UUID
 from airplay_linux.diagnostics.activity import safe_activity
 from airplay_linux.diagnostics.catalog import diagnostic
 from airplay_linux.diagnostics import boundary
-from airplay_linux.display.helper import HELPER_COMMAND, HelperFeatures
+from airplay_linux.display.helper import HELPER_COMMAND, HelperFeatures, VirtualHelper
 from airplay_linux.display.kscreen import OutputInfo
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import (
@@ -76,6 +76,7 @@ class _Creation:
     record: OwnershipRecord | None = None
     helper: ProcessIdentity | None = None
     output: OutputInfo | None = None
+    launch_baseline: LayoutSnapshot | None = None
     launch_attempted: bool = False
     fenced: bool = False
 
@@ -388,9 +389,20 @@ class DisplayCreator:
                     return await self._finish_failure(state, _failure(ErrorCode.stale_event, state.receiver_id))
 
                 state.launch_attempted = True
-                launch_result = await self._helper.launch(
-                    state.owner_uuid, self._runtime_directory, state.size,
-                )
+                if (
+                    isinstance(self._helper, VirtualHelper)
+                    and callable(getattr(self._observer, "observation", None))
+                ):
+                    launch_result = await self._helper.launch(
+                        state.owner_uuid,
+                        self._runtime_directory,
+                        state.size,
+                        lambda: self._capture_launch_boundary(state),
+                    )
+                else:
+                    launch_result = await self._helper.launch(
+                        state.owner_uuid, self._runtime_directory, state.size,
+                    )
                 if isinstance(launch_result, Err):
                     return await self._finish_failure(state, launch_result)
                 if type(launch_result.value) is not ProcessIdentity:
@@ -402,6 +414,7 @@ class DisplayCreator:
                     record,
                     stage="helper_started",
                     helper=state.helper,
+                    baseline=state.launch_baseline or record.baseline,
                     last_configuration_step="helper_started",
                 )
                 written = await self._persist(state, helper_record)
@@ -537,6 +550,50 @@ class DisplayCreator:
             except ValueError:
                 pass
 
+    async def _capture_launch_boundary(self, state: _Creation) -> Result[None]:
+        """Capture and bind the one observation immediately before helper spawn."""
+        if state.owner_uuid is None:
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        observation = getattr(self._observer, "observation", None)
+        if not callable(observation):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        try:
+            result = await observation()
+        except Exception:
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if (
+            type(result) is not Ok
+            or type(result.value) is not tuple
+            or len(result.value) != 2
+        ):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        outputs, layout = result.value
+        if (
+            type(outputs) is not tuple
+            or type(layout) is not LayoutSnapshot
+            or any(type(output) is not OutputInfo for output in outputs)
+            or type(layout.observation_subject) is not str
+            or not layout.observation_subject
+            or type(layout.observation_sequence) is not int
+            or layout.observation_sequence <= 0
+            or any(
+                output.observation_subject != layout.observation_subject
+                or output.observation_sequence != layout.observation_sequence
+                for output in outputs
+            )
+        ):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        register = getattr(self._output_verifier, "register_launch", None)
+        if callable(register):
+            try:
+                registered = register(state.owner_uuid, layout)
+            except Exception:
+                return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+            if registered is not True:
+                return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        state.launch_baseline = layout
+        return Ok(value=None)
+
     @staticmethod
     def _session_is_kde_wayland() -> bool:
         session = os.environ.get("XDG_SESSION_TYPE", "").strip().lower()
@@ -669,10 +726,23 @@ class DisplayCreator:
             return OwnedProcessScan(matches=(), complete=False)
         return result
 
+    @staticmethod
+    def _after_launch_fence(candidate: OutputInfo, baseline: LayoutSnapshot) -> bool:
+        return (
+            type(candidate.observation_subject) is str
+            and bool(candidate.observation_subject)
+            and type(candidate.observation_sequence) is int
+            and candidate.observation_sequence > 0
+            and type(baseline.observation_subject) is str
+            and candidate.observation_subject == baseline.observation_subject
+            and type(baseline.observation_sequence) is int
+            and candidate.observation_sequence > baseline.observation_sequence
+        )
+
     async def _verify_output(self, state: _Creation, candidate: OutputInfo) -> Result[None]:
         if self._is_fenced(state):
             return _failure(ErrorCode.stale_event, state.receiver_id)
-        if state.record is None or not self._absent_from_baseline(candidate, state.record.baseline):
+        if state.record is None:
             return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
         scan = self._owned_scan(state)
         if state.helper is None or not scan.complete or scan.matches != (state.helper,):
@@ -685,13 +755,27 @@ class DisplayCreator:
             )
         except Exception:
             return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if type(result) is not Ok or result.value is not None:
+            return result if isinstance(result, Err) else _failure(
+                ErrorCode.ownership_mismatch, state.receiver_id,
+            )
         # Recheck after the authority's await: PID reuse or removal admission
         # during verification cannot authorise a configuration/publication.
         scan = self._owned_scan(state)
         if self._is_fenced(state) or not scan.complete or scan.matches != (state.helper,):
             return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
-        if type(result) is not Ok or result.value is not None:
-            return result if isinstance(result, Err) else _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if (
+            state.launch_baseline is not None
+            and (
+                not self._absent_from_baseline(candidate, state.launch_baseline)
+                or not self._after_launch_fence(candidate, state.launch_baseline)
+            )
+        ):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
+        if state.launch_baseline is None and not self._absent_from_baseline(
+            candidate, state.record.baseline,
+        ):
+            return _failure(ErrorCode.ownership_mismatch, state.receiver_id)
         return Ok(value=None)
 
     async def _observe_new_output(

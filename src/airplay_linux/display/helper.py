@@ -30,7 +30,7 @@ import json
 import math
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -231,7 +231,11 @@ class VirtualHelper:
     # -- launch -------------------------------------------------------------
 
     async def launch(
-        self, owner_uuid: UUID, runtime_directory: str, size: Size,
+        self,
+        owner_uuid: UUID,
+        runtime_directory: str,
+        size: Size,
+        before_spawn: Callable[[], Awaitable[Result[None]]] | None = None,
     ) -> Result[ProcessIdentity]:
         """Spawn one helper carrying the exact ownership environment.
 
@@ -239,10 +243,12 @@ class VirtualHelper:
         and this reservation does not already have a live owned helper. The
         ownership scan is consulted inside the launch lock together with its
         completeness: a scan that could not inspect every candidate is
-        uncertainty, and uncertainty never authorises a second helper. The
-        post-spawn identity is verified again before it is handed out; a child
-        that cannot be proven is failed and cleanup is attempted through the
-        ownership-checked termination boundary.
+        uncertainty, and uncertainty never authorises a second helper. If
+        supplied, ``before_spawn`` captures launch-boundary evidence while this
+        lock is held and immediately before ``spawn``. The post-spawn identity is
+        verified again before it is handed out; a child that cannot be proven is
+        failed and cleanup is attempted through the ownership-checked termination
+        boundary.
         """
         if (
             not _valid_owner(owner_uuid)
@@ -264,6 +270,15 @@ class VirtualHelper:
                 # one-helper-per-reservation while ownership is unknown; retrying
                 # the scan is the remedy the caller is offered.
                 return _failure(ErrorCode.helper_failed)
+            if before_spawn is not None:
+                try:
+                    boundary = await before_spawn()
+                except Exception:
+                    return _failure(ErrorCode.ownership_mismatch)
+                if type(boundary) is Err:
+                    return boundary
+                if type(boundary) is not Ok or boundary.value is not None:
+                    return _failure(ErrorCode.ownership_mismatch)
             spec = CommandSpec(
                 argv=(self._command, "--resolution", f"{size.width}x{size.height}"),
                 env={

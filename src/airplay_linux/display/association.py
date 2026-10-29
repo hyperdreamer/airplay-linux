@@ -11,6 +11,7 @@ through an independent full observation. This does not claim an upstream
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 from uuid import UUID
 
 from airplay_linux.diagnostics import diagnostic
@@ -24,6 +25,31 @@ from airplay_linux.display.kscreen import KScreenObserver, OutputInfo
 
 def _refused() -> Err:
     return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchFence:
+    observation_subject: str
+    observation_sequence: int
+    baseline: LayoutSnapshot
+
+
+def _observation_stamp(value: object) -> tuple[str, int] | None:
+    subject = getattr(value, "observation_subject", None)
+    sequence = getattr(value, "observation_sequence", None)
+    if (
+        type(subject) is not str
+        or not subject
+        or type(sequence) is not int
+        or sequence <= 0
+    ):
+        return None
+    return subject, sequence
+
+
+def _after_fence(value: object, fence: _LaunchFence) -> bool:
+    stamp = _observation_stamp(value)
+    return stamp is not None and stamp[0] == fence.observation_subject and stamp[1] > fence.observation_sequence
 
 
 class KScreenOutputVerifier:
@@ -41,6 +67,21 @@ class KScreenOutputVerifier:
         self._helper = helper
         self._observer = observer
         self._ownerships = ownerships
+        self._launches: dict[OwnerId, _LaunchFence] = {}
+
+    def register_launch(self, owner_uuid: OwnerId, baseline: LayoutSnapshot) -> bool:
+        """Bind one fresh observer fence to the helper launch about to occur."""
+        if type(owner_uuid) is not UUID or type(baseline) is not LayoutSnapshot:
+            return False
+        stamp = _observation_stamp(baseline)
+        if stamp is None or owner_uuid in self._launches:
+            return False
+        self._launches[owner_uuid] = _LaunchFence(
+            observation_subject=stamp[0],
+            observation_sequence=stamp[1],
+            baseline=baseline,
+        )
+        return True
 
     async def __call__(
         self,
@@ -84,24 +125,28 @@ class KScreenOutputVerifier:
         if len(records) != 1 or type(records[0]) is not OwnershipRecord:
             return _refused()
         record = records[0]
+        fence = self._launches.get(owner_uuid)
         if (
-            record.runtime_directory != runtime_directory
+            fence is None
+            or record.runtime_directory != runtime_directory
             or record.helper != identity
             or record.stage == "reserved"
             or candidate.size != record.requested_size
             or (record.connector is not None and record.connector != candidate.connector)
             or (record.output_id is not None and record.output_id != candidate.output_id)
             or type(record.baseline) is not LayoutSnapshot
+            or record.baseline.outputs != fence.baseline.outputs
+            or not _after_fence(candidate, fence)
         ):
             return _refused()
 
         baseline_ids = {
             properties.get("id")
-            for properties in record.baseline.outputs.values()
+            for properties in fence.baseline.outputs.values()
             if type(properties.get("id")) is str
         }
         if (
-            candidate.connector in record.baseline.outputs
+            candidate.connector in fence.baseline.outputs
             or candidate.output_id in baseline_ids
         ):
             return _refused()
@@ -120,6 +165,7 @@ class KScreenOutputVerifier:
             type(outputs) is not tuple
             or type(layout) is not LayoutSnapshot
             or not isinstance(layout.outputs, Mapping)
+            or not _after_fence(layout, fence)
         ):
             return _refused()
         if any(type(output) is not OutputInfo for output in outputs):
@@ -150,7 +196,7 @@ class KScreenOutputVerifier:
             output for output in outputs
             if output.virtual is True
             and output.size == record.requested_size
-            and output.connector not in record.baseline.outputs
+            and output.connector not in fence.baseline.outputs
             and output.output_id not in baseline_ids
         ]
         if len(new_virtual_matches) != 1 or new_virtual_matches[0] != by_connector[0]:

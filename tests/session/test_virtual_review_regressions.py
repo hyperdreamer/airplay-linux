@@ -15,13 +15,136 @@ from airplay_linux.domain.operations import InstanceId, ProcessIdentity
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import DisplayState, Err, ErrorCode, Ok, SessionPhase, TransportState
 from airplay_linux.testing.adapters import Deferred, FakeDisplay, SequenceIds
-from airplay_linux.testing.builders import target
+from airplay_linux.testing.builders import context, target
 from airplay_linux.testing.time import FakeClock, FakeScheduler
 from airplay_linux.transport.doubletake import DoubleTakeTransport
 from test_virtual_and_resolution import start_virtual
-from virtual_scenarios import ContextTransport, SMALL, make_rig, settle, stream_event
+from virtual_scenarios import (
+    ContextTransport,
+    HD,
+    SMALL,
+    make_rig,
+    production_display,
+    settle,
+    stream_event,
+)
 
 pytestmark = pytest.mark.asyncio
+
+
+def _audit_foreign_output():
+    return dict(
+        id=19,
+        name="Virtual-foreign",
+        type="Virtual",
+        enabled=True,
+        pos={"x": 0, "y": 0},
+        scale=1,
+        currentModeId="1",
+        size={"width": HD.width, "height": HD.height},
+        modes=[{
+            "id": "1",
+            "size": {"width": HD.width, "height": HD.height},
+            "refreshRate": 60,
+        }],
+    )
+
+
+async def test_preexisting_exact_size_virtual_output_still_refused(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    provider, desktop, store = production_display(
+        tmp_path,
+        verifier=True,
+        initial_entries=[_audit_foreign_output()],
+        create_output=False,
+    )
+    result = await provider.create(target().receiver_id, target().endpoint_fingerprint, HD, context())
+
+    assert isinstance(result, Err), result
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert not store.records
+    assert not desktop.associations
+    assert len(desktop.entries) == 1
+
+
+async def test_launch_gap_foreign_output_is_refused_and_never_published(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    provider, desktop, store = production_display(tmp_path, verifier=True, create_output=False)
+    original_launch = provider.helper.launch
+
+    async def launch_with_foreign_output(*args):
+        desktop.entries.append(_audit_foreign_output())
+        return await original_launch(*args)
+
+    provider.helper.launch = launch_with_foreign_output
+    result = await provider.create(target().receiver_id, target().endpoint_fingerprint, HD, context())
+
+    assert isinstance(result, Err), result
+    assert desktop.associations == {}
+    assert all(record.stage != "published" for record in store.records.values())
+
+
+async def test_replayed_prelaunch_observation_cannot_prove_current_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    provider, desktop, store = production_display(tmp_path, verifier=True, create_output=False)
+    original_launch = provider.helper.launch
+    cached = []
+
+    async def launch_with_cached_observation(*args):
+        desktop.entries.append(_audit_foreign_output())
+        observation = await desktop.observer.observation()
+        assert isinstance(observation, Ok)
+        cached.append(observation)
+        launched = await original_launch(*args)
+        desktop.entries.clear()
+
+        async def replay():
+            return cached[0]
+
+        desktop.observer.observation = replay
+        return launched
+
+    provider.helper.launch = launch_with_cached_observation
+    outcomes = []
+    original_verify = desktop.output_verifier._verify
+
+    async def record_verify(*args):
+        result = await original_verify(*args)
+        outcomes.append(result)
+        return result
+
+    desktop.output_verifier._verify = record_verify
+    result = await provider.create(target().receiver_id, target().endpoint_fingerprint, HD, context())
+
+    assert isinstance(result, Err), result
+    assert cached and outcomes
+    assert isinstance(outcomes[0], Err)
+    assert all(record.stage != "published" for record in store.records.values())
+
+
+async def test_unconditional_verifier_cannot_publish_prelaunch_foreign_output(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    provider, desktop, store = production_display(tmp_path, verifier=True, create_output=False)
+    original_launch = provider.helper.launch
+
+    async def launch_with_foreign_output(*args):
+        desktop.entries.append(_audit_foreign_output())
+        return await original_launch(*args)
+
+    async def unconditional_success(*args):
+        return Ok(value=None)
+
+    provider.helper.launch = launch_with_foreign_output
+    desktop.output_verifier._verify = unconditional_success
+    result = await provider.create(target().receiver_id, target().endpoint_fingerprint, HD, context())
+
+    assert isinstance(result, Err), result
+    assert desktop.associations == {}
+    assert all(record.stage != "published" for record in store.records.values())
 
 
 @pytest.mark.parametrize("churn", ["offline", "endpoint"])

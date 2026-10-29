@@ -38,8 +38,9 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final, TypeVar
+from uuid import uuid4
 
 from airplay_linux.diagnostics import ALLOWED_COMMANDS, diagnostic
 from airplay_linux.domain.ports import Clock, CommandSpec, ProcessPort, Scheduler, Subscription
@@ -130,6 +131,8 @@ class OutputInfo:
     position: tuple[int, int]
     scale: float
     virtual: bool | None
+    observation_subject: str | None = field(default=None, compare=False, repr=False)
+    observation_sequence: int | None = field(default=None, compare=False, repr=False)
 
     @property
     def identity(self) -> OutputIdentity:
@@ -468,12 +471,27 @@ def _snapshot_properties(record: _Record) -> dict[str, str | int | bool]:
     return properties
 
 
-def _snapshot(records: tuple[_Record, ...]) -> LayoutSnapshot:
+def _snapshot(
+    records: tuple[_Record, ...],
+    *,
+    observation_subject: str | None = None,
+    observation_sequence: int | None = None,
+) -> LayoutSnapshot:
     outputs = {record.connector: _snapshot_properties(record) for record in records}
-    return LayoutSnapshot(outputs=outputs, baseline_hash=layout_hash(outputs))
+    return LayoutSnapshot(
+        outputs=outputs,
+        baseline_hash=layout_hash(outputs),
+        observation_subject=observation_subject,
+        observation_sequence=observation_sequence,
+    )
 
 
-def _outputs(records: tuple[_Record, ...]) -> tuple[OutputInfo, ...]:
+def _outputs(
+    records: tuple[_Record, ...],
+    *,
+    observation_subject: str | None = None,
+    observation_sequence: int | None = None,
+) -> tuple[OutputInfo, ...]:
     outputs: list[OutputInfo] = []
     for record in records:
         if (
@@ -493,6 +511,8 @@ def _outputs(records: tuple[_Record, ...]) -> tuple[OutputInfo, ...]:
                 position=record.position,
                 scale=record.scale,
                 virtual=record.virtual,
+                observation_subject=observation_subject,
+                observation_sequence=observation_sequence,
             ),
         )
     outputs.sort(key=lambda output: int(output.output_id))
@@ -720,6 +740,8 @@ class KScreenObserver:
         self._poll_interval = float(poll_interval)
         self._subscribers: list[Callable[[tuple[OutputInfo, ...]], None]] = []
         self._observed: tuple[OutputInfo, ...] | None = None
+        self._observation_subject = uuid4().hex
+        self._observation_sequence = 0
         self._configure_lock = asyncio.Lock()
 
     # -- bounded awaits -----------------------------------------------------
@@ -857,6 +879,10 @@ class KScreenObserver:
             except Exception:  # noqa: BLE001 - a subscriber must not break observation
                 continue
 
+    def _next_observation_stamp(self) -> tuple[str, int]:
+        self._observation_sequence += 1
+        return self._observation_subject, self._observation_sequence
+
     async def observation(self) -> Result[tuple[tuple[OutputInfo, ...], LayoutSnapshot]]:
         """Project candidates and complete evidence from the same raw read.
 
@@ -866,9 +892,18 @@ class KScreenObserver:
         result = await self._records()
         if isinstance(result, Err):
             return result
-        outputs = _outputs(result.value)
+        subject, sequence = self._next_observation_stamp()
+        outputs = _outputs(
+            result.value,
+            observation_subject=subject,
+            observation_sequence=sequence,
+        )
         self._publish(outputs)
-        return Ok(value=(outputs, _snapshot(result.value)))
+        return Ok(value=(outputs, _snapshot(
+            result.value,
+            observation_subject=subject,
+            observation_sequence=sequence,
+        )))
 
     async def snapshot(self) -> Result[LayoutSnapshot]:
         """The current layout as a restorable flat baseline, with a canonical hash."""
@@ -933,7 +968,11 @@ class KScreenObserver:
                         # The read answered, but not within the interval we promised
                         # to observe; a late layout is not evidence about the deadline.
                         return _failure(ErrorCode.cleanup_timeout)
-                    outputs = _outputs(result.value)
+                    outputs = _outputs(
+                        result.value,
+                        observation_subject=self._observation_subject,
+                        observation_sequence=self._next_observation_stamp()[1],
+                    )
                     self._publish(outputs)
                     last_error = None
                     if predicate(outputs):
@@ -1095,7 +1134,11 @@ class KScreenObserver:
         )
         if updated is None or not _verified(updated, target, request, mode):
             return _failure(ErrorCode.configuration_failed), None
-        return Ok(value=None), _outputs(readback.value)
+        return Ok(value=None), _outputs(
+            readback.value,
+            observation_subject=self._observation_subject,
+            observation_sequence=self._next_observation_stamp()[1],
+        )
 
     # -- subscription -------------------------------------------------------
 

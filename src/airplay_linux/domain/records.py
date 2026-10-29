@@ -51,6 +51,8 @@ def _freeze_properties(
 class LayoutSnapshot:
     outputs: Mapping[str, Mapping[str, str | int | bool]]
     baseline_hash: str
+    observation_subject: str | None = field(default=None, compare=False, repr=False)
+    observation_sequence: int | None = field(default=None, compare=False, repr=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "outputs", _freeze_properties(self.outputs))
