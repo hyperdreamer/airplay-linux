@@ -73,6 +73,14 @@ _PINNED_050_VERSION: Final[str] = "0.5.0"
 # that other concurrent streams stay untouched.
 _PINNED_050_TARGET_SCOPE_STATEMENT: Final[str] = "only the given ip"
 
+#: The vendored patch (docs/backend-fork.md) adds ``-capabilities`` and reports the
+#: captured display in ``status``.  That surface is recognised only together with a
+#: matching machine-readable advertisement, never from the extra flag alone.
+_PINNED_050_SOURCE_SENDER_FLAGS: Final[frozenset[str]] = _PINNED_050_SENDER_FLAGS | frozenset({"capabilities"})
+_PINNED_050_SOURCE_PROFILE: Final[str] = "doubletake-0.5+source"
+_CAPABILITY_SCHEMA_TOKEN: Final[str] = "capabilities-v1"
+_STATUS_SOURCE_TOKEN: Final[str] = "status-source"
+
 
 def _diagnostic(code: ErrorCode, *, command: str | None = None) -> Diagnostic:
     """Build a catalog diagnostic without carrying backend-owned text."""
@@ -103,6 +111,11 @@ class BackendFeatures:
     cancel_pairing: bool
     revoke_pairing: bool
     query_modes: bool
+
+    #: The build advertises (and this application has verified) that ``status``
+    #: reports which display each capture selected.  It says nothing about whether
+    #: the source is physical or owned: those remain separate, unproven gates.
+    source_reporting: bool = False
 
     def __post_init__(self) -> None:
         if type(self.profile) is not str or type(self.version) is not str:
@@ -675,7 +688,9 @@ def _target_scope_proven(command: _CtlCommand | None) -> bool:
     return re.search(r"\b(?:not|never|ignor\w*|unsupported|unavailable)\b", summary) is None
 
 
-def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
+def features_from_help(
+    sender_help: str, ctl_help: str, *, advertised: frozenset[str] = frozenset(),
+) -> BackendFeatures:
     """Decode the pinned release's published help contract conservatively.
 
     Evidence is an exact match against the control surface transcribed from the
@@ -696,14 +711,30 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
 
     sender_flags = _sender_surface(sender_help)
     ctl_commands = _ctl_surface(ctl_help)
-    verified = (
-        sender_flags is not None
-        and ctl_commands is not None
-        and sender_flags == _PINNED_050_SENDER_FLAGS
+    ctl_matches = (
+        ctl_commands is not None
         and {
             name: command.arguments for name, command in ctl_commands.items()
         } == _PINNED_050_CTL_COMMANDS
     )
+    patched_surface = (
+        sender_flags == _PINNED_050_SOURCE_SENDER_FLAGS and ctl_matches
+    )
+    verified = (
+        sender_flags is not None
+        and ctl_commands is not None
+        and (
+            sender_flags == _PINNED_050_SENDER_FLAGS or sender_flags == _PINNED_050_SOURCE_SENDER_FLAGS
+        )
+        and ctl_matches
+    )
+    if patched_surface and not {
+        _CAPABILITY_SCHEMA_TOKEN,
+        _STATUS_SOURCE_TOKEN,
+    } <= set(advertised):
+        # An extra flag is not an advertisement.  Without the machine-readable
+        # tokens this surface proves nothing, so fall through to the refusal below.
+        verified = False
     if not verified:
         # Unknown, partial, later, foreign, or merely-similar help text proves no
         # public capability and no private one.  Report the observed version text
@@ -736,7 +767,7 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
         for command in ("disconnect", "mute", "unmute")
     )
     return BackendFeatures(
-        profile=_PINNED_050_PROFILE,
+        profile=_PINNED_050_SOURCE_PROFILE if patched_surface else _PINNED_050_PROFILE,
         version=_PINNED_050_VERSION,
         foreground_control=False,
         owner_handshake=False,
@@ -752,6 +783,7 @@ def features_from_help(sender_help: str, ctl_help: str) -> BackendFeatures:
         cancel_pairing=False,
         revoke_pairing=False,
         query_modes=False,
+        source_reporting=patched_surface,
     )
 
 
@@ -832,6 +864,16 @@ async def probe_backend(process: ports.ProcessPort) -> Result[BackendFeatures]:
     if not _probe_exit_ok(ctl_result.value, frozenset({0, 2})):
         return _incompatible()
 
+    capabilities_result = await _probe_run(process, ("doubletake", "-capabilities"), timeout=3.0)
+    advertised: frozenset[str] = frozenset()
+    if isinstance(capabilities_result, Ok) and isinstance(capabilities_result.value, ports.CommandOutput):
+        if _probe_exit_ok(capabilities_result.value, frozenset({0})):
+            advertised = frozenset(
+                line.strip()
+                for line in _output_text(capabilities_result.value).splitlines()
+                if line.strip()
+            )
+
     version_result = await _probe_run(process, ("doubletake", "--version"), timeout=3.0)
     version_text = ""
     if isinstance(version_result, Ok) and isinstance(version_result.value, ports.CommandOutput):
@@ -849,7 +891,7 @@ async def probe_backend(process: ports.ProcessPort) -> Result[BackendFeatures]:
     # optional evidence: the pinned release rejects it with exit 2, so splicing
     # its error banner in front of the usage block would mask the very surface
     # the fingerprint has to match.
-    features = features_from_help(sender_help, ctl_help)
+    features = features_from_help(sender_help, ctl_help, advertised=advertised)
     if version_text:
         if features.profile == _PINNED_050_PROFILE and version_text != _PINNED_050_VERSION:
             # A recognized help surface cannot override affirmative evidence from

@@ -500,7 +500,7 @@ def test_probe_is_read_only_and_does_not_send_stdin():
     assert isinstance(result, Ok)
     _assert_pinned_public_surface(result.value)
     assert all(stdin is None for _, _, stdin in process.calls)
-    assert all(spec.argv[-1] in {"--help", "--version"} for spec, _, _ in process.calls)
+    assert all(spec.argv[-1] in {"--help", "--version", "-capabilities"} for spec, _, _ in process.calls)
 
 
 def test_probe_recognizes_the_pinned_surface_when_version_is_rejected():
@@ -519,6 +519,7 @@ def test_probe_recognizes_the_pinned_surface_when_version_is_rejected():
     process = _ProbeProcess([
         _streams(stderr=sender),
         _streams(stderr=ctl, exit_code=2),
+        _streams(stderr="flag provided but not defined: -capabilities\n", exit_code=2),
         _streams(stderr=_REJECTED_VERSION_FLAG + sender, exit_code=2),
     ])
 
@@ -533,6 +534,7 @@ def test_probe_recognizes_the_pinned_surface_when_version_is_rejected():
     assert [spec.argv for spec, _, _ in process.calls] == [
         ("doubletake", "--help"),
         ("doubletake-ctl", "--help"),
+        ("doubletake", "-capabilities"),
         ("doubletake", "--version"),
     ]
 
@@ -564,6 +566,7 @@ def test_probe_rejects_a_successful_contradictory_version_for_the_pinned_surface
     process = _ProbeProcess([
         _streams(stderr=sender),
         _streams(stderr=ctl, exit_code=2),
+        _streams(stderr="flag provided but not defined: -capabilities\n", exit_code=2),
         _streams(stdout="doubletake version 9.9.9\n", exit_code=0),
     ])
 
@@ -629,6 +632,7 @@ def test_version_evidence_is_reported_as_a_version_and_never_as_the_raw_banner()
         process = _ProbeProcess([
             _streams(stderr=sender_help),
             _streams(stderr=ctl, exit_code=2),
+            _streams(stderr="flag provided but not defined: -capabilities\n", exit_code=2),
             _streams(stdout=version_stdout, stderr=version_stderr),
         ])
         result = asyncio.run(probe_backend(process))
@@ -707,3 +711,104 @@ def test_probe_reports_empty_help_as_incompatible():
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.dependency_incompatible
+
+
+# --- the vendored source-reporting surface ---------------------------------------
+#
+# The vendored patch (docs/backend-fork.md) adds ``-capabilities`` and reports the
+# captured display in ``status``.  Recognition must require BOTH the patched help
+# surface AND the machine-readable advertisement, must never flip a different gate,
+# and must fail closed when either is missing.
+
+_SOURCE_SENDER = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+_CTL = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+_ADVERTISEMENT = frozenset({"capabilities-v1", "status-source"})
+
+
+def test_patched_surface_with_advertisement_reports_source_reporting_only():
+    features = features_from_help(_SOURCE_SENDER, _CTL, advertised=_ADVERTISEMENT)
+
+    assert features.profile == "doubletake-0.5+source"
+    assert features.version == "0.5.0"
+    assert features.source_reporting is True
+    # Reporting which display was captured proves nothing about ownership, source
+    # typing, audio or the credential service; those stay closed.
+    assert features.physical_source is False
+    assert features.foreground_control is False
+    assert features.owner_handshake is False
+    assert features.keyring is False
+    assert features.virtual_source is False
+    # The pinned release's own proven behaviours are unaffected.
+    assert features.multi_target is True
+    assert features.target_mute is True
+    assert features.audio_probe is True
+
+
+def test_patched_surface_without_advertisement_fails_closed():
+    """An extra flag is not an advertisement."""
+
+    features = features_from_help(_SOURCE_SENDER, _CTL)
+
+    assert features.profile == "doubletake-unknown"
+    assert features.source_reporting is False
+    assert features.multi_target is False
+
+
+def test_patched_surface_with_partial_advertisement_fails_closed():
+    features = features_from_help(_SOURCE_SENDER, _CTL, advertised=frozenset({"capabilities-v1"}))
+
+    assert features.profile == "doubletake-unknown"
+    assert features.source_reporting is False
+
+
+def test_advertisement_cannot_promote_an_unpatched_surface():
+    """Tokens alone prove nothing: the help surface must match a known build."""
+
+    features = features_from_help(
+        (FIXTURES / "doubletake-0.5-help.txt").read_text(), _CTL, advertised=_ADVERTISEMENT
+    )
+
+    assert features.profile == "doubletake-0.5"
+    assert features.source_reporting is False
+    assert features.multi_target is True
+
+
+def test_probe_reads_the_patched_advertisement_end_to_end():
+    patched = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+    process = _ProbeProcess([
+        _streams(stderr=patched),
+        _streams(stderr=_CTL, exit_code=2),
+        _streams(stdout="capabilities-v1\nstatus-source\n"),
+        _streams(stderr=_REJECTED_VERSION_FLAG + patched, exit_code=2),
+    ])
+
+    result = asyncio.run(probe_backend(process))
+
+    assert isinstance(result, Ok), result
+    assert result.value.profile == "doubletake-0.5+source"
+    assert result.value.source_reporting is True
+    assert result.value.physical_source is False
+    assert [spec.argv for spec, _, _ in process.calls] == [
+        ("doubletake", "--help"),
+        ("doubletake-ctl", "--help"),
+        ("doubletake", "-capabilities"),
+        ("doubletake", "--version"),
+    ]
+
+
+def test_probe_ignores_a_capability_banner_from_a_nonzero_exit():
+    """A rejected flag prints a banner; that is not an advertisement."""
+
+    patched = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+    process = _ProbeProcess([
+        _streams(stderr=patched),
+        _streams(stderr=_CTL, exit_code=2),
+        _streams(stdout="capabilities-v1\nstatus-source\n", exit_code=2),
+        _streams(stderr=_REJECTED_VERSION_FLAG + patched, exit_code=2),
+    ])
+
+    result = asyncio.run(probe_backend(process))
+
+    assert isinstance(result, Ok), result
+    assert result.value.profile == "doubletake-unknown"
+    assert result.value.source_reporting is False

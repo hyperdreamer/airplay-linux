@@ -21,6 +21,10 @@ applies to `main`, and passes their test suite, so the door is open to revisit.
 - adds optional `CaptureConfig.OnSource func(SourceInfo)`; nil keeps existing behaviour
 - covers both portal paths, because `PrepareCapture` is the single request site
 
+`vendor/doubletake/0003-capability-tokens.patch` (stacks on 0001+0002)
+- adds `-capabilities`, printing a stable machine-readable token list (`capabilities-v1`, `status-source`) and
+  exiting 0
+
 `vendor/doubletake/0002-status-report-selected-source.patch` (stacks on 0001)
 - `CapturePreparation.Source()` exposes the decoded source
 - `videoCaptureGroup` records it under the daemon mutex
@@ -73,6 +77,22 @@ Because `--help` is otherwise unchanged and the probe normalises that `Usage of 
 capability probe still resolves the patched build to profile `doubletake-0.5` with the same withheld flags.
 That is the point of the next section: installing the patch changes nothing observable to the application
 until the build advertises what it can do.
+
+## How the application recognises it
+
+Recognition requires **both** halves, and neither alone is enough:
+
+- the sender `--help` surface must match the patched build (`tests/fixtures/backend/doubletake-0.5-source-help.txt`,
+  which differs from the pinned fixture by exactly the `-capabilities` row);
+- `doubletake -capabilities` must exit 0 and print `capabilities-v1` and `status-source`.
+
+When both hold the profile becomes `doubletake-0.5+source` with `source_reporting=True`. That flag states only that the
+build reports which display it captured. It deliberately does **not** set `physical_source`, `owner_handshake`,
+`foreground_control` or `keyring`: reporting a source is not proving it is the physical monitor we asked for, and the
+verification that consumes the report belongs to the owned-daemon work, not to this patch.
+
+An extra flag without the tokens fails closed, tokens without the matching surface fail closed, a partial token set fails
+closed, and tokens printed on a non-zero exit are ignored.
 
 ## What is still missing on our side
 
