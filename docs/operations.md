@@ -20,6 +20,10 @@ secrets: credential references come from the Secret Service, never from applicat
 
 ## Gated capabilities
 
+For why each of these cannot be closed with the installed backend - including the two launch shapes
+`doubletake` offers and the source-selection gap that blocks Mirror independently of daemon
+ownership - see `docs/backend-compatibility.md`.
+
 `--check-environment` lists them. A gated capability is a **deliberate refusal**, not a bug. The application treats an
 unproven backend capability as absent and never infers one from the presence of a command, a version string, or a prior
 success.

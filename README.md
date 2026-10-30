@@ -35,12 +35,31 @@ airplay-linux --check-environment
 
 The two modes are mutually exclusive per receiver and independent across receivers.
 
-## Capabilities this build leaves gated
+## What this build can and cannot do
 
-The composition root refuses to fabricate evidence. In this build:
+The composition root refuses to fabricate evidence, so what follows is the measured state, not a
+list of missing features.
 
-- `virtual_display` — gated: no helper/output association verifier is supplied, and display
-  creation refuses to publish without one.
-- `remembered_trust` — gated: the keyring control is not rebound to the owned daemon.
+**On the host this was built against, no streaming session starts.** The installed `doubletake`
+0.5.0 affirms only `multi_target`, `audio_probe` and `target_mute`; transport admission requires
+`foreground_control`, `owner_handshake` and `keyring`, all withheld. Discovery, receiver listing
+and device inspection still work.
 
-They are reported at startup and by `--check-environment`. See `docs/operations.md`.
+Three independent prerequisites stand between this code and a working session, and this backend
+satisfies none of them:
+
+- **owned daemon control** — a supervised foreground daemon exposes no control socket, and a
+  daemonised one is not supervised; owning it needs a launch-receipt model that is specified but
+  not implemented;
+- **physical source selection** — `doubletake` has no monitor/output selector, so "send this
+  monitor" is not expressible; capture is the whole desktop;
+- **credential service** — the keyring backend is selectable but unproven, and remembered trust
+  does not survive a restart because the adapter implements no cross-process load.
+
+Virtual display is separately blocked: `krfb-virtualmonitor` is absent here, and the composition
+supplies no output-association verifier.
+
+Nothing above is worked around by inference — that is the point of the design. `--check-environment`
+reports the exact missing affirmations; `docs/operations.md` has the prerequisites and a live
+acceptance checklist; `docs/backend-compatibility.md` records why each gate cannot be closed with
+this backend.
