@@ -1,7 +1,13 @@
 # Owned daemon control — plan v2 (revised against the scope review)
 
 Status: **BLOCKED on an external prerequisite.** Do not begin phase 1 until P1 is satisfied, unless the intent is
-explicitly to buy infrastructure with no user-visible capability.
+chosen explicitly.
+
+> **Amended for run `pm-run-20261030-040814-aefef9c0` (epoch 1).** P1 is satisfied on this machine by the locally
+> carried patch chain (measured: `capabilities-v1`, `status-source`; see the design's §12 and
+> `docs/backend-fork.md`). The operator authorised Amendment 1 (`…-amendment-1.md`, reply: `A`), which changes exactly
+> one admission precondition list — the `connect` gate — and keeps every pairing operation, remembered trust and every
+> other gate closed. Read the amendment with this plan; where they differ on `connect`, the amendment governs.
 
 ## External preconditions
 

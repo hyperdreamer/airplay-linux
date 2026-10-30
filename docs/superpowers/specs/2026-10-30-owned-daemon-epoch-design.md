@@ -1,9 +1,10 @@
 # Owned-daemon epoch — design
 
-- **Status:** draft for review
-- **Contract:** `docs/superpowers/plans/2026-10-30-owned-daemon-control.md` (plan v2, the reviewed contract)
+- **Status:** draft for review round 3
+- **Contract:** `docs/superpowers/plans/2026-10-30-owned-daemon-control.md` (plan v2) **as amended by**
+  `docs/superpowers/plans/2026-10-30-owned-daemon-control-amendment-1.md` (operator-authorised, reply `A`)
 - **Handoff:** `docs/handoff-owned-daemon-epoch.md`
-- **Epoch:** 1, run wave 1
+- **Run:** `pm-run-20261030-040814-aefef9c0`, epoch 1, wave 1
 - **Scope:** Mirror mode against the locally patched `doubletake` 0.5.0 build that reports its captured display.
   Virtual mode is out of scope.
 
@@ -12,208 +13,208 @@
 The application already ships a 30-task implementation of sessions, transport, display, trust, diagnostics and UI,
 with every gate closed because the published backend cannot prove the operations those gates require. Two of those
 gates — `foreground_control` and `owner_handshake` — were written for an *authenticated* daemon control channel that
-`doubletake` does not have and will not have. `docs/backend-compatibility.md` records the resulting dead end and the
-two ways out; this epoch takes the first one deliberately:
+`doubletake` does not have and will not have. `docs/backend-compatibility.md` records the dead end and the two ways
+out; this epoch takes the first one deliberately:
 
 > **Adopt the cooperative single-user threat model explicitly.** Ownership is evidence-based: the daemon is trusted
-> because it lives in a directory only we created, its identity matches a launch receipt, and its socket inode, owning
-> process and command line agree. A hostile same-UID process is out of scope: on this desktop it already owns the
-> session.
+> because it lives in a directory only we created, its identity matches a launch receipt, and its socket entry, its
+> listening peer and its command line agree. A hostile same-UID process is out of scope: on this desktop it already
+> owns the session.
 
 `physical_source` is blocked for a second, independent reason: the released backend cannot be told which monitor to
-send and does not report which one it captured. This machine carries a locally patched build (`/home/bin/doubletake`,
-profile `doubletake-0.5+source`, `source_reporting=True`) whose `status` reply reports the selected display identity
-(`source_type`, size, position) per stream. That makes Mirror verifiable for the first time — but only if the
-application *consumes* that report and refuses an unverifiable capture.
+send and does not report which one it captured. This machine carries a locally patched build whose `status` reply
+reports the selected display identity per stream — but only if the report is *complete* and the application verifies
+it instead of interpreting it.
 
-Both changes are switches on a live control path that can start and stop a real daemon. The contract's activation
-invariant therefore governs the whole epoch:
+Both changes sit on a live control path that can start and stop a real daemon, so the contract's activation invariant
+governs the epoch:
 
 > No production detached spawn may exist until receipt production, verification, strict pidfd teardown and
 > cross-process reconciliation are all installed. **Every phase commit must carry a test proving that no production
-> spawn occurs**, so an intermediate commit cannot detach a candidate the remaining code cannot stop. Activation happens
-> in exactly one place.
+> spawn occurs.** Activation happens in exactly one place.
 
 ## 2. Goals and non-goals
 
 ### Goals
 
-1. `owned_daemon_control` is a capability that only a *composition* can affirm, that admission consumes instead of
-   the unprovable `foreground_control`/`owner_handshake` pair, and that the control adapter consumes through an
-   injected ownership authority so no mutating request is authorized by a flag alone.
-2. Durable, versioned reservation and launch-receipt records carry every fact the verifier needs, published atomically.
-3. Ownership is proven from evidence: dirfd-anchored socket identity, socket inode → owning pid, matching
-   `start_ticks`, a command line naming that exact socket, matching owner UID, and the recorded runtime-directory
-   device/inode, all re-read at verification time.
+1. `owned_daemon_control` is a capability that only a *composition* can affirm, that admission consumes instead of the
+   unprovable `foreground_control`/`owner_handshake` pair, and that the control adapter consumes through an injected
+   ownership authority, so no mutating request is authorized by a flag alone.
+2. Durable, versioned reservation and launch-receipt records carry every fact the verifier needs, published atomically
+   as single authoritative documents.
+3. Ownership is proven end to end: dirfd-anchored directory entry, the *live control peer* that answers on that entry,
+   its `start_ticks`, its command line naming that exact socket, its owner UID, the recorded directory identity, the
+   boot id and the endpoint generation.
 4. Teardown of an owned daemon never signals a number: a pidfd is opened and re-validated, every signal goes through
-   the descriptor, and an unavailable pidfd is a typed refusal, not a fallback.
-5. A shared-root authority serialises daemon launch, reconciliation and whole-daemon shutdown across application
-   processes, refusing while another live owner exists and reaping a prior instance only through the verifier.
+   the descriptor, and an unavailable pidfd is a typed refusal.
+5. A shared-root authority serialises launch, reconciliation and whole-daemon shutdown across application processes,
+   refusing while another live owner exists, reaping a prior instance only through the verifier, and keeping that
+   owner evidence for as long as the daemon lives.
 6. The launcher starts an *idle* daemon on a private socket with no target, no capture request and no credential
-   operation, and every crash window between reservation and `stopping` has a defined, tested outcome.
+   operation of its own, and every crash window between reservation and `stopping` has a defined, tested outcome.
 7. Activation is one commit: every consumer migrates, the credential-service proof and the source verification are
-   wired, and the operator-visible guarantee/refusal text matches what is actually proven.
-8. Acceptance runs on fakes only and proves with negative tripwires that no live path can run in the default suite.
+   wired behind a single ordered eligibility boundary, and the operator-visible guarantee/refusal text matches what is
+   proven.
+8. Acceptance runs on fakes only, through the real production composition, and proves with negative tripwires that no
+   live path can run in the default suite.
 
 ### Non-goals
 
 Virtual mode; hostile same-UID defence; whole-screen mirroring without a source identity; any relaxation of the
-receiver, transport-admission, trust, provider, target-generation, pairing-compensation or cleanup gates; changing
-the delivered `foreground_control`/`owner_handshake` *meanings* (they stay help-derived and stay false).
+receiver, trust, provider, target-generation, pairing-compensation or cleanup gates. The one admissible change to
+transport admission is Amendment 1's `connect` predicate (§4.6), which the operator authorised explicitly.
 
 ## 3. Threat model and the honesty boundary
 
 | Adversary | In scope? | Why |
 | --- | --- | --- |
 | A crashed, restarted or duplicated *application* instance | yes | the failure mode that strands or double-starts daemons |
-| A recycled PID, a replaced socket inode, a stale receipt from a previous boot | yes | ordinary races that must fail closed |
-| A different user | yes | UID checks on directory, socket and process |
-| A hostile process running as the same user | **no** | stated residual: it already owns the session and can drive the daemon through the same filesystem socket |
+| A recycled PID, a replaced socket entry, a stale receipt from a previous boot | yes | ordinary races that must fail closed |
+| A different user | yes | UID checks on directory, socket entry and process |
+| A hostile process running as the same user | **no** | stated residual: it already owns the session |
 
-The residual is disclosed in `README.md` and in the startup capability detail in the same words the design uses here.
-Nothing in this epoch may be described as authenticated ownership.
+The residual is disclosed in `README.md` and in the startup capability detail in the same words used here. Nothing in
+this epoch may be described as authenticated ownership.
 
 ## 4. Capability model
 
 ### 4.1 `owned_daemon_control` is composition-only
 
-`BackendFeatures` gains one field, `owned_daemon_control: bool = False`, with the same boolean-only invariant as its
-siblings. It is **never** set by `features_from_help` or `probe_backend`: help text proves a command surface, not that
-this composition can own a daemon. A pure composition function decides it:
+`BackendFeatures` gains `owned_daemon_control: bool = False`. It is **never** set by `features_from_help` or
+`probe_backend`: help text proves a command surface, not that this composition can own a daemon. One pure function
+decides it, and one composition call site invokes that function:
 
-```
-derive_composition_capabilities(
-    features,                      # help-derived, never trusted for ownership
-    launcher: LaunchCapability,    # spawn seam present and idle-launch argv constructible
-    ambient_socket: str | None,    # an inherited DOUBLETAKE socket, if any
-) -> BackendFeatures
+```text
+derive_composition_capabilities(probed, launcher, credential_proof, source_verifier, ambient_socket)
+    -> BackendFeatures
 ```
 
-`owned_daemon_control` becomes true only when the launcher seam is present, the private-socket runtime root is
-writable and no ambient socket is configured. An ambient-socket composition — the shape that would talk to a daemon
-somebody else started — cannot affirm it, and a help-derived feature set never carries it at all.
-
-`foreground_control` and `owner_handshake` keep their delivered meaning and stay `False` on every public backend
-build. They are no longer *admission* inputs.
+`owned_daemon_control` is true only when the launcher seam is available (verified `-daemonize`/`-socket`/
+`-cred-backend` surface, an absolute owned writable non-symlink runtime root), no ambient socket is configured, and
+the composition is the production graph. `foreground_control` and `owner_handshake` keep their delivered meaning, stay
+`False` on every public build, and stop being admission inputs.
 
 ### 4.2 Credential-service proof (P2)
 
-`keyring` likewise stops being a help-derived claim and becomes a composition-derived proof, because
-`-cred-backend keyring` merely selects storage. The composition runs a bounded, receiver-free
-`CredentialServiceProbe` before the capability report is finalised:
+`keyring` also stops being a help-derived claim and becomes a composition-derived proof. Before the capability report
+is finalised, and **only after** the structural prerequisites of §10.3 are satisfied, the composition runs
+`CredentialServiceProbe` with three legs:
 
-- **service leg** — one Secret Service introspection round trip through the existing D-Bus capability client
-  (no unlock, no item creation);
-- **backend positive leg** — launch the backend idle on a private socket in a throwaway directory with
-  `-cred-backend keyring` inside a private network namespace (`unshare -rn`), require the control socket to appear and
-  `status` to report `idle`, then tear it down; the backend constructs its keyring backend during startup, which is a
-  real `keyring.Get` round trip and fails hard when the Secret Service is unreachable;
-- **backend negative leg** — the same launch with `DBUS_SESSION_BUS_ADDRESS` pointing at a nonexistent socket, require
-  a nonzero exit, no control socket and no credentials file created anywhere: the backend refuses instead of falling
-  back to the file backend.
+- **service leg** — one Secret Service introspection round trip through the existing D-Bus capability client (no
+  unlock, no item creation);
+- **backend positive leg** — inside a private network namespace, an idle backend on a private socket with
+  `-cred-backend keyring` must reach `status == idle`; the backend constructs its keyring backend during startup,
+  which is a real `keyring.Get` round trip and fails hard when the Secret Service is unreachable;
+- **backend negative leg** — the same launch with `DBUS_SESSION_BUS_ADDRESS` pointing at a nonexistent socket must
+  exit nonzero, create no control socket and create no credentials file.
 
-All three legs must pass. A missing `unshare`, a missing Secret Service, or an unreadable backend leaves `keyring`
-false and admission refuses; the startup detail names the failed leg. The measurement that motivates every leg is in
-`docs/backend-fork.md` and the handoff; the positive and negative behaviour of the installed build is recorded in
-§12.
+All three legs must pass. A missing `unshare`, a missing Secret Service, an unreadable backend or a failed leg leaves
+`keyring` false, admission refuses, and the startup detail names the failed leg. The probe's own lifecycle is
+specified in §10.3 because it launches a backend.
 
-### 4.3 `physical_source` becomes true only with a verifier that consumes the report
+### 4.3 `physical_source` requires a verified *complete* report
 
-`features_from_help` keeps `physical_source=False`. The composition affirms it only when all of these hold:
+`BackendFeatures` gains `source_reporting_complete: bool = False`, decoded only when the patched surface *and* a third
+advertised token (`status-source-complete`) are present. The two-token build keeps `source_reporting=True` but is not
+complete, so it can never enable Mirror. The composition affirms `physical_source` only when all hold:
 
-1. the backend advertises and this application verified `source_reporting` (`capabilities-v1` + `status-source`
-   tokens **and** the patched help surface);
-2. a `ReportedSourceVerifier` is wired into the transport (§7);
-3. a physical capture provider is present and can inventory monitors.
+1. `source_reporting_complete` is true;
+2. a `ReportedSourceVerifier` (§7) is wired into the transport;
+3. a physical capture provider can inventory monitors (delivered rule: enabled **and** connected **and** a known
+   physical connector type).
 
-Absent any one of them, `physical_source` stays false and Mirror stays gated. The verifier is what converts the
-backend's report into evidence; without it the flag would be a claim.
+Absent any one, `physical_source` stays false and Mirror stays gated. `features_from_help` keeps `physical_source`
+`False` in every case.
 
 ### 4.4 Migration table (one row per consuming site)
 
 | Site | Today | After |
 | --- | --- | --- |
 | `policy.capabilities.ADMISSION_BACKEND_CAPABILITIES` | `foreground_control, owner_handshake, keyring` | `owned_daemon_control, keyring` (both composition-derived) |
-| `policy.capabilities` mode rubric | `admitted = …`, `mirror = … and physical_source` | unchanged shape; the three inputs are now the derived ones |
-| `transport.DoubleTakeTransport._admit` | refuses unless `foreground_control and owner_handshake and keyring` | refuses unless `owned_daemon_control and keyring` |
-| `process.DaemonRegistry._compatible` | same pair | `owned_daemon_control and keyring` |
-| `process.supervisor.DaemonSupervisor` start check | same pair | `owned_daemon_control` for the public backend; the fixture profile keeps `foreground_control and owner_handshake and keyring` |
-| `backend.control.PublishedDoubletakeControl._available` | every mutation and `shutdown` require `owner_handshake` | asks the injected `OwnershipAuthority` (§4.5); `owner_handshake` is no longer consulted by the evidence authority |
-| `backend.control.PublishedDoubletakeControl.handshake` | refuses before I/O when `owner_handshake` is false | the evidence authority returns a `VerifiedEndpoint`-backed proof for the same record; the fixture authority keeps the delivered handshake |
-| `backend.control.PublishedDoubletakeControl._revalidate_ownership` | requires the backend-reported owner token/instance/daemon/socket/protocol before every mutating request | the evidence authority re-proves the endpoint (socket `(device, inode)` unchanged, holder pid and `start_ticks` unchanged, generation current) immediately before and after the I/O; no backend-reported ownership field is required |
-| `backend.control.PublishedDoubletakeControl._available(connect)` | requires `foreground_control, owner_handshake, multi_target, target_bound_pairing, physical/virtual source, provisional_commit, cancel_pairing, revoke_pairing` | requires `owned_daemon_control, multi_target, (physical_source or virtual_source)`; the pairing-transaction group is removed **from connect only** (§4.6) |
-| `process.DaemonRegistry` readiness/release | `handshake()` + `shutdown` on the same control | `authority.prove(record)` for readiness and `authority.release(record)` (strict pidfd teardown) for release; the fixture authority keeps the delivered handshake |
-| `process.supervisor._request_release` | handshake then shutdown request | `authority.prove` then `authority.release`; the fixture profile keeps the handshake request |
-| `runtime._control_factory` | binds `owner_token`, `instance_uuid`, `protocol_version` into the profile | additionally binds the current receipt and the dispatch-fence source, and selects the authority from the derived features |
-| `runtime._capability_gates` / startup detail | lists the missing admission flags | names the owning authority, the credential leg and the source verifier |
-| `README.md` | documents the honest refusal | documents the cooperative-same-user guarantee, the residual and the exact refusal conditions |
+| `policy.capabilities` mode rubric | `admitted`, `mirror = … and physical_source` | unchanged shape with the derived inputs |
+| `transport.DoubleTakeTransport._admit` | refuses unless the old triplet | refuses unless `owned_daemon_control and keyring` |
+| `process.DaemonRegistry._compatible` | same triplet | `owned_daemon_control and keyring` |
+| `process.supervisor.DaemonSupervisor` start check | same triplet | public profile: `owned_daemon_control`; fixture profile unchanged |
+| `backend.control.PublishedDoubletakeControl._available` | every mutation and `shutdown` require `owner_handshake` | asks `authority.allows(operation)` (§4.5) |
+| `backend.control.PublishedDoubletakeControl._available(connect)` | old triplet + `multi_target` + pairing group + source | §4.6 (Amendment 1) |
+| `backend.control.PublishedDoubletakeControl.handshake` | refuses before I/O when `owner_handshake` is false | `authority.prove(record)`; the evidence authority returns an evidence proof |
+| `backend.control.PublishedDoubletakeControl._revalidate_ownership` | compares backend-reported owner/instance/daemon/socket/protocol before every mutating request | `authority.authorize(...)` before I/O and `authority.confirm(...)` after it; no backend-reported ownership field is required |
+| `backend.control.PublishedDoubletakeControl._ownership_check` (every status reply) | compares the same five backend fields | evidence authority: compares the status reply to *nothing ownership-bearing*; the identity comes from `authority.prove`/`confirm`. Fixture authority keeps the delivered comparison |
+| `transport.DoubleTakeTransport._start` / `_request` | requires `Handshake` and forwards it | requires `OwnershipProof` (`kind: handshake|evidence`) and forwards it unchanged |
+| `process.DaemonRegistry._authenticate` (readiness) | handshake + backend metadata in `status` | `authority.prove` + `status` *reachability* only; no backend identity fields |
+| `process.DaemonRegistry._authenticate(release=True)` | handshake then `shutdown` request | `authority.release(record)` (strict pidfd path) |
+| `process.supervisor._request_release` | handshake then shutdown request | `authority.prove` then `authority.release`; fixture profile unchanged |
+| `runtime._control_factory` | binds token/instance/protocol into the profile | binds the current receipt, the authority and the fence source; the legacy bindings remain only for the fixture authority |
+| `runtime._capability_gates` / startup detail | lists missing admission flags | names the owning authority, the credential leg and the source verifier |
+| `README.md` | documents the honest refusal | documents the cooperative-same-user guarantee, the residual, the Mirror precondition and the exact refusal conditions |
 
-No site may read `foreground_control`/`owner_handshake` for admission after activation; the fields remain on the
-dataclass for the application-contract fixture, whose handshake path continues to work unchanged.
+No site may read `foreground_control`/`owner_handshake` for admission after activation. The fields remain on the
+dataclass so the application-contract fixture's handshake path keeps working unchanged.
 
-### 4.5 The control authorization seam (post-activation)
+### 4.5 The control authorization seam (F-013)
 
-`backend/control.py` is the one module the delivered migration table missed: it is both an admission consumer and the
-only place that authorizes a mutating request. It gains one injected collaborator, so the control never decides
-*which* ownership evidence is acceptable by itself:
+```text
+OwnershipProof = {kind: "handshake"|"evidence", daemon: ProcessIdentity,
+                  socket_entry: (device, inode), generation: int, handshake: Handshake|None}
 
-```
 class OwnershipAuthority(Protocol):
-    async def prove(self, record: DaemonRecord) -> Result[Proof]      # pre-flight / readiness
-    async def authorize(self, record, operation) -> Result[Proof]    # immediately before mutating I/O
-    async def confirm(self, record, proof) -> Result[None]           # immediately after it
-    async def release(self, record) -> Result[None]                  # typed teardown only
+    def allows(self, operation: BackendOperation) -> bool                       # synchronous, pure
+    async def prove(self, record: DaemonRecord) -> Result[OwnershipProof]
+    async def authorize(self, record, operation, target: ReceiverTarget|None,
+                        fence: DispatchFence|None) -> Result[OwnershipProof]
+    async def confirm(self, record, proof: OwnershipProof) -> Result[None]
+    async def release(self, record: DaemonRecord) -> Result[None]
 ```
 
-Two implementations, selected by the derived features at composition time:
+Two implementations, selected by the derived features inside `runtime._control_factory`:
 
-- **`HandshakeAuthority`** — the delivered behaviour, unchanged: `owner_handshake` gating, `handshake()` proof,
-  backend-reported `owner_token`/`instance_uuid`/`daemon`/`socket_path`/`protocol_version` equality, fence checked
-  before the request. It is selected only for a profile that affirms `owner_handshake` (the application-contract
-  fixture).
-- **`EvidenceAuthority`** — the public-backend path: `prove`/`authorize` run `verify_owned_endpoint(receipt)` (§6),
-  require the verified generation to be the registry's current generation, and require the recorded dispatch fence
-  (`target.receiver_id`, endpoint generation and fingerprint) to match the request's target. `confirm` re-checks the
-  socket `(device, inode)` and that the same pid/`start_ticks` still holds it, so a replaced endpoint is detected even
-  if it happened mid-request. `release` is the strict pidfd path (§8).
+- **`HandshakeAuthority`** — the delivered behaviour unchanged, selected only for a profile that affirms
+  `owner_handshake` (the application-contract fixture): token/instance/daemon/socket/protocol equality, `Handshake`
+  proof, fence before the request.
+- **`EvidenceAuthority`** — the public path. `prove` runs `verify_owned_endpoint(receipt)` (§6) and requires the
+  verified generation to be the registry's current generation. `authorize` re-proves, then requires the fence to match
+  the request's target (receiver id, endpoint generation, fingerprint). `confirm` re-runs the peer and entry checks so a
+  replacement during the request is detected. `release` is the strict teardown of §8.
 
-Consequences that the plan must carry:
+Operation classes for `allows`, stated once:
 
-1. `_available()` asks `authority.allows(operation)`; the authority answers from the derived features *and* the
-   evidence, never from `features.owner_handshake`.
-2. `handshake()` becomes `authority.prove(record)` for the evidence authority, so `DaemonRegistry` and the supervisor
-   keep one call shape.
-3. The dispatch fence stays mandatory and stays evaluated immediately before mutating I/O. Removing it would be a
-   target-generation relaxation, which the contract forbids.
-4. The production factory injects the current receipt and the authority; it never constructs a control with an
-   unproven record.
+| Operation class | Requirement |
+| --- | --- |
+| `status`, `discover`, `devices` | always allowed; the reply is checked by `prove`, never by backend ownership metadata |
+| `disconnect`, `mute`, `unmute` | `owned_daemon_control and multi_target` (+ `target_mute` for mute) **and** a matching fence |
+| `connect` | §4.6 |
+| `shutdown` | `owned_daemon_control`, no target, no fence; allowed only on the authority's `release` path |
+| pairing operations, audio restart, mode query | unchanged delivered capability requirements, all currently false |
 
-### 4.6 Connect admission after activation
+`prove`/`confirm` are the only places a proof is minted; a control constructed without a proven record cannot perform
+a mutating request. `authorize` and `confirm` are awaited immediately before and after the adapter's I/O; no
+unverified window remains open across an awaited ownership check.
 
-The delivered `connect` gate also required the pairing-transaction group (`target_bound_pairing`, `provisional_commit`,
-`cancel_pairing`, `revoke_pairing`). That group stays closed for the public backend, so a mechanical swap of the
-ownership pair alone would leave Mirror unusable. The migration is deliberately narrow:
+### 4.6 Connect admission (Amendment 1, operator reply `A`)
 
-- `connect` requires `owned_daemon_control ∧ multi_target ∧ (physical_source ∨ virtual_source) ∧` the delivered
-  trust fence (no `CleanupRequired`/`RevocationPending`, unchanged) `∧` the exact-target dispatch fence (unchanged).
-- **every pairing operation** (`begin/submit/prepare/commit/cancel/revoke/mark_invalid`), `remembered_pairing`, and the
-  provisional-commit compensation path keep their delivered capability requirements and are not touched.
-- a start whose backend acknowledgement reports a credential challenge is **refused and disconnected for that exact
-  target**, returning `dependency_incompatible`: submitting a credential requires the gated pairing channel, so the
-  application must not leave a half-started stream behind. This is a typed refusal with a test, not a silent gap.
+`docs/superpowers/plans/2026-10-30-owned-daemon-control-amendment-1.md` is the authority for this row:
 
-No receiver, trust, provider, target-generation, pairing-compensation or cleanup check is removed by this row; only the
-*precondition* that a connect must itself be able to pair is dropped, because this backend cannot pair and Mirror does
-not require pairing for an already-trusted receiver.
+```text
+owned_daemon_control and multi_target and (physical_source or virtual_source)
+and trust-not-blocked and dispatch-fence-valid
+```
+
+Every pairing operation, remembered trust, provisional-commit compensation, cancellation and revocation keeps its
+delivered requirements and stays refused. The mandatory terms:
+
+1. **No pairing at connect.** A credential challenge in the acknowledgement or in `status` disconnects that exact
+   target and returns `dependency_incompatible`. No prompt, no secret, no leftover stream, no claimed capability.
+2. **The challenge window is observed.** The bounded post-connect wait of §7 is the same wait that detects a
+   challenge, so a credential-waiting start cannot sit unnoticed.
+3. The amendment is recorded in the contract, with the verbatim reply and the residual (§17).
 
 ## 5. Durable records
 
-Two new versioned record types, both persisted through `AtomicFiles` (temp + fsync + rename + directory fsync), both
-in `domain/records.py` with codecs in `storage/codecs.py` and a `JsonLaunchReceiptStore` repository:
+Two versioned record types, both published through `AtomicFiles` (temp + fsync + rename + directory fsync):
 
 ### 5.1 `DaemonReservation` (`airplay-linux/daemon-reservation`, version 1)
 
-Written **before** any spawn, so a crash between spawn and publication leaves something to reconcile.
+Written **before** any spawn.
 
 | Field | Meaning |
 | --- | --- |
@@ -231,366 +232,375 @@ Written **before** any spawn, so a crash between spawn and publication leaves so
 
 ### 5.2 `LaunchReceipt` (`airplay-linux/launch-receipt`, version 1)
 
-The reservation fields plus the observed launch state. One record per `launch_uuid`, retained after failure.
+The reservation fields plus observed launch state. Two **different** identity pairs are recorded, because they are
+different kernel objects and must never be conflated:
 
 | Field | Meaning |
 | --- | --- |
-| `state` | `reserved` → `detached` → `bound` → `ready` → `stopping` → `stopped`; or `failed` |
+| `state` | `reserved` → `detached` → `bound` → `ready`; `stopping` intent from any launched state; terminal `stopped` or `failed` |
 | `supervisor`, `daemon` | `{pid, start_ticks}` once observed (nullable) |
-| `socket_device`, `socket_inode` | `fstat` of the socket via the dirfd once bound |
-| `status_state` | the `state` field of the last `status` reply (`idle`, …) |
+| `entry_device`, `entry_inode` | `fstat` of the socket **directory entry**, taken via the dirfd |
+| `socket_inode` | the **kernel socket** inode from the unique `/proc/net/unix` row for that path |
+| `peer_pid`, `peer_start_ticks`, `peer_uid` | the peer observed through `SO_PEERCRED` on a control connection (§6) |
+| `status_state` | the `state` field of the last accepted `status` reply (`idle`, …) |
 | `credential_service` | `keyring_proven` \| `file_refused` \| `unknown` — evidence, never a secret |
 | `failure` | the diagnostic code of the transition into `failed` |
 | `updated_at` | store clock |
 
-Rules:
+Codec rules: reject an **unknown version**, a **missing field**, and any **partial record** (`bound` without entry and
+socket identity, `ready` without `peer_pid`/`status_state`, a non-null `daemon` without `supervisor`, a `stopping`
+without a preceding launched state). No field may default in a way that hides absence. Records never contain a token,
+PIN, password, credential reference or environment dump.
 
-- codecs reject an **unknown version**, a **missing field**, and any **partial record** (a `bound` state without
-  socket identity, a non-null `daemon` without `supervisor`, a `ready` without a `status_state`);
-- the receipt never contains a token, PIN, password, credential reference or environment dump;
-- an old receipt is never overwritten by a newer launch: the store keeps each `launch_uuid` and the registry records
-  which one is current, so a stale generation is detectable rather than erased;
-- `endpoint_generation` is what makes a rebuild of the same socket path detectable; the socket inode recorded at
-  `bound` is what proves the generation actually refers to the live endpoint.
+### 5.3 One authoritative document per receipt; derived current (F-012)
 
-### 5.3 One writer, one pointer, explicit transitions
+There is **no separate pointer file**. Each receipt is one file `<state_root>/daemon/receipts/<launch_uuid>.json`, and
+every transition is a single-record atomic replace. "Current" is *derived* from the store, never published:
 
-The registry is the **only** writer of both record types. The supervisor never writes a receipt: it keeps publishing
-its own and the child's identity into the delivered `DaemonRecord` store (the existing, tested observation channel),
-and the registry copies those observations into the receipt. This removes a two-writer crash window entirely and keeps
-the delivered supervisor handshake intact.
+```text
+current = the unique receipt whose state is in {reserved, detached, bound, ready, stopping}
+```
 
-Receipt transitions are compare-and-publish, each with a precondition that the registry checks while it holds the
-in-process registry lock and the shared-root authority (§9):
+- exactly one ⇒ that is the current launch;
+- two or more ⇒ ambiguity: `CleanupRequired`, no adoption, no replacement, no teardown of either;
+- none ⇒ no current launch (a `failed`/`stopped` record may still exist as evidence).
+
+The registry is the only writer of receipts. The supervisor keeps writing its own `DaemonRecord` lifecycle (the
+delivered observation channel) and never writes a receipt; after a crash the registry reconstructs the receipt state
+from that record plus the verifier. Transition preconditions, checked under the registry lock and the authority lease:
 
 | Transition | Precondition | Written fields |
 | --- | --- | --- |
-| `reserved` (create) | no current receipt for this endpoint, or the previous one is `stopped`/`failed` and its generation is provably finished | all reservation fields, `endpoint_generation = previous + 1` |
-| `reserved → detached` | the store record for this `instance_uuid` names the supervisor and the daemon identity, and the daemon identity equals the spawned child identity | `supervisor`, `daemon` |
-| `detached → bound` | the socket exists via the dirfd; the verifier proves the endpoint from a `reserved`-quality receipt | `socket_device`, `socket_inode` |
-| `bound → ready` | verification still holds and `status` answers `state == idle` | `status_state`, `credential_service` |
-| any → `failed` | a typed failure; the receipt is **retained** | `failure` |
-| `ready → stopping` | whole-daemon shutdown admitted | — |
-| `stopping → stopped` | strict teardown proved exact absence | — |
+| create `reserved` | derived current is empty, and generation = previous max + 1 | all reservation fields |
+| `reserved → detached` | store record names supervisor and daemon; daemon identity equals the spawned child | `supervisor`, `daemon` |
+| `detached → bound` | entry exists via the dirfd; socket row and peer prove the endpoint (§6) | `entry_*`, `socket_inode`, `peer_*` |
+| `bound → ready` | proof still holds and `status` answers `state == idle` | `status_state`, `credential_service` |
+| `reserved|detached|bound|ready → stopping` | whole-daemon shutdown or reconciliation admitted the stop; durable intent | state only |
+| `stopping → stopped` | strict teardown proved exact absence | state only |
+| `reserved|detached|bound|ready|stopping → failed` | a typed failure; evidence retained | `failure` |
 
-The current-launch pointer is `state_root/daemon/current.json` — `{schema, launch_uuid, endpoint_generation}`, written
-in the same operation as the transition that creates the receipt. Reconciliation compares the pointer, the receipt and
-the live verifier; a mismatch is `stale_event`, never an adoption.
+**Retention.** `failed` and `stopped` receipts are immutable terminal evidence and are **never deleted by teardown**.
+Only an explicit archival step outside teardown may move them, and it records a receipt of its own. M8 asserts survival
+across successful cleanup, retry and restart.
 
-Config handoff: the registry keeps the delivered config-pipe contract (owner token, protocol, record root, executable,
-features) and adds two fields — `launch_uuid` and `endpoint_generation` — so the supervisor's environment and any
-diagnostics can be correlated with the receipt without ever carrying a secret. The supervisor still refuses to start
-when the reservation does not match its arguments.
+**Crash injection** is required at each actual boundary — reservation write, spawn, supervisor publication, bind,
+receipt write, `status` poll, `stopping` write, signal, exit proof, unlink — not at coarse lifecycle labels.
 
-## 6. Ownership verifier
+## 6. Ownership verifier (F-010)
 
-New module `process/ownership.py`. One entry point:
+New module `process/ownership.py`:
 
-```
-verify_owned_endpoint(receipt, *, proc_root=/proc) -> Result[VerifiedEndpoint]
+```text
+verify_owned_endpoint(receipt) -> Result[VerifiedEndpoint]
 ```
 
-`VerifiedEndpoint` carries the daemon identity, the socket `(device, inode)`, the runtime-directory `(device, inode)`
-and the receipt generation. The check list, in order, each failing closed:
+The chain, each step failing closed, and the peer step is what binds the pathname to a process:
 
-1. **Dirfd anchoring.** Open the runtime directory from `/` with `O_NOFOLLOW|O_DIRECTORY`, require it to be a
-   directory owned by `owner_uid`, mode `0700`, and require its `fstat` `(device, inode)` to equal the receipt's.
-2. **Socket identity via the dirfd.** `fstat` the socket name relative to that descriptor; require `S_ISSOCK`, owner
-   `owner_uid`, and — when the receipt is already `bound` — equality with the recorded socket `(device, inode)`.
-3. **Inode → owning pid.** Read `/proc/net/unix`, find the row whose path equals the socket path and take its inode.
-   Scan `/proc/<pid>/fd` for exactly one process holding a socket whose inode matches. Zero holders, two or more
-   holders, an unreadable `/proc/net/unix` or an unreadable candidate `fd` directory is a refusal
-   (`ownership_mismatch`) — never a "best candidate".
-4. **`start_ticks` equality.** `read_identity_evidence(pid)` must be `present` and its `start_ticks` must equal the
-   receipt's `daemon.start_ticks`.
-5. **Command line names that exact socket.** `/proc/<pid>/cmdline` must contain the socket absolute path as the value
-   of `-socket` (and `-daemonize`), with no other `-socket` value. A pid whose command line names a *different*
-   socket is a refusal even when it holds the inode.
-6. **Owner UID.** The process's `/proc/<pid>` must be owned by `owner_uid`.
-7. **Boot identity.** The receipt's `boot_id` must equal the current boot id; a receipt from another boot is stale and
-   is never used to adopt or signal anything.
-8. **Generation.** `receipt.endpoint_generation` must equal the generation the registry recorded as current; a
-   superseded receipt is `stale_event`.
+1. **Dirfd anchoring.** Open the runtime directory from `/` with `O_NOFOLLOW|O_DIRECTORY`; require a directory owned by
+   `owner_uid`, mode `0700`, whose `(device, inode)` equals the receipt's.
+2. **Entry identity.** `fstat` the socket name relative to that descriptor; require `S_ISSOCK`, owner `owner_uid`, and
+   — when the receipt is already `bound` — equality with `entry_device/entry_inode`.
+3. **Live peer.** Connect an `AF_UNIX` socket to that entry and read `SO_PEERCRED`; the peer's `(pid, uid)` is the
+   process actually serving the path now. Require `uid == owner_uid`. Close immediately without sending a request.
+4. **Socket row uniqueness.** Read `/proc/net/unix`; require **exactly one** row whose path equals the socket path, and
+   require that the peer holds an `fd` referencing that row's inode. Two rows, zero rows, or a row whose only holders
+   are other processes is a refusal — never a best candidate.
+5. **`start_ticks` equality.** `read_identity_evidence(peer_pid)` must be `present` with `start_ticks` equal to the
+   receipt's `daemon.start_ticks`, and the UID of `/proc/<peer_pid>` must equal `owner_uid`.
+6. **Command line names that exact socket.** `/proc/<peer_pid>/cmdline` must carry the absolute socket path as the
+   value of `-socket` (and `-daemonize`), with no other `-socket` value.
+7. **Entry unchanged.** Re-`fstat` the entry through the descriptor; require the same `(device, inode)` as step 2. A
+   change during verification is a refusal.
+8. **Boot and generation.** Receipt `boot_id` equals the current boot id; `endpoint_generation` equals the registry's
+   current generation. A superseded receipt is `stale_event`.
 
-The verifier reads; it never signals, never unlinks, never writes.
+The verifier reads only: no signal, no unlink, no write. `authorize`/`confirm` (§4.5) re-run steps 3–7 around the I/O,
+which is what detects a replacement between authorization and dispatch.
 
-## 7. Reported-source verification (Mirror safety)
+## 7. Reported-source verification (F-008)
 
-New module `capture/source.py`:
+### 7.1 Producer completeness (carried patch)
 
+The carried `vendor/doubletake/0001-…` patch currently marks a source usable when only the type *or* the size arrived,
+so a missing position becomes `(0,0)` and is indistinguishable from a real one. The epoch revises the carried chain:
+
+- `portalStreamSource` reports usable **only** when the source type is present, the width and height are present and
+  positive, and the position is present as two integral values;
+- `vendor/doubletake/0003-…` advertises a third token, `status-source-complete`, alongside `capabilities-v1` and
+  `status-source`;
+- `docs/backend-fork.md` records the full three-patch chain, the rebuild command and the new binary's identity;
+- the installed build must be rebuilt from the chain; a build without the third token yields
+  `source_reporting_complete=False` and Mirror stays closed.
+
+### 7.2 Verifier acceptance
+
+```text
+BackendSource(type: int, width: int, height: int, x: int, y: int)      # decoded from status `source`
+verify_reported_source(requested: str, reported: BackendSource, layout: tuple[OutputInfo, ...])
+    -> Result[None]
 ```
-BackendSource(type: int, width: int, height: int, x: int, y: int)          # decoded from status
-verify_reported_source(requested: str, reported: BackendSource,
-                       layout: tuple[OutputInfo, ...]) -> Result[None]
-```
 
-Acceptance requires **all** of: `type == 1` (portal monitor source); exactly one physical output in a fresh KScreen
-observation whose `(width, height)` and `(x, y)` equal the reported size and position; and that output's connector
-equal to the requested connector. Zero matches, two matches, a window source, an unknown type, or a layout that
-cannot be read all fail with `unsupported_source`.
+Acceptance requires **all** of:
 
-Where it runs: `DoubleTakeTransport.start_stream` sends `connect <target>`, then polls `status` (bounded by the
-existing startup timeout) until the stream for that target carries a `source`. On success the stream is admitted; on
-mismatch, timeout or refusal the transport disconnects **that target only** and returns the typed failure, so an
-unverified capture is never left running.
+1. `type == 1` (portal monitor source);
+2. `width > 0` and `height > 0` — dimensions are positive; **coordinates are signed** and may legitimately be
+   negative (the delivered KScreen adapter accepts negative positions), so only the dimensions carry a positivity rule;
+3. exactly one **enabled output of any type or origin** in a fresh KScreen observation matches `(width, height, x, y)`;
+   zero matches, two matches, or an unreadable layout all refuse;
+4. that unique output's connector equals the requested connector **and** it satisfies the delivered physical-origin rule
+   (enabled, connected, known physical connector type). A same-geometry virtual or unknown output therefore refuses
+   instead of aliasing the requested monitor.
 
-Decoder rule: the status `source` object has Go's default field names (`Type`, `Width`, `Height`, `X`, `Y`) and is
-decoded strictly — integers only, non-negative, no unknown keys tolerated as evidence. An absent `source` decodes to
-`None`, which the verifier treats as "unverified", never as "fine".
+### 7.3 Data path (pinned end to end)
 
-The data path is pinned end to end, so a profile carrying `source_reporting` can never stand in for a verifier:
-
-1. `backend/contract.py`: `BackendStream` gains `source: BackendSource | None = None`, validated like its siblings;
-   `decode_status` calls a strict `_decode_source` that rejects non-mapping values, non-integer or negative members,
-   and a `source` key with no usable identity.
-2. `capture/source.py`: the pure `verify_reported_source` function plus a `ReportedSourceVerifier` port whose
-   production implementation reads a fresh layout from the injected `KScreenObserver` and refuses when the
-   observation is stale, unreadable or ambiguous.
-3. `transport.DoubleTakeTransport.__init__` takes `source_verifier: ReportedSourceVerifier | None`; `_start` calls it
-   after the connect acknowledgement and before `ready`/`emit`, and on any failure calls `_stop_owned` (disconnect of
-   that exact target) before returning `unsupported_source`.
+1. `backend/contract.py`: `BackendStream.source: BackendSource | None`; a strict `_decode_source` rejects non-mapping
+   values, non-integer members, unknown keys and an object with no usable identity. Absent `source` decodes to `None`,
+   which the verifier treats as unverified.
+2. `capture/source.py`: the pure function plus a `ReportedSourceVerifier` port whose production implementation reads a
+   fresh layout from the injected `KScreenObserver` and refuses an unreadable, stale or ambiguous observation.
+3. `transport.DoubleTakeTransport.__init__(source_verifier=…)`; `_start` polls `status` (bounded) after the connect
+   acknowledgement for the stream of that exact target, then verifies, then emits `ready`. A credential challenge in
+   the same poll is a refusal under §4.6. Any failure ⇒ `_stop_owned` disconnects that exact target and returns
+   `unsupported_source`.
 4. `runtime._compose_production` constructs the verifier and passes it to the transport, and
-   `derive_composition_capabilities` sets `physical_source` only when that same verifier object was wired. A
-   `source_reporting` backend with no verifier yields `physical_source=False`.
+   `derive_composition_capabilities` sets `physical_source` only when that same object was wired.
 
 ## 8. Strict teardown
 
-`ProcessPort.terminate` gains a strict keyword (`strict=True` is used for every owned-daemon termination):
+Port signature: `terminate(identity, owner_uuid, runtime_directory, deadline, *, strict: bool = False)`.
 
-1. classify the identity; a mismatch is a refusal, an absent process is success;
-2. open a pidfd; **if no pidfd can be opened, refuse** with `dependency_incompatible` and signal nothing — the
-   numeric branch remains only for the non-owned paths that already rely on it;
-3. re-validate the identity *after* opening the descriptor (§6 steps 4–6 against the same start ticks and socket);
+1. classify the identity; a mismatch refuses, an absent process is success;
+2. open a pidfd; **if none can be opened, refuse** with `dependency_incompatible` and signal nothing — the numeric
+   branch remains only for the delivered non-owned paths;
+3. re-validate the identity *after* opening (start ticks, UID, socket peer/argv where the receipt supplies it);
 4. deliver `SIGTERM` through the descriptor only;
-5. wait for exact exit with a bounded deadline, polling the descriptor (never a PID);
+5. wait for exact exit with a bounded deadline, polling the descriptor (a non-child process has no `wait` obligation);
 6. escalate to `SIGKILL` through the descriptor, then require exit within the kill bound;
-7. only after proven exit: unlink the socket through the dirfd after re-checking `(device, inode)` and proving no
-   live holder, and delete the receipt.
+7. only after proven exit: re-check the entry through the dirfd, unlink it, and transition the receipt to `stopped`
+   (the receipt is retained, §5.3).
 
 A durable `stopping` intent is written **before** the first signal. On any failure the receipt, the obligation and the
 `cleanup_required` notice are retained; teardown never reports success it did not observe.
 
-Serialisation: a per-receiver `Stop` issues `disconnect <exact target>` on the authenticated control and nothing else.
-The shared daemon is terminated only inside `DaemonRegistry.shutdown()` (whole-application shutdown) while the
-shared-root authority is held.
+Strict call sites: `DaemonRegistry._stop`, `DaemonRegistry.shutdown`, `EvidenceAuthority.release`,
+`DaemonSupervisor._request_release` (public profile) and the credential probe's teardown. A test asserts each passes
+`strict=True`.
 
-Explicit contract (F-003):
+Serialisation: a per-receiver `Stop` issues `disconnect <exact target>` on the authorized control and nothing else. The
+shared daemon terminates only inside `DaemonRegistry.shutdown()`, while the authority is held.
 
-- port signature `terminate(identity, owner_uuid, runtime_directory, deadline, *, strict: bool = False)`;
-- `strict=True` is passed by every owned-daemon call site: `DaemonRegistry._stop`, `DaemonRegistry.shutdown`,
-  `EvidenceAuthority.release`, `DaemonSupervisor._request_release` and the credential-probe teardown. A test asserts
-  the call sites pass it, so a future call cannot silently inherit the non-strict path;
-- `strict=True` and no pidfd ⇒ `Err(dependency_incompatible)` **before** any signal, never `os.kill`;
-- the receipt-backed identity is revalidated after the descriptor is opened and again immediately before the first
-  signal; a mismatch closes the descriptor and refuses;
-- the bounded exact-exit wait polls the descriptor (a process that is not our direct child has no `wait` obligation), so
-  "exited" is proven by the descriptor becoming readable, not by a PID probe;
-- the non-strict branch is retained only for the already-delivered non-owned paths and is asserted to be unreachable
-  from the owned-daemon registry.
-
-## 9. Cross-process authority
+## 9. Cross-process authority (F-009)
 
 New module `process/authority.py`:
 
-- lock file `<state_root>/daemon/authority.lock` (`flock`, non-blocking with bounded retry);
-- owner record `<state_root>/daemon/authority.owner` — `{schema, instance_uuid, app: {pid, start_ticks}, boot_id,
-  acquired_at}` written atomically after the lock is held;
-- `acquire(instance) -> Result[AuthorityLease]` refuses with `ownership_mismatch` while another owner is recorded and
-  its process is *proved live* (identity + boot + UID); a recorded owner that is provably absent/terminated is
-  replaced inside the same critical section; unreadable evidence retains `CleanupRequired` and refuses.
+- lock file `<state_root>/daemon/authority.lock` (`flock`, non-blocking, bounded retry);
+- owner record `<state_root>/daemon/authority.owner` — `{schema, instance_uuid, app:{pid,start_ticks}, boot_id,
+  acquired_at}`, written atomically while the lock is held.
 
-**Lease lifetime.** The lease is per mutating operation, not for the process lifetime: `_reconcile()`, `_launch()` and
-`shutdown()` acquire it, perform their work, and release it in a `finally`. The lock therefore only serialises
-mutations; *durable* ownership is carried by the owner record, which names the application instance that currently
-owns the daemon and stays until that instance transfers or clears it in its own shutdown. A second application
-instance can always read the record, and refuses while the named owner is proved live; it never waits forever and
-never adopts a live daemon. `release()` is a compare-and-remove of the exact record it wrote, so a stale release can
-never delete a successor's owner record; an unreadable or mismatched record leaves the lease held and reports
-`CleanupRequired`.
+Three **distinct** operations, never conflated:
 
-The registry takes the authority for `_reconcile()` (prior-instance reaping through the verifier), `_launch()` and
-`shutdown()`; `ensure()` on an already-ready record does not need it but re-verifies ownership each time. A second
-application instance therefore cannot launch a second daemon, cannot reap the first one's, and cannot silently adopt
-it.
+| Operation | Effect |
+| --- | --- |
+| `acquire(instance) -> Lease` | takes the flock; refuses with `ownership_mismatch` while another owner is recorded and proved live; replaces a provably absent owner; refuses on unreadable evidence and retains `CleanupRequired` |
+| `Lease.unlock()` | releases **only** the flock, in a `finally` after each mutating operation |
+| `clear_owner(expected)` | compare-and-removes the durable owner record, only after exact teardown/reconciliation proved absence, and only while holding the lock |
+
+Lifetime: the owner record is published when a launch is admitted and **survives every per-operation unlock** until
+`clear_owner` proves the daemon is gone. A second application instance therefore always sees a live owner between
+operations and refuses. `clear_owner` compares the exact record it wrote, so a stale release cannot delete a
+successor's record.
+
+Nesting rule: acquisition is non-reentrant; `shutdown()` acquires once and calls the internal `_reconcile_locked()`,
+never the public `reconcile()`. Cancellation still runs the `finally` that unlocks, and a cancellation that arrives
+after a successful `clear_owner` is a no-op.
 
 ## 10. Isolated idle launcher
 
-### 10.1 The launcher capability seam
+### 10.1 Launcher capability seam
 
-`LaunchCapability` is a small protocol in `process/launcher.py` so the composition — never a probe — decides whether
-this process can own a daemon:
-
-```
-class LaunchCapability(Protocol):
-    def available(self) -> bool          # a verified daemon-mode surface and a writable, owned private root
-    def argv(self, socket_path: str) -> tuple[str, ...]
-    def ambient_socket(self) -> str | None
-```
-
-The production implementation is `BackendLaunchCapability(executable, features, runtime_root, environment)`:
-`available()` requires the help surface to expose `-daemonize`, `-socket` and `-cred-backend` (already proven by the
-pinned profile), the runtime root to be an absolute, owned, writable directory that is not a symlink, and
-`ambient_socket()` to return `None`; `argv()` is the exact idle shape below. One call site decides the capability —
-`runtime._compose_production`, immediately after `probe_backend` and before the registry is constructed:
-
-```
-features = derive_composition_capabilities(
-    probed, launcher=BackendLaunchCapability(...), credential_proof=..., source_verifier=...)
-```
-
-Nothing else may set `owned_daemon_control`; a test asserts the only assignment site is this composition function.
+`LaunchCapability` (in `process/launcher.py`): `available()`, `argv(socket_path)`, `ambient_socket()`. The production
+implementation checks the verified `-daemonize`/`-socket`/`-cred-backend` surface, an absolute owned writable
+non-symlink runtime root, and `ambient_socket() is None`. The single call site is `runtime._compose_production`.
 
 ### 10.2 Launch shape
 
-```
+```text
 doubletake -daemonize -socket <runtime_directory>/daemon.sock -cred-backend keyring
 ```
 
-- no `-target`, `-code`, `-pair`, `-test`, `-x11-*`, `-creds`: nothing resolves a receiver, selects a capture source or
-  performs a credential operation;
-- `-cred-backend keyring` is mandatory: it is what forbids the file fallback at credential time, and its construction
-  is the positive credential-service leg;
-- the child stays the supervisor's direct child (the installed build does not fork), keeps the
-  parent-death `SIGKILL` protection, and its identity is published in the receipt as it becomes observable;
-- readiness = socket present **and** verifier proof **and** `status` answers `state == idle` **and** the daemon
-  identity equals the spawned child identity.
+No `-target`, `-code`, `-pair`, `-test`, `-x11-*`, `-creds`: nothing resolves a receiver, selects a capture source or
+performs a credential operation. `-cred-backend keyring` is mandatory: it forbids the file fallback and its
+construction is the positive credential leg. The child stays the supervisor's direct child (the installed build does
+not fork), keeps the parent-death `SIGKILL` protection, and its identity is published as it becomes observable.
+Readiness = socket entry present **and** §6 proof **and** `status == idle` **and** the verified daemon identity equals
+the spawned child identity.
 
-Crash windows, each an explicit test:
+*(Unchanged from the previous revision: the five crash-window rows.)*
 
 | Window | Required outcome |
 | --- | --- |
 | reservation → spawn | receipt `failed`; no process; directory and socket absent or exactly removed |
-| spawn → bind | verified child terminated by pidfd; receipt retained `failed`; replacement allowed only after proof of absence |
-| bind → receipt | socket identified, daemon verified, receipt completes; a verification failure terminates the exact daemon and retains the receipt |
-| receipt → running | `status` failure or non-idle state → terminate exactly, retain `failed` receipt, block replacement while uncertainty remains |
-| running → stopping | `stopping` intent durable before the first signal; exact-exit wait; obligation retained on failure |
+| spawn → bind | verified child terminated by pidfd; receipt retained `failed`; replacement only after absence is proved |
+| bind → receipt | entry and peer identified, daemon verified, receipt completes; a verification failure terminates the exact daemon and retains the receipt |
+| receipt → running | `status` failure or non-idle state ⇒ terminate exactly, retain `failed`, block replacement while uncertainty remains |
+| running → stopping | `stopping` durable before the first signal; exact-exit wait; obligation retained on failure |
 
-A failed verification may leave either an exact cleanup or a *retained uncertainty* that blocks replacement. It may
-never leave an unowned candidate and may never enable streaming.
+### 10.3 The credential probe runs on the same lifecycle (F-011)
+
+The probe is a backend launch and is therefore bound by the activation invariant. Two rules make that true:
+
+1. **Ordered eligibility.** The composition evaluates structural prerequisites in order and stops at the first
+   absence: `owned_daemon_control` derivable (launcher available, private root, no ambient socket) → source verifier
+   wired → receipt store, verifier, authority and strict teardown constructible → *only then* the credential probe.
+   An incomplete composition therefore performs **zero** launches, including the probe.
+2. **Namespace-consistent lifecycle.** The probe does not launch the backend from the application process. It runs a
+   dedicated foreground child:
+
+   ```text
+   unshare -rn <python> -m airplay_linux.process.credential_probe --socket <private> --record-root <private>
+   ```
+
+   which inside the namespace writes its own reservation, spawns the backend as its direct child, requires `idle`,
+   records `SO_PEERCRED`/`/proc/net/unix` evidence **in the namespace it will read**, tears it down by the strict pidfd
+   path, retains a `failed` record on any failure, and prints a verdict document on stdout. Every fact the probe
+   reports is therefore observed in the same namespace and by the same lifecycle code as a production launch.
 
 ## 11. Activation (one commit)
 
 The activation commit contains, together:
 
-1. §4.4's migration for every site — including `backend/control.py`'s `_available`, `handshake` and
-   `_revalidate_ownership` through the `OwnershipAuthority` seam (§4.5) and the narrowed `connect` admission (§4.6);
-2. the credential-service probe and its capability wiring;
-3. the reported-source verifier, the strict status decode and the `physical_source` derivation (§7);
-4. the operator disclosure (README guarantee/refusal/residual, startup capability detail naming the owning authority,
+1. §4.4's migration for **every** row, including `_ownership_check`, the transport `Handshake`→`OwnershipProof`
+   change, registry readiness/release and the supervisor release path;
+2. §4.6's connect predicate, with Amendment 1 cited and the credential-challenge refusal tested;
+3. the credential probe (§4.2, §10.3) and its capability wiring;
+4. the reported-source verifier, strict decode, `source_reporting_complete` and `physical_source` derivation (§7), plus
+   the revised carried patch chain and its rebuild record;
+5. the operator disclosure (README guarantee/refusal/residual, startup capability detail naming the owning authority,
    the credential leg and the source verifier);
-5. the activation-gated no-spawn test: with any one element missing (no owned-daemon capability, no credential proof,
-   no source verifier, no control authority), the production composition performs **zero** spawns and admission
-   refuses.
+6. the activation-gated no-spawn test (§14.2) with its guard-removal control and the per-element omission matrix.
 
-Documentation corrections shipped with the same commit: `docs/backend-fork.md` must apply the full carried chain
-(`vendor/doubletake/0001-…`, `0002-…`, `0003-…`) in order, because the application requires the capability tokens from
-`0003` to verify the patched surface; the plan's `reports/upstream/0001-…` path is superseded by that chain, and the
-recorded build identity is the three-patch chain against `v0.5.0`. T6 is stated precisely as **no receiver selection,
-no capture request, no credential mutation and no credential material in any application record**; the bounded
-read-only keyring construction performed by the backend at startup is required by P2 and is the only credential-side
-operation the launcher causes.
-
-Nothing in the activation commit relaxes an existing gate: receiver, transport admission, trust, provider, target
-generation, pairing compensation and cleanup keep their delivered checks.
+Nothing in the activation commit relaxes any other gate.
 
 ## 12. Measured evidence for the external preconditions
 
 Recorded on this machine before design freeze (receiver-free, inside `unshare -rn`, private socket, temporary state):
 
 - patched backend: `doubletake -capabilities` → `capabilities-v1`, `status-source`; help surface matches the pinned
-  patched layout; `status` reply shape for a stream carries `source` (Go field names).
-- `doubletake -daemonize -socket <private> -cred-backend keyring` idles, creates `daemon.sock` (`srwx------`) and
+  patched layout; a stream's `status` reply carries `source`.
+- `-daemonize -socket <private> -cred-backend keyring` idles, creates `daemon.sock` (`srwx------`) and
   `daemon.sock.lock`, answers `{"ok":true,"state":"idle"}`, exits 0 on `SIGTERM`.
 - the same launch with an unreachable session bus exits 1 with `keyring backend: system keyring not available`, creates
   no control socket and no credentials file.
-- the socket appears in `/proc/net/unix` with its path and inode, which is what §6 step 3 consumes.
+- the socket appears in `/proc/net/unix` with its path and inode; the peer of a connection to it is the daemon.
+- the delivered foreground argv (no `-daemonize`) ignores `-socket` and starts discovery — the behaviour this epoch
+  replaces.
 
-These measurements make P1 and P2 satisfiable here; they are not themselves the proof the shipped code needs, which is
-why §4.2 and §7 are implemented and tested rather than asserted.
+These measurements make P1 and P2 satisfiable here; the shipped code must still prove them (§4.2, §7).
 
 ## 13. Error handling
 
-Every refusal uses an existing catalog code — `ownership_mismatch` (evidence disagreement, ambiguity, refused
-authority, network-namespace or backend evidence missing), `stale_socket`/`stale_event` (superseded endpoint or
-generation), `daemon_failed` (readiness/exit failures), `cleanup_timeout` (unconfirmed teardown),
-`dependency_incompatible` (no pidfd, no `unshare`), `unsupported_source` (unverifiable reported source). No new code,
-no backend exception text and no path beyond the runtime directory appears in a diagnostic. Application metadata never
-contains a PIN, secret or credential reference; the receipt's `credential_service` field is a three-state evidence
-token, not a reference.
+Existing catalog codes only: `ownership_mismatch` (evidence disagreement, ambiguity, refused authority, missing
+`unshare` or backend evidence), `stale_socket`/`stale_event` (superseded endpoint or generation), `daemon_failed`
+(readiness/exit failures), `cleanup_timeout` (unconfirmed teardown), `dependency_incompatible` (no pidfd, missing
+prerequisite, credential challenge at connect), `unsupported_source` (unverifiable reported source). No backend
+exception text and no path beyond the runtime directory appears in a diagnostic. Metadata never contains a PIN, secret
+or credential reference.
 
 ## 14. Test strategy
 
-### 14.1 Named mutations (from the contract; each must be killed by a named test)
+### 14.1 Named mutations (each killed by a named test that pins the mechanism)
 
-| ID | Mutation | Must fail |
+| ID | Mutation | Killing test obligation |
 | --- | --- | --- |
-| M1 | set `owned_daemon_control=True` inside `probe_backend` | the composition-derived capability tests |
-| M2 | drop `endpoint_generation` from the encoded receipt | the receipt codec round-trip test |
-| M3 | accept a pid whose command line names a different socket | the verifier's command-line test |
-| M4 | accept a mismatched `start_ticks` | the verifier's identity test |
-| M5 | fall back to a numeric `kill` when no pidfd exists | the strict-teardown test |
-| M6 | skip the shared-root lock | the concurrent-startup test |
-| M7 | leave the candidate running when verification fails | the launcher crash-window test |
-| M8 | erase the durable receipt on failure | the launcher retention test |
-| M9 | enable `owned_daemon_control` with source verification absent | the activation acceptance test |
-| M10 | permit a live path by default | the negative-tripwire test |
+| M1 | `owned_daemon_control=True` inside `probe_backend` | raw probe/decode result is false; eligible composition true; ambient-socket false |
+| M2 | omit `endpoint_generation` from the encoded receipt | encode/decode round-trip and strict rejection of the missing field, with a non-default generation; derived-current agreement |
+| M3 | accept argv naming a different socket | holding identity/UID/ticks/entry valid, change only the `-socket` value ⇒ refuse before status/mutation/signal |
+| M4 | accept mismatched `start_ticks` | change only the recorded-vs-observed ticks ⇒ refuse; separately cover reuse during pidfd opening |
+| M5 | numeric kill when pidfd is unavailable | otherwise-owned live identity, pidfd unavailable ⇒ typed refusal **and** an independent signal observer records zero numeric signals; every owned call passes `strict=True` |
+| M6 | remove the shared-root `flock` | two authority/registry instances, barrier before owner publication ⇒ both would proceed; live owner between operations; stale release after succession |
+| M7 | leave the candidate live after a verification failure | exact-identity case ⇒ candidate death observed; unreadable-identity case ⇒ nothing signalled, obligation retained, replacement blocked |
+| M8 | erase the receipt on failure | reopen storage after failure, after successful cleanup, after retry, after restart ⇒ the `failed` record survives and cannot authorize replacement |
+| M9 | enable ownership with source verification absent | all other fakes valid, remove only the wired verifier ⇒ `physical_source=False`, typed refusal, zero launches at both process boundaries |
+| M10 | permit a live path by default | unmarked default test **attempts** the live backend, D-Bus and socket boundaries and fails on the attempt, even when the dependency is unavailable |
 
-Each mutation is applied in a disposable copy, the killing test is run from the lane or audit worktree, and the
-survivors (if any) are reported by name rather than waved through.
+Additional regression obligations (not renumbering M1–M10): each former connect prerequisite individually; absent or
+malformed source position; same-size non-origin selection; physical/virtual geometry collision; negative-coordinate
+layouts; duplicate `/proc/net/unix` path rows; unlinked old listener plus replacement entry; replacement during first
+bind; replacement between authorization and dispatch; owner survival after ordinary unlock; retained failed receipts
+after exact cleanup; public-shape status without legacy metadata.
 
 ### 14.2 No-spawn proofs
 
-Every phase commit carries `tests/acceptance/test_no_production_spawn.py`, which composes the production path with a
-recording process port and asserts zero `spawn` calls while activation is incomplete. In phase 4 the same file gains
-the completeness matrix (four elements: owned-daemon capability, credential proof, source verifier, receipt +
-teardown + authority present): each missing element must yield zero spawns and a typed refusal.
+`tests/acceptance/test_no_production_spawn.py` observes the **final process boundary** (`run` *and* `spawn`) through an
+injected process port in the real production composition (`build_runtime(..., overrides={"process": recorder})`).
 
-### 14.3 Activation acceptance matrix (F-001)
+- Phases 1–3: assert zero launches, and assert that the same test with all fake prerequisites satisfied but the
+  activation guard removed **does** attempt a launch — so the assertion cannot pass vacuously against today's
+  incompatible profile.
+- Phase 4: for each of the six elements (owned-daemon capability, receipt production, verifier, strict teardown,
+  authority, credential proof, source verifier) remove exactly one and require zero launches plus a typed refusal.
+  The unmodified composition is the only case that launches.
 
-A dedicated acceptance file proves the seam rather than the flag:
+### 14.3 Activation acceptance matrix
 
 | Composition | Expected |
 | --- | --- |
-| complete owned composition, fake backend + fake verifier + fake credential witness | launch admitted; `status` succeeds; `connect` is authorized by the evidence authority; a target-scoped `disconnect`/`mute`/`unmute` is authorized with a matching fence; whole-daemon shutdown releases by strict teardown |
-| evidence authority with a receipt whose generation or socket inode no longer matches | every mutating operation refused before I/O; no spawn; `stale_event` |
-| fence mismatch (receiver/endpoint generation) | refused before I/O; `stale_target` |
-| `owned_daemon_control` absent | zero spawns; `dependency_incompatible` |
-| credential proof absent | zero spawns; `dependency_incompatible` naming the credential leg |
-| source verifier absent with `source_reporting=True` | `physical_source=False`, `connect` refused, zero spawns |
-| credential-challenging acknowledgement on connect | exact-target disconnect, `dependency_incompatible`, no pairing attempt |
+| public-shape fake (`foreground_control=False`, `owner_handshake=False`, pairing flags false, status replies with **no** owner/instance/daemon/socket/protocol fields), complete fakes | `EvidenceAuthority` is selected and recorded; launch admitted; `status` accepted; `connect` authorized with a valid fence; target-scoped `disconnect`/`mute`/`unmute` authorized; whole-daemon shutdown releases by strict teardown |
+| same, receipt generation or entry inode changed | every mutating operation refused before I/O; no launch; `stale_event` |
+| same, fence mismatch | refused before I/O; `stale_target` |
+| same, credential challenge on connect | exact-target disconnect, `dependency_incompatible`, no pairing attempt, no stream |
+| owned_daemon_control absent / credential proof absent / source verifier absent / authority absent | zero launches; typed refusal naming the element; `physical_source=False` where the verifier is the missing element |
+| legacy fixture profile | `HandshakeAuthority` selected; delivered handshake behaviour unchanged (separate test, not the public-acceptance evidence) |
 
 ### 14.4 Offline acceptance (phase 5)
 
-A fake backend that speaks the delivered control protocol (delivered fixture profile, no network), a fake KScreen
-observer and a fake Secret Service witness: production composition, launch, verify, per-receiver stop, whole-daemon
-shutdown, restart after crash, and a refusal matrix. Negative tripwires: default-suite tests fail if a live
-`doubletake`, a live D-Bus session bus, or a live socket lease is reachable from an unmarked test; each skip message
-names the missing capability exactly (`owned daemon control`, `credential service proof`, `physical source
-verification`).
+Fake backend speaking the delivered control protocol with the **public** shape, fake KScreen observer, fake Secret
+Service witness: production composition, launch, verify, per-receiver stop, whole-daemon shutdown, restart after crash,
+and the refusal matrix. Negative tripwires: an unmarked default test fails if a live `doubletake`, a live D-Bus session
+bus or a live socket lease is reachable from it, and each skip names the missing capability exactly (`owned daemon
+control`, `credential service proof`, `physical source verification`).
 
 ### 14.5 Suite hygiene
 
-Full suite headless (`QT_QPA_PLATFORM=offscreen PYTHONHASHSEED=0 LC_ALL=C.UTF-8`), short `--basetemp`, real-process
-tests against the repo installed in `~/.venvs/airplay-linux`. The known supervisor flake is recorded, not masked.
+Full suite headless (`QT_QPA_PLATFORM=offscreen PYTHONHASHSEED=0 LC_ALL=C.UTF-8`), short `--basetemp`, real-process tests
+against the repo installed in `~/.venvs/airplay-linux`. Baseline recorded: 3787 passed, 12 skipped. The known
+supervisor flake is recorded, not masked.
 
-## 16. Review resolutions (design review 1)
+## 15. Review resolutions
 
-| Finding | Resolution in this document |
+### Design review 1
+
+| Finding | Resolution |
 | --- | --- |
-| F-001 blocker — control authorization seam | §4.5 (`OwnershipAuthority`, two implementations, `_available`/`handshake`/`_revalidate_ownership`, fence kept), §4.6 (narrow `connect` admission and the credential-challenge refusal), §14.3 (acceptance matrix). |
-| F-002 major — source verification not wired | §7 data path 1–4 (contract field, strict decoder, verifier port, transport injection, capability derivation). |
-| F-003 major — pidfd-only teardown | §8 explicit contract: `strict` keyword, refusal before signal, revalidation after open, poll-based exact exit, named strict call sites, non-strict branch unreachable from the registry. |
-| F-004 major — receipt lifecycle and supervisor handoff | §5.3 single writer (registry), compare-and-publish transition table with preconditions, `current.json` pointer, config-pipe additions (`launch_uuid`, `endpoint_generation`); the supervisor keeps the delivered `DaemonRecord` publication. |
-| F-005 major — composition authority not connected | §4.1 + §10.1 `LaunchCapability` protocol, the single composition call site, the ambient-socket rule; §9 per-operation `AuthorityLease` around `_reconcile`/`_launch`/`shutdown`, durable owner record, compare-and-remove release. |
-| F-006 minor — evidence/isolation wording | §11 documentation corrections: the full three-patch chain, `vendor/` identities, precise T6 wording (no credential mutation/material; only the bounded read-only keyring construction required by P2). |
+| F-001 control authorization seam | §4.5 (authority, two implementations, full consumer table in §4.4) |
+| F-002 source data path | §7.3 (contract field, strict decoder, verifier port, transport injection, derivation) |
+| F-003 pidfd-only teardown | §8 (strict contract, refusal before signal, revalidation after open, call sites) |
+| F-004 receipt lifecycle | §5.3 (single writer, transition preconditions, retention) |
+| F-005 composition authority | §4.1/§10.1 (launcher seam, one call site) and §9 |
+| F-006 docs wording | §11 (full patch chain, precise T6 wording) |
 
-## 17. Residuals
+### Design review 2
+
+| Finding | Resolution |
+| --- | --- |
+| F-007 connect admission relaxed without authority | Operator decision `A`; contract Amendment 1; §4.6 with the challenge refusal and bounded window; §14.3 row |
+| F-008 fabricated coordinates / ambiguous match | §7.1 producer completeness + third token; §7.2 signed coordinates, positive dimensions, uniqueness across **all** outputs, physical-origin rule retained |
+| F-009 owner erased on unlock | §9 (`unlock` vs `clear_owner`, owner lifetime, nesting rule) |
+| F-010 pathname not bound to the live peer | §6 steps 3–7 (`SO_PEERCRED`, unique socket row, entry unchanged, separate entry/socket identity fields in §5.2) |
+| F-011 probe outside the activation boundary | §10.3 (ordered eligibility, namespace-consistent probe lifecycle) and §14.2 (final-boundary observation, guard-removal control) |
+| F-012 two-file publication / stop and retention contradictions | §5.3 (one authoritative document, derived current, `stopping` from every launched state, immutable retention) |
+| F-013 authority protocol under-specified / fixture could select legacy | §4.5 (proof type, `allows`, no-target operations, `authorize`/`confirm` placement) and §14.3 (public-shape acceptance, legacy fixture kept separate) |
+
+## 16. Residuals
 
 - A hostile same-UID process is out of scope (§3) and is disclosed.
-- Evidence-based ownership cannot distinguish our daemon from a same-user impersonator that binds the socket first and
-  reproduces the recorded command line; the 0700 directory, dirfd anchoring and receipt narrow this to an attack that
-  already requires the user's own privileges.
-- Reported-source verification trusts the portal's report and the compositor's observation; it proves the *reported*
-  source equals the requested monitor's geometry, not that the compositor drew that monitor.
+- Evidence-based ownership cannot distinguish our daemon from a same-user impersonator that binds the entry first and
+  reproduces the recorded command line; the 0700 directory, dirfd anchoring, peer credentials and the receipt narrow
+  this to an attack that already requires the user's own privileges.
+- Reported-source verification proves the *reported, complete* identity equals the requested monitor's geometry and
+  that the unique matching output is the requested physical connector. It does not prove the compositor drew that
+  monitor.
+- Amendment 1's residual: the application may start to a receiver it cannot re-pair; a later credential demand makes
+  every subsequent start fail with a typed refusal.
 - Remembered trust still does not survive a restart on the adapter (`docs/operations.md`); this epoch does not change
   that, and the startup detail continues to say so.
