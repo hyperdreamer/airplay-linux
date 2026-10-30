@@ -206,7 +206,7 @@ delivered requirements and stays refused. The mandatory terms:
    target and returns `dependency_incompatible`. No prompt, no secret, no leftover stream, no claimed capability.
 2. **The challenge window is observed.** The bounded post-connect wait of §7 is the same wait that detects a
    challenge, so a credential-waiting start cannot sit unnoticed.
-3. The amendment is recorded in the contract, with the verbatim reply and the residual (§17).
+3. The amendment is recorded in the contract, with the verbatim reply and the residual (§16).
 
 ## 5. Durable records
 
@@ -326,8 +326,11 @@ so a missing position becomes `(0,0)` and is indistinguishable from a real one. 
 
 - `portalStreamSource` reports usable **only** when the source type is present, the width and height are present and
   positive, and the position is present as two integral values;
-- `vendor/doubletake/0003-…` advertises a third token, `status-source-complete`, alongside `capabilities-v1` and
-  `status-source`;
+- the activation commit's revised `vendor/doubletake/0003-…` patch **will** advertise a third token,
+  `status-source-complete`, alongside `capabilities-v1` and `status-source`. Until that revised chain is built and
+  installed, **no carried or installed artifact advertises the third token**, so `source_reporting_complete` stays
+  false, `physical_source` stays false and Mirror stays closed. The claim is conditional on §11 item 4, not a
+  statement about the current tree;
 - `docs/backend-fork.md` records the full three-patch chain, the rebuild command and the new binary's identity;
 - the installed build must be rebuilt from the chain; a build without the third token yields
   `source_reporting_complete=False` and Mirror stays closed.
@@ -495,7 +498,9 @@ Recorded on this machine before design freeze (receiver-free, inside `unshare -r
 - the delivered foreground argv (no `-daemonize`) ignores `-socket` and starts discovery — the behaviour this epoch
   replaces.
 
-These measurements make P1 and P2 satisfiable here; the shipped code must still prove them (§4.2, §7).
+These measurements establish that P2 is satisfiable here and that P1's *reporting channel* exists and is readable; they
+do **not** make P1 satisfiable as specified, because P1 additionally requires the complete-identity producer of §7.1
+(§11 item 4's revised chain and its rebuild record). The shipped code must prove both (§4.2, §7).
 
 ## 13. Error handling
 
