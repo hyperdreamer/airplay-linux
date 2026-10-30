@@ -70,3 +70,16 @@ pairing flags false, status responses carrying no backend ownership metadata):
 3. a credential challenge disconnects exactly that target and returns the typed refusal, leaving no stream;
 4. all four former pairing prerequisites are independently proven *not* to be consulted by `connect`, and to still be
    required by every pairing operation.
+
+## 6. Clarification 1.1 (draftsmanship, no decision change)
+
+§5 item 4's closing phrase — "and to still be required by every pairing operation" — is clarified as follows, because
+as written it can be read as adding the four former connect prerequisites to operations that never required them:
+
+- every pairing operation still requires **its own delivered prerequisite list** (Amendment §3), exactly as
+  `backend.control.PublishedDoubletakeControl._available` defines it today;
+- the phrase does not add a prerequisite to any operation, and does not remove one from any operation;
+- the other reading would contradict §3 ("keeps its delivered requirements") and would *strengthen* operations outside
+  the authorised change, which this amendment does not authorise.
+
+No operator decision changes. `connect` moves (§1, §2); every pairing operation keeps the predicate it has today.
