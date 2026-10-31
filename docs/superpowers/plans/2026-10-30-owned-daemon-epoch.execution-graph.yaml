@@ -59,6 +59,9 @@ tasks:
       - "src/airplay_linux/storage/repositories.py"
       - "src/airplay_linux/storage/__init__.py"
       - "tests/storage/test_reservation_codecs.py"
+      - "tests/storage/test_launch_receipts.py"
+      - "tests/storage/test_cleanup_intents.py"
+      - "tests/storage/test_supervisor_release_intents.py"
       - "tests/storage/test_repositories.py"
     resources: []
     produces:
@@ -227,6 +230,7 @@ tasks:
       - "src/airplay_linux/process/supervisor.py"
       - "tests/process/test_owned_launcher.py"
       - "tests/process/test_daemon_registry.py"
+      - "tests/process/test_supervisor.py"
     resources: []
     produces:
       - name: "OwnedDaemonRegistry"
@@ -277,12 +281,21 @@ tasks:
     depends_on: ["T-001"]
     ownership:
       - "vendor/doubletake/0001-capture-report-selected-source.patch"
+      - "vendor/doubletake/0002-status-report-selected-source.patch"
+      - "vendor/doubletake/0003-capability-tokens.patch"
       - "src/airplay_linux/backend/contract.py"
       - "src/airplay_linux/display/inventory.py"
+      - "src/airplay_linux/capture/source.py"
       - "src/airplay_linux/display/kscreen.py"
+      - "src/airplay_linux/capture/physical.py"
       - "src/airplay_linux/transport/doubletake.py"
+      - "src/airplay_linux/runtime.py"
       - "docs/backend-fork.md"
       - "tests/backend/test_contract.py"
+      - "tests/backend/test_carried_source_patch.py"
+      - "tests/display/test_inventory.py"
+      - "tests/capture/test_reported_source.py"
+      - "tests/runtime/test_owned_source.py"
     resources: []
     produces:
       - name: "BackendFeatures.source_reporting_complete"
@@ -332,6 +345,7 @@ tasks:
       - "src/airplay_linux/runtime.py"
       - "src/airplay_linux/testing/adapters.py"
       - "tests/process/test_credential_probe.py"
+      - "tests/runtime/test_owned_probe.py"
       - "tests/acceptance/test_no_production_spawn.py"
     resources: []
     produces:
@@ -381,8 +395,19 @@ tasks:
     depends_on: ["T-006", "T-007", "T-008"]
     ownership:
       - "src/airplay_linux/runtime.py"
-      - "README.md"
+      - "src/airplay_linux/backend/contract.py"
+      - "src/airplay_linux/backend/control.py"
+      - "src/airplay_linux/policy/capabilities.py"
+      - "src/airplay_linux/transport/doubletake.py"
+      - "src/airplay_linux/process/daemon_registry.py"
+      - "src/airplay_linux/process/supervisor.py"
+      - "docs/backend-fork.md"
       - "tests/backend/test_control.py"
+      - "tests/transport/test_doubletake.py"
+      - "tests/policy/test_capabilities.py"
+      - "tests/process/test_daemon_registry.py"
+      - "tests/acceptance/test_no_production_spawn.py"
+      - "tests/process/test_credential_probe.py"
       - "tests/acceptance/test_owned_daemon_epoch.py"
     resources: []
     produces:
@@ -497,7 +522,7 @@ tasks:
       - "tests/conftest.py"
       - "tests/acceptance/test_offline_tripwires.py"
       - "tests/acceptance/test_owned_daemon_epoch.py"
-      - "pyproject.toml"
+      - "tests/acceptance/test_no_production_spawn.py"
     resources: []
     produces:
       - name: "acceptance.mutation_matrix"
