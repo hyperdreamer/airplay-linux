@@ -1,7 +1,26 @@
 diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
-index 0a82965..407af34 100644
+index 0a82965..9a21b8c 100644
 --- a/internal/airplay/capture.go
 +++ b/internal/airplay/capture.go
+@@ -62,13 +62,13 @@ type CaptureConfig struct {
+ // than what was requested.
+ type SourceInfo struct {
+ 	// Type is the portal's source_type value (1 = monitor, 2 = window).
+-	Type uint32
++	Type uint32 `json:"type"`
+ 	// Width and Height are the selected source's size in pixels.
+-	Width  int
+-	Height int
++	Width  int `json:"width"`
++	Height int `json:"height"`
+ 	// X and Y are the selected source's position in the compositor layout.
+-	X int
+-	Y int
++	X int `json:"x"`
++	Y int `json:"y"`
+ }
+ 
+ // IsMonitor reports whether the portal returned a monitor source.
 @@ -185,6 +185,8 @@ type CapturePreparation struct {
  
  	pwNodeID   uint32
@@ -25,10 +44,10 @@ index 0a82965..407af34 100644
  	if err != nil {
  		return nil, fmt.Errorf("screencast portal: %w", err)
  	}
-@@ -393,6 +400,15 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
+@@ -391,6 +398,15 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
+ 	return preparation, nil
+ }
  
- // Start launches the prepared encoder using the supplied nominal receiver
- // canvas. Zero dimensions leave the captured source at its native size.
 +// Source reports which display the portal selected, when the reply carried a
 +// usable identity. It is available once the preparation has been created.
 +func (p *CapturePreparation) Source() (SourceInfo, bool) {
@@ -38,9 +57,9 @@ index 0a82965..407af34 100644
 +	return p.source, true
 +}
 +
+ // Start launches the prepared encoder using the supplied nominal receiver
+ // canvas. Zero dimensions leave the captured source at its native size.
  func (p *CapturePreparation) Start(width, height int) (*ScreenCapture, error) {
- 	return p.startWithContextAndCodec(nil, width, height, "")
- }
 diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
 index f00cc8a..56d9d51 100644
 --- a/internal/daemon/daemon.go
