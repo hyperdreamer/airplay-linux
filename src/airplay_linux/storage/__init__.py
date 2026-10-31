@@ -18,6 +18,12 @@ from .atomic import (
     state_root,
 )
 from .codecs import (
+    encode_daemon_reservation, decode_daemon_reservation,
+    encode_launch_receipt, decode_launch_receipt,
+    encode_daemon_cleanup_intent, decode_daemon_cleanup_intent,
+    encode_supervisor_release_intent, decode_supervisor_release_intent,
+    encode_authority_owner, decode_authority_owner,
+    encode_probe_verdict, decode_probe_verdict,
     CREDENTIAL_REFERENCE_CONFLICT,
     DAEMON_SCHEMA,
     DESIRED_STATES,
@@ -38,6 +44,9 @@ from .codecs import (
     is_ambiguous_identity,
 )
 from .repositories import (
+    JsonLaunchReceiptStore,
+    JsonDaemonCleanupIntentStore,
+    JsonSupervisorReleaseIntentStore,
     DAEMON_DIRECTORY,
     OWNERSHIP_DIRECTORY,
     RECEIVER_DIRECTORY,
@@ -50,6 +59,11 @@ from .repositories import (
 )
 
 __all__ = [
+    "JsonLaunchReceiptStore", "JsonDaemonCleanupIntentStore", "JsonSupervisorReleaseIntentStore",
+    "encode_daemon_reservation", "decode_daemon_reservation", "encode_launch_receipt", "decode_launch_receipt",
+    "encode_daemon_cleanup_intent", "decode_daemon_cleanup_intent",
+    "encode_supervisor_release_intent", "decode_supervisor_release_intent",
+    "encode_authority_owner", "decode_authority_owner", "encode_probe_verdict", "decode_probe_verdict",
     "AtomicFiles",
     "CREDENTIAL_REFERENCE_CONFLICT",
     "DAEMON_DIRECTORY",

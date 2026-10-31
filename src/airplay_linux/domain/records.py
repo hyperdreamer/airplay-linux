@@ -19,6 +19,8 @@ from .resources import (
 )
 
 if TYPE_CHECKING:
+    from uuid import UUID
+
     from .identity import ReceiverId, ReceiverTarget, ServiceRecord
     from .operations import (
         ChallengeView,
@@ -33,6 +35,7 @@ if TYPE_CHECKING:
     )
     from .resources import (
         Diagnostic,
+        ErrorCode,
         Mode,
         PhysicalMonitorSource,
         ResolutionDecision,
@@ -99,6 +102,84 @@ class DaemonRecord:
     socket_path: str
     lifecycle: Literal["starting", "running", "stopping"]
     runtime_directory: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class DaemonReservation:
+    """Required immutable launch identity; observation and credentials are separate."""
+
+    schema_version: int
+    launch_uuid: UUID = field(repr=False)
+    instance_uuid: InstanceId = field(repr=False)
+    app: ProcessIdentity = field(repr=False)
+    owner_uid: int = field(repr=False)
+    boot_id: str = field(repr=False)
+    runtime_directory: str = field(repr=False)
+    runtime_device: int = field(repr=False)
+    runtime_inode: int = field(repr=False)
+    endpoint_generation: int
+    socket_name: str = field(repr=False)
+    protocol_version: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class LaunchReceipt(DaemonReservation):
+    """Append-only observed evidence across one launch's durable transitions."""
+
+    state: Literal["reserved", "detached", "bound", "ready", "stopping", "stopped", "failed"]
+    daemon_instance_uuid: InstanceId | None = field(repr=False)
+    supervisor: ProcessIdentity | None = field(repr=False)
+    daemon: ProcessIdentity | None = field(repr=False)
+    entry_device: int | None = field(repr=False)
+    entry_inode: int | None = field(repr=False)
+    socket_inode: int | None = field(repr=False)
+    peer_pid: int | None = field(repr=False)
+    peer_start_ticks: int | None = field(repr=False)
+    peer_uid: int | None = field(repr=False)
+    status_state: str | None
+    credential_service: Literal["keyring_proven", "file_refused", "unknown"]
+    failure: ErrorCode | None
+    updated_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class DaemonCleanupIntent:
+    launch_uuid: UUID = field(repr=False)
+    reason: ErrorCode
+    intent_at: float
+    completed_at: float | None
+    outcome: Literal["stopped"] | ErrorCode | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class SupervisorReleaseIntent:
+    schema_version: int
+    launch_uuid: UUID = field(repr=False)
+    instance_uuid: InstanceId = field(repr=False)
+    app: ProcessIdentity = field(repr=False)
+    supervisor: ProcessIdentity = field(repr=False)
+    daemon: ProcessIdentity = field(repr=False)
+    reason: Literal["application-exited", "parent-mismatch"]
+    intent_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class AuthorityOwner:
+    schema: Literal["airplay-linux/daemon-authority-owner/v1"]
+    instance_uuid: InstanceId = field(repr=False)
+    app: ProcessIdentity = field(repr=False)
+    boot_id: str = field(repr=False)
+    acquired_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProbeVerdict:
+    schema: Literal["airplay-linux/credential-service-proof"]
+    version: int
+    service_leg: Literal["passed", "failed", "not_run"]
+    backend_positive_leg: Literal["passed", "failed", "not_run"]
+    backend_negative_leg: Literal["passed", "failed", "not_run"]
+    failure: ErrorCode | None
 
 
 @dataclass(frozen=True, kw_only=True)
