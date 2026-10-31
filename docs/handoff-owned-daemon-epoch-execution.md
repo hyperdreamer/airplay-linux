@@ -88,3 +88,19 @@ No production spawn path exists yet: `T-009` is the only activation commit. `T-0
 unimplemented, so the design's receipts, verifier, authority, launcher, credential proof, source
 verification and acceptance matrix exist only as reviewed text. Nothing in this run has contacted a live
 AirPlay receiver, and nothing should outside `unshare -rn` with a private socket.
+
+## Receipts review outcome (recorded after the first handoff write)
+
+`T-002`'s task review returned `SPEC: FAIL / QUALITY: CHANGES_REQUESTED` with **11 load-bearing
+Important findings**, each with file:line evidence and disposable mutation probes. The lane's SDD state is
+`TASK_REVIEW_DECISION` at revision 11, the findings are in the canonical finding ledger, and the fixer
+package is written at
+`<receipts run root>/finding-package-round-1.json` with `prior_attempts: []`.
+
+Next action for that lane is a fix round 1 dispatch (`fixer`, tier = implementer tier), then re-review,
+then final review, then candidate integration. The findings cluster into five mechanisms: durability
+confirmation on identical republication (F-1), stage-complete receipt validation (F-2, F-3),
+initial-publication/completion ordering and filename refusal (F-4, F-5), identity and privacy contracts
+(F-6, F-7), encoder robustness and bounds (F-8, F-9), and test strength (F-10, F-11). F-11 also affects
+the analogous test in `tests/storage/test_repositories.py`, and its correction must use the real
+`build_runtime(..., overrides={'process': recorder})` entrypoint.
