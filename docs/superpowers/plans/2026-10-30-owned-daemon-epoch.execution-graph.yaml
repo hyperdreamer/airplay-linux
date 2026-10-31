@@ -140,6 +140,7 @@ tasks:
     tier: "frontier"
     depends_on: []
     ownership:
+      - "tests/testing/test_fakes.py"
       - "src/airplay_linux/process/procfs.py"
       - "src/airplay_linux/process/linux.py"
       - "src/airplay_linux/process/teardown.py"
