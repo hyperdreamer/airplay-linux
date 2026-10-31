@@ -124,7 +124,24 @@ async def test_receipt_codec_rejection_matrix_by_state(tmp_path, receipt_state_d
     persistence_refusal(await repositories.JsonLaunchReceiptStore(files).all())
 
 
-def test_all_partial_states_and_unknown_versions_refuse(receipt_state_documents):
+async def test_all_partial_states_and_unknown_versions_refuse(tmp_path, receipt_state_documents):
+    reserved = receipt_state_documents["reserved"]
+    raw = codecs.encode_launch_receipt(reserved)
+    document = json.loads(raw)
+    assert_refused(
+        codecs.decode_launch_receipt,
+        wire({name: value for name, value in document.items() if name != "endpoint_generation"}),
+    )
+    assert_refused(
+        codecs.decode_launch_receipt,
+        wire(document | {"schema": "airplay-linux/launch-receipt/future"}),
+    )
+    assert_refused(codecs.decode_launch_receipt, wire(document | {"version": 2}))
+
+    transition_store = store_at(tmp_path / "reserved-to-stopping")
+    assert isinstance(await transition_store.write(reserved), Ok)
+    assert isinstance(await transition_store.write(receipt_state_documents["stopping"]), Ok)
+
     ready = receipt_state_documents["ready"]
     identity = ("daemon_instance_uuid", "supervisor", "daemon")
     endpoint = ("entry_device", "entry_inode", "socket_inode", "peer_pid", "peer_start_ticks", "peer_uid")
@@ -174,7 +191,16 @@ def test_all_partial_states_and_unknown_versions_refuse(receipt_state_documents)
                                 failure=ErrorCode.daemon_failed if state == "failed" else None)
         with pytest.raises(codecs.RecordError):
             codecs.encode_launch_receipt(without_daemon)
-    reserved = receipt_state_documents["reserved"]
+    for terminal in ("failed", "stopped"):
+        root = tmp_path / f"terminal-{terminal}"
+        store = store_at(root)
+        assert isinstance(await store.write(reserved), Ok)
+        terminal_record = receipt_state_documents[terminal]
+        assert isinstance(await store.write(terminal_record), Ok)
+        before = AtomicFiles(root).read(receipt_key(terminal_record))
+        persistence_refusal(await store.write(replace(terminal_record, updated_at=5.0)))
+        assert AtomicFiles(root).read(receipt_key(terminal_record)) == before
+
     raw = codecs.encode_launch_receipt(reserved)
     assert codecs.decode_launch_receipt(raw) == reserved
     for suffix in (b" ", b"\n", b"\t", b"{}"):
@@ -291,14 +317,45 @@ async def test_failed_cleanup_intent_roundtrip_and_one_completion_preserve_recei
     assert isinstance(await store.write(states["failed"]), Ok)
     files = AtomicFiles(tmp_path)
     before = files.read(receipt_key(states["failed"]))
-    initial, completed, _ = cleanup_documents()
+
+    initial, completed, timed_out = cleanup_documents()
+    initial_raw = codecs.encode_daemon_cleanup_intent(initial)
+    initial_document = json.loads(initial_raw)
+    assert set(initial_document) == {
+        "schema", "version", "launch_uuid", "reason", "intent_at", "completed_at", "outcome",
+    }
+    assert initial_document["completed_at"] is None
+    assert initial_document["outcome"] is None
+    assert codecs.decode_daemon_cleanup_intent(initial_raw) == initial
+    for _, payload in malformed_documents(initial_raw):
+        assert_refused(codecs.decode_daemon_cleanup_intent, payload)
+
+    cleanup_key = f"daemon/cleanup-intents/{initial.launch_uuid}.json"
     intents = repositories.JsonDaemonCleanupIntentStore(files)
     assert isinstance(await intents.write(initial), Ok)
+    assert files.read(cleanup_key) == initial_raw
     assert isinstance(await intents.write(completed), Ok)
+    completed_raw = codecs.encode_daemon_cleanup_intent(completed)
+    assert files.read(cleanup_key) == completed_raw
+    for changed in (timed_out, replace(completed, completed_at=None, outcome=None)):
+        persistence_refusal(await intents.write(changed))
+        assert files.read(cleanup_key) == completed_raw
     assert isinstance(await repositories.JsonDaemonCleanupIntentStore(files).write(completed), Ok)
     assert await repositories.JsonDaemonCleanupIntentStore(files).all() == Ok(value=(completed,))
+
+    persistence_refusal(await store.write(replace(states["failed"], updated_at=5.0)))
+    assert files.read(receipt_key(states["failed"])) == before
     persistence_refusal(await store.write(replace(states["failed"], state="stopping", failure=None)))
     assert files.read(receipt_key(states["failed"])) == before
+
+    stopped_root = tmp_path / "stopped-receipt"
+    stopped_store = store_at(stopped_root)
+    stopped_files = AtomicFiles(stopped_root)
+    assert isinstance(await stopped_store.write(states["reserved"]), Ok)
+    assert isinstance(await stopped_store.write(states["stopped"]), Ok)
+    stopped_before = stopped_files.read(receipt_key(states["stopped"]))
+    persistence_refusal(await stopped_store.write(replace(states["stopped"], updated_at=5.0)))
+    assert stopped_files.read(receipt_key(states["stopped"])) == stopped_before
     assert await store_at(tmp_path).all() == Ok(value=(states["failed"],))
 
 
