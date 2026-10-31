@@ -25,11 +25,13 @@ import os
 import signal
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain import ports
 from airplay_linux.domain.operations import ProcessIdentity
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
@@ -41,7 +43,9 @@ from airplay_linux.process.linux import (
 from airplay_linux.process.procfs import (
     OWNER_TOKEN_ENV,
     RUNTIME_DIRECTORY_ENV,
+    IdentityEvidence,
     IdentityState,
+    TerminationEvidence,
     read_identity,
     read_identity_evidence,
 )
@@ -981,7 +985,174 @@ def test_a_closed_subscription_stops_receiving_exits():
     assert exits == []
 
 
-# --------------------------------------------------------------------------- ownership
+# --------------------------------------------------------------------------- strict owned termination
+
+
+@pytest.fixture
+def strict_signal_observer():
+    identity = ProcessIdentity(pid=8123, start_ticks=44_001)
+    evidence = TerminationEvidence(
+        stage="pre_bind",
+        expected_identity=identity,
+        expected_uid=os.getuid(),
+        expected_socket_name="daemon.sock",
+        expected_supervisor=ProcessIdentity(pid=8122, start_ticks=44_000),
+        expected_entry=None,
+        expected_socket_inode=None,
+    )
+
+    class Observer(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=Path("/proc"))
+            self.identity_value = identity
+            self.evidence = evidence
+            self.pidfd_available = True
+            self.fresh_identity = identity
+            self.revalidation: Ok | Err = Ok(value=evidence)
+            self.events: list[str] = []
+            self.numeric_signals: list[tuple[int, int]] = []
+            self.pidfd_signals: list[tuple[int, int]] = []
+
+        def _classify(self, identity, owner_uuid, runtime_directory):  # type: ignore[override]
+            self.events.append("classify")
+            return "owned"
+
+        def _open_pidfd(self, pid: int):  # type: ignore[override]
+            self.events.append("open_pidfd")
+            return 73 if self.pidfd_available else None
+
+        def _read_strict_identity(self, identity):  # type: ignore[override]
+            self.events.append("read_identity")
+            return IdentityEvidence(
+                pid=identity.pid,
+                state=IdentityState.present,
+                identity=self.fresh_identity,
+                parent=8122,
+                uid=self.evidence.expected_uid,
+            )
+
+        def _signal(self, pidfd: int | None, pid: int, signum: int) -> bool:
+            self.events.append("signal")
+            if pidfd is None:
+                self.numeric_signals.append((pid, signum))
+            else:
+                self.pidfd_signals.append((pidfd, signum))
+            return True
+
+        def _close_pidfd(self, pidfd: int | None) -> None:
+            if pidfd is not None:
+                self.events.append("close_pidfd")
+
+        async def _await_exit(self, identity, pidfd, child, timeout):  # type: ignore[override]
+            self.events.append("await_exit")
+            return True
+
+        def revalidate(self):
+            self.events.append("revalidate")
+            return self.revalidation
+
+    observer = Observer()
+    return observer
+
+
+def test_strict_receipt_revalidation_after_pidfd_open_refuses_without_signals(
+    strict_signal_observer,
+):
+    s = strict_signal_observer
+    s.revalidation = Err(error=diagnostic(ErrorCode.ownership_mismatch))
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert s.events.index("open_pidfd") < s.events.index("revalidate")
+    assert s.events.index("revalidate") < s.events.index("close_pidfd")
+    assert s.numeric_signals == []
+    assert s.pidfd_signals == []
+
+
+def test_strict_no_pidfd_never_signals_numeric_pid(strict_signal_observer):
+    s = strict_signal_observer
+    s.pidfd_available = False
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err) and result.error.code == ErrorCode.dependency_incompatible
+    assert s.numeric_signals == s.pidfd_signals == []
+
+
+def test_strict_revalidates_identity_after_pidfd_open(strict_signal_observer):
+    s = strict_signal_observer
+    s.fresh_identity = ProcessIdentity(pid=s.identity_value.pid, start_ticks=44_002)
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert "revalidate" not in s.events
+    assert s.numeric_signals == []
+    assert s.pidfd_signals == []
+
+
+def test_strict_valid_candidate_signals_only_through_pidfd(strict_signal_observer):
+    s = strict_signal_observer
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert result == Ok(value=None)
+    assert s.pidfd_signals == [(73, signal.SIGTERM)]
+    assert s.numeric_signals == []
+    assert s.events.index("revalidate") < s.events.index("signal")
+    assert s.events[-1] == "close_pidfd"
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    (
+        ("pre_bind_missing_supervisor", lambda e: replace(e, expected_supervisor=None)),
+        ("pre_bind_entry_present", lambda e: replace(e, expected_entry=(1, 2))),
+        ("pre_bind_inode_present", lambda e: replace(e, expected_socket_inode=3)),
+        ("pre_bind_ticks_invalid", lambda e: replace(
+            e, expected_identity=ProcessIdentity(pid=e.expected_identity.pid, start_ticks=-1),
+        )),
+        ("pre_bind_uid_invalid", lambda e: replace(e, expected_uid=-1)),
+        ("pre_bind_socket_argv_missing", lambda e: replace(e, expected_socket_name="")),
+        ("bound_entry_missing", lambda e: replace(
+            e, stage="bound", expected_entry=None, expected_socket_inode=3,
+        )),
+        ("bound_inode_missing", lambda e: replace(
+            e, stage="bound", expected_entry=(1, 2), expected_socket_inode=None,
+        )),
+    ),
+)
+def test_strict_incomplete_stage_evidence_refuses_before_pidfd(
+    strict_signal_observer, label, mutate,
+):
+    del label
+    s = strict_signal_observer
+    s.evidence = mutate(s.evidence)
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.dependency_incompatible
+    assert "open_pidfd" not in s.events
+    assert s.numeric_signals == s.pidfd_signals == []
 
 
 def test_identity_of_a_foreign_pid_is_exact_and_not_owned():

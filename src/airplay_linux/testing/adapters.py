@@ -14,7 +14,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass, replace
 from types import MappingProxyType
-from typing import Any, Generic, Literal, TypeVar, get_args
+from typing import Any, Generic, Literal, TYPE_CHECKING, TypeVar, get_args
 from uuid import UUID
 
 from airplay_linux.domain import messages, ports, resources
@@ -65,6 +65,9 @@ from airplay_linux.domain.resources import (
 )
 
 from .time import FakeClock
+
+if TYPE_CHECKING:
+    from airplay_linux.process.procfs import TerminationEvidence
 
 T = TypeVar("T")
 
@@ -911,6 +914,7 @@ class FakeProcess(_Scripted, _EventSource):
         self.spawned: list[ports.CommandSpec] = []
         self.runs: list[tuple[ports.CommandSpec, float]] = []
         self.terminated: list[ProcessIdentity] = []
+        self.strict_terminations: list[TerminationEvidence] = []
         self._identities: dict[int, ProcessIdentity] = {}
         self._environments: dict[int, Mapping[str, str]] = {}
         self._next_pid = 4000
@@ -988,17 +992,54 @@ class FakeProcess(_Scripted, _EventSource):
 
     async def terminate(
         self, identity: ProcessIdentity, owner_uuid: UUID,
-        runtime_directory: str, deadline: float,
+        runtime_directory: str, deadline: float, *, strict: bool = False,
+        evidence: TerminationEvidence | None = None,
+        revalidate: Callable[[], Result[TerminationEvidence]] | None = None,
     ) -> Result[None]:
         self._record(
             "terminate", identity=identity, owner_uuid=owner_uuid,
             runtime_directory=runtime_directory, deadline=deadline,
+            strict=strict, evidence=evidence is not None,
+            revalidate=revalidate is not None,
         )
         if not self.owned(identity, owner_uuid, runtime_directory):
             return _failure(
                 ErrorCode.ownership_mismatch,
                 "Process identity is not owned by this runtime directory",
             )
+        if strict:
+            if evidence is None or revalidate is None:
+                return _failure(
+                    ErrorCode.dependency_incompatible,
+                    "Strict termination requires stage evidence and revalidation",
+                )
+            from airplay_linux.process.procfs import termination_evidence_complete
+
+            if not termination_evidence_complete(evidence):
+                return _failure(
+                    ErrorCode.dependency_incompatible,
+                    "Strict termination requires complete stage evidence",
+                )
+            if getattr(evidence, "expected_identity", None) != identity:
+                return _failure(
+                    ErrorCode.ownership_mismatch,
+                    "Strict termination evidence names a different process",
+                )
+            try:
+                checked = revalidate()
+            except Exception:
+                return _failure(
+                    ErrorCode.ownership_mismatch,
+                    "Strict termination evidence could not be revalidated",
+                )
+            if isinstance(checked, Err):
+                return checked
+            if not isinstance(checked, Ok) or checked.value != evidence:
+                return _failure(
+                    ErrorCode.ownership_mismatch,
+                    "Strict termination evidence changed before the signal",
+                )
+            self.strict_terminations.append(evidence)
         scripted = await self._take("terminate")
         if scripted is not _UNSET:
             return scripted

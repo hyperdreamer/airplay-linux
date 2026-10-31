@@ -30,10 +30,10 @@ Three consequences shape this module:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Final, Literal
 from uuid import UUID
 
 from airplay_linux.domain.operations import ProcessIdentity
@@ -78,6 +78,87 @@ class OwnershipState(StrEnum):
     owned = "owned"
     not_owned = "not_owned"
     unreadable = "unreadable"
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerminationEvidence:
+    """The immutable, stage-specific facts a strict teardown must recheck.
+
+    The process port deliberately receives these facts instead of a receipt.  A
+    registry or endpoint verifier owns the authority to produce them, while the
+    process runner only compares the expected instance and its freshly observed
+    identity before it sends a signal.
+    """
+
+    stage: Literal["pre_bind", "bound"] = field(repr=False)
+    expected_identity: ProcessIdentity = field(repr=False)
+    expected_uid: int = field(repr=False)
+    expected_socket_name: str = field(repr=False)
+    expected_supervisor: ProcessIdentity | None = field(repr=False)
+    expected_entry: tuple[int, int] | None = field(repr=False)
+    expected_socket_inode: int | None = field(repr=False)
+
+
+def termination_evidence_complete(evidence: object) -> bool:
+    """Whether ``evidence`` contains every fact required for its stage.
+
+    ``None`` has an explicit meaning in the bound fields: pre-bind has no socket
+    entry or kernel socket inode yet, while bound must have both.  The process
+    runner uses this predicate before opening a pidfd, so an incomplete caller
+    can never turn a partially observed record into a signal authorization.
+    """
+    if not isinstance(evidence, TerminationEvidence):
+        return False
+    identity = evidence.expected_identity
+    if (
+        type(identity) is not ProcessIdentity
+        or not _valid_pid(identity.pid)
+        or type(identity.start_ticks) is not int
+        or identity.start_ticks < 0
+    ):
+        return False
+    if type(evidence.expected_uid) is not int or evidence.expected_uid < 0:
+        return False
+    if (
+        type(evidence.expected_socket_name) is not str
+        or not evidence.expected_socket_name
+        or "\0" in evidence.expected_socket_name
+    ):
+        return False
+
+    def valid_identity(value: object) -> bool:
+        return (
+            value is not None
+            and type(value) is ProcessIdentity
+            and _valid_pid(value.pid)
+            and type(value.start_ticks) is int
+            and value.start_ticks >= 0
+        )
+
+    def valid_entry(value: object) -> bool:
+        return (
+            type(value) is tuple
+            and len(value) == 2
+            and all(type(part) is int and part > 0 for part in value)
+        )
+
+    if evidence.stage == "pre_bind":
+        return (
+            valid_identity(evidence.expected_supervisor)
+            and evidence.expected_entry is None
+            and evidence.expected_socket_inode is None
+        )
+    if evidence.stage == "bound":
+        return (
+            valid_entry(evidence.expected_entry)
+            and type(evidence.expected_socket_inode) is int
+            and evidence.expected_socket_inode > 0
+            and (
+                evidence.expected_supervisor is None
+                or valid_identity(evidence.expected_supervisor)
+            )
+        )
+    return False
 
 
 @dataclass(frozen=True, kw_only=True)
