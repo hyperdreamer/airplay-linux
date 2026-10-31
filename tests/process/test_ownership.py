@@ -234,6 +234,25 @@ def owned_endpoint_evidence(monkeypatch):
     assert e.opened == {}, "temporary directory descriptors leaked"
 
 
+@pytest.fixture
+def reserved_supervisor_release(owned_endpoint_evidence):
+    e = owned_endpoint_evidence
+    e.receipts = (replace(
+        e.receipt, state="reserved", daemon_instance_uuid=None, supervisor=None, daemon=None,
+        entry_device=None, entry_inode=None, socket_inode=None,
+        peer_pid=None, peer_start_ticks=None, peer_uid=None,
+        status_state=None, credential_service="unknown",
+    ),)
+    e.entry, e.rows = None, ()
+    e.identities[110] = IdentityEvidence(pid=110, state=IdentityState.absent)
+    e.intent = SimpleNamespace(
+        schema_version=1, launch_uuid=e.receipt.launch_uuid, instance_uuid=e.receipt.instance_uuid,
+        app=e.record.app, supervisor=e.record.supervisor, daemon=e.record.daemon,
+        reason="application-exited", intent_at=2.0,
+    )
+    return e
+
+
 def verify(e):
     return ownership_module().verify_owned_endpoint(e.receipt, current_generation=e.current_generation)
 
@@ -515,6 +534,70 @@ async def test_release_refuses_unreadable_identity_and_replacement_after_exit(ow
     assert e.unlink_calls == []
 
 
+async def test_reserved_receipt_supervisor_release_uses_fresh_pre_bind_evidence(reserved_supervisor_release):
+    e = reserved_supervisor_release
+    result = await authority(e, supervisor_intent=e.release_intent).release(e.record)
+    assert isinstance(result, Ok)
+    assert e.signal_calls == [e.record.daemon]
+    assert len(e.termination_calls) == 1
+    evidence = e.termination_calls[0][1]
+    assert evidence.stage == "pre_bind"
+    assert evidence.expected_identity == e.record.daemon
+    assert evidence.expected_supervisor == e.record.supervisor
+    assert evidence.expected_entry is None and evidence.expected_socket_inode is None
+    assert e.io_calls == e.launch_calls == e.unlink_calls == []
+
+
+@pytest.mark.parametrize("member,value", [
+    ("daemon_instance_uuid", InstanceId(UUID(int=999))),
+    ("daemon", ProcessIdentity(pid=130, start_ticks=31)),
+    ("supervisor", ProcessIdentity(pid=120, start_ticks=21)),
+])
+@pytest.mark.parametrize("after_open", [False, True])
+async def test_supervisor_release_refuses_populated_receipt_identity_mismatch(reserved_supervisor_release, member, value, after_open):
+    e = reserved_supervisor_release
+    observed = dict(
+        daemon_instance_uuid=e.record.instance_uuid, daemon=e.record.daemon,
+        supervisor=e.record.supervisor,
+    )
+    observed[member] = value
+    def contradict_receipt():
+        e.receipts = (replace(e.receipts[0], state="detached", **observed),)
+    if after_open:
+        e.on_post_open = contradict_receipt
+    else:
+        contradict_receipt()
+    assert_refused(await authority(e, supervisor_intent=e.release_intent).release(e.record), ErrorCode.ownership_mismatch)
+    assert len(e.termination_calls) == int(after_open)
+    assert_no_effects(e)
+
+
+@pytest.mark.parametrize("failure", ["parent", "ticks", "supervisor_ticks", "argv", "intent_daemon", "live_app"])
+@pytest.mark.parametrize("after_open", [False, True])
+async def test_reserved_supervisor_release_rechecks_intent_and_process_facts(reserved_supervisor_release, failure, after_open):
+    e = reserved_supervisor_release
+    def change():
+        if failure == "parent":
+            e.identities[130] = live(e.record.daemon, parent=999)
+        elif failure == "ticks":
+            e.identities[130] = live(ProcessIdentity(pid=130, start_ticks=31))
+        elif failure == "supervisor_ticks":
+            e.identities[120] = live(ProcessIdentity(pid=120, start_ticks=21), parent=110)
+        elif failure == "argv":
+            e.argv = (b"doubletake", b"-daemonize", b"-socket", b"/wrong/socket")
+        elif failure == "intent_daemon":
+            e.intent.daemon = ProcessIdentity(pid=999, start_ticks=30)
+        else:
+            e.identities[110] = live(e.receipt.app, parent=1)
+    if after_open:
+        e.on_post_open = change
+    else:
+        change()
+    assert_refused(await authority(e, supervisor_intent=e.release_intent).release(e.record), ErrorCode.ownership_mismatch)
+    assert len(e.termination_calls) == int(after_open)
+    assert_no_effects(e)
+
+
 async def test_no_receipt_supervisor_release_requires_saved_reservation_and_own_intent(owned_endpoint_evidence):
     e = owned_endpoint_evidence
     e.receipts = ()
@@ -686,6 +769,97 @@ async def test_handshake_authority_retains_each_legacy_equality(owned_endpoint_e
     result = await a.prove(e.record)
     assert isinstance(result, Err)
     assert all(argv[3] == "status" for argv in process.calls), "raw status must not recurse through authority"
+    assert_no_effects(e)
+
+
+@pytest.mark.parametrize("kind", ["evidence", "handshake"])
+async def test_authorities_refuse_external_shutdown_but_keep_strict_release(owned_endpoint_evidence, kind):
+    from airplay_linux.backend.control import HandshakeAuthority
+    e = owned_endpoint_evidence
+    a = strict_authority = authority(e)
+    process = FixtureProcess(e.record)
+    if kind == "handshake":
+        control = PublishedDoubletakeControl(process, ApplicationContractProfile(
+            socket_path=e.record.socket_path, owner_token=e.record.owner_token, instance_uuid=e.record.instance_uuid,
+        ))
+        a = HandshakeAuthority(
+            control, socket_entry=lambda _: Ok(value=(4, 60)), generation=lambda _: 7,
+            release=strict_authority.release,
+        )
+    assert a.allows(BackendOperation.shutdown) is True
+    assert isinstance(await a.prove(e.record), Ok), "valid ownership is the unchanged control"
+    process.calls.clear()
+    observations = len(e.walk), len(e.peer_anchors)
+    assert_refused(await a.authorize(e.record, BackendOperation.shutdown, None, None), ErrorCode.dependency_incompatible)
+    assert process.calls == [] and (len(e.walk), len(e.peer_anchors)) == observations
+    assert e.termination_calls == []
+    assert_no_effects(e)
+    e.receipts = (replace(e.receipt, state="stopping"),)
+    assert isinstance(await a.release(e.record), Ok)
+    assert e.signal_calls == [e.record.daemon] and len(e.unlink_calls) == 1
+    assert len(e.termination_calls) == 1 and e.termination_calls[0][1].stage == "bound"
+    assert all(argv[3] == "status" for argv in process.calls)
+    assert e.io_calls == e.launch_calls == []
+
+
+@pytest.mark.parametrize("owned,multi_target,physical_source,expected", [
+    (True, True, True, True),
+    (False, True, True, False),
+    (True, False, True, False),
+    (True, True, False, False),
+])
+@pytest.mark.parametrize("keyring", [False, True])
+def test_connect_capability_predicate_is_independent_of_keyring(owned_endpoint_evidence, owned, multi_target, physical_source, expected, keyring):
+    e = owned_endpoint_evidence
+    features = replace(
+        PublishedDoubletakeProfile(socket_path=e.record.socket_path).features,
+        owned_daemon_control=owned, multi_target=multi_target, physical_source=physical_source,
+        keyring=keyring,
+    )
+    assert authority(e, features=features).allows(BackendOperation.connect) is expected
+    assert e.walk == [] and e.termination_calls == []
+    assert_no_effects(e)
+
+
+@pytest.mark.parametrize("keyring", [False, True])
+async def test_transport_admission_still_requires_keyring(owned_endpoint_evidence, tmp_path, keyring):
+    from airplay_linux.storage import AtomicFiles, JsonReceiverStore
+    from airplay_linux.testing.adapters import FakeCapture, SequenceIds
+    from airplay_linux.testing.builders import context
+    from airplay_linux.testing.time import FakeClock, FakeScheduler
+    from airplay_linux.transport.doubletake import DoubleTakeTransport
+    from airplay_linux.trust.fences import TrustFenceRegistry
+    from airplay_linux.trust.keyring import BackendKeyringStore
+    e = owned_endpoint_evidence
+    process = FixtureProcess(e.record)
+    profile = ApplicationContractProfile(
+        socket_path=e.record.socket_path, owner_token=e.record.owner_token, instance_uuid=e.record.instance_uuid,
+    )
+    features = replace(profile.features, keyring=keyring)
+    control = PublishedDoubletakeControl(process, profile)
+    ensured = []
+    async def ensure():
+        ensured.append(e.record)
+        return Ok(value=e.record)
+    registry = SimpleNamespace(
+        ensure=ensure, subscribe=lambda _: SimpleNamespace(close=lambda: None),
+    )
+    clock = FakeClock(20)
+    transport = DoubleTakeTransport(
+        lambda _: control, registry, FakeCapture(), BackendKeyringStore(control, features),
+        JsonReceiverStore(AtomicFiles(root=tmp_path)), TrustFenceRegistry(), features,
+        clock, FakeScheduler(clock), SequenceIds(100),
+    )
+    receiver = target()
+    transport.update_target(receiver, receiver.receiver_id)
+    admitted = await transport._admit(receiver, context())
+    if keyring:
+        assert isinstance(admitted, Ok) and admitted.value.record == e.record
+        assert ensured == [e.record] and len(process.calls) == 1
+        assert process.calls[0][3] == "status"
+    else:
+        assert_refused(admitted, ErrorCode.dependency_incompatible)
+        assert ensured == process.calls == []
     assert_no_effects(e)
 
 

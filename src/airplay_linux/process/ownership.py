@@ -304,7 +304,7 @@ class EvidenceAuthority:
         if operation in {BackendOperation.mute, BackendOperation.unmute}:
             return f.multi_target and f.target_mute
         if operation is BackendOperation.connect:
-            return f.multi_target and f.physical_source and f.keyring
+            return f.multi_target and f.physical_source
         if operation is BackendOperation.shutdown:
             return True
         # This authority represents the public evidence contract. Unsupported
@@ -397,7 +397,7 @@ class EvidenceAuthority:
         self, record: DaemonRecord, operation: BackendOperation,
         target: ReceiverTarget | None, fence: DispatchFence | None,
     ) -> Result[OwnershipProof]:
-        if not self.allows(operation):
+        if operation is BackendOperation.shutdown or not self.allows(operation):
             return _err(ErrorCode.dependency_incompatible)
         if requires_dispatch_fence(operation) and (target is None or fence is None):
             return _err(ErrorCode.dependency_incompatible)
@@ -435,10 +435,7 @@ class EvidenceAuthority:
             return
         _require(receipt is None or receipt.state in {"reserved", "detached", "bound", "ready"})
         if receipt is not None:
-            _require(
-                receipt.daemon_instance_uuid == record.instance_uuid
-                and receipt.daemon == record.daemon and receipt.supervisor == record.supervisor,
-            )
+            self._join(receipt, record, complete=False)
         _require(self._supervisor_intent is not None)
         loaded = self._supervisor_intent()
         if isinstance(loaded, Err):

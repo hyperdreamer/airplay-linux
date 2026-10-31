@@ -990,7 +990,7 @@ class HandshakeAuthority:
         self, record: DaemonRecord, operation: BackendOperation,
         target: ReceiverTarget | None, fence: DispatchFence | None,
     ) -> Result[OwnershipProof]:
-        if not self.allows(operation):
+        if operation is BackendOperation.shutdown or not self.allows(operation):
             return _err(ErrorCode.dependency_incompatible)
         if requires_dispatch_fence(operation) and (target is None or fence is None):
             return _err(ErrorCode.dependency_incompatible)
