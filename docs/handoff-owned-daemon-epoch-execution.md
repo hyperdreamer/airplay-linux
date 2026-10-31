@@ -124,3 +124,22 @@ SDD state is truthfully left at `FIX_RUNNING` revision 13 with one outstanding r
 'baseline lacked the composition seam' (or a recovery ruling), then either open attempt-2 from
 `da5d933` or re-run the fix intent against this rebased attempt. Do not resolve it by monkeypatching
 `build_runtime` — the proof must observe the real injected ProcessPort.
+
+## Receipts attempt-2 state at final handoff
+
+- Implementation commit: `c165871` (10 files, +1884/−3) with all eleven earlier findings designed in.
+- Task review: `SPEC: FAIL / QUALITY: CHANGES_REQUESTED` with **one** remaining finding, `F-10`, confined
+  to two named storage tests. The reviewer replayed 49 supplied mutant/selector pairs: every mutant died,
+  including the three real-`build_runtime` no-spawn controls, and ten of the eleven earlier findings are
+  closed. `F-10` is the exact-name verification gap only: production guards are present, but
+  `test_all_partial_states_and_unknown_versions_refuse` and
+  `test_failed_cleanup_intent_roundtrip_and_one_completion_preserve_receipt` do not themselves exercise
+  missing-member/schema refusal, a real reserved→stopping transition, terminal-rewrite refusal, or a changed
+  second completion.
+- Fix round 1 was dispatched and the child terminated without producing a report or a commit. The SDD state
+  is left at `FIX_RUNNING` revision 12 with the round-1 fix intent (and its exact rendered bytes) stored;
+  the recovery ruling naming the silent termination is recorded.
+
+Next action: reissue the stored fix-intent bytes for `F-10` (do not re-render), then re-review, final
+review, and candidate integration. The finding package at `finding-package-round-1.json` already carries
+the correction text and the reviewer's evidence paths.
