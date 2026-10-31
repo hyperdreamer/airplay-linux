@@ -139,7 +139,10 @@ def termination_evidence_complete(evidence: object) -> bool:
         return (
             type(value) is tuple
             and len(value) == 2
-            and all(type(part) is int and part > 0 for part in value)
+            and type(value[0]) is int
+            and value[0] >= 0
+            and type(value[1]) is int
+            and value[1] > 0
         )
 
     if evidence.stage == "pre_bind":
