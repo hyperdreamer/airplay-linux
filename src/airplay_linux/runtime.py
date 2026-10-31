@@ -16,10 +16,10 @@ import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from airplay_linux.backend.contract import BackendFeatures, probe_backend
+from airplay_linux.backend.contract import BackendFeatures, CredentialProofVerdict, probe_backend
 from airplay_linux.backend.control import (
     PublishedDoubletakeControl,
     PublishedDoubletakeProfile,
@@ -40,10 +40,12 @@ from airplay_linux.display.locking import CreationLock
 from airplay_linux.display.recovery import DisplayRecovery
 from airplay_linux.display.removal import DisplayRemover
 from airplay_linux.domain.operations import InstanceId, OperationContext
+from airplay_linux.domain.ports import ProcessPort
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 from airplay_linux.policy.audio import PipeWirePortalAudioProbe
 from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process.daemon_registry import DaemonRegistry
+from airplay_linux.process.launcher import LaunchCapability, ProductionLaunchCapability
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.session import Handler, ManagerDeps, Route, SessionManager
 from airplay_linux.session.audio import build_audio_handlers, compose_audio_handlers
@@ -67,11 +69,52 @@ from airplay_linux.transport.doubletake import DoubleTakeTransport
 from airplay_linux.trust.fences import TrustFenceRegistry
 from airplay_linux.trust.keyring import BackendKeyringStore
 
+if TYPE_CHECKING:
+    from airplay_linux.capture.source import ReportedSourceVerifier
+
+# Only Task 9 may activate the graph once every lifecycle seam is installed.
+# This is deliberately independent of pure launch/capability eligibility.
+_OWNED_DAEMON_EPOCH_ACTIVE = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class _OwnedDaemonInstallation:
+    """Assembly seam for the future source verifier and isolated proof producer."""
+
+    source_verifier: ReportedSourceVerifier = field(repr=False)
+    credential_proof: Callable[[], Awaitable[Result[CredentialProofVerdict]]] = field(repr=False)
+
+
+def _install_owned_daemon_epoch(
+    config: RuntimeConfig, *, process: ProcessPort, launcher: LaunchCapability,
+) -> _OwnedDaemonInstallation | None:
+    # Foundation lanes are not installed yet. Assembly must remain inert: proof
+    # dispatch is a separate step behind the activation check below.
+    return None
+
+
+def derive_composition_capabilities(
+    probed: BackendFeatures, launcher: LaunchCapability,
+    credential_proof: CredentialProofVerdict,
+    source_verifier: ReportedSourceVerifier | None, ambient_socket: str | None,
+) -> BackendFeatures:
+    """Combine captured evidence without probing or authorizing execution."""
+    owned = launcher.production_graph and launcher.available() and ambient_socket is None
+    reporting = probed.source_reporting_complete
+    verifier = source_verifier is not None
+    inventory = verifier and source_verifier.physical_inventory_available
+    return replace(
+        probed, owned_daemon_control=owned,
+        physical_source=bool(reporting and verifier and inventory), keyring=credential_proof.proven,
+    )
+
+
 #: Dependency names :func:`build_runtime` accepts as test overrides. Kept explicit
 #: so an unknown keyword fails loudly instead of silently wiring the real adapter.
 OVERRIDABLE = frozenset(
     {
         "deps",
+        "process",
         "capabilities",
         "transport",
         "pairing",
@@ -261,7 +304,7 @@ def _capability_gates(report: Any) -> dict[str, str]:
     return gated
 
 
-def _control_factory(process: LinuxProcessRunner, features: BackendFeatures):
+def _control_factory(process: ProcessPort, features: BackendFeatures):
     def make(record) -> PublishedDoubletakeControl:
         profile = PublishedDoubletakeProfile(
             socket_path=record.socket_path,
@@ -277,10 +320,13 @@ def _control_factory(process: LinuxProcessRunner, features: BackendFeatures):
     return make
 
 
-async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
+async def _compose_production(
+    config: RuntimeConfig, *, process: ProcessPort | None = None,
+) -> _ProductionGraph:
     """Construct all real adapters, leaving unsupported evidence gated."""
 
-    process = LinuxProcessRunner()
+    if process is None:
+        process = LinuxProcessRunner()
     clock = _SystemClock()
     scheduler = _SystemScheduler()
     ids = _SystemIds()
@@ -292,7 +338,27 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     daemons = JsonDaemonStore(files)
 
     backend = await probe_backend(process)
-    features = backend.value if isinstance(backend, Ok) else _unavailable_features()
+    probed = backend.value if isinstance(backend, Ok) else _unavailable_features()
+    launcher = ProductionLaunchCapability(probed, config.runtime_root, production_graph=True)
+    installation = _install_owned_daemon_epoch(config, process=process, launcher=launcher)
+    credential_proof = CredentialProofVerdict(
+        service_leg="not_run", backend_positive_leg="not_run",
+        backend_negative_leg="not_run", failure=None,
+    )
+    # This closed boundary precedes every owned-backend/probe dispatch. Pure
+    # all-passed inputs or an eligible launcher cannot substitute for activation.
+    if (
+        _OWNED_DAEMON_EPOCH_ACTIVE and installation is not None
+        and launcher.production_graph and launcher.available() and launcher.ambient_socket() is None
+    ):
+        proof = await installation.credential_proof()
+        if isinstance(proof, Ok) and type(proof.value) is CredentialProofVerdict:
+            credential_proof = proof.value
+    features = derive_composition_capabilities(
+        probed, launcher, credential_proof,
+        installation.source_verifier if installation is not None else None,
+        launcher.ambient_socket(),
+    )
 
     resolver = IdentityResolver()
     discovery = ZeroconfDiscovery(resolver, clock, AzcMdnsClient(clock))
@@ -570,7 +636,7 @@ async def build_runtime(
         raise TypeError("individual runtime adapter overrides require a deps override")
 
     if deps_override is None:
-        graph = await _compose_production(config)
+        graph = await _compose_production(config, process=provided.get("process"))
         deps = graph.deps
         registry = graph.registry
         startup = graph.startup
@@ -624,4 +690,5 @@ __all__ = [
     "build_runtime",
     "compose_handlers",
     "compose_manager",
+    "derive_composition_capabilities",
 ]

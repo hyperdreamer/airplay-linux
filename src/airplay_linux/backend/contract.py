@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field, replace
-from typing import Any, Final, TypeAlias
+from typing import Any, Final, Literal, TypeAlias
 from uuid import UUID
 
 from airplay_linux.diagnostics import diagnostic
@@ -117,6 +117,11 @@ class BackendFeatures:
     #: the source is physical or owned: those remain separate, unproven gates.
     source_reporting: bool = False
 
+    #: Ownership comes only from production composition, never public tokens.
+    owned_daemon_control: bool = False
+    #: Exact complete-source recognition is installed by the source lane.
+    source_reporting_complete: bool = False
+
     def __post_init__(self) -> None:
         if type(self.profile) is not str or type(self.version) is not str:
             raise TypeError("backend profile and version must be strings")
@@ -133,6 +138,33 @@ class BackendFeatures:
         if capability in {"profile", "version"}:
             return False
         return getattr(self, capability) is True
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialProofVerdict:
+    """Transient, sanitized outcome of the three independent credential legs."""
+
+    service_leg: Literal["passed", "failed", "not_run"]
+    backend_positive_leg: Literal["passed", "failed", "not_run"]
+    backend_negative_leg: Literal["passed", "failed", "not_run"]
+    failure: ErrorCode | None
+
+    def __post_init__(self) -> None:
+        legs = (self.service_leg, self.backend_positive_leg, self.backend_negative_leg)
+        if any(type(leg) is not str or leg not in {"passed", "failed", "not_run"} for leg in legs):
+            raise ValueError("invalid credential proof leg")
+        if self.failure is not None and type(self.failure) is not ErrorCode:
+            raise TypeError("invalid credential proof failure")
+        if "failed" in legs and self.failure is None:
+            raise ValueError("credential proof failed without a failure")
+        if all(leg == "passed" for leg in legs) and self.failure is not None:
+            raise ValueError("credential proof passed with a failure")
+
+    @property
+    def proven(self) -> bool:
+        return self.failure is None and all(leg == "passed" for leg in (
+            self.service_leg, self.backend_positive_leg, self.backend_negative_leg,
+        ))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -909,6 +941,7 @@ __all__ = [
     "BackendFeatures",
     "BackendReply",
     "BackendStream",
+    "CredentialProofVerdict",
     "DevicesReply",
     "StatusReply",
     "decode_devices",
