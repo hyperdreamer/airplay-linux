@@ -1,14 +1,17 @@
 # Owned daemon control — plan v2 (revised against the scope review)
 
-Status: **BLOCKED on an external prerequisite.** Do not begin phase 1 until P1 is satisfied, unless the intent is
-explicitly to buy infrastructure with no user-visible capability.
+Status: **P1 satisfied; P2 still blocks phase 4.** Phase 1–3 may proceed. `physical_source` may not become `True`
+until T5a and T7 are delivered (`P2` is then the only remaining external prerequisite).
 
 ## External preconditions
 
-- **P1 — source identity (blocking).** The sender must report which output it captured. The upstream patch
-  (`reports/upstream/0001-capture-report-selected-source.patch`, verified to build and pass `go test ./...` against
-  `v0.5.0` with Go 1.27.3) exposes it to a caller; `StreamInfo` must also carry it before a supervisor can read it.
-  Without P1 there is no way to satisfy HR-03 and this plan cannot deliver Mirror.
+- **P1 — source identity (satisfied 2026-10-31).** The sender reports which output each stream captured.
+  Delivered as `omarroth/doubletake#76` (head `2b5f1b0`), carried locally by
+  `vendor/doubletake/0001-capture-report-selected-source.patch` and `0002-status-report-selected-source.patch`, and by
+  the installed `/home/bin` binaries advertising `capabilities-v1` + `status-source` (`profile doubletake-0.5+source`,
+  `source_reporting=True`). Per stream, `status` carries `source: {type, width, height, x, y, has_position}` and omits
+  it when the portal reported nothing usable. `docs/backend-fork.md` records what the field does and does not mean.
+  Remaining work is consuming it (T5a), not obtaining it.
 - **P2 — credential service proof.** `keyring` requires a real Secret Service round trip plus backend credential
   operations, including refusal without file fallback. Selecting `-cred-backend keyring` proves nothing.
 - **P3 — not required for Mirror:** `krfb-virtualmonitor` (that is Virtual's blocker).
@@ -45,6 +48,29 @@ phase 4.
   `CleanupRequired` retained when evidence is uncertain.
   *Mutation M6:* skip the shared-root lock → concurrent-startup test fails.
   *No-spawn proof:* the same phase-1 invariant test.
+- **T5a** Source identity verification, phase 2 (after T3–T5, before T7; added in revision 3 for P1). Join each
+  stream's reported `source` with the facts already trusted here: `OutputInfo` (connector, logical `position`,
+  current-mode size, `scale`, `virtual`) and the ownership store. Portal monitor streams report
+  `position = screen->geometry().topLeft()` and `size = screen->size()` in device-independent coordinates, so
+  `position` is the primary key and `size` is corroboration: a match requires
+  `round(width/scale), round(height/scale)` to equal the output's current-mode size. Verify a stream only against its
+  **own** requested connector (per `device_ip`), and only when the reported type is monitor, `has_position` is true,
+  and exactly one enabled output matches; that output's connector must equal the requested one and must not be
+  virtual or owned by the helper. Refuse — never fall through to an unverified capture — on a missing `source`,
+  missing `has_position`, no match, several matches, a scale disagreement, or a non-monitor type.
+  The verifier returns a typed observation and the production default is **observe only**: the outcome (reported
+  source plus matched connector, or the refusal reason) is surfaced in status/diagnostics so real layouts can be
+  checked before it gates anything. No gate changes in this task; T7 is the single commit that acts on it.
+  *Accept:* a 1.5-scaled output whose portal size is the logical size matches its connector; two outputs sharing a
+  position are refused as ambiguous; a window-typed source, a source without `has_position`, a source matching a
+  virtual or owned output, and a source matching a different connector each refuse with their own reason; two
+  streams with different sources are verified independently, so one mismatch does not disturb the other; an
+  observing verifier never blocks a stream.
+  *Mutations:* **M11** compare portal size with the mode size directly, ignoring `scale` → the scaled-layout test
+  fails. **M12** accept the first candidate when several outputs share the position → the ambiguity test fails.
+  **M13** treat a missing `has_position` as a real `(0,0)` → the absent-position test fails. **M14** drop the
+  virtual/owned-output exclusion → the self-capture test fails.
+  *No-spawn proof:* the same phase-1 invariant test.
 
 ## Phase 3 — isolated idle launcher (not exposed to production)
 
@@ -56,10 +82,11 @@ phase 4.
 
 ## Phase 4 — gate integration and disclosure (the single activation commit)
 
-- **T7** Migrate every consumer of `foreground_control`/`owner_handshake`, wire the credential-service proof (P2) and the
-  source verification (P1+upstream), and expose the actual guarantee/refusal state in `README` and the startup capability
-  detail. Activation requires a complete eligible composition; anything missing leaves the gate closed.
-  *Mutation M9:* enable with source verification absent → acceptance test fails.
+- **T7** Migrate every consumer of `foreground_control`/`owner_handshake`, wire the credential-service proof (P2) and act on
+  the source verification produced by T5a (P1), and expose the actual guarantee/refusal state in `README` and the startup
+  capability detail. Activation requires a complete eligible composition and no standing source refusal; anything
+  missing leaves the gate closed.
+  *Mutation M9:* enable while T5a's refusals are ignored → acceptance test fails.
 
 ## Phase 5 — offline acceptance
 
@@ -75,4 +102,5 @@ generation, pairing-compensation or cleanup gates.
 R1 receipt producer/format/lifetime + command peer (T2, T3) · R2 crash recovery and failed verification (T6) · R3 gate
 migration and independent prerequisites (T1, T7, P1, P2) · R4 cross-process authority (T5) · R5 endpoint generation and
 reconnect (T2, T4, T5) · R6 strict teardown without numeric fallback + activation order (T4, phase ordering) · R7 enforced
-isolation and useful acceptance (T8) · R8 named mutations M1–M10 per task · R9 operator-visible bounded guarantee (T7).
+isolation and useful acceptance (T8) · R8 named mutations M1–M14 per task · R9 operator-visible bounded guarantee (T7) ·
+R10 consuming the reported source without overclaiming it (P1, T5a, T7).
