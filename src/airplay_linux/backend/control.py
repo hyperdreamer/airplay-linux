@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Final, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Final, Literal, Protocol, TypeAlias, runtime_checkable
 from uuid import UUID
 
 from airplay_linux.backend.contract import (
@@ -38,6 +38,10 @@ from airplay_linux.domain.resources import (
     Ok,
     Result,
 )
+
+
+if TYPE_CHECKING:
+    from airplay_linux.domain.records import DaemonRecord
 
 
 class BackendOperation(StrEnum):
@@ -204,6 +208,45 @@ class Handshake:
             f"instance_uuid={self.instance_uuid!r}, owner_token=<redacted>, "
             f"daemon={self.daemon!r}, protocol_version={self.protocol_version!r})"
         )
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnershipProof:
+    """Transient proof; no identifying or legacy secret-bearing value is printed."""
+
+    kind: Literal["handshake", "evidence"]
+    daemon: ProcessIdentity = field(repr=False)
+    socket_entry: tuple[int, int] = field(repr=False)
+    generation: int = field(repr=False)
+    handshake: Handshake | None = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"handshake", "evidence"}:
+            raise ValueError("invalid ownership proof kind")
+        if (self.kind == "handshake") != isinstance(self.handshake, Handshake):
+            raise ValueError("invalid ownership proof handshake")
+        if self.kind == "evidence" and self.handshake is not None:
+            raise ValueError("invalid ownership proof handshake")
+
+
+@runtime_checkable
+class OwnershipAuthority(Protocol):
+    """Dormant authorization seam; production composition selects it at activation."""
+
+    def allows(self, operation: BackendOperation) -> bool: ...
+
+    async def prove(self, record: DaemonRecord) -> Result[OwnershipProof]: ...
+
+    async def authorize(
+        self, record: DaemonRecord, operation: BackendOperation,
+        target: ReceiverTarget | None, fence: DispatchFence | None,
+    ) -> Result[OwnershipProof]: ...
+
+    async def confirm(
+        self, record: DaemonRecord, proof: OwnershipProof,
+    ) -> Result[None]: ...
+
+    async def release(self, record: DaemonRecord) -> Result[None]: ...
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -849,6 +892,140 @@ class PublishedDoubletakeControl:
         self._callbacks.clear()
 
 
+class HandshakeAuthority:
+    """Retain the fixture's equality checks through nonrecursive raw status I/O.
+
+    Entry/generation observations and the complete lifecycle release operation
+    are injected. Merely constructing this authority never changes the public
+    adapter's selection or admission gates.
+    """
+
+    def __init__(
+        self, control: PublishedDoubletakeControl, *,
+        socket_entry: Callable[[DaemonRecord], Result[tuple[int, int]]],
+        generation: Callable[[DaemonRecord], int],
+        release: Callable[[DaemonRecord], Awaitable[Result[None]]] | None = None,
+    ) -> None:
+        self._control = control
+        self._socket_entry = socket_entry
+        self._generation = generation
+        self._release = release
+
+    def allows(self, operation: BackendOperation) -> bool:
+        return (
+            isinstance(operation, BackendOperation)
+            and self._control._profile.features.owner_handshake
+            and self._control._available(operation)
+        )
+
+    async def prove(self, record: DaemonRecord) -> Result[OwnershipProof]:
+        control, profile = self._control, self._control._profile
+        if control._closed or not profile.features.owner_handshake:
+            return _err(ErrorCode.dependency_incompatible)
+        if record.socket_path != profile.socket_path:
+            return _err(ErrorCode.stale_socket)
+        if (
+            record.daemon is None
+            or (profile.instance_uuid is not None and profile.instance_uuid != record.instance_uuid)
+            or (profile.owner_token is not None and _secret_text(profile.owner_token) != record.owner_token)
+            or (profile.protocol_version is not None and profile.protocol_version != record.protocol_version)
+        ):
+            return _err(ErrorCode.ownership_mismatch)
+        try:
+            entry_before = self._socket_entry(record)
+            generation_before = self._generation(record)
+        except Exception:
+            return _err(ErrorCode.ownership_mismatch)
+        if isinstance(entry_before, Err):
+            return entry_before
+        argv = profile.try_argv(BackendOperation.status, None, EmptyPayload())
+        if isinstance(argv, Err):
+            return argv
+        response = await control._run(argv.value)
+        if isinstance(response, Err):
+            return response
+        if response.value.exit_code != 0:
+            return _err(ErrorCode.daemon_failed)
+        status = decode_status(control._response_object(response.value))
+        if isinstance(status, Err):
+            return status
+        checked = control._ownership_check(status)
+        if isinstance(checked, Err):
+            return checked
+        if status.socket_path != record.socket_path:
+            return _err(ErrorCode.stale_socket)
+        if (
+            status.owner_token != record.owner_token
+            or status.instance_uuid != record.instance_uuid
+            or status.daemon != record.daemon
+            or status.protocol_version != record.protocol_version
+        ):
+            return _err(ErrorCode.ownership_mismatch)
+        try:
+            entry_after = self._socket_entry(record)
+            generation_after = self._generation(record)
+        except Exception:
+            return _err(ErrorCode.ownership_mismatch)
+        if isinstance(entry_after, Err):
+            return entry_after
+        if entry_before != entry_after or generation_before != generation_after:
+            return _err(ErrorCode.stale_event)
+        if (
+            not isinstance(entry_after, Ok)
+            or type(entry_after.value) is not tuple or len(entry_after.value) != 2
+            or type(entry_after.value[0]) is not int or entry_after.value[0] < 0
+            or type(entry_after.value[1]) is not int or entry_after.value[1] <= 0
+            or type(generation_after) is not int or generation_after <= 0
+        ):
+            return _err(ErrorCode.ownership_mismatch)
+        return Ok(value=OwnershipProof(
+            kind="handshake", daemon=record.daemon, socket_entry=entry_after.value,
+            generation=generation_after, handshake=Handshake(
+                instance_uuid=record.instance_uuid, owner_token=record.owner_token,
+                daemon=record.daemon, protocol_version=record.protocol_version,
+            ),
+        ))
+
+    async def authorize(
+        self, record: DaemonRecord, operation: BackendOperation,
+        target: ReceiverTarget | None, fence: DispatchFence | None,
+    ) -> Result[OwnershipProof]:
+        if operation is BackendOperation.shutdown or not self.allows(operation):
+            return _err(ErrorCode.dependency_incompatible)
+        if requires_dispatch_fence(operation) and (target is None or fence is None):
+            return _err(ErrorCode.dependency_incompatible)
+        proof = await self.prove(record)
+        if isinstance(proof, Err):
+            return proof
+        if fence is not None and PublishedDoubletakeControl._is_mutation(operation):
+            checked = fence()
+            if isinstance(checked, Err):
+                return checked
+            if not isinstance(checked, Ok) or checked.value is not None:
+                return _err(ErrorCode.dependency_incompatible)
+        return proof
+
+    async def confirm(
+        self, record: DaemonRecord, proof: OwnershipProof,
+    ) -> Result[None]:
+        if not isinstance(proof, OwnershipProof) or proof.kind != "handshake":
+            return _err(ErrorCode.ownership_mismatch)
+        current = await self.prove(record)
+        if isinstance(current, Err):
+            return current
+        if current.value != proof:
+            return _err(ErrorCode.stale_event)
+        return Ok(value=None)
+
+    async def release(self, record: DaemonRecord) -> Result[None]:
+        if self._release is None or not self.allows(BackendOperation.shutdown):
+            return _err(ErrorCode.dependency_incompatible)
+        proof = await self.prove(record)
+        if isinstance(proof, Err):
+            return proof
+        return await self._release(record)
+
+
 def _secret_text(value: SensitiveText | str | None) -> str | None:
     if isinstance(value, SensitiveText):
         try:
@@ -934,8 +1111,11 @@ __all__ = [
     "DispatchFence",
     "EmptyPayload",
     "Handshake",
+    "HandshakeAuthority",
     "ModesPayload",
     "MutePayload",
+    "OwnershipAuthority",
+    "OwnershipProof",
     "PairingPayload",
     "PublishedDoubletakeControl",
     "PublishedDoubletakeProfile",
