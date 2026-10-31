@@ -69,10 +69,13 @@ from airplay_linux.domain.operations import ProcessIdentity
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 
 from .procfs import (
+    IdentityEvidence,
     IdentityState,
+    TerminationEvidence,
     owner_evidence,
     read_identity,
     read_identity_evidence,
+    termination_evidence_complete,
 )
 
 #: Bytes retained per stream; anything past this is drained and discarded.
@@ -388,8 +391,15 @@ class LinuxProcessRunner:
 
     async def terminate(
         self, identity: ProcessIdentity, owner_uuid: UUID,
-        runtime_directory: str, deadline: float,
+        runtime_directory: str, deadline: float, *, strict: bool = False,
+        evidence: TerminationEvidence | None = None,
+        revalidate: Callable[[], Result[TerminationEvidence]] | None = None,
     ) -> Result[None]:
+        if strict:
+            return await self._terminate_strict(
+                identity, owner_uuid, runtime_directory, deadline,
+                evidence=evidence, revalidate=revalidate,
+            )
         classified = self._classify(identity, owner_uuid, runtime_directory)
         if classified == _GONE:
             return Ok(value=None)
@@ -433,6 +443,88 @@ class LinuxProcessRunner:
             return _timed_out()
         finally:
             self._close_pidfd(pidfd)
+
+    async def _terminate_strict(
+        self, identity: ProcessIdentity, owner_uuid: UUID,
+        runtime_directory: str, deadline: float, *,
+        evidence: TerminationEvidence | None,
+        revalidate: Callable[[], Result[TerminationEvidence]] | None,
+    ) -> Result[None]:
+        """Terminate only through a pidfd after a complete stage re-check."""
+        if evidence is None or revalidate is None or not termination_evidence_complete(evidence):
+            return Err(error=diagnostic(ErrorCode.dependency_incompatible))
+        if evidence.expected_identity != identity:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+
+        classified = self._classify(identity, owner_uuid, runtime_directory)
+        if classified == _GONE:
+            return Ok(value=None)
+        if classified != _OWNED:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+
+        pidfd = self._open_pidfd(identity.pid)
+        if pidfd is None:
+            return Err(error=diagnostic(ErrorCode.dependency_incompatible))
+        child = self._tracked(identity)
+        try:
+            checked = self._strict_revalidation(identity, evidence, revalidate)
+            if isinstance(checked, Err):
+                return checked
+            if checked == _GONE:
+                return Ok(value=None)
+            if not self._signal(pidfd, identity.pid, signal.SIGTERM):
+                return Err(error=diagnostic(ErrorCode.dependency_incompatible))
+            if await self._await_exit(identity, pidfd, child, max(0.0, float(deadline))):
+                return Ok(value=None)
+
+            checked = self._strict_revalidation(identity, evidence, revalidate)
+            if isinstance(checked, Err):
+                return checked
+            if checked == _GONE:
+                return Ok(value=None)
+            if not self._signal(pidfd, identity.pid, signal.SIGKILL):
+                return Err(error=diagnostic(ErrorCode.dependency_incompatible))
+            if await self._await_exit(identity, pidfd, child, self.kill_timeout):
+                return Ok(value=None)
+            return _timed_out()
+        finally:
+            self._close_pidfd(pidfd)
+
+    def _strict_revalidation(
+        self, identity: ProcessIdentity, evidence: TerminationEvidence,
+        revalidate: Callable[[], Result[TerminationEvidence]],
+    ) -> str | Err:
+        """Read process identity, then compare a fresh same-stage observation."""
+        current = self._read_strict_identity(identity)
+        if current.state is IdentityState.absent:
+            return _GONE
+        if current.state is IdentityState.terminated:
+            if current.identity == identity:
+                return _GONE
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        if (
+            current.state is not IdentityState.present
+            or current.identity != identity
+            or current.uid != evidence.expected_uid
+        ):
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        try:
+            checked = revalidate()
+        except Exception:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        if isinstance(checked, Err):
+            return checked
+        if (
+            not isinstance(checked, Ok)
+            or not termination_evidence_complete(checked.value)
+            or checked.value != evidence
+        ):
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        return _OWNED
+
+    def _read_strict_identity(self, identity: ProcessIdentity) -> IdentityEvidence:
+        """Fresh procfs facts used by strict teardown; overridable in offline tests."""
+        return read_identity_evidence(identity.pid, self._proc_root)
 
     def subscribe(self, callback: Callable[[ports.ProcessExit], None]) -> ports.Subscription:
         self._subscribers.append(callback)
