@@ -9,6 +9,9 @@ from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
 if TYPE_CHECKING:
+    # Postponed foundation-lane signature; no import of the unfinished implementation.
+    from airplay_linux.process.procfs import TerminationEvidence
+
     from .identity import ReceiverId, ReceiverTarget, ReceiverView
     from .messages import (
         Command,
@@ -36,7 +39,10 @@ if TYPE_CHECKING:
     )
     from .records import (
         ActivityEvent,
+        DaemonCleanupIntent,
         DaemonRecord,
+        LaunchReceipt,
+        SupervisorReleaseIntent,
         OwnershipRecord,
         RecoveryItem,
         SavedReceiver,
@@ -235,6 +241,24 @@ class DaemonStore(Protocol):
     async def delete(self, instance_uuid: InstanceId) -> Result[None]: ...
 
 
+class LaunchReceiptStore(Protocol):
+    async def write(self, record: LaunchReceipt) -> Result[None]: ...
+
+    async def all(self) -> Result[tuple[LaunchReceipt, ...]]: ...
+
+
+class DaemonCleanupIntentStore(Protocol):
+    async def write(self, record: DaemonCleanupIntent) -> Result[None]: ...
+
+    async def all(self) -> Result[tuple[DaemonCleanupIntent, ...]]: ...
+
+
+class SupervisorReleaseIntentStore(Protocol):
+    async def write(self, record: SupervisorReleaseIntent) -> Result[None]: ...
+
+    async def read(self) -> Result[SupervisorReleaseIntent | None]: ...
+
+
 class ActivitySink(Protocol):
     def emit(self, event: ActivityEvent) -> None: ...
 
@@ -278,7 +302,9 @@ class ProcessPort(Protocol):
 
     async def terminate(
         self, identity: ProcessIdentity, owner_uuid: UUID,
-        runtime_directory: str, deadline: float,
+        runtime_directory: str, deadline: float, *, strict: bool = False,
+        evidence: TerminationEvidence | None = None,
+        revalidate: Callable[[], Result[TerminationEvidence]] | None = None,
     ) -> Result[None]: ...
 
     def subscribe(self, callback: Callable[[ProcessExit], None]) -> Subscription: ...
