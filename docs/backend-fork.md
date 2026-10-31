@@ -2,12 +2,19 @@
 
 ## Why we carry a patch
 
-Mirror mode promises to send **one chosen physical monitor**. The portal already tells the
-sender which display it selected (`source_type`, `size`, `position`), but `doubletake` reads only
-the size and discards the rest, and its daemon `status` reply carries no resolution and no source
-identity. Without that, this application cannot verify what it is actually sending: it cannot tell
-the requested monitor from a different one, from a window, or from a virtual output another
-application (or our own helper) created. Refusing to guess is a design rule here, not a preference.
+Mirror mode promises to send **one chosen physical monitor**. Upstream `doubletake` reads the
+selected stream's size from the ScreenCast portal reply and discards the other source metadata;
+its daemon `status` reply exposes no captured-source information. This patch retains the portal's
+optional `source_type`, `size` and `position` per capture group and reports them per stream, so the
+application has evidence to compare with compositor outputs. Refusing to guess is a design rule
+here, not a preference.
+
+That evidence is partial. Portal `source_type=1` means MONITOR; on KDE this also covers regions
+and existing virtual outputs, so `IsMonitor()` does not prove that a source is physical or owned
+by us. Portal size and position use compositor coordinates, which need not be pixels. `x` and `y`
+are usable only when `has_position` is true: an absent or malformed position must remain distinct
+from a genuine `(0,0)`. The sender must correlate this metadata with compositor output identity
+and ownership, and refuse ambiguous matches or any output our own helper created.
 
 We raised it upstream as `omarroth/doubletake#76`. We closed it once because we needed the
 capability for a shipping product and did not want it gated on review timing; the maintainer then
@@ -18,10 +25,11 @@ different sources and streams sharing one capture report that capture's source.
 
 ## Upstream status (2026-10-31)
 
-`omarroth/doubletake#76` is open with three commits (capture layer, parser tests, per-stream
-status), based on `main` at `5e2f1cb`, and the maintainer has said they are open to merging it.
-The fork branch `streaminfo-source` tracks the PR head, so a patched build can be rebuilt from it
-directly.
+`omarroth/doubletake#76` is open at `2b5f1b0` with four commits (capture layer, parser tests,
+per-stream status, and the optional-position/production-handoff follow-up), based on `main` at
+`5e2f1cb`. The maintainer has said they are open to merging it. The fork branch `streaminfo-source`
+tracks the PR head, so a patched build can be rebuilt from it directly. The follow-up was pushed
+as a descendant commit to preserve the reopened PR's history.
 
 ## What the patches do
 
@@ -32,11 +40,16 @@ directly.
 - covers both portal paths, because `PrepareCapture` is the single request site
 
 `vendor/doubletake/0002-status-report-selected-source.patch` (stacks on 0001)
-- `CapturePreparation.Source()` exposes the decoded source
+
+- `CapturePreparation.Source()` exposes the decoded, potentially partial metadata
 - `videoCaptureGroup` records it under the daemon mutex
 - `StreamInfo.Source` is reported as an optional `source` object in `ctl status`, read per stream
-  from that stream's own capture group and omitted when the portal reported no usable identity
-- `SourceInfo` serialises with lowercase keys (`type`, `width`, `height`, `x`, `y`)
+  from that stream's own capture group and omitted when no decoded type or usable size was reported
+- `SourceInfo` serialises with lowercase keys (`type`, `width`, `height`, `x`, `y`, `has_position`)
+- `HasPosition` is false for missing or malformed position and true for a valid coordinate pair,
+  including `(0,0)`; its JSON key is always present when `source` is present
+- documents the limits of source type and compositor coordinates; `OnSource` runs after portal
+  selection, before opening the PipeWire remote, so a callback does not prove setup succeeded
 
 `vendor/doubletake/0003-capability-tokens.patch` (stacks on 0001+0002)
 - adds `-capabilities`, printing a stable machine-readable token list (`capabilities-v1`, `status-source`) and
@@ -44,7 +57,7 @@ directly.
 
 ## How to build
 
-Requires Go >= 1.21 (verified with 1.27.3) and the GStreamer plugins the project already needs.
+Requires Go >= 1.25 (verified with 1.27.3) and the GStreamer plugins the project already needs.
 
 ```sh
 git clone https://github.com/omarroth/doubletake
@@ -58,21 +71,30 @@ go build -o "$HOME/.local/bin/doubletake-ctl" ./cmd/doubletake-ctl
 ```
 
 Re-verified 2026-10-31 against upstream `main` (`5e2f1cb`) with Go 1.27.3: all three patches apply
-cleanly to a clean clone, `go build ./...` OK, `go vet ./...` clean, and `go test -count=1 ./...`
-passes (`internal/airplay` 11.2 s, `internal/daemon` 13.1 s). The same tree is what PR #76 carries,
-except that the PR also includes the Go tests for the parser and for per-stream reporting; the
-vendored patches carry product code only.
+cleanly with strict whitespace checks to both that revision and `v0.5.0`; the patched tree passes
+`go build ./...`, `go vet ./...`, and `go test -count=1 ./...`. Its capture and daemon source files
+are byte-identical to PR #76 at `2b5f1b0`; patch 0003 adds the local capability advertisement.
+
+The PR additionally passes `go test -race -count=1 ./...` and includes the parser/status tests and
+three production-path integration tests. These exercise a private D-Bus portal through real
+capture preparation, group creation and status, using synthetic video at the GStreamer source
+boundary. They cover distinct groups, a joining stream retaining the original group's source,
+missing metadata, and known versus unknown position in status JSON. Disposable-copy mutations
+that drop the portal callback, preparation retention, accessor result, group storage or position
+availability all fail the integration tests. Those tests require `dbus-daemon` and GStreamer
+software-encoding/RTP elements and skip when dependencies are absent. The vendored patches carry
+product code only.
 
 ## Installed locally (this machine)
 
 Built from the three patches applied to upstream `main` with Go 1.27.3, matching PR #76 (fork
-branch `streaminfo-source`, commit `a97b835`), and installed ahead of the packaged binaries:
+branch `streaminfo-source`, commit `2b5f1b0`), and installed ahead of the packaged binaries:
 
 ```text
-/home/bin/doubletake       10549231 bytes   (patched; /usr/bin/doubletake is the packaged 6476312)
-/home/bin/doubletake-ctl    6943093 bytes
-/home/bin/doubletake.prev   10531487 bytes   the previous patched builds, kept for a one-command revert
-/home/bin/doubletake-ctl.prev 6924757 bytes
+/home/bin/doubletake       10552847 bytes   (patched; /usr/bin/doubletake is the packaged 6476312)
+/home/bin/doubletake-ctl    6942725 bytes
+/home/bin/doubletake.prev   10549231 bytes   the previous patched builds, kept for a one-command revert
+/home/bin/doubletake-ctl.prev 6943093 bytes
 /home/bin/airplay-linux    -> ~/.venvs/airplay-linux/bin/airplay-linux   (the application)
 ```
 
@@ -92,11 +114,9 @@ network namespace): the daemon logs `[daemon] listening on <path>`, `ctl status`
 removes the socket, `-capabilities` prints `capabilities-v1` and `status-source`, and `--help` is
 identical to the packaged build except its `Usage of <argv0>:` line and the `-capabilities` row.
 
-Because `--help` is otherwise unchanged and the probe normalises that `Usage of <argv0>:` line, the
-capability probe still resolves the patched build to profile `doubletake-0.5` with the same withheld flags.
-That is what the next section is about: the only difference the application could observe without
-`-capabilities` is the new `source` object in `ctl status`, and it does not read that yet, so a build
-has to advertise what it can do before the application will consume it.
+The help surface retains the packaged build's options plus `-capabilities`. Recognition uses both
+that help surface and the tokens, as described below. Reporting source metadata alone does not
+establish the physical-output guarantees required by Mirror mode.
 
 ## How the application recognises it
 
@@ -107,7 +127,7 @@ Recognition requires **both** halves, and neither alone is enough:
 - `doubletake -capabilities` must exit 0 and print `capabilities-v1` and `status-source`.
 
 When both hold the profile becomes `doubletake-0.5+source` with `source_reporting=True`. That flag states only that the
-build reports which display it captured. It deliberately does **not** set `physical_source`, `owner_handshake`,
+build reports portal source metadata per stream. It deliberately does **not** set `physical_source`, `owner_handshake`,
 `foreground_control` or `keyring`: reporting a source is not proving it is the physical monitor we asked for, and the
 verification that consumes the report belongs to the owned-daemon work, not to this patch.
 
@@ -116,10 +136,11 @@ closed, and tokens printed on a non-zero exit are ignored.
 
 ## What is still missing on our side
 
-The capability probe in `backend/contract.py` derives support from documented `--help` evidence only,
-and the administrative help text is unchanged by these patches. Until a patched build advertises the
-capability in a way the probe can verify, `physical_source` stays false and Mirror stays gated — that
-recognition step is task T1 of `owned-daemon-control-v2`, not something to assume.
+The profile recognises the reporting capability, but the application does not yet consume the
+per-stream `source` object. Verification must compare available metadata with compositor output
+identity and ownership, including rejection of the helper's own virtual outputs. `physical_source`
+stays false and Mirror stays gated until those checks are implemented; neither the capability
+token nor `IsMonitor()` is sufficient evidence.
 
 ## Licensing
 
