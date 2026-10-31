@@ -104,3 +104,23 @@ initial-publication/completion ordering and filename refusal (F-4, F-5), identit
 (F-6, F-7), encoder robustness and bounds (F-8, F-9), and test strength (F-10, F-11). F-11 also affects
 the analogous test in `tests/storage/test_repositories.py`, and its correction must use the real
 `build_runtime(..., overrides={'process': recorder})` entrypoint.
+
+## Receipts lane: fix round 1 returned NEEDS_CONTEXT (recorded after the second handoff write)
+
+The round-1 fixer refused rather than guessing, correctly: `F-11` requires the production
+composition seam `build_runtime(..., overrides={'process': recorder})`, which Task 1 introduced but
+which does not exist at the lane's original segment base `c597425` (T-001 was integrated afterwards).
+The task allowlist also excludes `src/airplay_linux/runtime.py`, so the fixer had no lawful way to
+supply the seam. Its report names the missing interface and the ownership conflict, and it changed
+nothing.
+
+PM action taken: the lane branch was rebased onto the current integration tip `da5d933` (clean; the
+lane's commit is now `8ff583d2126568209c1965105860fabbdba46c51`), so T-001's seam is present in the lane worktree and `F-11` is now
+implementable inside the existing allowlist (`tests/storage/test_launch_receipts.py`,
+`tests/storage/test_repositories.py`).
+
+SDD state is truthfully left at `FIX_RUNNING` revision 13 with one outstanding round-1 fix intent;
+`FIX_RUNNING` has no legal re-dispatch edge. To continue: record `fixer-blocked` with the reason
+'baseline lacked the composition seam' (or a recovery ruling), then either open attempt-2 from
+`da5d933` or re-run the fix intent against this rebased attempt. Do not resolve it by monkeypatching
+`build_runtime` — the proof must observe the real injected ProcessPort.
