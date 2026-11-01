@@ -273,45 +273,55 @@ async def test_phase_guard_blocks_eligible_production_launch(private_socket_root
     )
 
 
+@pytest.fixture
+def public_production_graph(recording_probe_processes, monkeypatch):
+    """Real composition and both witness legs, with final-port classification."""
+    c = recording_probe_processes
+    c.recorder = ProcessRecorder()
+    observe = c.outer.observe_invocation
+
+    def record(method, spec):
+        c.recorder._record(method, spec)
+        return observe(method, spec)
+
+    monkeypatch.setattr(c.outer, "observe_invocation", record)
+    return c
+
+
 @pytest.mark.asyncio
 async def test_missing_source_verifier_blocks_all_production_launches(
-    tmp_path, monkeypatch, offline_boundaries,
+    public_production_graph, monkeypatch,
 ):
-    recorder = ProcessRecorder()
-    root = tmp_path / "runtime"
-    root.mkdir(mode=0o700)
-    config = RuntimeConfig(state_root=tmp_path / "state", runtime_root=root, live=False)
-    proof_calls = []
-
-    async def should_not_run():
-        proof_calls.append(True)
-        raise AssertionError("credential proof ran before source verification")
-
+    c = public_production_graph
     original_installation = composition._install_owned_daemon_epoch
 
     def installation(config, *, process, launcher):
-        return replace(
-            original_installation(config, process=process, launcher=launcher),
-            source_verifier=None, credential_proof=should_not_run,
-        )
+        installed = original_installation(config, process=process, launcher=launcher)
+        assert process is c.outer and callable(installed.credential_proof)
+        assert installed.source_verifier is not None
+        return replace(installed, source_verifier=None)
 
     monkeypatch.setattr(composition, "_install_owned_daemon_epoch", installation)
-    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/fake/unshare")
-
-    result = await build_runtime(config, overrides={"process": recorder})
-    assert isinstance(result, Ok)
-    runtime = result.value
+    runtime = await c.build_complete_production_and_probe()
     try:
+        assert runtime.registry._process is c.outer
         assert runtime.gated["owned_daemon_control"] == "source verifier"
-        refused = await runtime.registry.ensure()
-        assert isinstance(refused, Err)
-        assert refused.error.code is ErrorCode.dependency_incompatible
+        assert runtime.deps.transport._features.physical_source is False
+        for attempt in (runtime.registry.ensure, runtime.deps.restart_daemon):
+            refused = await attempt()
+            assert isinstance(refused, Err)
+            assert refused.error.code is ErrorCode.dependency_incompatible
     finally:
         await runtime.shutdown()
 
-    assert proof_calls == []
-    assert not any(event.method == "spawn" for event in recorder.observations)
-    assert recorder.events("outer_namespace") == []
+    assert c.events == ["derive", "registry"]
+    assert c.outer_unshare == [] and c.inner_launches == []
+    assert c.recorder.events("outer_namespace") == []
+    assert c.recorder.events("direct_backend") == []
+    assert not any(event.method == "spawn" for event in c.recorder.observations)
+    assert c.inner.invocations == []
+    for kind in ("help_observation", "version_observation", "capability_observation"):
+        assert c.recorder.events(kind)
 
 
 @pytest.mark.asyncio
@@ -329,16 +339,14 @@ async def test_missing_source_verifier_blocks_all_production_launches(
     ],
 )
 async def test_each_missing_activation_element_blocks_launch(
-    tmp_path, monkeypatch, offline_boundaries, missing, label,
+    public_production_graph, monkeypatch, missing, label,
 ):
-    recorder = ProcessRecorder()
-    root = tmp_path / "runtime"
-    root.mkdir(mode=0o700)
-    config = RuntimeConfig(state_root=tmp_path / "state", runtime_root=root, live=False)
+    c = public_production_graph
     original_installation = composition._install_owned_daemon_epoch
 
     def installation(config, *, process, launcher):
         installed = original_installation(config, process=process, launcher=launcher)
+        assert process is c.outer
         if missing == "owned_daemon_control":
             monkeypatch.setattr(type(launcher), "available", lambda self: False)
             return installed
@@ -346,14 +354,21 @@ async def test_each_missing_activation_element_blocks_launch(
         return replace(installed, **{missing: value})
 
     monkeypatch.setattr(composition, "_install_owned_daemon_epoch", installation)
-    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/fake/unshare")
-
-    result = await build_runtime(config, overrides={"process": recorder})
-    assert isinstance(result, Ok)
-    runtime = result.value
+    runtime = await c.build_complete_production_and_probe()
     try:
         assert runtime.gated["owned_daemon_control"] == label
+        if missing == "source_verifier":
+            assert runtime.deps.transport._features.physical_source is False
+        for attempt in (runtime.registry.ensure, runtime.deps.restart_daemon):
+            refused = await attempt()
+            assert isinstance(refused, Err) and refused.error.code is ErrorCode.dependency_incompatible
     finally:
         await runtime.shutdown()
-    assert not any(event.method == "spawn" for event in recorder.observations)
-    assert recorder.events("outer_namespace") == []
+    assert c.events == ["derive", "registry"]
+    assert c.outer_unshare == [] and c.inner_launches == []
+    assert not c.outer.spawned and c.inner.invocations == []
+    assert not any(event.method == "spawn" for event in c.recorder.observations)
+    assert c.recorder.events("outer_namespace") == []
+    assert c.recorder.events("direct_backend") == []
+    for kind in ("help_observation", "version_observation", "capability_observation"):
+        assert c.recorder.events(kind)
