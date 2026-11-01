@@ -264,6 +264,328 @@ def _source_status(receiver, source):
     ))
 
 
+async def _drain_transport():
+    for _ in range(20):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("incomplete", ["other_target", "absent_source", "duplicate_target", "wrong_reply", "read_error"])
+async def test_reported_source_waits_for_exact_target_evidence(tmp_path, incomplete):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    observations = {
+        "other_target": _source_status(h.b, source),
+        "absent_source": _source_status(h.a, None),
+        "duplicate_target": Ok(value=replace(
+            _source_status(h.a, source).value,
+            streams=_source_status(h.a, source).value.streams * 2,
+        )),
+        "wrong_reply": Ok(value=AckReply(operation="status")),
+        "read_error": Err(error=diagnostic(ErrorCode.transport_failed)),
+    }
+    h.control.results[BackendOperation.status].extend([
+        observations[incomplete], _source_status(h.a, source),
+    ])
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 1
+    assert not pending.done()
+    assert verifier.calls == []
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+
+    h.scheduler.advance(0.099)
+    await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 1
+    h.scheduler.advance(0.001)
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    assert len(h.control.calls(BackendOperation.status)) == 2
+    assert verifier.calls == [("DP-1", source)]
+    assert any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+async def test_reported_source_wait_has_one_five_second_deadline(tmp_path):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].extend(
+        _source_status(h.b, source) if index % 2 else _source_status(h.a, None)
+        for index in range(60)
+    )
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 1
+    assert not pending.done()
+
+    for _ in range(49):
+        h.scheduler.advance(0.1)
+        await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 50
+    assert not pending.done()
+
+    h.scheduler.advance(0.1)
+    await _drain_transport()
+    assert pending.done()
+    result = await pending
+
+    assert_error(result, ErrorCode.unsupported_source)
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert len(h.control.calls(BackendOperation.status)) == 50
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert h.transport._streams == {}
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocked", ["status", "verifier"])
+@pytest.mark.parametrize("expiry", ["scheduler", "late_reply"])
+async def test_reported_source_deadline_bounds_inflight_observation(tmp_path, blocked, expiry):
+    gate = Gate()
+
+    class WaitingVerifier(SourceVerifier):
+        async def verify(self, requested, reported):
+            await gate.wait()
+            return await super().verify(requested, reported)
+
+    verifier = WaitingVerifier() if blocked == "verifier" else SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    if blocked == "status":
+        h.control.gates[(BackendOperation.status, None)] = gate
+    else:
+        h.control.results[BackendOperation.status].append(_source_status(
+            h.a, BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+        ))
+    pending = asyncio.create_task(h.start())
+    await gate.entered.wait()
+    h.scheduler.advance(4.9)
+    await _drain_transport()
+    assert not pending.done()
+    if expiry == "scheduler":
+        h.scheduler.advance(0.1)
+    else:
+        h.clock.advance(0.1)
+        gate.release(_source_status(
+            h.a, BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+        ))
+    await _drain_transport()
+    assert pending.done()
+
+    assert_error(await pending, ErrorCode.unsupported_source)
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert h.transport._streams == {}
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+async def test_reported_source_deadline_starts_after_connect_acknowledgement(tmp_path):
+    h = Harness(
+        tmp_path, source_verifier=SourceVerifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    connect = h.control.gates[(BackendOperation.connect, h.a.receiver_id)] = Gate()
+    status = h.control.gates[(BackendOperation.status, None)] = Gate()
+    pending = asyncio.create_task(h.start())
+    await connect.entered.wait()
+    h.scheduler.advance(4.0)
+    connect.release()
+    await status.entered.wait()
+
+    h.scheduler.advance(4.9)
+    await _drain_transport()
+    assert not pending.done()
+    h.scheduler.advance(0.1)
+    await _drain_transport()
+    assert pending.done()
+
+    assert_error(await pending, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+
+
+@pytest.mark.asyncio
+async def test_reported_source_deadline_does_not_reset_after_incomplete_reads(tmp_path):
+    verified = Gate()
+
+    class WaitingVerifier(SourceVerifier):
+        async def verify(self, requested, reported):
+            await verified.wait()
+            return await super().verify(requested, reported)
+
+    h = Harness(
+        tmp_path, source_verifier=WaitingVerifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    h.control.results[BackendOperation.status].extend([
+        _source_status(h.a, None), _source_status(h.b, None),
+        _source_status(h.a, BackendSource(type=1, width=1920, height=1080, x=0, y=0)),
+    ])
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    h.scheduler.advance(0.1)
+    await _drain_transport()
+    h.scheduler.advance(0.1)
+    await verified.entered.wait()
+
+    # A completion at the original deadline is too late even if its timeout
+    # callback has not run yet; the two reads must not replenish the budget.
+    h.clock.advance(4.8)
+    verified.release()
+    assert_error(await pending, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.status)) == 3
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+async def test_reported_source_wall_deadline_does_not_restart_after_a_read(tmp_path, monkeypatch):
+    loop = asyncio.get_running_loop()
+    timers = []
+
+    def call_later(delay, callback):
+        timer = loop.call_at(loop.time() + delay, callback)
+        timers.append((delay, callback, timer))
+        return timer
+
+    monkeypatch.setattr(loop, "call_later", call_later)
+    h = Harness(
+        tmp_path, source_verifier=SourceVerifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    status = h.control.gates[(BackendOperation.status, None)] = Gate()
+    pending = asyncio.create_task(h.start())
+    await status.entered.wait()
+    assert [timer[0] for timer in timers] == [5.0, 5.0]
+    source_expire = timers[1][1]
+    h.scheduler.advance(2.0)
+    status.release(_source_status(h.a, None))
+    await _drain_transport()
+    h.scheduler.advance(0.1)
+    await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 2
+    assert len(timers) == 2
+    assert timers[0][2].cancelled()
+    assert not timers[1][2].cancelled()
+    assert not pending.done()
+
+    # Drive the single wall expiration while injected time is still at 22.1.
+    source_expire()
+    assert_error(await pending, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_result", ["absent", "mismatch"])
+@pytest.mark.parametrize("cleanup", ["confirmed", "rejected", "timeout"])
+async def test_unverified_source_cleanup_precedence_retains_exact_obligation(tmp_path, source_result, cleanup):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].append(_source_status(h.b, source))
+    b = await h.handle(h.b, ctx=context(lease=2))
+    h.events.clear()
+    if source_result == "mismatch":
+        verifier.result = Err(error=diagnostic(ErrorCode.unsupported_source))
+    h.control.results[BackendOperation.status].append(
+        _source_status(h.a, source if source_result == "mismatch" else None),
+    )
+    if cleanup == "rejected":
+        h.control.results[BackendOperation.disconnect].append(
+            Err(error=diagnostic(ErrorCode.transport_failed)),
+        )
+    elif cleanup == "timeout":
+        disconnect = h.control.gates[(BackendOperation.disconnect, h.a.receiver_id)] = Gate()
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    if source_result == "absent":
+        assert not pending.done()
+        h.scheduler.advance(5.0)
+        await _drain_transport()
+    if cleanup == "timeout":
+        await asyncio.wait_for(disconnect.entered.wait(), timeout=1.0)
+        assert not pending.done()
+        h.scheduler.advance(5.0)
+        await _drain_transport()
+        assert pending.done()
+
+    result = await pending
+    assert_error(result, ErrorCode.unsupported_source if cleanup == "confirmed" else ErrorCode.cleanup_timeout)
+    calls = h.control.calls(BackendOperation.disconnect)
+    assert len(calls) == 1
+    assert calls[0]["target"]["receiver_id"] == h.a.receiver_id
+    assert h.b.receiver_id in h.control.connected
+    assert h.transport._streams[b.lease_id].handle == b
+    assert (context().transport_lease_id in h.transport._streams) is (cleanup != "confirmed")
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    if cleanup == "timeout":
+        disconnect.release()
+        await _drain_transport()
+        assert h.control.connected == {h.b.receiver_id}
+        assert context().transport_lease_id not in h.transport._streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalidated", ["cancelled", "replacement"])
+async def test_late_source_verification_cannot_publish_an_invalidated_start(tmp_path, invalidated):
+    verified = Gate()
+
+    class WaitingVerifier(SourceVerifier):
+        async def verify(self, requested, reported):
+            await verified.wait()
+            return await super().verify(requested, reported)
+
+    h = Harness(
+        tmp_path, source_verifier=WaitingVerifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    h.control.results[BackendOperation.status].append(_source_status(
+        h.a, BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+    ))
+    pending = asyncio.create_task(h.start())
+    await verified.entered.wait()
+    if invalidated == "cancelled":
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+    else:
+        replacement = target("replacement")
+        h.admit(replacement)
+    verified.release()
+    await _drain_transport()
+
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    if invalidated == "cancelled":
+        assert len(h.control.calls(BackendOperation.disconnect)) == 1
+        assert h.control.connected == set()
+    else:
+        assert_error(await pending, ErrorCode.cleanup_timeout)
+        assert h.control.calls(BackendOperation.disconnect) == []
+        assert context().transport_lease_id in h.transport._streams
+
+
 @pytest.mark.asyncio
 async def test_physical_stream_requires_fresh_backend_source_verification(tmp_path):
     verifier = SourceVerifier()
@@ -688,17 +1010,66 @@ async def test_cancelled_start_before_capture_finishes_cannot_acquire_backend_re
 
 
 @pytest.mark.asyncio
-async def test_connect_acceptance_without_streaming_does_not_claim_video_readiness(tmp_path):
+@pytest.mark.parametrize("state", [None, "idle", "discovering", "connecting", "pin_required"])
+@pytest.mark.parametrize("cleanup", ["confirmed", "rejected", "timeout"])
+async def test_connect_acceptance_without_streaming_does_not_claim_video_readiness(tmp_path, state, cleanup):
     h = Harness(tmp_path)
+    b = await h.handle(h.b, ctx=context(lease=2))
+    h.events.clear()
     h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
-        operation="connect", target=h.a.canonical_host, state="connecting",
+        operation="connect", target=h.a.canonical_host, state=state,
     )))
-    result = await h.start()
-    assert isinstance(result, Ok)
+    # Queued replies replace the fake's effects; model the possible acquisition.
+    h.control.connected.add(h.a.receiver_id)
+    if cleanup == "rejected":
+        h.control.results[BackendOperation.disconnect].append(
+            Err(error=diagnostic(ErrorCode.transport_failed)),
+        )
+    elif cleanup == "timeout":
+        gate = h.control.gates[(BackendOperation.disconnect, h.a.receiver_id)] = Gate()
+
+    pending = asyncio.create_task(h.start())
+    if cleanup == "timeout":
+        await asyncio.wait_for(gate.entered.wait(), timeout=1.0)
+        h.scheduler.advance(5.0)
+        await _drain_transport()
+        assert pending.done()
+    result = await pending
+
+    assert_error(result, ErrorCode.unsupported_source if cleanup == "confirmed" else ErrorCode.cleanup_timeout)
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    calls = h.control.calls(BackendOperation.disconnect)
+    assert len(calls) == 1
+    assert calls[0]["target"]["receiver_id"] == h.a.receiver_id
+    assert calls[0]["target"]["canonical_host"] == h.a.canonical_host
+    assert calls[0]["target"]["endpoint_generation"] == h.a.endpoint_generation
+    assert h.b.receiver_id in h.control.connected
+    assert h.transport._streams[b.lease_id].handle == b
+    assert (context().transport_lease_id in h.transport._streams) is (cleanup != "confirmed")
+    assert not any(h.control.calls(operation) for operation in (
+        BackendOperation.begin_pairing, BackendOperation.submit_pairing,
+    ))
+    if cleanup == "timeout":
+        gate.release()
+        await _drain_transport()
+        assert h.control.connected == {h.b.receiver_id}
+        assert context().transport_lease_id not in h.transport._streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ready", [False, True])
+async def test_audio_start_refusal_preserves_its_failure_event(tmp_path, ready):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    # Preserve the old test's pre-ready audio branch without admitting an
+    # unconfirmed connect through the public start API.
+    h.transport._streams[handle.lease_id].ready = ready
     h.control.results[BackendOperation.start_audio].append(Err(error=diagnostic(ErrorCode.audio_denied)))
-    assert_error(await h.transport.start_audio(result.value, context()), ErrorCode.audio_denied)
-    assert h.events[-1].kind is TransportEventKind.audio_start_failed
+    assert_error(await h.transport.start_audio(handle, context()), ErrorCode.audio_denied)
+    if ready:
+        assert h.events[-1].kind is TransportEventKind.audio_failed
+    else:
+        assert h.events[-1].kind is TransportEventKind.audio_start_failed
 
 
 @pytest.mark.asyncio

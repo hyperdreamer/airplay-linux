@@ -50,6 +50,8 @@ if TYPE_CHECKING:
 
 
 CONTROL_TIMEOUT = 5.0
+SOURCE_TIMEOUT = 5.0
+SOURCE_POLL_INTERVAL = 0.1
 SHUTDOWN_TIMEOUT = 15.0
 
 
@@ -415,12 +417,15 @@ class DoubleTakeTransport:
         task.add_done_callback(finished)
         return task
 
-    async def _wait(self, task: asyncio.Task, code: ErrorCode, abandon=None, *, timeout=CONTROL_TIMEOUT):
+    async def _wait(
+        self, task: asyncio.Task, code: ErrorCode, abandon=None, *, timeout=CONTROL_TIMEOUT,
+        timeout_until: asyncio.Future | None = None,
+    ):
         loop = asyncio.get_running_loop()
         deadline = loop.create_future()
 
         def expired():
-            if task.done() or deadline.done():
+            if task.done() or deadline.done() or (timeout_until is not None and timeout_until.done()):
                 return
             if abandon is not None:
                 abandon()
@@ -429,8 +434,17 @@ class DoubleTakeTransport:
         scheduled = self._scheduler.call_at(self._clock.now() + timeout, expired)
         realtime = loop.call_later(timeout, expired)
         try:
-            done, _ = await asyncio.wait((task, deadline), return_when=asyncio.FIRST_COMPLETED)
-            return task.result() if task in done else _failure(code)
+            waiting = (task, deadline) if timeout_until is None else (task, deadline, timeout_until)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            if deadline in done:
+                return _failure(code)
+            # Connect has answered. Its admission timer must not preempt the
+            # bounded source wait or the exact-target cleanup that now owns time.
+            scheduled.cancel()
+            realtime.cancel()
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             if abandon is not None:
                 abandon()
@@ -439,6 +453,8 @@ class DoubleTakeTransport:
             scheduled.cancel()
             realtime.cancel()
             deadline.cancel()
+            if timeout_until is not None and not timeout_until.done():
+                timeout_until.cancel()
 
     def _current(self, target: ReceiverTarget, context: OperationContext) -> Result[None]:
         checked = self._targets.require_current(target)
@@ -610,7 +626,8 @@ class DoubleTakeTransport:
             audio=AudioState.Starting if audio_policy.enabled else AudioState.Disabled,
         )
         self._streams[lease] = stream
-        acquisition = self._spawn(self._start(stream))
+        connected = asyncio.get_running_loop().create_future()
+        acquisition = self._spawn(self._start(stream, connected))
 
         def abandon() -> None:
             stream.abandoned = True
@@ -620,7 +637,9 @@ class DoubleTakeTransport:
             if acquisition.done() and stream.handle is not None and not stream.released:
                 self._spawn(self._abandon_completed(stream))
 
-        return await self._wait(acquisition, ErrorCode.transport_failed, abandon)
+        return await self._wait(
+            acquisition, ErrorCode.transport_failed, abandon, timeout_until=connected,
+        )
 
     async def _abandon_completed(self, stream: _Stream) -> Result[None]:
         cleaned = await self._stop_owned(stream, stream.context)
@@ -642,26 +661,60 @@ class DoubleTakeTransport:
         daemon = stream.daemon
         if daemon is None or not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.stale_event)
-        status = await _safe(
-            daemon.control.request(
-                BackendOperation.status, None, EmptyPayload(), None,
-            ),
-            ErrorCode.unsupported_source,
-        )
-        if isinstance(status, Err) or not isinstance(status.value, StatusReply):
-            return _failure(ErrorCode.unsupported_source)
-        matches = tuple(
-            item for item in status.value.streams
-            if item.target == stream.target.canonical_host
-        )
-        if len(matches) != 1:
-            return _failure(ErrorCode.unsupported_source)
+        deadline = self._clock.now() + SOURCE_TIMEOUT
+        polling = self._spawn(self._poll_reported_source(stream, deadline))
         try:
-            return await verifier.verify(stream.source.connector, matches[0].source)
-        except Exception:
-            return _failure(ErrorCode.unsupported_source)
+            return await self._wait(polling, ErrorCode.unsupported_source, timeout=SOURCE_TIMEOUT)
+        finally:
+            # Status and inventory reads confer no acquisition authority. Retire
+            # the poll on expiry so a late reply cannot publish or start a poll.
+            if not polling.done():
+                polling.cancel()
 
-    async def _start(self, stream: _Stream) -> Result[StreamHandle]:
+    async def _poll_reported_source(self, stream: _Stream, deadline: float) -> Result[None]:
+        loop = asyncio.get_running_loop()
+        while self._clock.now() < deadline:
+            daemon = stream.daemon
+            if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
+                return _failure(ErrorCode.stale_event)
+            checked = self._current(stream.target, stream.context)
+            if isinstance(checked, Err):
+                return checked
+            status = await _safe(
+                daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
+                ErrorCode.unsupported_source,
+            )
+            if self._clock.now() >= deadline:
+                break
+            if isinstance(status, Ok) and isinstance(status.value, StatusReply):
+                matches = tuple(
+                    item for item in status.value.streams
+                    if item.target == stream.target.canonical_host
+                )
+                if len(matches) == 1 and matches[0].source is not None:
+                    verified = await _safe(
+                        self._source_verifier.verify(stream.source.connector, matches[0].source),
+                        ErrorCode.unsupported_source,
+                    )
+                    return verified if self._clock.now() < deadline else _failure(ErrorCode.unsupported_source)
+            # Every read shares the same absolute deadline; incomplete or foreign
+            # observations cannot extend it or certify the requested connector.
+            wake = loop.create_future()
+
+            def tick():
+                if not wake.done():
+                    wake.set_result(None)
+
+            scheduled = self._scheduler.call_at(
+                min(self._clock.now() + SOURCE_POLL_INTERVAL, deadline), tick,
+            )
+            try:
+                await wake
+            finally:
+                scheduled.cancel()
+        return _failure(ErrorCode.unsupported_source)
+
+    async def _start(self, stream: _Stream, connected: asyncio.Future) -> Result[StreamHandle]:
         if isinstance(stream.source, PhysicalMonitorSource):
             verified = await _safe(self._capture.verify(stream.source), ErrorCode.unsupported_source)
             if isinstance(verified, Err):
@@ -688,6 +741,8 @@ class DoubleTakeTransport:
             result = await self._request(
                 stream.daemon, BackendOperation.connect, stream.target, ConnectPayload(), stream.context,
             )
+            if not connected.done():
+                connected.set_result(None)
             if isinstance(result, Err) and result.error.code in (
                 ErrorCode.receiver_rejected, ErrorCode.unsupported_source,
                 ErrorCode.unsupported_operation,
@@ -696,18 +751,25 @@ class DoubleTakeTransport:
                 return self._failed(stream, result)
             checked = self._current(stream.target, stream.context)
             if _ack(result, BackendOperation.connect, stream.target) and isinstance(checked, Ok) and not stream.abandoned and stream.daemon.alive:
-                source_checked = (
-                    await self._verify_reported_source(stream)
-                    if isinstance(stream.source, PhysicalMonitorSource)
-                    else Ok(value=None)
-                )
-                if isinstance(source_checked, Err):
-                    failure = source_checked
+                if result.value.state != "streaming":
+                    failure = _failure(ErrorCode.unsupported_source)
                 else:
-                    stream.ready = result.value.state == "streaming"
-                    if stream.ready:
+                    source_checked = (
+                        await self._verify_reported_source(stream)
+                        if isinstance(stream.source, PhysicalMonitorSource)
+                        else Ok(value=None)
+                    )
+                    checked = self._current(stream.target, stream.context)
+                    if isinstance(source_checked, Err):
+                        failure = source_checked
+                    elif isinstance(checked, Err):
+                        failure = checked
+                    elif stream.abandoned or not stream.daemon.alive:
+                        failure = _failure(ErrorCode.stale_event)
+                    else:
+                        stream.ready = True
                         self._emit(stream, TransportEventKind.ready)
-                    return Ok(value=stream.handle)
+                        return Ok(value=stream.handle)
             else:
                 failure = result if isinstance(result, Err) else (
                     checked if isinstance(checked, Err) else _failure(
@@ -716,7 +778,9 @@ class DoubleTakeTransport:
                 )
         # Source provenance is local verification plus the affirmed feature;
         # the exact request ack supplies connect acceptance only.
-        cleaned = await self._stop_owned(stream, stream.context)
+        cleaned = await self._wait(
+            self._spawn(self._stop_owned(stream, stream.context)), ErrorCode.cleanup_timeout,
+        )
         return self._failed(stream, cleaned if isinstance(cleaned, Err) else failure)
 
     def _owned(self, handle: StreamHandle, context: OperationContext | None = None) -> Result[_Stream]:
