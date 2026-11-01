@@ -269,13 +269,16 @@ class BackendControl(Protocol):
         target: ReceiverTarget | None,
         payload: BackendPayload,
         context: OperationContext | None,
+        *,
+        dispatch_fence: DispatchFence | None = None,
+        ownership_proof: OwnershipProof | None = None,
     ) -> Result[BackendReply]: ...
 
     def subscribe(self, callback: Callable[[BackendNotice], None]) -> Subscription: ...
 
     async def handshake(
         self, owner_token: SensitiveText | str, instance_uuid: InstanceId,
-    ) -> Result[Handshake]: ...
+    ) -> Result[Handshake | OwnershipProof]: ...
 
     async def close(self) -> None: ...
 
@@ -513,6 +516,9 @@ class UnsupportedControl:
         target: ReceiverTarget | None,
         payload: BackendPayload,
         context: OperationContext | None,
+        *,
+        dispatch_fence: DispatchFence | None = None,
+        ownership_proof: OwnershipProof | None = None,
     ) -> Result[BackendReply]:
         return _err(self._code)
 
@@ -538,6 +544,8 @@ class PublishedDoubletakeControl:
         *,
         timeout: float = 5.0,
         clock: Clock | None = None,
+        record: DaemonRecord | None = None,
+        authority: OwnershipAuthority | None = None,
     ) -> None:
         self._process = process
         self._profile = profile
@@ -546,6 +554,9 @@ class PublishedDoubletakeControl:
         self._closed = False
         self._callbacks: list[Callable[[BackendNotice], None]] = []
         self._handshake: Handshake | None = None
+        self._ownership_proof: OwnershipProof | None = None
+        self._record = record
+        self._authority = authority
 
     def subscribe(self, callback: Callable[[BackendNotice], None]) -> Subscription:
         self._callbacks.append(callback)
@@ -565,13 +576,20 @@ class PublishedDoubletakeControl:
                 # an untyped or secret-bearing failure.
                 continue
 
+    def _public_authority(self) -> bool:
+        return self._record is not None and self._authority is not None
+
     def _available(self, operation: BackendOperation) -> bool:
         features = self._profile.features
+        if (features.profile in {"doubletake-0.5", "doubletake-0.5+source"}
+                and features.owned_daemon_control and not self._public_authority()):
+            return False
         if operation in {BackendOperation.status, BackendOperation.discover, BackendOperation.devices}:
             return True
-        # A socket path is routing information, not an ownership proof.  Every
-        # operation that can mutate daemon state requires the independently
-        # authenticated handshake recorded by ``handshake``.
+        if features.profile in {"doubletake-0.5", "doubletake-0.5+source"}:
+            return self._public_authority() and self._authority.allows(operation)
+        if self._public_authority():
+            return self._authority.allows(operation)
         if not features.owner_handshake:
             return False
         if operation is BackendOperation.disconnect:
@@ -654,6 +672,18 @@ class PublishedDoubletakeControl:
         return value
 
     def _ownership_check(self, status: StatusReply) -> Result[None]:
+        if self._public_authority():
+            # Public status omits the legacy owner token, daemon identity,
+            # instance UUID, protocol and socket fields. Receipt-backed evidence
+            # supplies the binding; supplied legacy metadata is not authority.
+            if any(
+                value is not None for value in (
+                    status.owner_token, status.instance_uuid, status.daemon,
+                    status.socket_path, status.protocol_version,
+                )
+            ):
+                return _err(ErrorCode.ownership_mismatch)
+            return Ok(value=None)
         expected_owner = self._profile.owner_token
         expected_instance = self._profile.instance_uuid
         if expected_owner is not None:
@@ -689,8 +719,36 @@ class PublishedDoubletakeControl:
             BackendOperation.devices,
         }
 
-    async def _revalidate_ownership(self) -> Result[None]:
+    async def _public_prove(self) -> Result[OwnershipProof]:
+        if not self._public_authority():
+            return _err(ErrorCode.dependency_incompatible)
+        result = await self._authority.prove(self._record)
+        if isinstance(result, Err):
+            return result
+        if not isinstance(result.value, OwnershipProof) or result.value.kind != "evidence":
+            return _err(ErrorCode.ownership_mismatch)
+        return result
+
+    async def _revalidate_ownership(
+        self, operation: BackendOperation, target: ReceiverTarget | None,
+        fence: DispatchFence | None,
+    ) -> Result[OwnershipProof | None]:
         """Recheck the exact authenticated daemon before each mutation."""
+        if self._public_authority():
+            authorized = await self._authority.authorize(
+                self._record, operation, target, fence,
+            )
+            if isinstance(authorized, Err):
+                return authorized
+            proof = authorized.value
+            if not isinstance(proof, OwnershipProof) or proof.kind != "evidence":
+                return _err(ErrorCode.ownership_mismatch)
+            current = await self._authority.prove(self._record)
+            if isinstance(current, Err):
+                return current
+            if current.value != proof:
+                return _err(ErrorCode.stale_event)
+            return Ok(value=proof)
         handshake = self._handshake
         if handshake is None:
             return _err(ErrorCode.dependency_incompatible)
@@ -743,6 +801,7 @@ class PublishedDoubletakeControl:
         context: OperationContext | None,
         *,
         dispatch_fence: DispatchFence | None = None,
+        ownership_proof: OwnershipProof | None = None,
     ) -> Result[BackendReply]:
         """Dispatch one typed command against an already admitted target.
 
@@ -774,6 +833,16 @@ class PublishedDoubletakeControl:
         if not self._available(op):
             return _err(ErrorCode.dependency_incompatible)
 
+        read_proof: OwnershipProof | None = None
+        ownership: OwnershipProof | None = None
+        if not self._is_mutation(op) and self._public_authority():
+            proved = await self._public_prove()
+            if isinstance(proved, Err):
+                return proved
+            read_proof = proved.value
+            if ownership_proof is not None and ownership_proof != read_proof:
+                return _err(ErrorCode.stale_event)
+
         if self._is_mutation(op):
             # A required fence that is absent rejects before any I/O at all: an
             # unfenced target-addressed state change must not even run the
@@ -782,9 +851,12 @@ class PublishedDoubletakeControl:
             # because the wrapper reaches this method with ``None``.
             if requires_dispatch_fence(op) and dispatch_fence is None:
                 return _err(ErrorCode.dependency_incompatible)
-            ownership = await self._revalidate_ownership()
-            if isinstance(ownership, Err):
-                return ownership
+            ownership_result = await self._revalidate_ownership(op, target, dispatch_fence)
+            if isinstance(ownership_result, Err):
+                return ownership_result
+            ownership = ownership_result.value
+            if ownership_proof is not None and ownership != ownership_proof:
+                return _err(ErrorCode.stale_event)
             # Closing the dispatch window: no await may separate this
             # re-evaluation from the spawn below, so a replacement admitted
             # during the ownership query can never receive this command. Pairing
@@ -795,6 +867,13 @@ class PublishedDoubletakeControl:
                     return fenced
 
         process_result = await self._run(argv_result.value)
+        if self._public_authority():
+            proof = ownership if self._is_mutation(op) else read_proof
+            if proof is None:
+                return _err(ErrorCode.ownership_mismatch)
+            confirmed = await self._authority.confirm(self._record, proof)
+            if isinstance(confirmed, Err):
+                return confirmed
         if isinstance(process_result, Err):
             return process_result
         output = process_result.value
@@ -841,9 +920,15 @@ class PublishedDoubletakeControl:
 
     async def handshake(
         self, owner_token: SensitiveText | str, instance_uuid: InstanceId,
-    ) -> Result[Handshake]:
+    ) -> Result[Handshake | OwnershipProof]:
         if self._closed:
             return _err(ErrorCode.daemon_failed)
+        if self._public_authority():
+            proof = await self._public_prove()
+            if isinstance(proof, Err):
+                return proof
+            self._ownership_proof = proof.value
+            return proof
         if not self._profile.features.owner_handshake:
             return _err(ErrorCode.dependency_incompatible)
         if _secret_text(owner_token) is None or not isinstance(instance_uuid, UUID):
@@ -889,6 +974,7 @@ class PublishedDoubletakeControl:
     async def close(self) -> None:
         self._closed = True
         self._handshake = None
+        self._ownership_proof = None
         self._callbacks.clear()
 
 

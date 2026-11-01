@@ -43,31 +43,55 @@ and toolchain downloads disabled; it needs neither GStreamer nor a live backend.
 
 ## How to build
 
-Requires Go >= 1.21 (verified with 1.27.3) and the GStreamer plugins the project already needs.
+Requires Go >= 1.25 (verified with 1.27.3) and the GStreamer development libraries the project already needs.
 
 ```sh
 git clone https://github.com/omarroth/doubletake
 cd doubletake
-git checkout v0.5.0            # or main; both verified
+git checkout c896e3689ab85c3ed520e502308dedfbb5a4c221 # v0.5.0, activation rebuild base
 git apply /path/to/vendor/doubletake/0001-capture-report-selected-source.patch
 git apply /path/to/vendor/doubletake/0002-status-report-selected-source.patch
 git apply /path/to/vendor/doubletake/0003-capability-tokens.patch
-go build -o "$HOME/.local/bin/doubletake" ./cmd/doubletake
-go build -o "$HOME/.local/bin/doubletake-ctl" ./cmd/doubletake-ctl
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -o ./doubletake ./cmd/doubletake
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -o ./doubletake-ctl ./cmd/doubletake-ctl
 ```
 
-Verification performed when the patches were carried (Go 1.27.3):
-`go build ./...` OK, `go vet` clean, `go test -count=1 ./...` passes
-(`internal/airplay` 11.4 s, `internal/daemon` 13.4 s).
-The full-chain binary identity check is:
+Historical verification when the patches were carried (Go 1.27.3) recorded `go build ./...`,
+`go vet` and `go test -count=1 ./...` passing. For the activation rebuild, both commands above
+were executed successfully from a clean archive of the pinned base, applying each carried patch
+with `git apply --check` followed by `git apply` in 0001 → 0002 → 0003 order. No local source
+changes from the reference checkout were included. The activation build used Go 1.27.3 linux/amd64,
+`CGO_ENABLED=1`, `GOPROXY=off`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, cached modules in `/tmp/gopath`
+and GStreamer 1.28.8. Its identity check is:
 
 ```sh
-sha256sum "$HOME/.local/bin/doubletake" "$HOME/.local/bin/doubletake-ctl"
-"$HOME/.local/bin/doubletake" -capabilities
+sha256sum ./doubletake ./doubletake-ctl
+./doubletake -capabilities
 ```
 
 The expected capability output is exactly three lines, in order:
 `capabilities-v1`, `status-source`, `status-source-complete`.
+
+## Activation rebuild identity
+
+The actual rebuild artifacts are `/tmp/oe9-build-_ptfq1cr/doubletake` and
+`/tmp/oe9-build-_ptfq1cr/doubletake-ctl`. The build record is
+`/tmp/oe9-build-_ptfq1cr/identity.json`; these temporary verification artifacts were not installed.
+The immutable inputs and observed artifacts are:
+
+```text
+base v0.5.0 commit   c896e3689ab85c3ed520e502308dedfbb5a4c221
+0001 sha256         195038d392f41c263cba4533604d4d7c2a5fb8122ebb0bae87106d27b0e3b169
+0002 sha256         e10ff1d922f14f6ff7996d249264588b000942321dc5f66afce5d3269cc5ee80
+0003 sha256         482e7ec85940b35381686730ae248b491065bfc66d28ec449b62717e0d803567
+doubletake sha256   eabdf411c3882004780100e8b11ebb9fcf877e7c2cb1057047282d095c7fb8f6
+doubletake-ctl      c1b1f0e8069dbbb53237a68c9b0b30d3f0e018bc21cc5726ab36bc68b271304f
+```
+
+The rebuilt sender exited 0 with exactly the three capability lines above. This switch exits
+before daemon construction; verification launched no daemon, opened no control socket and
+contacted no receiver or session bus. Binary hashes identify this particular build; compiler and
+native library differences can change hashes in another environment.
 
 ## Installed locally (this machine)
 
@@ -79,9 +103,10 @@ The currently installed `/home/bin` binaries predate the third patch. Their reco
 ```
 
 They print only `capabilities-v1` and `status-source`, so they are intentionally **not** a valid
-full-chain installation. After rebuilding with all three patches, replace this block with the two
-new SHA-256 values from the identity command above and require all three capability lines before
-using Mirror mode.
+full-chain installation. This activation rebuilt and identified the full chain above; selecting
+those binaries for an operator installation remains a separate action. Require all three capability
+lines before using Mirror mode. The two currently installed file hashes were rechecked during
+activation and still match this block.
 
 `/home/bin` precedes `/usr/bin` on this account's `PATH`, so `doubletake` and `doubletake-ctl`
 now resolve to the patched builds **for this user**. The packaged files are untouched.
@@ -118,12 +143,25 @@ we asked for. The verifier consumes the report against one fresh KScreen invento
 An extra flag without the tokens fails closed, tokens without the matching surface fail closed, a partial token set fails
 closed, and tokens printed on a non-zero exit are ignored.
 
-## What is still missing on our side
+## Activation in the application
 
-The capability probe in `backend/contract.py` derives source-reporting support from the documented `--help`
-evidence and the complete three-token output. Until a patched build advertises the third token,
-`source_reporting_complete` and `physical_source` stay false and Mirror stays gated. A two-token installation is
-therefore deliberately refused even though it can still return a partial `source` object.
+The capability probe in `backend/contract.py` derives source-reporting support from the documented
+`--help` evidence and the complete three-token output. A two-token installation is deliberately
+refused even when it can return a partial `source` object.
+
+Production composition now installs receipt-backed `EvidenceAuthority`, shared root authority,
+strict pidfd teardown, the isolated credential-service witness and the fresh KScreen source verifier.
+Public transport admission uses `owned_daemon_control` and `keyring`; the fixture-only handshake
+contract remains separate. Mirror additionally requires `multi_target` and verified physical-source
+evidence. The selected target's source must match type, complete geometry and signed position before
+stream readiness, under the same five-second deadline as credential-challenge polling. Connect-time
+or status-time credential challenges disconnect only that target without pairing or prompting.
+
+These checks establish cooperative same-user ownership, not protection against a malicious process
+with the same UID. Missing, unreadable, conflicting or stale evidence refuses control/teardown and
+retains cleanup obligations. The activation verification used deterministic boundaries and did not
+claim a live receiver acceptance run. See the README for the complete refusal and residual-guarantee
+disclosure.
 
 ## Licensing
 

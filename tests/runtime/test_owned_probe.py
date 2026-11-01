@@ -1,4 +1,4 @@
-"""The installed production witness remains inert until the activation task."""
+"""The installed production witness remains inert when activation is disabled."""
 from __future__ import annotations
 
 from airplay_linux import runtime as composition
@@ -11,7 +11,6 @@ from tests.process.test_credential_probe import (  # shared offline boundaries, 
 
 async def test_installed_probe_stays_closed_before_activation(recording_probe_processes, monkeypatch):
     c = recording_probe_processes
-    assert composition._OWNED_DAEMON_EPOCH_ACTIVE is False
     installed = []
     original = composition._install_owned_daemon_epoch
 
@@ -19,7 +18,7 @@ async def test_installed_probe_stays_closed_before_activation(recording_probe_pr
         result = original(*args, **kwargs)
         assert all(getattr(result, member) is not None for member in (
             "source_verifier", "receipts", "endpoint_verifier", "strict_teardown",
-            "shared_authority", "credential_proof",
+            "shared_authority", "ownership", "credential_proof",
         ))
         installed.append(result)
         return result
@@ -27,6 +26,7 @@ async def test_installed_probe_stays_closed_before_activation(recording_probe_pr
     monkeypatch.setattr(composition, "_install_owned_daemon_epoch", observe)
     runtime = await c.build_complete_production_and_probe(activate=False)
     try:
+        assert composition._OWNED_DAEMON_EPOCH_ACTIVE is False
         assert len(installed) == 1
         assert c.outer_unshare == [] and c.inner_launches == []
         assert not c.outer.spawned

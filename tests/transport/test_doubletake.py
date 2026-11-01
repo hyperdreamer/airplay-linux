@@ -313,6 +313,60 @@ async def test_reported_source_waits_for_exact_target_evidence(tmp_path, incompl
 
 
 @pytest.mark.asyncio
+async def test_reported_source_credential_challenge(tmp_path):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    stream = BackendStream(
+        device="Receiver", target=h.a.canonical_host, state="pin_required",
+        has_audio=False, audio_muted=False, source=None,
+    )
+    h.control.results[BackendOperation.status].append(Ok(value=StatusReply(
+        state="pin_required", device="Receiver", target=h.a.canonical_host,
+        has_audio=False, audio_muted=False, needs_credential=True,
+        credential_kind="pin", streams=(stream,),
+    )))
+
+    result = await h.start()
+
+    assert_error(result, ErrorCode.dependency_incompatible)
+    assert verifier.calls == []
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert h.control.calls(BackendOperation.disconnect)[0]["target"]["receiver_id"] == h.a.receiver_id
+    assert h.transport._streams == {}
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+async def test_reported_source_foreign_credential_challenge(tmp_path):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    requested = _source_status(h.a, source).value
+    foreign = replace(
+        requested.streams[0], target=h.b.canonical_host,
+        state="pin_required", credential_kind="pin",
+    )
+    h.control.results[BackendOperation.status].append(Ok(value=replace(
+        requested, state="pin_required", target=h.b.canonical_host,
+        needs_credential=True, credential_kind="pin",
+        streams=(foreign, *requested.streams),
+    )))
+
+    result = await h.start()
+
+    assert isinstance(result, Ok), result
+    assert verifier.calls == [("DP-1", source)]
+    assert h.control.calls(BackendOperation.disconnect) == []
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("credential_kind", ["pin", "password"])
 @pytest.mark.parametrize("projected_target", ["requested", "other"])
 @pytest.mark.parametrize("cleanup", ["confirmed", "rejected", "timeout"])
@@ -416,6 +470,111 @@ async def test_reported_source_foreign_credential_challenge_does_not_refuse_requ
     assert verifier.calls == [("DP-1", source)]
     assert any(event.kind is TransportEventKind.ready for event in h.events)
     assert h.control.calls(BackendOperation.disconnect) == []
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_observation", ["source", "challenge"])
+async def test_source_and_challenge_share_one_post_connect_deadline(tmp_path, final_observation):
+    verifier = SourceVerifier()
+    h = Harness(tmp_path, source_verifier=verifier, physical_source=True, source_reporting_complete=True)
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    foreign = _source_status(h.b, source).value
+    foreign_challenge = Ok(value=replace(
+        foreign, state="pin_required", needs_credential=True, credential_kind="pin",
+        streams=(replace(foreign.streams[0], state="pin_required", credential_kind="pin"),),
+    ))
+    # Alternate incomplete requested evidence and another target's challenge.
+    # Neither observation establishes readiness or replenishes the original budget.
+    h.control.results[BackendOperation.status].extend(
+        _source_status(h.a, None) if index % 2 == 0 else foreign_challenge
+        for index in range(49)
+    )
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    for _ in range(48):
+        h.scheduler.advance(0.1)
+        await _drain_transport()
+    assert len(h.control.calls(BackendOperation.status)) == 49
+    late = h.control.gates[(BackendOperation.status, None)] = Gate()
+    h.scheduler.advance(0.1)
+    await _drain_transport()
+    assert late.entered.is_set() and not pending.done()
+    final = _source_status(h.a, source)
+    if final_observation == "challenge":
+        report = final.value
+        final = Ok(value=replace(
+            report, state="pin_required", needs_credential=True, credential_kind="pin",
+            streams=(replace(report.streams[0], state="pin_required", credential_kind="pin"),),
+        ))
+    # Let a reply return at the absolute deadline before delivering timer callbacks.
+    h.clock.advance(0.1)
+    late.release(final)
+    await _drain_transport()
+    assert pending.done(), "alternating source/challenge observations reset the shared deadline"
+    assert_error(await pending, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.status)) == 50
+    assert verifier.calls == []
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.transport._streams == {}
+    assert h.scheduler.pending() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["source", "ack_challenge", "status_challenge"])
+@pytest.mark.parametrize("cleanup", ["rejected", "timeout"])
+async def test_unconfirmed_start_disconnect_takes_cleanup_timeout_precedence(tmp_path, failure, cleanup):
+    verifier = SourceVerifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier, physical_source=True, source_reporting_complete=True,
+        owned_daemon_control=True,
+    )
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].append(_source_status(h.b, source))
+    b = await h.handle(h.b, ctx=context(lease=2))
+    h.events.clear()
+    verifier.calls.clear()
+    verifier.result = Err(error=diagnostic(ErrorCode.unsupported_source)) if failure == "source" else Ok(value=None)
+    if failure == "ack_challenge":
+        h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+            operation="connect", target=h.a.canonical_host, state="pin_required",
+        )))
+    else:
+        report = _source_status(h.a, source).value
+        if failure == "status_challenge":
+            report = replace(
+                report, state="pin_required", needs_credential=True, credential_kind="pin",
+                streams=(replace(report.streams[0], state="pin_required", credential_kind="pin"),),
+            )
+        h.control.results[BackendOperation.status].append(Ok(value=report))
+    h.control.connected.add(h.a.receiver_id)
+    if cleanup == "rejected":
+        h.control.results[BackendOperation.disconnect].append(Err(error=diagnostic(ErrorCode.transport_failed)))
+    else:
+        gate = h.control.gates[(BackendOperation.disconnect, h.a.receiver_id)] = Gate()
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    if cleanup == "timeout":
+        assert gate.entered.is_set() and not pending.done()
+        h.scheduler.advance(5.0)
+        await _drain_transport()
+    assert pending.done()
+    assert_error(await pending, ErrorCode.cleanup_timeout)
+    assert context().transport_lease_id in h.transport._streams
+    assert h.transport._streams[b.lease_id].handle == b
+    assert h.b.receiver_id in h.control.connected
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert h.control.calls(BackendOperation.disconnect)[0]["target"]["receiver_id"] == h.a.receiver_id
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert {call["operation"] for call in h.control.journal.calls("request")} <= {
+        BackendOperation.connect, BackendOperation.status, BackendOperation.disconnect,
+    }
+    if cleanup == "timeout":
+        gate.release()
+        await _drain_transport()
+        assert context().transport_lease_id not in h.transport._streams
+        assert h.control.connected == {h.b.receiver_id}
     assert h.scheduler.pending() == ()
 
 

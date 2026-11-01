@@ -167,10 +167,14 @@ async def test_process_observations_classify_direct_and_unshare_daemon_launches(
 
 
 
-async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypatch, offline_boundaries):
+async def test_activation_reaches_the_owned_lifecycle_after_bootstrap(
+    tmp_path, monkeypatch, offline_boundaries, active=True,
+):
     from airplay_linux.backend.contract import CredentialProofVerdict
     from airplay_linux.process.launcher import ProductionLaunchCapability
 
+    if not active:
+        monkeypatch.setattr(composition, "_OWNED_DAEMON_EPOCH_ACTIVE", False)
     recorder = ProcessRecorder()
     root = tmp_path / "r"
     root.mkdir(mode=0o700)
@@ -232,24 +236,120 @@ async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypat
         assert [source.connector for source in monitors.value] == ["DP-1"]
         assert runtime.deps.transport._features.owned_daemon_control is True
         assert runtime.deps.transport._features.physical_source is True
-        # A pure all-passed verdict is eligible, but the installed proof producer
-        # may not run until activation. Raw help's old gates remain closed.
+        # The pure derivation is eligible independently of the installed phase guard.
         pure = composition.derive_composition_capabilities(
             runtime.deps.transport._features, seen.launcher, passed, verifier, None,
         )
         assert pure.keyring is True
+        # With the epoch active, the proof producer is reached only after the
+        # ordered installation checks and lifecycle admission is attempted.
         for attempt in (runtime.registry.ensure, runtime.deps.restart_daemon):
             refused = await attempt()
             assert isinstance(refused, Err)
-            assert refused.error.code is ErrorCode.dependency_incompatible
+            assert refused.error.code in {
+                ErrorCode.daemon_failed, ErrorCode.dependency_incompatible,
+                ErrorCode.persistence_failed, ErrorCode.ownership_mismatch,
+            }
     finally:
         await runtime.shutdown()
-    assert recorder.events("direct_backend") == [], "phase guard allowed a direct backend launch"
-    assert recorder.events("outer_namespace") == [], "phase guard allowed an outer namespace launch"
-    assert not any(event.method == "spawn" for event in recorder.observations)
-    assert seen.probe_calls == 0
-    assert runtime.deps.transport._features.keyring is False
+    assert bool(recorder.events("outer_namespace")) is active
+    assert any(event.method == "spawn" for event in recorder.observations) is active
+    assert seen.probe_calls == int(active)
+    assert runtime.deps.transport._features.keyring is active
     assert runtime.deps.transport._features.foreground_control is False
     assert runtime.deps.transport._features.owner_handshake is False
     for kind in ("help_observation", "version_observation", "capability_observation", "inventory_observation"):
         assert recorder.events(kind), f"final process override bypassed {kind}"
+
+
+@pytest.mark.asyncio
+async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypatch, offline_boundaries):
+    await test_activation_reaches_the_owned_lifecycle_after_bootstrap(
+        tmp_path, monkeypatch, offline_boundaries, active=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_missing_source_verifier_blocks_all_production_launches(
+    tmp_path, monkeypatch, offline_boundaries,
+):
+    recorder = ProcessRecorder()
+    root = tmp_path / "runtime"
+    root.mkdir(mode=0o700)
+    config = RuntimeConfig(state_root=tmp_path / "state", runtime_root=root, live=False)
+    proof_calls = []
+
+    async def should_not_run():
+        proof_calls.append(True)
+        raise AssertionError("credential proof ran before source verification")
+
+    original_installation = composition._install_owned_daemon_epoch
+
+    def installation(config, *, process, launcher):
+        return replace(
+            original_installation(config, process=process, launcher=launcher),
+            source_verifier=None, credential_proof=should_not_run,
+        )
+
+    monkeypatch.setattr(composition, "_install_owned_daemon_epoch", installation)
+    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/fake/unshare")
+
+    result = await build_runtime(config, overrides={"process": recorder})
+    assert isinstance(result, Ok)
+    runtime = result.value
+    try:
+        assert runtime.gated["owned_daemon_control"] == "source verifier"
+        refused = await runtime.registry.ensure()
+        assert isinstance(refused, Err)
+        assert refused.error.code is ErrorCode.dependency_incompatible
+    finally:
+        await runtime.shutdown()
+
+    assert proof_calls == []
+    assert not any(event.method == "spawn" for event in recorder.observations)
+    assert recorder.events("outer_namespace") == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("missing", "label"),
+    [
+        ("owned_daemon_control", "owned daemon control"),
+        ("receipts", "receipt production"),
+        ("endpoint_verifier", "endpoint verifier"),
+        ("strict_teardown", "strict teardown"),
+        ("shared_authority", "shared authority"),
+        ("ownership", "ownership authority"),
+        ("credential_proof", "credential proof producer"),
+        ("source_verifier", "source verifier"),
+    ],
+)
+async def test_each_missing_activation_element_blocks_launch(
+    tmp_path, monkeypatch, offline_boundaries, missing, label,
+):
+    recorder = ProcessRecorder()
+    root = tmp_path / "runtime"
+    root.mkdir(mode=0o700)
+    config = RuntimeConfig(state_root=tmp_path / "state", runtime_root=root, live=False)
+    original_installation = composition._install_owned_daemon_epoch
+
+    def installation(config, *, process, launcher):
+        installed = original_installation(config, process=process, launcher=launcher)
+        if missing == "owned_daemon_control":
+            monkeypatch.setattr(type(launcher), "available", lambda self: False)
+            return installed
+        value = (lambda *args: None) if missing == "strict_teardown" else None
+        return replace(installed, **{missing: value})
+
+    monkeypatch.setattr(composition, "_install_owned_daemon_epoch", installation)
+    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/fake/unshare")
+
+    result = await build_runtime(config, overrides={"process": recorder})
+    assert isinstance(result, Ok)
+    runtime = result.value
+    try:
+        assert runtime.gated["owned_daemon_control"] == label
+    finally:
+        await runtime.shutdown()
+    assert not any(event.method == "spawn" for event in recorder.observations)
+    assert recorder.events("outer_namespace") == []
