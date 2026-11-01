@@ -16,22 +16,27 @@ import sys
 import time
 from collections import deque
 from collections.abc import Callable
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import AsyncIterator, Literal
 from uuid import UUID, uuid4
 
 from airplay_linux.backend.contract import BackendFeatures, StatusReply
 from airplay_linux.backend.control import (
-    BackendControl, BackendOperation, EmptyPayload, Handshake,
+    BackendControl, BackendOperation, EmptyPayload, Handshake, OwnershipAuthority,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.operations import InstanceId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import (
-    Clock, CommandSpec, DaemonStore, IdFactory, ProcessExit, ProcessPort, Scheduler, Subscription,
+    Clock, CommandSpec, DaemonCleanupIntentStore, DaemonStore, IdFactory,
+    LaunchReceiptStore, ProcessExit, ProcessPort, Scheduler, Subscription,
+    SupervisorReleaseIntentStore,
 )
-from airplay_linux.domain.records import DaemonRecord
+from airplay_linux.domain.records import AuthorityOwner, DaemonRecord, LaunchReceipt
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
+from airplay_linux.process.authority import AuthorityLease, SharedRootAuthority
+from airplay_linux.process.launcher import LaunchCapability
 from airplay_linux.process.procfs import (
     IdentityEvidence, IdentityState, OwnedProcessScan, owned_processes,
     read_identity, read_identity_evidence,
@@ -39,6 +44,10 @@ from airplay_linux.process.procfs import (
 from airplay_linux.process.supervisor import (
     TERMINATION_GRACE, config_pipe, module_environment, private_directory,
     socket_info, unlink_stale_socket,
+)
+from airplay_linux.storage import AtomicFiles, StorageError
+from airplay_linux.storage.repositories import (
+    JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore, JsonSupervisorReleaseIntentStore,
 )
 
 
@@ -103,6 +112,13 @@ class DaemonRegistry:
         restart_limit: int = 3, restart_window: float = 60.0,
         inspect_process: Callable[[int], IdentityEvidence] = read_identity_evidence,
         scan_owned: Callable[[UUID, str], OwnedProcessScan] = _scan_owned,
+        app_instance_uuid: InstanceId | None = None,
+        receipts: LaunchReceiptStore | None = None,
+        cleanup_intents: DaemonCleanupIntentStore | None = None,
+        supervisor_intents: Callable[[str], SupervisorReleaseIntentStore] | None = None,
+        authority: SharedRootAuthority | None = None,
+        launcher: LaunchCapability | None = None,
+        ownership: OwnershipAuthority | None = None,
     ) -> None:
         self.runtime_directory = Path(runtime_directory)
         self._record_root = Path(record_root) if record_root is not None else self.runtime_directory.parent
@@ -125,6 +141,30 @@ class DaemonRegistry:
         self._restart_window = restart_window
         self._inspect = inspect_process
         self._scan = scan_owned
+        # Inactive runtime composition may carry a public feature snapshot
+        # before its lifecycle installation. Missing seams gate admission; they
+        # must not prevent the deliberately dormant runtime from being built.
+        self._public_seams_complete = all(value is not None for value in (
+            app_instance_uuid, receipts, cleanup_intents, supervisor_intents,
+            authority, launcher, ownership,
+        ))
+        self._app_instance_uuid = app_instance_uuid if app_instance_uuid is not None else InstanceId(uuid4())
+        files = AtomicFiles(self._record_root)
+        self._receipts = receipts if receipts is not None else JsonLaunchReceiptStore(files)
+        self._cleanup_intents = cleanup_intents if cleanup_intents is not None else JsonDaemonCleanupIntentStore(files)
+        self._supervisor_intents = supervisor_intents if supervisor_intents is not None else (
+            lambda runtime: JsonSupervisorReleaseIntentStore(AtomicFiles(Path(runtime)))
+        )
+        self._authority = authority if authority is not None else SharedRootAuthority(
+            files, inspect_process=inspect_process,
+        )
+        self._launcher = launcher
+        self._ownership = ownership
+        self._instance_owner: AuthorityOwner | None = None
+        self._authority_lease: AuthorityLease | None = None
+        self._receipt_history: tuple[LaunchReceipt, ...] = ()
+        self._endpoint_generations: dict[tuple[str, str], int] = {}
+        self._current_receipts: dict[tuple[str, str], LaunchReceipt] = {}
         self._restarts: deque[float] = deque()
         self._has_launched = False
         self._record: DaemonRecord | None = None
@@ -171,8 +211,11 @@ class DaemonRegistry:
         return failure
 
     def _compatible(self) -> bool:
+        if self._features.owned_daemon_control and not self._public_seams_complete:
+            return False
         return (
-            self._features.foreground_control and self._features.owner_handshake
+            self._features.profile == 'application-contract-v1'
+            and self._features.foreground_control and self._features.owner_handshake
             and self._features.keyring
         )
 
@@ -182,10 +225,39 @@ class DaemonRegistry:
             self._restarts.popleft()
         return len(self._restarts) < self._restart_limit
 
-    async def ensure(self) -> Result[DaemonRecord]:
+    @asynccontextmanager
+    async def _operation(self) -> AsyncIterator[Result[AuthorityLease]]:
         async with self._lock:
+            if self._instance_owner is None:
+                boot = self._authority.boot_id()
+                if boot is None:
+                    yield self._cleanup_required(_error(ErrorCode.ownership_mismatch))
+                    return
+                self._instance_owner = AuthorityOwner(
+                    schema='airplay-linux/daemon-authority-owner/v1',
+                    instance_uuid=self._app_instance_uuid, app=self._app,
+                    boot_id=boot, acquired_at=self._clock.now(),
+                )
+            acquired = await self._authority.acquire(self._instance_owner)
+            if isinstance(acquired, Err):
+                yield self._cleanup_required(acquired)
+                return
+            self._authority_lease = acquired.value
+            try:
+                yield acquired
+            finally:
+                self._authority_lease = None
+                acquired.value.unlock()
+
+    async def ensure(self) -> Result[DaemonRecord]:
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
             if not self._compatible():
                 return _error(ErrorCode.dependency_incompatible)
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return self._cleanup_required(obligations)
             if self._record is not None and self._ready and not self._exited:
                 records = await self._store.all()
                 if isinstance(records, Err):
@@ -201,29 +273,35 @@ class DaemonRegistry:
                 return Ok(value=self._record)
             if self._has_launched and not self._budget_available():
                 return _error(ErrorCode.daemon_failed)
-            reconciled = await self._reconcile()
+            reconciled = await self._reconcile_locked()
             if isinstance(reconciled, Err):
                 return reconciled
             return await self._launch()
 
     async def reconcile_previous(self) -> Result[None]:
-        async with self._lock:
-            return await self._reconcile()
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            return await self._reconcile_locked()
 
     async def restart(self) -> Result[DaemonRecord]:
-        async with self._lock:
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
             if not self._compatible():
                 return _error(ErrorCode.dependency_incompatible)
             if self._has_launched and not self._budget_available():
                 return _error(ErrorCode.daemon_failed)
-            stopped = await self._reconcile()
+            stopped = await self._reconcile_locked()
             if isinstance(stopped, Err):
                 return stopped
             return await self._launch()
 
     async def shutdown(self) -> Result[None]:
-        async with self._lock:
-            return await self._reconcile()
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            return await self._reconcile_locked()
 
     async def _pause(self) -> None:
         if self._scheduler is None:
@@ -256,6 +334,9 @@ class DaemonRegistry:
                 return self._cleanup_required(_error(ErrorCode.stale_socket), record)
         except OSError:
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch), record)
+        published = await self._authority.publish_owner(self._instance_owner)
+        if isinstance(published, Err):
+            return self._cleanup_required(published, record)
         written = await self._store.write(record)
         if isinstance(written, Err):
             return self._cleanup_required(written, record)
@@ -423,16 +504,87 @@ class DaemonRegistry:
         except Exception:
             return _error(ErrorCode.ownership_mismatch)
 
-    async def _reconcile(self) -> Result[None]:
+    async def _receipt_obligations_locked(self) -> Result[None]:
+        """Derive history without granting public cleanup to the fixture path.
+
+        Public receipt lifecycle execution is installed separately. Until then,
+        an unresolved receipt or intent must not reach legacy token teardown.
+        """
+        receipts = await self._receipts.all()
+        if isinstance(receipts, Err):
+            return receipts
+        intents = await self._cleanup_intents.all()
+        if isinstance(intents, Err):
+            return intents
+        self._receipt_history = receipts.value
+        self._endpoint_generations = {}
+        self._current_receipts = {}
+        grouped: dict[tuple[str, str], list[LaunchReceipt]] = {}
+        for receipt in receipts.value:
+            grouped.setdefault((receipt.runtime_directory, receipt.socket_name), []).append(receipt)
+        for endpoint, history in grouped.items():
+            maximum = max(item.endpoint_generation for item in history)
+            self._endpoint_generations[endpoint] = maximum
+            current = tuple(item for item in history if item.state not in {'failed', 'stopped'})
+            if len(current) > 1 or (current and current[0].endpoint_generation != maximum):
+                return _error(ErrorCode.ownership_mismatch)
+            if current:
+                self._current_receipts[endpoint] = current[0]
+        if receipts.value or intents.value:
+            # These channels are never inferred absent from an empty legacy
+            # observation store. Their public stop/recovery writer owns them.
+            return _error(ErrorCode.ownership_mismatch)
+        return Ok(value=None)
+
+    async def _reconcile_locked(self) -> Result[None]:
+        if self._authority_lease is None or self._authority_lease._unlocked:
+            return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
+        obligations = await self._receipt_obligations_locked()
+        if isinstance(obligations, Err):
+            return self._cleanup_required(obligations)
         records = await self._store.all()
         if isinstance(records, Err):
             return self._cleanup_required(records)
+        if self._record is not None and not any(
+            r.instance_uuid == self._record.instance_uuid for r in records.value
+        ):
+            return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
+        # Inspect every supervisor channel before the first destructive action,
+        # including an otherwise unrecorded runtime directory.
+        runtimes = {str(self.runtime_directory), *(r.runtime_directory for r in records.value)}
+        for runtime in runtimes:
+            try:
+                intent = await self._supervisor_intents(runtime).read()
+            except (OSError, StorageError):
+                return self._cleanup_required(_error(ErrorCode.persistence_failed))
+            if isinstance(intent, Err):
+                return self._cleanup_required(intent)
+            if intent.value is not None:
+                return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         for record in records.value:
             result = await self._stop(record)
             if isinstance(result, Err):
                 return self._cleanup_required(result, record)
+        # Missing observations cannot prove that an endpoint has gone away.
+        # Never remove an unrecorded socket; retain the owner for recovery.
+        for runtime in runtimes:
+            try:
+                with private_directory(Path(runtime)) as descriptor:
+                    try:
+                        os.stat('daemon.sock', dir_fd=descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    return self._cleanup_required(_error(ErrorCode.stale_socket))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return self._cleanup_required(_error(ErrorCode.stale_socket))
         self._record = None
         self._ready = False
+        if self._authority.owner is not None:
+            cleared = await self._authority.clear_owner(self._authority_lease.owner)
+            if isinstance(cleared, Err):
+                return self._cleanup_required(cleared)
         return Ok(value=None)
 
     async def _stop(self, record: DaemonRecord) -> Result[None]:

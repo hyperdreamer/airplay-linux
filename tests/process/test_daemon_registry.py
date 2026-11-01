@@ -235,6 +235,18 @@ async def test_incompatible_backend_is_never_launched(harness):
 
 
 @run_async
+async def test_public_profile_with_fixture_flags_cannot_select_foreground_launch(harness):
+    h = harness
+    h.registry._features = replace(
+        FEATURES, profile='doubletake-0.5+source', owned_daemon_control=True,
+    )
+    result = await h.start()
+    assert isinstance(result, Err) and result.error.code is ErrorCode.dependency_incompatible
+    assert not h.process.spawned
+    assert not h.store.records
+
+
+@run_async
 async def test_failed_starting_publication_never_spawns(harness):
     harness.store.queue_result('write', Err(error=diagnostic(ErrorCode.persistence_failed)))
     result = await harness.start()
@@ -465,6 +477,185 @@ async def test_failed_launches_consume_restart_budget_and_success_does_not_reset
     h.process.fail_spawn = False
     assert isinstance(await h.start(), Ok)
     assert len(h.process.spawned) == 4
+
+
+@run_async
+@pytest.mark.parametrize('states', [
+    (('reserved', 1), ('ready', 1)),
+    (('reserved', 1), ('stopped', 2)),
+    (('failed', 4),),
+    (('ready', 3),),
+])
+async def test_receipt_obligations_block_legacy_cleanup_and_replacement(harness, states):
+    from types import SimpleNamespace
+    from airplay_linux.domain.records import LaunchReceipt
+
+    h = harness
+    started = await h.start()
+    assert isinstance(started, Ok)
+    r = started.value
+    receipts = []
+    for index, (state, generation) in enumerate(states):
+        receipts.append(LaunchReceipt(
+            schema_version=1, launch_uuid=UUID(int=index + 20),
+            instance_uuid=InstanceId(UUID(int=10)), app=APP, owner_uid=os.getuid(),
+            boot_id=h.registry._authority.boot_id(), runtime_directory=r.runtime_directory,
+            runtime_device=0, runtime_inode=1, endpoint_generation=generation,
+            socket_name='daemon.sock', protocol_version='v1', state=state,
+            daemon_instance_uuid=None if state == 'reserved' else r.instance_uuid,
+            supervisor=None if state == 'reserved' else SUPERVISOR,
+            daemon=None if state == 'reserved' else DAEMON,
+            entry_device=None, entry_inode=None, socket_inode=None,
+            peer_pid=None, peer_start_ticks=None, peer_uid=None,
+            status_state=None, credential_service='unknown',
+            failure=ErrorCode.daemon_failed if state == 'failed' else None, updated_at=1.0,
+        ))
+
+    async def all_receipts():
+        return Ok(value=tuple(receipts))
+
+    h.registry._receipts = SimpleNamespace(all=all_receipts)
+    before = (h.registry._record_root / 'daemon/authority.owner').read_bytes()
+    for operation in (h.registry.ensure, h.registry.restart, h.registry.shutdown):
+        refused = await operation()
+        assert isinstance(refused, Err)
+        assert not h.process.terminated
+        assert len(h.process.spawned) == 1
+        assert Path(r.socket_path).exists()
+        assert (h.registry._record_root / 'daemon/authority.owner').read_bytes() == before
+    assert h.notices[-1].kind == 'cleanup_required'
+
+
+@run_async
+async def test_supervisor_intent_without_receipt_is_retained_without_signals(harness):
+    from types import SimpleNamespace
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+
+    h = harness
+    started = await h.start()
+    assert isinstance(started, Ok)
+    intent = SupervisorReleaseIntent(
+        schema_version=1, launch_uuid=UUID(int=99), instance_uuid=InstanceId(UUID(int=10)),
+        app=APP, supervisor=SUPERVISOR, daemon=DAEMON,
+        reason='application-exited', intent_at=1.0,
+    )
+
+    async def read_intent():
+        return Ok(value=intent)
+
+    h.registry._supervisor_intents = lambda runtime: SimpleNamespace(read=read_intent)
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err)
+    assert not h.process.terminated
+    assert h.store.records
+    assert (h.registry._record_root / 'daemon/authority.owner').exists()
+
+
+@run_async
+async def test_missing_observation_does_not_clear_owner_or_abandon_live_daemon(harness):
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    h.store.records.clear()
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err) and refused.error.code is ErrorCode.ownership_mismatch
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    assert h.process.identity(DAEMON.pid) == DAEMON
+    assert (h.registry.runtime_directory / 'daemon.sock').exists()
+
+
+@run_async
+async def test_orphan_endpoint_retains_owner_without_an_observation(harness):
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    h.registry._record = None
+    h.store.records.clear()
+    refused = await h.registry.reconcile_previous()
+    assert isinstance(refused, Err) and refused.error.code is ErrorCode.stale_socket
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    assert (h.registry.runtime_directory / 'daemon.sock').exists()
+
+
+@run_async
+async def test_registry_exception_unlocks_and_retains_owner(harness):
+    import fcntl
+
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+
+    async def broken():
+        raise RuntimeError('injected store failure')
+
+    h.store.all = broken
+    with pytest.raises(RuntimeError, match='injected store failure'):
+        await h.registry.shutdown()
+    assert owner_path.read_bytes() == before
+    descriptor = os.open(owner_path.with_name('authority.lock'), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+    assert not h.process.terminated
+
+
+@run_async
+async def test_shutdown_acquires_once_and_cancellation_unlocks(harness):
+    import fcntl
+
+    h = harness
+    assert hasattr(h.registry, '_authority'), 'registry missing shared-root authority'
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    authority = h.registry._authority
+    acquire = authority.acquire
+    acquisitions = []
+
+    async def counted(instance):
+        acquisitions.append(instance)
+        return await acquire(instance)
+
+    authority.acquire = counted
+    entered = asyncio.Event()
+    all_records = h.store.all
+
+    async def paused():
+        entered.set()
+        await asyncio.Future()
+
+    h.store.all = paused
+    pending = asyncio.create_task(h.registry.shutdown())
+    await asyncio.wait_for(entered.wait(), 1.0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert len(acquisitions) == 1
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    descriptor = os.open(owner_path.with_name('authority.lock'), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+    h.store.all = all_records
+    acquisitions.clear()
+    h.process.keep_alive = True
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err)
+    assert len(acquisitions) == 1
+    assert owner_path.read_bytes() == before
+    h.process.keep_alive = False
+    acquisitions.clear()
+    assert await h.registry.shutdown() == Ok(value=None)
+    assert len(acquisitions) == 1
+    assert not owner_path.exists()
 
 
 @run_async
