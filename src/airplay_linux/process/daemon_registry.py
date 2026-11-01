@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import AsyncIterator, Literal
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from airplay_linux.backend.contract import BackendFeatures, StatusReply
 from airplay_linux.backend.control import (
@@ -126,6 +126,7 @@ class DaemonRegistry:
         ownership: OwnershipAuthority | None = None,
     ) -> None:
         self.runtime_directory = Path(runtime_directory)
+        self._configured_runtime = self.runtime_directory
         self._record_root = Path(record_root) if record_root is not None else self.runtime_directory.parent
         self._app = app if app is not None else read_identity(os.getpid())
         if self._app is None:
@@ -153,6 +154,13 @@ class DaemonRegistry:
             app_instance_uuid, receipts, cleanup_intents, supervisor_intents,
             authority, launcher, ownership,
         ))
+        if app_instance_uuid is None and features.profile == 'application-contract-v1':
+            # Delivered fixture compositions in one application may reopen the
+            # same failed launch through another registry. Their shared lease
+            # has the same application identity, independent of daemon IDs.
+            app_instance_uuid = InstanceId(uuid5(
+                NAMESPACE_OID, f'airplay-linux/fixture/{self._app.pid}/{self._app.start_ticks}',
+            ))
         self._app_instance_uuid = app_instance_uuid if app_instance_uuid is not None else InstanceId(uuid4())
         files = AtomicFiles(self._record_root)
         self._receipts = receipts if receipts is not None else JsonLaunchReceiptStore(files)
@@ -218,11 +226,14 @@ class DaemonRegistry:
         return failure
 
     def _compatible(self) -> bool:
+        # Public lifecycle admission remains dormant until composition activates
+        # it. Preserve the delivered feature-based contract for fixture profiles.
+        if self._features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}:
+            return False
         if self._features.owned_daemon_control and not self._public_seams_complete:
             return False
         return (
-            self._features.profile == 'application-contract-v1'
-            and self._features.foreground_control and self._features.owner_handshake
+            self._features.foreground_control and self._features.owner_handshake
             and self._features.keyring
         )
 
@@ -280,7 +291,7 @@ class DaemonRegistry:
                 return Ok(value=self._record)
             if self._has_launched and not self._budget_available():
                 return _error(ErrorCode.daemon_failed)
-            reconciled = await self._reconcile_locked()
+            reconciled = await self._reconcile()
             if isinstance(reconciled, Err):
                 return reconciled
             return await self._launch()
@@ -299,12 +310,18 @@ class DaemonRegistry:
                 return _error(ErrorCode.dependency_incompatible)
             if self._has_launched and not self._budget_available():
                 return _error(ErrorCode.daemon_failed)
-            stopped = await self._reconcile_locked()
+            stopped = await self._reconcile()
             if isinstance(stopped, Err):
                 return stopped
             return await self._launch()
 
     async def shutdown(self) -> Result[None]:
+        if (self._features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}
+                and not self._public_seams_complete and not self._has_launched and self._record is None):
+            # An inactive composition never acquired a daemon lifetime. Runtime
+            # shutdown still joins normally; explicit reconciliation retains
+            # strict refusal of malformed/unresolved public evidence.
+            return Ok(value=None)
         async with self._operation() as acquired:
             if isinstance(acquired, Err):
                 return acquired
@@ -461,15 +478,33 @@ class DaemonRegistry:
         history = await self._receipts.all()
         if isinstance(history, Err):
             return history
+        launch_uuid = self._ids.new()
+        runtime = self._configured_runtime
+        try:
+            previous = await self._supervisor_intents(str(runtime)).read()
+            if isinstance(previous, Err):
+                return self._cleanup_required(previous)
+            # The old supervisor's one publication is immutable. Give the next
+            # instance a separate channel instead of overwriting or reusing it.
+            if previous.value is not None:
+                runtime = runtime / launch_uuid.hex
+            argv = self._launcher.argv(str(runtime / 'daemon.sock'))
+        except (ValueError, OSError, StorageError):
+            return self._cleanup_required(_error(ErrorCode.dependency_incompatible))
         generation = max((r.endpoint_generation for r in history.value
-                          if r.runtime_directory == str(self.runtime_directory)), default=0) + 1
+                          if (r.runtime_directory, r.socket_name) == (str(runtime), 'daemon.sock')), default=0) + 1
         if generation > 2**63 - 1:
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         try:
-            argv = self._launcher.argv(str(self.runtime_directory / 'daemon.sock'))
-        except (ValueError, OSError):
-            return _error(ErrorCode.dependency_incompatible)
-        launch_uuid = self._ids.new()
+            if runtime != self._configured_runtime:
+                with private_directory(self._configured_runtime) as parent:
+                    os.mkdir(runtime.name, 0o700, dir_fd=parent)
+                    os.fsync(parent)
+            with private_directory(runtime):
+                pass
+        except OSError:
+            return self._cleanup_required(_error(ErrorCode.persistence_failed))
+        self.runtime_directory = runtime
         daemon_id = InstanceId(self._ids.new())
         self._launch_correlation = (launch_uuid, generation, daemon_id)
         try:
@@ -708,9 +743,15 @@ class DaemonRegistry:
     ) -> Result[None]:
         """Observe an already requested release. Recovery never sends a signal."""
         matches = (
-            intent.launch_uuid == receipt.launch_uuid and intent.instance_uuid == receipt.instance_uuid
+            self._runtime_matches(receipt)
+            and intent.launch_uuid == receipt.launch_uuid and intent.instance_uuid == receipt.instance_uuid
             and intent.app == receipt.app == record.app
             and intent.supervisor == record.supervisor and intent.daemon == record.daemon
+            and record.runtime_directory == receipt.runtime_directory
+            and record.socket_path == str(Path(receipt.runtime_directory) / receipt.socket_name)
+            and record.protocol_version == receipt.protocol_version
+            and record.lifecycle in {'starting', 'running', 'stopping'}
+            and record.instance_uuid not in {receipt.instance_uuid, InstanceId(receipt.launch_uuid)}
             and (receipt.supervisor is None or receipt.supervisor == intent.supervisor)
             and (receipt.daemon is None or receipt.daemon == intent.daemon)
             and (receipt.daemon_instance_uuid is None or receipt.daemon_instance_uuid == record.instance_uuid)
@@ -723,6 +764,13 @@ class DaemonRegistry:
         # The outcome document above never authorizes a signal. Freeze failure
         # if this recovery cannot prove completed cleanup before any later retry.
         if receipt.state not in {'failed', 'stopped'}:
+            # The durable observation may be ahead of the reserved receipt.
+            # Retain its correlated identities before freezing terminal bytes;
+            # cleanup can then remove the observation without losing the join.
+            receipt = replace(
+                receipt, daemon_instance_uuid=record.instance_uuid,
+                supervisor=record.supervisor, daemon=record.daemon,
+            )
             absent = self._receipt_absent(receipt)
             result = Ok(value=None)
             if absent and receipt.daemon is not None:
@@ -740,6 +788,84 @@ class DaemonRegistry:
             receipt = terminal
         return await self._cleanup_terminal(receipt, record)
 
+    async def _owned_runtime_channels(
+        self, history: tuple[LaunchReceipt, ...], records: tuple[DaemonRecord, ...],
+    ) -> Result[dict[str, SupervisorReleaseIntent | None]]:
+        """Account for every channel before the first cleanup or publication."""
+        for record in records:
+            if not any(
+                r.runtime_directory == record.runtime_directory and r.app == record.app
+                and r.protocol_version == record.protocol_version
+                and record.socket_path == str(Path(r.runtime_directory) / r.socket_name)
+                for r in history
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+        if self._record is not None and not any(
+            r.instance_uuid == self._record.instance_uuid for r in records
+        ):
+            return _error(ErrorCode.ownership_mismatch)
+        runtimes = {str(self._configured_runtime), str(self.runtime_directory),
+                    *(r.runtime_directory for r in history), *(r.runtime_directory for r in records)}
+        channels = {}
+        pending = list(sorted(runtimes, reverse=True))
+        while pending:
+            runtime = pending.pop()
+            receipts = tuple(r for r in history if r.runtime_directory == runtime)
+            if any(not self._runtime_matches(r) for r in receipts):
+                return _error(ErrorCode.ownership_mismatch)
+            if receipts:
+                maximum = max(r.endpoint_generation for r in receipts)
+                if sum(r.endpoint_generation == maximum for r in receipts) != 1:
+                    return _error(ErrorCode.ownership_mismatch)
+            try:
+                try:
+                    info = os.lstat(runtime)
+                except FileNotFoundError:
+                    channels[runtime] = None
+                    continue
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700):
+                    return _error(ErrorCode.ownership_mismatch)
+                with private_directory(Path(runtime)) as descriptor:
+                    # A missing receipt cannot hide a retained child runtime.
+                    # Discover directories without following symlinks, before
+                    # any recovery is allowed to modify a known endpoint.
+                    with os.scandir(descriptor) as entries:
+                        for entry in entries:
+                            if entry.name in {'daemon.sock', 'release-intent.json'}:
+                                continue
+                            if entry.is_symlink():
+                                return _error(ErrorCode.ownership_mismatch)
+                            if entry.is_dir(follow_symlinks=False):
+                                child = str(Path(runtime) / entry.name)
+                                if child not in runtimes:
+                                    runtimes.add(child)
+                                    pending.append(child)
+                    try:
+                        os.stat('daemon.sock', dir_fd=descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        if not receipts:
+                            return _error(ErrorCode.stale_socket)
+                loaded = await self._supervisor_intents(runtime).read()
+            except (OSError, StorageError):
+                return _error(ErrorCode.persistence_failed)
+            if isinstance(loaded, Err):
+                return loaded
+            intent = loaded.value
+            if intent is not None:
+                correlated = tuple(r for r in receipts if r.launch_uuid == intent.launch_uuid)
+                if len(correlated) != 1:
+                    return _error(ErrorCode.ownership_mismatch)
+                receipt = correlated[0]
+                if (receipt.instance_uuid != intent.instance_uuid or receipt.app != intent.app
+                        or receipt.supervisor not in {None, intent.supervisor}
+                        or receipt.daemon not in {None, intent.daemon}):
+                    return _error(ErrorCode.ownership_mismatch)
+            channels[runtime] = intent
+        return Ok(value=channels)
+
     async def _reconcile_owned_locked(self) -> Result[None]:
         checked = await self._receipt_obligations_locked()
         if isinstance(checked, Err):
@@ -748,6 +874,9 @@ class DaemonRegistry:
         if isinstance(records, Err):
             return self._cleanup_required(records)
         history = self._receipt_history
+        channels = await self._owned_runtime_channels(history, records.value)
+        if isinstance(channels, Err):
+            return self._cleanup_required(channels)
         for receipt in history:
             endpoint = tuple(r for r in history if r.runtime_directory == receipt.runtime_directory)
             newest = max(r.endpoint_generation for r in endpoint)
@@ -768,11 +897,9 @@ class DaemonRegistry:
                 socket_path=str(Path(receipt.runtime_directory) / receipt.socket_name), lifecycle='stopping',
                 runtime_directory=receipt.runtime_directory,
             )
-            supervisor_intent = await self._supervisor_intents(receipt.runtime_directory).read()
-            if isinstance(supervisor_intent, Err):
-                return self._cleanup_required(supervisor_intent, record)
-            if supervisor_intent.value is not None:
-                result = await self._recover_supervisor_intent(receipt, record, supervisor_intent.value)
+            supervisor_intent = channels.value[receipt.runtime_directory]
+            if supervisor_intent is not None and supervisor_intent.launch_uuid == receipt.launch_uuid:
+                result = await self._recover_supervisor_intent(receipt, record, supervisor_intent)
             elif receipt.state in {'failed', 'stopped'}:
                 result = await self._cleanup_terminal(receipt, record)
             else:
@@ -1048,11 +1175,19 @@ class DaemonRegistry:
                 return _error(ErrorCode.ownership_mismatch)
             if current:
                 self._current_receipts[endpoint] = current[0]
+        if self._public_lifecycle() and any(
+            not any(r.launch_uuid == intent.launch_uuid for r in receipts.value) for intent in intents.value
+        ):
+            return _error(ErrorCode.ownership_mismatch)
         if (receipts.value or intents.value) and not self._public_lifecycle():
             # These channels are never inferred absent from an empty legacy
             # observation store. Their public stop/recovery writer owns them.
             return _error(ErrorCode.ownership_mismatch)
         return Ok(value=None)
+
+    async def _reconcile(self) -> Result[None]:
+        """Retain the delivered fixture seam inside the operation's shared lease."""
+        return await self._reconcile_locked()
 
     async def _reconcile_locked(self) -> Result[None]:
         if self._authority_lease is None or self._authority_lease._unlocked:

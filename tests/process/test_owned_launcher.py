@@ -76,8 +76,7 @@ class Facts(ownership.EndpointObservations):
         return self.peer_pid, os.getuid(), os.getgid()
 
     def unix_inodes(self, path):
-        assert path == str(self.case.runtime / 'daemon.sock')
-        return self.rows
+        return self.rows if path == str(self.case.runtime / 'daemon.sock') else ()
 
     def holds_socket(self, pid, inode):
         return pid == DAEMON.pid and inode == 800
@@ -108,6 +107,7 @@ class Process(FakeProcess):
         assert history, 'public launch spawned before its durable reservation'
         receipt = history[-1]
         assert receipt.state == 'reserved'
+        c.runtime = Path(receipt.runtime_directory)
         assert c.authority.owner is not None
         assert len(spec.pass_fds) == 1
         config = json.loads(os.read(spec.pass_fds[0], 4096))
@@ -236,6 +236,8 @@ class OwnedCase:
                 self.hit(boundary)
             result = await write(receipt)
             self.events.append('receipt:' + receipt.state)
+            if isinstance(result, Ok) and receipt.state in {'failed', 'stopped'}:
+                self.hit('after-terminal-write')
             if receipt.state == 'detached':
                 self.hit('after-detached-write')
             if receipt.state == 'ready':
@@ -246,8 +248,12 @@ class OwnedCase:
         cleanup_write = self.cleanup.write
 
         async def observed_cleanup(intent):
-            self.hit('cleanup-intent-publication' if intent.completed_at is None else 'cleanup-intent-completion')
-            return await cleanup_write(intent)
+            boundary = 'cleanup-intent-publication' if intent.completed_at is None else 'cleanup-intent-completion'
+            self.hit(boundary)
+            result = await cleanup_write(intent)
+            if isinstance(result, Ok):
+                self.hit('after-' + boundary)
+            return result
 
         self.cleanup.write = observed_cleanup
         self.registry = DaemonRegistry(
@@ -497,3 +503,128 @@ async def test_isolated_launcher_is_unreachable_from_guarded_production(candidat
     production = tmp_path / 'production'
     production.mkdir()
     await test_phase_guard_blocks_eligible_production_launch(production, monkeypatch, tripwire)
+
+
+@pytest.mark.parametrize('operation', ['reconcile', 'launch'])
+@pytest.mark.parametrize('channel', [
+    'empty', 'socket', 'malformed-supervisor', 'orphan-supervisor',
+    'orphan-cleanup', 'completed-orphan-cleanup', 'malformed-cleanup',
+])
+async def test_all_runtime_channels_are_accounted_before_recovery_or_launch(candidate_failure_cases, channel, operation):
+    c = candidate_failure_cases
+    path = None
+    frozen = None
+    if channel == 'socket':
+        c.bind()
+        path = c.runtime / 'daemon.sock'
+    elif channel == 'malformed-supervisor':
+        path = c.runtime / 'release-intent.json'
+        path.write_bytes(b'{')
+    elif channel == 'orphan-supervisor':
+        intent = SupervisorReleaseIntent(
+            schema_version=1, launch_uuid=UUID(int=700), instance_uuid=APP_ID,
+            app=APP, supervisor=SUPERVISOR, daemon=DAEMON,
+            reason='application-exited', intent_at=1.0,
+        )
+        assert await c.supervisor_intents(str(c.runtime)).write(intent) == Ok(value=None)
+        path = c.runtime / 'release-intent.json'
+    elif channel in {'orphan-cleanup', 'completed-orphan-cleanup'}:
+        intent = DaemonCleanupIntent(
+            launch_uuid=UUID(int=700), reason=ErrorCode.daemon_failed, intent_at=1.0,
+            completed_at=None, outcome=None,
+        )
+        assert await c.cleanup.write(intent) == Ok(value=None)
+        if channel == 'completed-orphan-cleanup':
+            intent = replace(intent, completed_at=2.0, outcome='stopped')
+            assert await c.cleanup.write(intent) == Ok(value=None)
+        path = c.root / 'daemon/cleanup-intents' / (str(intent.launch_uuid) + '.json')
+    elif channel == 'malformed-cleanup':
+        path = c.root / 'daemon/cleanup-intents' / (str(UUID(int=700)) + '.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{')
+    if path is not None and channel != 'socket':
+        frozen = path.read_bytes()
+    socket_entry = path.stat().st_ino if channel == 'socket' else None
+    c.reopen()
+    result = await (c.launch() if operation == 'launch' else c.registry.reconcile_previous())
+    if channel == 'empty':
+        assert isinstance(result, Ok)
+        assert len(c.process.spawned) == (operation == 'launch')
+    else:
+        assert isinstance(result, Err)
+        expected = (ErrorCode.persistence_failed if channel.startswith('malformed') else
+                    ErrorCode.stale_socket if channel == 'socket' else ErrorCode.ownership_mismatch)
+        assert result.error.code is expected
+        assert c.notices[-1].kind == 'cleanup_required'
+        assert not c.process.spawned and not c.process.terminated
+        assert not (await c.receipts.all()).value
+        if frozen is not None:
+            assert path.read_bytes() == frozen
+        else:
+            assert path.stat().st_ino == socket_entry
+
+
+@pytest.mark.parametrize('operation', ['reconcile', 'launch'])
+@pytest.mark.parametrize('channel', ['socket', 'orphan-supervisor', 'malformed-supervisor'])
+@pytest.mark.parametrize('depth', [1, 2])
+async def test_orphaned_child_runtime_channels_block_admission(candidate_failure_cases, channel, depth, operation):
+    c = candidate_failure_cases
+    orphan = c.runtime
+    for level in range(depth):
+        orphan = orphan / (UUID(int=700).hex if level == 0 else 'child')
+        orphan.mkdir(mode=0o700)
+    path = orphan / ('daemon.sock' if channel == 'socket' else 'release-intent.json')
+    if channel == 'socket':
+        endpoint = socket.socket(socket.AF_UNIX)
+        endpoint.bind(str(path))
+        c.sockets.append(endpoint)
+        frozen = path.stat().st_ino
+    else:
+        if channel == 'orphan-supervisor':
+            intent = SupervisorReleaseIntent(
+                schema_version=1, launch_uuid=UUID(int=700), instance_uuid=APP_ID,
+                app=APP, supervisor=SUPERVISOR, daemon=DAEMON,
+                reason='application-exited', intent_at=1.0,
+            )
+            assert await c.supervisor_intents(str(orphan)).write(intent) == Ok(value=None)
+        else:
+            path.write_bytes(b'{')
+        frozen = path.read_bytes()
+    c.reopen()
+    result = await (c.launch() if operation == 'launch' else c.registry.reconcile_previous())
+    assert isinstance(result, Err)
+    assert result.error.code is (ErrorCode.stale_socket if channel == 'socket' else
+                                 ErrorCode.persistence_failed if channel == 'malformed-supervisor' else
+                                 ErrorCode.ownership_mismatch)
+    assert c.notices[-1].kind == 'cleanup_required'
+    assert not c.process.spawned and not c.process.terminated
+    assert not (await c.receipts.all()).value
+    assert (path.stat().st_ino if channel == 'socket' else path.read_bytes()) == frozen
+
+
+@pytest.mark.parametrize('unaccounted', ['orphan-cleanup', 'malformed-supervisor', 'socket'])
+async def test_unaccounted_channel_blocks_cleanup_of_another_known_endpoint(candidate_failure_cases, unaccounted):
+    c = candidate_failure_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    receipt_path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    before = receipt_path.read_bytes()
+    other = c.root / 'other'
+    other.mkdir(mode=0o700)
+    # The configured endpoint is relevant even when all receipts name another one.
+    c.registry.runtime_directory = other
+    if unaccounted == 'malformed-supervisor':
+        (other / 'release-intent.json').write_bytes(b'{')
+    elif unaccounted == 'socket':
+        endpoint = socket.socket(socket.AF_UNIX)
+        endpoint.bind(str(other / 'daemon.sock'))
+        c.sockets.append(endpoint)
+    else:
+        assert await c.cleanup.write(DaemonCleanupIntent(
+            launch_uuid=UUID(int=700), reason=ErrorCode.daemon_failed, intent_at=1.0,
+            completed_at=None, outcome=None,
+        )) == Ok(value=None)
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert not c.process.terminated
+    assert receipt_path.read_bytes() == before
+    assert c.process.identity(DAEMON.pid) == DAEMON

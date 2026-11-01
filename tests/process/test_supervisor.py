@@ -425,6 +425,7 @@ def public_supervisor_case(tmp_path, monkeypatch):
     c = next(fixture)
 
     async def create():
+        from test_owned_launcher import SUPERVISOR
         r = await c.current()
         reservation = DaemonReservation(**{n: getattr(r, n) for n in (
             'schema_version', 'launch_uuid', 'instance_uuid', 'app', 'owner_uid', 'boot_id',
@@ -502,6 +503,153 @@ def public_supervisor_case(tmp_path, monkeypatch):
         next(fixture)
     except StopIteration:
         pass
+
+
+@pytest.mark.parametrize('origin', ['reserved', 'detached', 'bound'])
+@pytest.mark.parametrize('boundary', [
+    None, 'cleanup-intent-publication', 'after-cleanup-intent-publication',
+    'terminal-write', 'after-terminal-write', 'cleanup-intent-completion',
+    'after-cleanup-intent-completion',
+])
+async def test_supervisor_gap_recovery_retains_identities_across_every_write(public_supervisor_case, origin, boundary):
+    from test_owned_launcher import APP, SUPERVISOR, DAEMON, FEATURES, Crash
+    c = public_supervisor_case
+    if origin == 'reserved':
+        c.bind_on_spawn = False
+    launch_boundary = {'reserved': 'supervisor-publication', 'detached': 'after-detached-write',
+                       'bound': 'status-poll'}[origin]
+    c.hooks[launch_boundary] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    receipt = await c.current()
+    assert receipt.state == origin
+    observation = c.record
+    c.process.exit(APP)
+    supervisor = await c.supervisor()
+    assert await supervisor._request_release(observation, FEATURES) == Ok(value=None)
+    intent_path = c.runtime / 'release-intent.json'
+    frozen_intent = intent_path.read_bytes()
+    c.reopen()
+    if boundary is not None:
+        c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            await c.registry.reconcile_previous()
+        assert boundary in c.events
+        c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    terminal = await c.current()
+    assert terminal.state == 'stopped'
+    assert (terminal.daemon_instance_uuid, terminal.supervisor, terminal.daemon) == (
+        observation.instance_uuid, SUPERVISOR, DAEMON,
+    )
+    receipt_path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen_terminal = receipt_path.read_bytes()
+    completion = (await c.cleanup.all()).value[0]
+    assert completion.completed_at is not None and completion.outcome == 'stopped'
+    assert (await c.store.all()).value == ()
+    for _ in range(2):
+        c.reopen()
+        assert await c.registry.reconcile_previous() == Ok(value=None)
+        assert receipt_path.read_bytes() == frozen_terminal
+        assert intent_path.read_bytes() == frozen_intent
+        assert (await c.cleanup.all()).value == (completion,)
+    assert c.process.terminated == [DAEMON]
+
+
+async def test_successors_keep_independent_immutable_supervisor_channels(public_supervisor_case, monkeypatch):
+    from airplay_linux.testing.adapters import SequenceIds
+    import test_owned_launcher as identities
+    c = public_supervisor_case
+    configured_runtime = c.runtime
+    old_files = {}
+    expected_terminations = []
+    for index, action in enumerate(['app-death', 'registry-shutdown', 'app-death']):
+        if index:
+            monkeypatch.setattr(identities, 'APP', ProcessIdentity(pid=110 + index * 100, start_ticks=10 + index))
+            monkeypatch.setattr(identities, 'SUPERVISOR', ProcessIdentity(pid=120 + index * 100, start_ticks=20 + index))
+            monkeypatch.setattr(identities, 'DAEMON', ProcessIdentity(pid=130 + index * 100, start_ticks=30 + index))
+            monkeypatch.setattr(identities, 'APP_ID', InstanceId(UUID(int=900 + index * 100)))
+            c.process.register(identities.APP, {})
+            c.facts.peer_pid = identities.DAEMON.pid
+            c.runtime = configured_runtime
+            c.reopen()
+            c.registry._ids = SequenceIds(seed=1000 + index * 100)
+        assert isinstance(await c.launch(), Ok)
+        receipt = await c.current()
+        assert receipt.instance_uuid == identities.APP_ID
+        assert receipt.daemon == identities.DAEMON
+        if index:
+            assert c.runtime != configured_runtime
+            assert str(c.runtime).startswith(str(configured_runtime) + '/')
+        history = (await c.receipts.all()).value
+        assert receipt.endpoint_generation == max((
+            r.endpoint_generation for r in history if r.runtime_directory == receipt.runtime_directory
+            and r.launch_uuid != receipt.launch_uuid
+        ), default=0) + 1
+        expected_terminations.append(identities.DAEMON)
+        if action == 'app-death':
+            c.process.exit(identities.APP)
+            supervisor = await c.supervisor()
+            assert await supervisor._request_release(c.record, identities.FEATURES) == Ok(value=None)
+            intent_path = c.runtime / 'release-intent.json'
+            assert intent_path not in old_files
+            old_files[intent_path] = intent_path.read_bytes()
+            c.reopen()
+            assert await c.registry.reconcile_previous() == Ok(value=None)
+        else:
+            assert await c.registry.shutdown() == Ok(value=None)
+        assert (await c.current()).state == 'stopped'
+        assert c.process.identity(identities.DAEMON.pid) is None
+        assert not (c.runtime / 'daemon.sock').exists()
+        terminal_path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+        old_files[terminal_path] = terminal_path.read_bytes()
+        c.reopen()
+        assert await c.registry.reconcile_previous() == Ok(value=None)
+        assert c.process.terminated == expected_terminations
+        assert all(path.read_bytes() == payload for path, payload in old_files.items())
+
+
+async def test_historical_supervisor_channel_is_correlated_before_stopping_a_newer_launch(public_supervisor_case, monkeypatch):
+    from types import SimpleNamespace
+    from airplay_linux.testing.adapters import SequenceIds
+    import test_owned_launcher as identities
+    c = public_supervisor_case
+    assert isinstance(await c.launch(), Ok)
+    old_receipt = await c.current()
+    c.process.exit(identities.APP)
+    supervisor = await c.supervisor()
+    assert await supervisor._request_release(c.record, identities.FEATURES) == Ok(value=None)
+    c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    intent_path = c.runtime / 'release-intent.json'
+    frozen_intent = intent_path.read_bytes()
+    monkeypatch.setattr(identities, 'APP', ProcessIdentity(pid=210, start_ticks=110))
+    monkeypatch.setattr(identities, 'SUPERVISOR', ProcessIdentity(pid=220, start_ticks=120))
+    monkeypatch.setattr(identities, 'DAEMON', ProcessIdentity(pid=230, start_ticks=130))
+    monkeypatch.setattr(identities, 'APP_ID', InstanceId(UUID(int=1900)))
+    c.process.register(identities.APP, {})
+    c.facts.peer_pid = identities.DAEMON.pid
+    c.reopen()
+    c.registry._ids = SequenceIds(seed=2000)
+    actual_intents = c.registry._supervisor_intents
+
+    async def no_intent():
+        return Ok(value=None)
+
+    # Recreate a successor already admitted by the reviewed implementation in
+    # the reused endpoint. The historical file stays physically byte-identical;
+    # only admission's injected view emulates the old missing-intent behavior.
+    c.registry._supervisor_intents = lambda runtime: SimpleNamespace(read=no_intent)
+    assert isinstance(await c.launch(), Ok)
+    successor = await c.current()
+    assert successor.runtime_directory == old_receipt.runtime_directory
+    assert successor.endpoint_generation == old_receipt.endpoint_generation + 1
+    c.registry._supervisor_intents = actual_intents
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.current()).state == 'stopped'
+    assert c.process.terminated == [old_receipt.daemon, successor.daemon]
+    assert c.process.identity(successor.daemon.pid) is None
+    assert intent_path.read_bytes() == frozen_intent
 
 
 async def test_public_config_and_fixture_record_schema_preserve_identity_channels(public_supervisor_case):
