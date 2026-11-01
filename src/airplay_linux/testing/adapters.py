@@ -12,7 +12,8 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Generic, Literal, TYPE_CHECKING, TypeVar, get_args
 from uuid import UUID
@@ -1057,6 +1058,85 @@ class FakeProcess(_Scripted, _EventSource):
         if self._identities.get(identity.pid) == identity:
             del self._identities[identity.pid]
             self._environments.pop(identity.pid, None)
+
+
+@dataclass(frozen=True, kw_only=True)
+class ProcessInvocation:
+    """A direct invocation, never a launch inferred from nested namespace argv."""
+
+    method: str
+    kind: str
+    argv: tuple[str, ...] = field(repr=False)
+
+
+@dataclass(kw_only=True)
+class ProbeLaunchObservation:
+    leg: str
+    launch_uuid: UUID = field(repr=False)
+    identity: ProcessIdentity = field(repr=False)
+    env: Mapping[str, str] = field(repr=False)
+    exit_code: int | None = None
+    socket_exists: bool | None = None
+    credentials_file_exists: bool | None = None
+
+
+class ProbeProcessRecorder(FakeProcess):
+    """Observe actual witness calls and completion, without fabricating proofs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.invocations: list[ProcessInvocation] = []
+        self.outer_unshare: list[ports.CommandSpec] = []
+        self.inner_launches: list[ProbeLaunchObservation] = []
+        self.subscribe(self._probe_exit)
+
+    def observe_invocation(self, method: str, spec: ports.CommandSpec) -> None:
+        executable = Path(spec.argv[0]).name
+        if executable == "unshare":
+            kind = "outer_namespace"
+            self.outer_unshare.append(spec)
+        elif "-daemonize" in spec.argv[1:]:
+            kind = "direct_backend"
+        elif spec.argv[-1] == "--help":
+            kind = "help_observation"
+        elif spec.argv[-1] == "--version":
+            kind = "version_observation"
+        elif spec.argv[-1] == "-capabilities":
+            kind = "capability_observation"
+        elif spec.argv == ("kscreen-doctor", "-j"):
+            kind = "inventory_observation"
+        else:
+            kind = "other"
+        self.invocations.append(ProcessInvocation(method=method, kind=kind, argv=spec.argv))
+
+    async def run(self, spec, timeout, stdin=None):
+        self.observe_invocation("run", spec)
+        return await super().run(spec, timeout, stdin)
+
+    async def spawn(self, spec):
+        self.observe_invocation("spawn", spec)
+        result = await super().spawn(spec)
+        if isinstance(result, Ok) and "-daemonize" in spec.argv[1:]:
+            socket_path = spec.argv[spec.argv.index("-socket") + 1]
+            self.inner_launches.append(ProbeLaunchObservation(
+                leg=Path(socket_path).parent.name,
+                launch_uuid=UUID(spec.env[self.OWNER_TOKEN_ENV]), identity=result.value,
+                env=MappingProxyType(dict(spec.env)),
+            ))
+        return result
+
+    def _probe_exit(self, event: ports.ProcessExit) -> None:
+        for observation in self.inner_launches:
+            if observation.identity == event.identity:
+                observation.exit_code = event.exit_code
+
+    def observe_probe_absences(
+        self, identity: ProcessIdentity, *, socket_exists: bool, credentials_file_exists: bool,
+    ) -> None:
+        for observation in self.inner_launches:
+            if observation.identity == identity:
+                observation.socket_exists = socket_exists
+                observation.credentials_file_exists = credentials_file_exists
 
 
 # --------------------------------------------------------------------------- stores
