@@ -30,16 +30,15 @@ def test_same_size_other_position_is_not_requested_source():
 
 def test_enabled_foreign_or_virtual_geometry_collision_refuses():
     requested = _reported()
-    assert isinstance(
-        verify_reported_source("DP-1", requested, (_output("HDMI-1"),)), Err,
-    )
-    assert isinstance(
-        verify_reported_source(
-            "DP-1", requested,
-            (_output("DP-1", output_type=14, virtual=True),),
-        ),
-        Err,
-    )
+    for duplicate in (
+        _output("HDMI-1"),
+        _output("DP-2", virtual=True),
+        _output("DP-3", virtual=None),
+    ):
+        assert isinstance(
+            verify_reported_source("DP-1", requested, (_output(), duplicate)),
+            Err,
+        )
 
 
 def test_disabled_geometry_match_does_not_create_ambiguity():
@@ -51,11 +50,15 @@ def test_disabled_geometry_match_does_not_create_ambiguity():
 
 
 def test_enabled_disconnected_or_unknown_geometry_collision_refuses():
-    for output in (
+    requested = _reported()
+    for duplicate in (
         _output("DP-2", connected=False),
-        _output("Cast-1", output_type="Unknown", virtual=None),
+        _output("DP-3", output_type="Unknown", virtual=None),
     ):
-        assert isinstance(verify_reported_source("DP-1", _reported(), (output,)), Err)
+        assert isinstance(
+            verify_reported_source("DP-1", requested, (_output(), duplicate)),
+            Err,
+        )
 
 
 def test_negative_coordinate_physical_layout_is_accepted():

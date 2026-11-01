@@ -1,9 +1,23 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 
 PATCHES = Path(__file__).parents[2] / "vendor" / "doubletake"
+
+
+def test_carried_patch_chain_is_parseable() -> None:
+    """Every documented patch is accepted by Git's patch parser."""
+    for patch in sorted(PATCHES.glob("*.patch")):
+        result = subprocess.run(
+            ["git", "apply", "--numstat", str(patch)],
+            cwd=PATCHES.parents[1],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"{patch.name}: {result.stderr}"
 
 
 def test_complete_token_requires_complete_producer() -> None:

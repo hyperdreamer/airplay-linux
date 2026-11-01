@@ -2,7 +2,7 @@ diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
 index 13bc64d..0a82965 100644
 --- a/internal/airplay/capture.go
 +++ b/internal/airplay/capture.go
-@@ -45,6 +45,68 @@ type CaptureConfig struct {
+@@ -45,6 +45,84 @@ type CaptureConfig struct {
  
  	RestoreToken     string
  	SaveRestoreToken func(string) error
@@ -87,7 +87,7 @@ index 13bc64d..0a82965 100644
  }
  
  // ValidateHWAccel checks a capture encoder preference. An empty value keeps the
-@@ -278,7 +340,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+@@ -278,7 +356,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
  	if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
  		return nil, err
  	}
@@ -96,7 +96,7 @@ index 13bc64d..0a82965 100644
  	if err != nil {
  		return nil, fmt.Errorf("screencast portal: %w", err)
  	}
-@@ -2436,7 +2498,7 @@ func normalizeContext(ctx context.Context) context.Context {
+@@ -2436,7 +2514,7 @@ func normalizeContext(ctx context.Context) context.Context {
  // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
  // the retained portal session (which must stay open for capture and retries), and a
  // fresh restore token when the portal grants persistence.
@@ -105,7 +105,7 @@ index 13bc64d..0a82965 100644
  	ctx = normalizeContext(ctx)
  	conn, err := dbus.ConnectSessionBus()
  	if err != nil {
-@@ -2636,6 +2698,15 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+@@ -2636,6 +2714,15 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
  			dbg("[CAPTURE] portal stream properties did not contain a usable size: %#v", streamProperties)
  		}
  	}

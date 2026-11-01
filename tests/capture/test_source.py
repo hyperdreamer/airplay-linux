@@ -26,6 +26,14 @@ def _physical_name(name: str) -> bool:
     return not name.casefold().startswith(("virtual", "window", "region"))
 
 
+def test_capture_physical_reexports_shared_output_whitelists():
+    from airplay_linux.capture import physical
+    from airplay_linux.display import inventory
+
+    assert physical.PHYSICAL_OUTPUT_TYPES is inventory.PHYSICAL_OUTPUT_TYPES
+    assert physical.PHYSICAL_OUTPUT_TYPE_NAMES is inventory.PHYSICAL_OUTPUT_TYPE_NAMES
+
+
 def test_reported_source_requires_unique_physical_monitor():
     reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
     assert isinstance(verify_reported_source("DP-1", reported, _layout(_monitor())), Ok)

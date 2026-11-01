@@ -34,6 +34,8 @@ from airplay_linux.display.inventory import (
     INVENTORY_TIMEOUT,
     KSCREEN_PROBE,
     KScreenInventory,
+    PHYSICAL_OUTPUT_TYPE_NAMES,
+    PHYSICAL_OUTPUT_TYPES,
     _is_physical_connector,
     _is_physical_output_type,
 )
