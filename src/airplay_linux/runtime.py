@@ -12,6 +12,8 @@ the runtime instead of substituting a permissive fake.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -44,6 +46,9 @@ from airplay_linux.domain.ports import ProcessPort
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 from airplay_linux.policy.audio import PipeWirePortalAudioProbe
 from airplay_linux.policy.capabilities import EnvironmentProbe
+from airplay_linux.process.authority import SharedRootAuthority
+from airplay_linux.process.credential_probe import CredentialServiceProbe
+from airplay_linux.process.ownership import verify_owned_endpoint
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.launcher import LaunchCapability, ProductionLaunchCapability
 from airplay_linux.process.linux import LinuxProcessRunner
@@ -61,6 +66,7 @@ from airplay_linux.session.virtual import build_virtual_handlers, compose_virtua
 from airplay_linux.storage import (
     AtomicFiles,
     JsonDaemonStore,
+    JsonLaunchReceiptStore,
     JsonOwnershipStore,
     JsonReceiverStore,
     JsonSessionStore,
@@ -86,17 +92,61 @@ _OWNED_DAEMON_EPOCH_ACTIVE = False
 
 @dataclass(frozen=True, kw_only=True)
 class _OwnedDaemonInstallation:
-    """Assembly seam for the future source verifier and isolated proof producer."""
+    """Inert installed lifecycle dependencies, separate from permission to run."""
 
-    source_verifier: ReportedSourceVerifier = field(repr=False)
-    credential_proof: Callable[[], Awaitable[Result[CredentialProofVerdict]]] = field(repr=False)
+    source_verifier: ReportedSourceVerifier | None = field(repr=False)
+    credential_proof: Callable[[], Awaitable[Result[CredentialProofVerdict]]] | None = field(repr=False)
+    receipts: JsonLaunchReceiptStore | None = field(default=None, repr=False)
+    endpoint_verifier: Callable | None = field(default=None, repr=False)
+    strict_teardown: Callable | None = field(default=None, repr=False)
+    shared_authority: SharedRootAuthority | None = field(default=None, repr=False)
+    source_inventory: KScreenInventory | None = field(default=None, repr=False)
 
 
 def _install_owned_daemon_epoch(
     config: RuntimeConfig, *, process: ProcessPort, launcher: LaunchCapability,
-) -> _OwnedDaemonInstallation | None:
-    # Foundation lanes are not installed yet. Assembly must remain inert: proof
-    # dispatch is a separate step behind the activation check below.
+) -> _OwnedDaemonInstallation:
+    # Construction opens neither the shared authority nor a namespace. Task 9
+    # still owns the sole production activation switch.
+    files = AtomicFiles(config.state_root)
+    inventory = KScreenInventory(process)
+    probe = CredentialServiceProbe(process=process, record_root=config.state_root, unshare="unshare")
+    return _OwnedDaemonInstallation(
+        source_verifier=KScreenReportedSourceVerifier(inventory, physical_inventory_available=True),
+        credential_proof=probe.check, receipts=JsonLaunchReceiptStore(files),
+        endpoint_verifier=verify_owned_endpoint, strict_teardown=process.terminate,
+        shared_authority=SharedRootAuthority(files), source_inventory=inventory,
+    )
+
+
+def _resolve_unshare() -> str | None:
+    return shutil.which("unshare")
+
+
+def _probe_bootstrap(installation: _OwnedDaemonInstallation | None, launcher: LaunchCapability) -> str | None:
+    """Ordered pre-keyring eligibility; a fixed missing-evidence label or None."""
+    if not (launcher.production_graph and launcher.available() and launcher.ambient_socket() is None):
+        return "owned daemon control"
+    if installation is None or installation.source_verifier is None:
+        return "source verifier"
+    if installation.receipts is None:
+        return "receipt production"
+    if not callable(installation.endpoint_verifier):
+        return "endpoint verifier"
+    if not callable(installation.strict_teardown):
+        return "strict teardown"
+    parameters = inspect.signature(installation.strict_teardown).parameters
+    if not ({"strict", "evidence", "revalidate"} <= parameters.keys()
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())):
+        return "strict teardown"
+    # These are installation prerequisites even though the isolated child must
+    # never acquire the application's authority or consult registry compatibility.
+    if installation.shared_authority is None:
+        return "shared authority"
+    if not callable(installation.credential_proof):
+        return "credential proof producer"
+    if _resolve_unshare() is None:
+        return "unshare"
     return None
 
 
@@ -354,14 +404,26 @@ async def _compose_production(
     )
     # This closed boundary precedes every owned-backend/probe dispatch. Pure
     # all-passed inputs or an eligible launcher cannot substitute for activation.
-    if (
-        _OWNED_DAEMON_EPOCH_ACTIVE and installation is not None
-        and launcher.production_graph and launcher.available() and launcher.ambient_socket() is None
-    ):
-        proof = await installation.credential_proof()
-        if isinstance(proof, Ok) and type(proof.value) is CredentialProofVerdict:
-            credential_proof = proof.value
-    source_inventory = KScreenInventory(process)
+    probe_gate = "production activation"
+    if _OWNED_DAEMON_EPOCH_ACTIVE:
+        probe_gate = _probe_bootstrap(installation, launcher)
+        if probe_gate is None:
+            proof = await installation.credential_proof()
+            if isinstance(proof, Ok) and type(proof.value) is CredentialProofVerdict:
+                credential_proof = proof.value
+                if not credential_proof.proven:
+                    probe_gate = next((name for name, leg in (
+                        ("credential service leg", credential_proof.service_leg),
+                        ("credential positive leg", credential_proof.backend_positive_leg),
+                        ("credential negative leg", credential_proof.backend_negative_leg),
+                    ) if leg != "passed"), "credential proof")
+            else:
+                probe_gate = "credential proof files"
+    source_inventory = (
+        installation.source_inventory
+        if installation is not None and installation.source_inventory is not None
+        else KScreenInventory(process)
+    )
     source_verifier = (
         installation.source_verifier
         if installation is not None
@@ -501,6 +563,8 @@ async def _compose_production(
         manager, deps, registry, credential_loader=credentials.load_credential_ref,
     )
     gated = _capability_gates(report)
+    if probe_gate is not None:
+        gated["owned_daemon_control"] = probe_gate
     return _ProductionGraph(deps, manager, registry, startup, persistence, report, gated)
 
 

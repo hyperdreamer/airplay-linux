@@ -21,6 +21,7 @@ from airplay_linux.domain.resources import CapabilityReport, Err, ErrorCode, Ok
 from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.runtime import RuntimeConfig, build_runtime
+from tests.process.test_credential_probe import namespace_probe_witness, recording_probe_processes
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
 
@@ -121,7 +122,9 @@ def offline_boundaries(monkeypatch):
     return forbidden
 
 
-async def test_process_observations_classify_direct_and_unshare_daemon_launches():
+async def test_process_observations_classify_direct_and_unshare_daemon_launches(
+    namespace_probe_witness, recording_probe_processes,
+):
     recorder = ProcessRecorder()
     direct = ("doubletake", "-daemonize", "-socket", "/private/daemon.sock", "-cred-backend", "keyring")
     await recorder.run(CommandSpec(argv=direct, env={}), timeout=1.0)
@@ -138,6 +141,30 @@ async def test_process_observations_classify_direct_and_unshare_daemon_launches(
     for kind in ("help_observation", "version_observation", "capability_observation", "inventory_observation"):
         assert len(recorder.events(kind)) == 1
     assert len(recorder.observations) == 8
+
+    c = recording_probe_processes
+    runtime = await c.build_complete_production_and_probe()
+    try:
+        assert len(c.outer_unshare) == 1 and len(c.inner_launches) == 2
+        assert sum(item.kind == "outer_namespace" for item in c.outer.invocations) == 1
+        assert sum(item.kind == "direct_backend" for item in c.inner.invocations) == 2
+        assert not any(item.kind == "direct_backend" for item in c.outer.invocations)
+        assert {item.kind for item in c.outer.invocations} >= {
+            "help_observation", "version_observation", "capability_observation",
+        }
+        positive, negative = c.inner_launches
+        assert (positive.leg, negative.leg) == ("positive", "negative")
+        assert positive.launch_uuid != negative.launch_uuid
+        assert negative.env["DBUS_SESSION_BUS_ADDRESS"] == c.unreachable_bus
+        assert negative.exit_code != 0
+        assert negative.socket_exists is False and negative.credentials_file_exists is False
+        archive = c.runtime_config.state_root / "archives/probe" / str(c.config.probe_uuid)
+        assert {file.stem for file in (archive / "receipts").glob("*.json")} == {
+            str(positive.launch_uuid), str(negative.launch_uuid),
+        }
+    finally:
+        await runtime.shutdown()
+
 
 
 async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypatch, offline_boundaries):
@@ -172,17 +199,21 @@ async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypat
         ), env={}), timeout=15.0)
         return Ok(value=passed)
 
+    original_installation = composition._install_owned_daemon_epoch
+
     def installation(config, *, process, launcher):
         assert process is recorder
         assert isinstance(launcher, ProductionLaunchCapability)
         assert launcher.production_graph and launcher.available()
         seen.launcher = launcher
-        return composition._OwnedDaemonInstallation(
+        return replace(
+            original_installation(config, process=process, launcher=launcher),
             source_verifier=verifier, credential_proof=credential_proof,
         )
 
     monkeypatch.setattr(composition, "probe_backend", complete_source_probe)
     monkeypatch.setattr(composition, "_install_owned_daemon_epoch", installation)
+    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/fake/unshare")
     # Verify interception independently before entering production composition.
     for method in (LinuxProcessRunner().run, LinuxProcessRunner().spawn):
         with pytest.raises(AssertionError, match="offline test reached"):
