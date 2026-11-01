@@ -22,6 +22,7 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.procfs import IdentityEvidence, IdentityState, OwnedProcessScan
 from airplay_linux.testing.adapters import FakeProcess, MemoryDaemonStore, SequenceIds
+from tests.process.test_credential_probe import private_socket_root
 
 APP = ProcessIdentity(pid=100, start_ticks=10)
 SUPERVISOR = ProcessIdentity(pid=200, start_ticks=20)
@@ -183,8 +184,8 @@ def run_async(test):
 
 
 @pytest.fixture
-def harness(tmp_path):
-    h = Harness(tmp_path)
+def harness(private_socket_root):
+    h = Harness(private_socket_root)
     try:
         yield h
     finally:
@@ -682,9 +683,9 @@ async def test_private_runtime_rejects_symlink_directory_and_socket(harness, tmp
 
 
 @pytest.fixture
-def application_daemon_identity_cases(tmp_path, monkeypatch):
+def application_daemon_identity_cases(private_socket_root, monkeypatch):
     from test_owned_launcher import candidate_failure_cases
-    yield from candidate_failure_cases.__wrapped__(tmp_path, monkeypatch)
+    yield from candidate_failure_cases.__wrapped__(private_socket_root, monkeypatch)
 
 
 async def test_receipt_joins_application_and_observed_daemon_instance_without_token(application_daemon_identity_cases):
@@ -836,3 +837,147 @@ async def test_supervisor_intent_recovery_terminalises_without_resignalling(appl
     assert failed.read_bytes() == frozen
     assert (c.runtime / 'release-intent.json').read_bytes() == before
     assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("path", ["registry_stop", "registry_shutdown", "evidence", "supervisor", "namespace_probe"])
+@pytest.mark.parametrize(("stage", "changed"), [
+    (stage, changed)
+    for stage in ("pre_bind", "bound")
+    for changed in (None, "identity", "uid", "supervisor", "socket_name", "receipt", "runtime", "entry", "socket_inode", "peer", "fd_holder")
+    if (stage == "bound" and changed != "supervisor") or (stage == "pre_bind" and changed not in {"entry", "socket_inode", "peer", "fd_holder"})
+])
+async def test_every_owned_termination_passes_strict_true(private_socket_root, monkeypatch, path, stage, changed):
+    """Exercise each production caller and its real synchronous post-open verifier."""
+    from types import SimpleNamespace
+    from airplay_linux.process.procfs import termination_evidence_complete
+    from tests.process.test_credential_probe import namespace_probe_witness
+    from tests.process.test_supervisor import public_supervisor_case
+    from tests.process.test_owned_launcher import OwnedCase, Crash, APP
+
+    fixture = None
+    if path == "namespace_probe":
+        c = namespace_probe_witness.__wrapped__(private_socket_root, monkeypatch)
+        process, facts = c.inner, c.facts
+        if stage == "pre_bind":
+            facts.bound_after = 4.0
+    elif path == "supervisor":
+        fixture = public_supervisor_case.__wrapped__(private_socket_root, monkeypatch)
+        c = next(fixture)
+        process, facts = c.process, c.facts
+    else:
+        c = OwnedCase(private_socket_root, monkeypatch)
+        process, facts = c.process, c.facts
+
+    observations = []
+    real_terminate = process.terminate
+
+    async def observe(identity, owner_uuid, runtime, deadline, *, strict=False, evidence=None, revalidate=None):
+        assert strict is True
+        assert termination_evidence_complete(evidence)
+        assert evidence.stage == stage
+        assert evidence.expected_identity == identity
+        assert evidence.expected_socket_name == str(Path(runtime) / "daemon.sock")
+        assert deadline == 3.0
+        assert callable(revalidate)
+        assert revalidate() == Ok(value=evidence), "unchanged stage must pass before pidfd-open"
+        callback_calls = []
+
+        def after_open():
+            callback_calls.append(True)
+            if changed in {"identity", "uid", "supervisor"}:
+                identity_before = facts.identity
+
+                def altered(pid):
+                    value = identity_before(pid)
+                    selected = evidence.expected_supervisor if changed == "supervisor" else identity
+                    if pid == selected.pid:
+                        if changed == "uid":
+                            return replace(value, uid=value.uid + 1)
+                        return replace(value, identity=replace(selected, start_ticks=selected.start_ticks + 1))
+                    return value
+
+                monkeypatch.setattr(facts, "identity", altered)
+            elif changed == "socket_name":
+                monkeypatch.setattr(facts, "cmdline", lambda pid: b"doubletake\0-daemonize\0-socket\0/wrong.sock\0")
+            elif changed == "receipt":
+                receipt_path = next((c.config.record_root / "receipts").glob("*.json")) if path == "namespace_probe" else (
+                    c.root / "daemon/receipts" / f"{owner_uuid}.json"
+                )
+                receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+            elif changed == "runtime":
+                fstat = facts.fstat
+
+                def changed_directory(fd):
+                    value = fstat(fd)
+                    return SimpleNamespace(st_mode=value.st_mode, st_uid=value.st_uid,
+                                           st_dev=value.st_dev, st_ino=value.st_ino + 1)
+
+                monkeypatch.setattr(facts, "fstat", changed_directory)
+            elif changed == "entry":
+                stat = facts.stat
+
+                def changed_entry(*args, **kwargs):
+                    value = stat(*args, **kwargs)
+                    return SimpleNamespace(st_mode=value.st_mode, st_uid=value.st_uid,
+                                           st_dev=value.st_dev, st_ino=value.st_ino + 1)
+
+                monkeypatch.setattr(facts, "stat", changed_entry)
+            elif changed == "peer":
+                peer = facts.peer
+                monkeypatch.setattr(facts, "peer", lambda *args: (peer(*args)[0] + 1, os.getuid(), os.getgid()))
+            elif changed == "fd_holder":
+                monkeypatch.setattr(facts, "holds_socket", lambda pid, inode: False)
+            elif changed == "socket_inode":
+                rows = facts.unix_inodes
+                monkeypatch.setattr(facts, "unix_inodes", lambda name: tuple(inode + 1 for inode in rows(name)))
+            return revalidate()
+
+        # This injected process boundary models pidfd-open before invoking the
+        # production callback against independently changed kernel/durable facts.
+        result = await real_terminate(
+            identity, owner_uuid, runtime, deadline, strict=strict,
+            evidence=evidence, revalidate=after_open,
+        )
+        assert callback_calls == [True]
+        observations.append((evidence, result))
+        return result
+
+    monkeypatch.setattr(process, "terminate", observe)
+    try:
+        if path == "namespace_probe":
+            result = await c.module.run_backend_leg(c.config, "positive", process=process, supervisor=facts.supervisor)
+            assert result.cleanup_confirmed is (changed is None)
+        else:
+            if stage == "pre_bind":
+                c.bind_on_spawn = False
+                c.hooks["supervisor-publication"] = lambda: (_ for _ in ()).throw(Crash())
+                with pytest.raises(Crash):
+                    await c.registry.ensure()
+            else:
+                assert isinstance(await c.registry.ensure(), Ok)
+            if path == "supervisor":
+                process.exit(APP)
+                runner = await c.supervisor()
+                result = await runner._request_release(c.record, c.registry._features)
+            elif path == "evidence":
+                receipt = await c.current()
+                assert isinstance(await c.receipts.write(replace(receipt, state="stopping")), Ok)
+                result = await c.ownership.release(c.record)
+            elif path == "registry_stop":
+                result = await c.registry._stop_owned(c.record)
+            else:
+                result = await c.registry.shutdown()
+            assert isinstance(result, Ok if changed is None else Err), result
+        assert len(observations) == 1, "the owned caller must reach exactly one strict process boundary"
+        assert len(process.terminated) == (1 if changed is None else 0)
+        if changed is not None:
+            if path == "namespace_probe":
+                assert facts.entries, "uncertainty must retain the socket entry"
+            elif stage == "bound":
+                assert (Path(c.runtime) / "daemon.sock").exists()
+    finally:
+        if fixture is not None:
+            fixture.close()
+            c.close()
+        elif path != "namespace_probe":
+            c.close()

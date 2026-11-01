@@ -304,7 +304,7 @@ class EvidenceAuthority:
         if operation in {BackendOperation.mute, BackendOperation.unmute}:
             return f.multi_target and f.target_mute
         if operation is BackendOperation.connect:
-            return f.multi_target and f.physical_source
+            return f.multi_target and (f.physical_source or f.virtual_source)
         if operation is BackendOperation.shutdown:
             return True
         # This authority represents the public evidence contract. Unsupported

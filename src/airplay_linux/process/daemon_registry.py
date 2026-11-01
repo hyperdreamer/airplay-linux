@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import inspect
 import os
 import socket
 import stat
@@ -91,6 +92,27 @@ def _token(value: SensitiveText | str) -> str:
 
 def _scan_owned(instance_uuid: UUID, runtime: str) -> OwnedProcessScan:
     return owned_processes(instance_uuid, runtime)
+
+
+def _accepts_ownership_proof(control: object) -> bool:
+    method = getattr(control, 'request', None)
+    if method is None:
+        return False
+    try:
+        parameters = inspect.signature(getattr(method, '__func__', method)).parameters
+    except (TypeError, ValueError):
+        return False
+    candidate = parameters.get('ownership_proof')
+    if candidate is not None and candidate.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.VAR_KEYWORD,
+    }:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 class DaemonRegistry:
@@ -226,10 +248,12 @@ class DaemonRegistry:
         return failure
 
     def _compatible(self) -> bool:
-        # Public lifecycle admission remains dormant until composition activates
-        # it. Preserve the delivered feature-based contract for fixture profiles.
         if self._features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}:
-            return False
+            return (
+                self._public_lifecycle()
+                and self._features.owned_daemon_control
+                and self._features.keyring
+            )
         if self._features.owned_daemon_control and not self._public_seams_complete:
             return False
         return (
@@ -317,7 +341,7 @@ class DaemonRegistry:
 
     async def shutdown(self) -> Result[None]:
         if (self._features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}
-                and not self._public_seams_complete and not self._has_launched and self._record is None):
+                and not self._compatible() and not self._has_launched and self._record is None):
             # An inactive composition never acquired a daemon lifetime. Runtime
             # shutdown still joins normally; explicit reconciliation retains
             # strict refusal of malformed/unresolved public evidence.
@@ -1065,7 +1089,13 @@ class DaemonRegistry:
             control = self._control_factory(record)
             try:
                 async with asyncio.timeout(self._startup_timeout):
-                    status = await control.request(BackendOperation.status, None, EmptyPayload(), None)
+                    request_kwargs: dict[str, object] = {}
+                    if _accepts_ownership_proof(control):
+                        request_kwargs['ownership_proof'] = proof.value
+                    status = await control.request(
+                        BackendOperation.status, None, EmptyPayload(), None,
+                        **request_kwargs,
+                    )
                     checked = await self._ownership.confirm(record, proof.value)
                     if isinstance(checked, Err):
                         return checked

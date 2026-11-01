@@ -37,29 +37,50 @@ The two modes are mutually exclusive per receiver and independent across receive
 
 ## What this build can and cannot do
 
-The composition root refuses to fabricate evidence, so what follows is the measured state, not a
-list of missing features.
+The owned-daemon epoch is active. Production control uses `EvidenceAuthority` to join an
+application-owned launch receipt to the current daemon process, private socket entry, kernel socket
+row, peer credentials, file-descriptor holder and endpoint generation. Registry, supervisor,
+transport and control share this authority. Teardown requires a pidfd, stage-complete evidence and
+fresh verification after opening the pidfd; unresolved evidence retains a cleanup obligation.
 
-**On the host this was built against, no streaming session starts.** The installed `doubletake`
-0.5.0 affirms only `multi_target`, `audio_probe` and `target_mute`; transport admission requires
-`foreground_control`, `owner_handshake` and `keyring`, all withheld. Discovery, receiver listing
-and device inspection still work.
+This is a **cooperative same-user guarantee**. Another process with the same UID can inspect or
+modify user-owned files and processes; this is not isolation from a malicious same-user process.
+Old, foreign, ambiguous, replaced or unreadable ownership evidence is refused before control or
+signals. A same-user process that impersonates the expected entry and argv remains indistinguishable
+under this guarantee. Reported geometry does not attest the compositor's actual pixels. A receiver
+can later require pairing that this application cannot service, and remembered trust still does not
+survive an application restart. A crash requires reconciliation of durable receipts and a new endpoint
+generation before replacement.
 
-Three independent prerequisites stand between this code and a working session, and this backend
-satisfies none of them:
+Mirror requires every activation prerequisite: owned daemon control, durable receipts, endpoint
+verification, strict teardown, shared authority, a credential-service witness and the wired source
+verifier. Missing prerequisites produce a named `dependency_incompatible` refusal with no backend
+launch. The credential witness uses one private network/mount namespace and two isolated backend
+legs before registry construction; its file-backed evidence must prove the service, positive and
+negative legs. Public admission requires `owned_daemon_control`, `keyring` and `multi_target`.
 
-- **owned daemon control** — a supervised foreground daemon exposes no control socket, and a
-  daemonised one is not supervised; owning it needs a launch-receipt model that is specified but
-  not implemented;
-- **physical source selection** — `doubletake` has no monitor/output selector, so "send this
-  monitor" is not expressible; capture is the whole desktop;
-- **credential service** — the keyring backend is selectable but unproven, and remembered trust
-  does not survive a restart because the adapter implements no cross-process load.
+A full-chain source-reporting build must advertise `capabilities-v1`, `status-source` and
+`status-source-complete`. Before publishing a stream, the application matches that target's reported
+monitor type, complete size and signed position against one fresh KScreen inventory of the requested
+physical output. Window/virtual sources, missing position, a different monitor or ambiguous geometry
+produce `unsupported_source`. Source acquisition and credential-challenge polling share one 5.0 s
+deadline. A challenge from the connect acknowledgement or status stops only that exact target and
+returns `dependency_incompatible`; unconfirmed target cleanup takes `cleanup_timeout` precedence.
+No credential prompt or pairing operation is offered by this public profile.
 
-Virtual display is separately blocked: `krfb-virtualmonitor` is absent here, and the composition
-supplies no output-association verifier.
+The public backend still withholds `foreground_control`, `owner_handshake`, `target_bound_pairing`,
+`provisional_commit`, `cancel_pairing`, `revoke_pairing`, `audio_restart` and `query_modes`. Startup
+diagnostics name the selected authority, failed credential leg, missing complete-source or inventory
+evidence and withheld flags. The fixture-only application-contract profile retains its original
+handshake and pairing prerequisites.
 
-Nothing above is worked around by inference — that is the point of the design. `--check-environment`
-reports the exact missing affirmations; `docs/operations.md` has the prerequisites and a live
-acceptance checklist; `docs/backend-compatibility.md` records why each gate cannot be closed with
-this backend.
+The binaries currently installed in `/home/bin` advertise only the older two-token source contract,
+so **Mirror remains gated on this host until a complete build is installed and all runtime evidence
+passes**. The activation rebuild and its actual artifact hashes are recorded in
+[docs/backend-fork.md](docs/backend-fork.md). Verification used deterministic external boundaries;
+no live receiver streaming session was attempted. Virtual display has its own helper, source and
+output-association prerequisites and is not enabled by this activation.
+
+`--check-environment` reports capability evidence; [docs/operations.md](docs/operations.md) has the
+operator checks and [docs/backend-compatibility.md](docs/backend-compatibility.md) records the backend
+surfaces. Discovery, receiver listing and device inspection remain available when streaming is gated.

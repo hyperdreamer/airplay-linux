@@ -19,6 +19,7 @@ from airplay_linux.backend.control import (
     ModesPayload,
     MutePayload,
     PairingPayload,
+    OwnershipProof,
     PublishedDoubletakeControl,
     PublishedDoubletakeProfile,
     SourcePayload,
@@ -26,7 +27,7 @@ from airplay_linux.backend.control import (
     UnsupportedControl,
 )
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId
+from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId, ProcessIdentity
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.testing.builders import physical, target
@@ -501,6 +502,119 @@ def test_published_control_fails_closed_per_operation_before_process_io():
 class _SlowProcess:
     async def run(self, spec, timeout, stdin=None):
         await asyncio.sleep(1)
+
+
+@pytest.mark.parametrize("disabled", [
+    None, "target_bound_pairing", "provisional_commit", "cancel_pairing", "revoke_pairing",
+])
+def test_connect_does_not_consult_each_former_pairing_prerequisite(disabled):
+    from airplay_linux.process.ownership import EvidenceAuthority
+    from airplay_linux.process.procfs import TerminationEvidence
+
+    pairing = {name: disabled is not None and name != disabled for name in (
+        "target_bound_pairing", "provisional_commit", "cancel_pairing", "revoke_pairing",
+    )}
+    features = replace(
+        secure_features(), profile="doubletake-0.5+source", version="0.5.0",
+        foreground_control=False, owner_handshake=False, owned_daemon_control=True,
+        physical_source=True, virtual_source=False, **pairing,
+    )
+    authority = EvidenceAuthority(
+        receipts=lambda: (), process=object(), evidence_factory=TerminationEvidence, features=features,
+    )
+    control = PublishedDoubletakeControl(
+        _Process([]), PublishedDoubletakeProfile(socket_path="/run/private.sock", features=features),
+        record=object(), authority=authority,
+    )
+    assert control._available(BackendOperation.connect) is True
+
+
+async def test_pairing_operation_flag_truth_table_rejects_only_missing_own_flags():
+    requirements = {
+        BackendOperation.begin_pairing: ("target_bound_pairing", "cancel_pairing"),
+        BackendOperation.submit_pairing: ("target_bound_pairing", "keyring", "provisional_commit"),
+        BackendOperation.prepare_pairing: ("target_bound_pairing", "keyring", "provisional_commit"),
+        BackendOperation.commit_pairing: ("keyring", "provisional_commit"),
+        BackendOperation.mark_invalid: ("revoke_pairing",),
+        BackendOperation.revoke_pairing: ("revoke_pairing",),
+        BackendOperation.cancel_pairing: ("cancel_pairing",),
+    }
+    pairing_flags = {"target_bound_pairing", "keyring", "provisional_commit", "cancel_pairing", "revoke_pairing"}
+    for operation, own_flags in requirements.items():
+        flags = {name: name in own_flags for name in pairing_flags}
+        profile = ApplicationContractProfile(
+            socket_path="/run/user/1000/private.sock", owner_token="owner-token",
+            instance_uuid=InstanceId(UUID(int=9)), features=replace(secure_features(), **flags),
+        )
+        process = _ApplicationContractProcess({"status", operation.value})
+        control = PublishedDoubletakeControl(process, profile)
+        assert control._available(operation) is True, operation
+        assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+        admitted = await control.request(operation, target(), EmptyPayload(), context())
+        assert isinstance(admitted, Ok), (operation, admitted)
+        assert [call[0].argv[3] for call in process.calls] == ["status", "status", operation.value]
+        for flag in own_flags:
+            blocked = replace(profile.features, **{flag: False})
+            blocked_process = _Process([])
+            blocked_control = PublishedDoubletakeControl(blocked_process, replace(profile, features=blocked))
+            assert blocked_control._available(operation) is False, (operation, flag)
+            refused = await blocked_control.request(operation, target(), EmptyPayload(), context())
+            assert isinstance(refused, Err) and refused.error.code is ErrorCode.dependency_incompatible
+            assert blocked_process.calls == []
+
+
+@pytest.mark.parametrize("operation", [op for op in BackendOperation if op not in {
+    BackendOperation.status, BackendOperation.discover, BackendOperation.devices,
+}])
+def test_fixture_mutations_still_require_owner_handshake(operation):
+    profile = replace(secure_profile(), features=replace(secure_features(), owner_handshake=False))
+    control = PublishedDoubletakeControl(_Process([]), profile)
+    assert control._available(operation) is False
+
+
+def test_replacement_between_authorization_and_dispatch_refuses():
+    daemon = ProcessIdentity(pid=300, start_ticks=3)
+    first = OwnershipProof(
+        kind="evidence", daemon=daemon, socket_entry=(1, 2), generation=1,
+        handshake=None,
+    )
+    replacement = replace(first, generation=2)
+
+    class Authority:
+        async def authorize(self, record, operation, target, fence):
+            return Ok(value=first)
+
+        async def prove(self, record):
+            return Ok(value=replacement)
+
+        def allows(self, operation):
+            return operation is BackendOperation.connect
+
+        async def confirm(self, record, proof):
+            return Ok(value=None)
+
+    process = _Process([])
+    control = PublishedDoubletakeControl(
+        process,
+        PublishedDoubletakeProfile(
+            socket_path="/run/private.sock",
+            features=replace(
+                secure_features(), profile="doubletake-0.5", version="0.5.0",
+                foreground_control=False, owner_handshake=False,
+                owned_daemon_control=True, physical_source=True,
+            ),
+        ),
+        record=object(), authority=Authority(),
+    )
+
+    result = asyncio.run(control.request(
+        BackendOperation.connect, target(), ConnectPayload(), context(),
+        dispatch_fence=_open_fence, ownership_proof=first,
+    ))
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.stale_event
+    assert process.calls == []
 
 
 class _GatedProcess:

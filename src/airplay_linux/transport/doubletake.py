@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
-    Handshake, ModesPayload, MutePayload, requires_dispatch_fence,
+    Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
@@ -99,11 +99,34 @@ def _request_accepts_dispatch_fence(method: object) -> bool:
     )
 
 
+@lru_cache(maxsize=None)
+def _request_accepts_ownership_proof(method: object) -> bool:
+    try:
+        parameters = signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    candidate = parameters.get("ownership_proof")
+    if candidate is not None and candidate.kind in {
+        Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY,
+        Parameter.VAR_KEYWORD,
+    }:
+        return True
+    return any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
 def _accepts_dispatch_fence(control: object) -> bool:
     method = getattr(control, "request", None)
     if method is None:
         return False
     return _request_accepts_dispatch_fence(getattr(method, "__func__", method))
+
+
+def _accepts_ownership_proof(control: object) -> bool:
+    method = getattr(control, "request", None)
+    if method is None:
+        return False
+    return _request_accepts_ownership_proof(getattr(method, "__func__", method))
 
 
 async def _safe(operation: Awaitable, code: ErrorCode = ErrorCode.transport_failed):
@@ -139,6 +162,7 @@ class _Subscription:
 class _Daemon:
     record: DaemonRecord
     control: BackendControl
+    ownership_proof: OwnershipProof | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     authenticated: bool = False
     alive: bool = True
@@ -470,7 +494,15 @@ class DoubleTakeTransport:
         checked = self._current(target, context)
         if isinstance(checked, Err):
             return checked
-        if not (self._features.foreground_control and self._features.owner_handshake and self._features.keyring):
+        if self._features.profile in {"doubletake-0.5", "doubletake-0.5+source"}:
+            admitted = self._features.owned_daemon_control and self._features.keyring
+        else:
+            admitted = (
+                self._features.foreground_control
+                and self._features.owner_handshake
+                and self._features.keyring
+            )
+        if not admitted:
             return _failure(ErrorCode.dependency_incompatible)
         ensured = await _safe(self._registry.ensure(), ErrorCode.daemon_failed)
         if isinstance(ensured, Err):
@@ -500,16 +532,25 @@ class DoubleTakeTransport:
             if not daemon.alive:
                 return _failure(ErrorCode.daemon_failed)
             if not daemon.authenticated:
-                proof = await _safe(daemon.control.handshake(record.owner_token, record.instance_uuid), ErrorCode.ownership_mismatch)
+                proof = await _safe(
+                    daemon.control.handshake(record.owner_token, record.instance_uuid),
+                    ErrorCode.ownership_mismatch,
+                )
                 if isinstance(proof, Err):
                     return proof
-                h = proof.value
-                owner = h.owner_token.reveal_for_backend() if isinstance(h, Handshake) and isinstance(h.owner_token, SensitiveText) else getattr(h, "owner_token", None)
-                if not isinstance(h, Handshake) or (
-                    h.instance_uuid != record.instance_uuid or owner != record.owner_token
-                    or h.daemon != record.daemon or h.protocol_version != record.protocol_version
-                ):
-                    return _failure(ErrorCode.ownership_mismatch)
+                value = proof.value
+                if isinstance(value, OwnershipProof):
+                    if value.kind != "evidence" or value.daemon != record.daemon:
+                        return _failure(ErrorCode.ownership_mismatch)
+                    daemon.ownership_proof = value
+                else:
+                    h = value
+                    owner = h.owner_token.reveal_for_backend() if isinstance(h, Handshake) and isinstance(h.owner_token, SensitiveText) else getattr(h, "owner_token", None)
+                    if not isinstance(h, Handshake) or (
+                        h.instance_uuid != record.instance_uuid or owner != record.owner_token
+                        or h.daemon != record.daemon or h.protocol_version != record.protocol_version
+                    ):
+                        return _failure(ErrorCode.ownership_mismatch)
                 daemon.authenticated = True
             checked = self._current(target, context)
             if isinstance(checked, Err):
@@ -550,12 +591,14 @@ class DoubleTakeTransport:
             # a replacement admitted during the adapter's awaited ownership
             # revalidation would otherwise receive the command.
             return _failure(ErrorCode.dependency_incompatible)
+        request_kwargs: dict[str, object] = {}
         if fenced:
-            result = await _safe(daemon.control.request(
-                operation, target, payload, context, dispatch_fence=fence,
-            ))
-        else:
-            result = await _safe(daemon.control.request(operation, target, payload, context))
+            request_kwargs["dispatch_fence"] = fence
+        if _accepts_ownership_proof(daemon.control):
+            request_kwargs["ownership_proof"] = daemon.ownership_proof
+        result = await _safe(daemon.control.request(
+            operation, target, payload, context, **request_kwargs,
+        ))
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
         checked = self._targets.require_cleanup(target) if cleanup else self._current(target, context)
@@ -767,7 +810,9 @@ class DoubleTakeTransport:
                     # Preserve the virtual acquisition contract: the caller owns
                     # this handle while waiting for a separate readiness event.
                     return Ok(value=stream.handle)
-                if result.value.state != "streaming":
+                if self._features.owned_daemon_control and result.value.state == "pin_required":
+                    failure = _failure(ErrorCode.dependency_incompatible)
+                elif result.value.state != "streaming":
                     failure = _failure(ErrorCode.unsupported_source)
                 else:
                     source_checked = (
