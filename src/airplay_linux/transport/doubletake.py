@@ -691,6 +691,18 @@ class DoubleTakeTransport:
                     item for item in status.value.streams
                     if item.target == stream.target.canonical_host
                 )
+                if (
+                    status.value.target == stream.target.canonical_host
+                    and (
+                        status.value.state == "pin_required"
+                        or status.value.needs_credential
+                        or status.value.credential_kind is not None
+                    )
+                ) or any(
+                    item.state == "pin_required" or item.credential_kind is not None
+                    for item in matches
+                ):
+                    return _failure(ErrorCode.dependency_incompatible)
                 if len(matches) == 1 and matches[0].source is not None:
                     verified = await _safe(
                         self._source_verifier.verify(stream.source.connector, matches[0].source),
