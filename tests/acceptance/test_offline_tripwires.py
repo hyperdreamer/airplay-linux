@@ -68,6 +68,21 @@ async def test_execution_entry_points_refuse_before_lookup(offline_boundary_trip
     "({command})",
     "{{ {command}; }}",
     "true & {command}",
+    "printf x#y;{command}",
+    "printf x#y&&{command}",
+    "# ignored comment\n{command}",
+    "printf '%s' ';' 'then';{command}",
+    "if false;then true;else {command};fi",
+    "while {command};do :;done",
+    "while false;do {command};done",
+    "! {command}",
+    "exec {command}",
+    "command -- {command}",
+    "for value in offline;do {command};done",
+    "for value do {command};done",
+    "case offline in offline) {command};;esac",
+    "case offline in other|offline) {command};;esac",
+    "time -p {command}",
     "/bin/sh -c '{command}'",
 ))
 @pytest.mark.parametrize("entry", ("subprocess", "shell_argv", "explicit_shell", "asyncio"))
@@ -130,6 +145,30 @@ def test_unsupported_shell_evaluation_refuses_before_child_creation(
     ("if true;then printf offline;fi", "offline"),
     ("(printf offline)", "offline"),
     ("printf '%s' 'doubletake -daemonize'", "doubletake -daemonize"),
+    ("printf '%s' 'doubletake'", "doubletake"),
+    ("printf '%s' 'doubletake-ctl'", "doubletake-ctl"),
+    ("printf '%s' 'sh'", "sh"),
+    ("printf '%s' '$HOME'", "$HOME"),
+    ("printf '%s' 'foo?bar'", "foo?bar"),
+    ("printf '%s' 'a=b'", "a=b"),
+    ("printf '%s' 'eval'", "eval"),
+    ("printf '%s' 'PATH'", "PATH"),
+    ("printf '%s' 'if' 'then' 'do' 'else' 'while' '!' '{' 'exec'", "ifthendoelsewhile!{exec"),
+    ("printf '%s' \"foo?bar\"", "foo?bar"),
+    ("printf '%s' double\\take", "doubletake"),
+    ("printf '%s' 'double'\"take\"", "doubletake"),
+    ("printf x#y # doubletake -daemonize", "x#y"),
+    ("# doubletake-ctl -status\nprintf offline", "offline"),
+    ("printf '%s' 'a;doubletake -daemonize'", "a;doubletake -daemonize"),
+    ("for value in doubletake sh eval PATH;do printf offline;done", "offlineofflineofflineoffline"),
+    ("case doubletake in doubletake) printf offline;;esac", "offline"),
+    ("case doubletake\nin\ndoubletake) printf offline;;esac", "offline"),
+    ("read value </dev/null || printf offline", "offline"),
+    ("set -- doubletake sh;printf offline", "offline"),
+    ("export ordinary;printf offline", "offline"),
+    ("exec printf '%s' doubletake", "doubletake"),
+    ("command printf '%s' sh", "sh"),
+    ("env -- printf '%s' doubletake", "doubletake"),
 ))
 def test_unrelated_shell_programs_remain_available(offline_boundary_tripwires, program, output):
     result = subprocess.run(program, shell=True, capture_output=True, text=True, check=True)
@@ -147,8 +186,26 @@ def test_compound_shell_permits_marked_private_shims(
     )
     shim.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path))
-    result = subprocess.run(f"true;{name} -status", shell=True, capture_output=True, text=True, check=True)
+    socket_path = tmp_path / "sh"
+    result = subprocess.run(
+        f"true;{name} -status -socket '{socket_path}'",
+        shell=True, capture_output=True, text=True, check=True,
+    )
     assert result.stdout == "private"
+    assert offline_boundary_tripwires.attempted == []
+
+
+@pytest.mark.parametrize("name", ("doubletake", "doubletake-ctl", "sh"))
+@pytest.mark.parametrize("redirect", (">", "2>", ">>"))
+def test_shell_redirection_paths_are_data(
+    offline_boundary_tripwires, tmp_path, name, redirect,
+):
+    output = tmp_path / name
+    result = subprocess.run(
+        f"{redirect}'{output}' printf offline", shell=True,
+        capture_output=True, text=True, check=True,
+    )
+    assert (result.stdout, output.read_text()) == (("offline", "") if redirect == "2>" else ("", "offline"))
     assert offline_boundary_tripwires.attempted == []
 
 
@@ -158,6 +215,8 @@ def test_compound_shell_permits_marked_private_shims(
     "/usr/bin/env -i {command}",
     "command -p {command}",
     "read PATH;{command}",
+    "export PATH;{command}",
+    "for PATH in /absent;do {command};done",
 ))
 def test_shell_cannot_retarget_a_permitted_private_shim(
     offline_boundary_tripwires, tmp_path, monkeypatch, name, program,

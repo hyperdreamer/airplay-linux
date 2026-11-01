@@ -114,34 +114,210 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         attempted.append(boundary)
         raise OfflineBoundaryRefusal(f"unmarked live boundary attempted: {boundary}")
 
+    def shell_tokens(program):
+        # Keep quote information: reserved words and operators only have syntax
+        # when unquoted. A '#' starts a comment only at the start of a word.
+        tokens = []
+        word = []
+        started = quoted = assignment = brace = False
+
+        def finish_word():
+            nonlocal started, quoted, assignment, brace
+            if started:
+                value = "".join(word)
+                if brace and value not in {"{", "}"}:
+                    refuse("backend")
+                kind = "assignment" if assignment else "quoted" if quoted else "word"
+                tokens.append((value, kind))
+                word.clear()
+            started = quoted = assignment = brace = False
+
+        index = 0
+        while index < len(program):
+            char = program[index]
+            if char in " \t\n":
+                finish_word()
+                if char == "\n":
+                    tokens.append((";", "operator"))
+                index += 1
+            elif char == "#" and not started:
+                end = program.find("\n", index)
+                index = len(program) if end < 0 else end
+            elif char in {"'", '"'}:
+                quote = char
+                started = quoted = True
+                index += 1
+                while index < len(program) and program[index] != quote:
+                    char = program[index]
+                    if quote == '"' and char in "$`":
+                        refuse("backend")
+                    if (quote == '"' and char == "\\" and index + 1 < len(program)
+                            and program[index + 1] in '$`"\\\n'):
+                        index += 1
+                        if program[index] != "\n":
+                            word.append(program[index])
+                    else:
+                        word.append(char)
+                    index += 1
+                if index == len(program):
+                    refuse("backend")
+                index += 1
+            elif char == "\\":
+                index += 1
+                if index == len(program):
+                    refuse("backend")
+                if program[index] != "\n":
+                    started = quoted = True
+                    word.append(program[index])
+                index += 1
+            elif char in ";&|()<>":
+                # Adjacent unquoted digits are an IO number, not an executable.
+                if char in "<>" and not quoted and "".join(word).isdigit():
+                    word.clear()
+                    started = False
+                finish_word()
+                operator = next((op for op in (
+                    "&>>", "<<-", "<<<", ";;&", "&&", "||", ">>", "<<",
+                    "<&", ">&", "<>", ">|", "&>", "|&", ";;", ";&",
+                ) if program.startswith(op, index)), char)
+                tokens.append((operator, "operator"))
+                index += len(operator)
+            else:
+                # Active expansion/evaluation remains unsupported. Quoted or
+                # escaped literal data reaches this lexer without these checks.
+                if char in "$`*?[]":
+                    refuse("backend")
+                if char == "=" and not quoted and "".join(word).isidentifier():
+                    assignment = True
+                brace |= char in "{}"
+                word.append(char)
+                started = True
+                index += 1
+        finish_word()
+        return tokens
+
     def check_shell(program, *, env=None):
         if opted_in:
             return
-        program = os.fsdecode(program)
-        # Support literal shell programs, not expansion or evaluation that can
-        # manufacture executable names. shlex is a lexer, not a shell parser.
-        if any(marker in program for marker in ("$", "`", "*", "?", "[", "]", "<<", "\\\n")):
-            refuse("backend")
-        lexer = shlex.shlex(program, posix=True, punctuation_chars=";&|()<>")
-        lexer.whitespace_split = True
-        try:
-            words = list(lexer)
-        except ValueError:
-            refuse("backend")
-        for word in words:
-            # These can evaluate another program or change private PATH lookup.
-            if (word in {"eval", "source", ".", "cd", "pushd", "popd", "unset", "alias", "PATH"}
-                    or ("=" in word and word.split("=", 1)[0].isidentifier())
-                    or (word not in {"{", "}"} and ("{" in word or "}" in word))):
+
+        def command(argv):
+            if not argv:
+                return
+            name = "." if argv[0] == "." else Path(argv[0]).name
+            # These can evaluate code or change lookup for a later command.
+            if name in {"eval", "source", ".", "cd", "pushd", "popd", "unset", "alias"}:
                 refuse("backend")
-        # Conservatively inspect every word, including commands after shell
-        # operators/keywords and nested shell/env/exec/unshare invocations.
-        # Shell arguments never receive the direct read-only observation bypass.
-        for index, word in enumerate(words):
-            if (Path(word).name in {"env", "command"} and index + 1 < len(words)
-                    and words[index + 1].startswith("-") and words[index + 1] != "--"):
+            if name == "read" and "PATH" in argv[1:]:
                 refuse("backend")
-            check_process(words[index:], env=env, observation=False)
+            if name in {"export", "declare", "typeset", "local", "readonly"} and any(
+                value.split("=", 1)[0] == "PATH" for value in argv[1:]
+            ):
+                refuse("backend")
+            if name == "hash" and any(value.startswith("-p") for value in argv[1:]):
+                refuse("backend")
+            if name in {"env", "command", "exec", "builtin", "time"}:
+                tail = argv[1:]
+                if name == "exec":
+                    while tail:
+                        if tail[0] == "--":
+                            tail = tail[1:]
+                            break
+                        if tail[0] == "-a" and len(tail) > 1:
+                            tail = tail[2:]
+                        elif tail[0] in {"-c", "-l", "-cl", "-lc"}:
+                            tail = tail[1:]
+                        else:
+                            break
+                elif name == "time" and tail[:1] == ["-p"]:
+                    tail = tail[1:]
+                if tail and tail[0] == "--":
+                    tail = tail[1:]
+                elif tail and (tail[0].startswith("-")
+                               or ("=" in tail[0] and tail[0].split("=", 1)[0].isidentifier())):
+                    refuse("backend")
+                command(tail)
+            else:
+                # Arguments, including a private socket called 'sh', never
+                # become separate executable candidates.
+                check_process(argv, env=env, observation=False)
+
+        argv = []
+        redirect = False
+        for_header = None
+        cases = []
+        for value, kind in shell_tokens(os.fsdecode(program)):
+            # Loop variables/values and case subjects/patterns are shell data.
+            # Their bodies resume command parsing at 'do' or the pattern's ')'.
+            if for_header is not None:
+                if kind == "operator" and value == ";" and for_header != "variable":
+                    for_header = None
+                elif kind == "operator":
+                    refuse("backend")
+                elif for_header == "variable":
+                    if not value.isidentifier() or value == "PATH":
+                        refuse("backend")
+                    for_header = "in"
+                elif for_header == "in" and kind == "word" and value == "in":
+                    for_header = "values"
+                elif for_header == "in" and kind == "word" and value == "do":
+                    for_header = None
+                elif for_header != "values":
+                    refuse("backend")
+                continue
+            if cases and cases[-1] in {"subject", "in", "pattern"}:
+                state = cases[-1]
+                if state == "subject" and kind != "operator":
+                    cases[-1] = "in"
+                elif state == "in" and kind == "word" and value == "in":
+                    cases[-1] = "pattern"
+                elif state == "in" and kind == "operator" and value == ";":
+                    continue
+                elif state == "pattern":
+                    if kind == "operator" and value == ")":
+                        cases[-1] = "body"
+                    elif kind == "word" and value == "esac":
+                        cases.pop()
+                    elif kind == "operator" and value not in {"(", "|", ";"}:
+                        refuse("backend")
+                else:
+                    refuse("backend")
+                continue
+            if cases and kind == "operator" and value in {";;", ";&", ";;&"}:
+                if redirect:
+                    refuse("backend")
+                command(argv)
+                argv = []
+                cases[-1] = "pattern"
+            elif kind == "operator":
+                if redirect:
+                    refuse("backend")
+                if value in {"<", ">", ">>", "<&", ">&", "<>", ">|", "&>", "&>>"}:
+                    redirect = True
+                elif value in {";", "&", "&&", "||", "|", "|&", "(", ")"}:
+                    command(argv)
+                    argv = []
+                else:
+                    refuse("backend")
+            elif redirect:
+                redirect = False
+            elif not argv and kind == "word" and value in {"for", "select"}:
+                for_header = "variable"
+            elif not argv and kind == "word" and value == "case":
+                cases.append("subject")
+            elif not argv and kind == "word" and value == "esac" and cases:
+                cases.pop()
+            elif not argv and kind == "word" and value in {
+                "if", "then", "elif", "else", "while", "until", "do", "!", "{",
+                "fi", "done", "}",
+            }:
+                continue
+            elif not argv and kind == "assignment":
+                refuse("backend")
+            else:
+                argv.append(value)
+        if redirect or for_header is not None or cases:
+            refuse("backend")
+        command(argv)
 
     def check_process(argv, *, env=None, observation=True):
         if isinstance(argv, (str, bytes)):
