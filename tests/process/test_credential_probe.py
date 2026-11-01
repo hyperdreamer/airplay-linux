@@ -7,8 +7,11 @@ import importlib
 import json
 import os
 import stat
+import subprocess
+import sys
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -206,7 +209,14 @@ class InnerProcess(ProbeProcessRecorder):
 
 
 @pytest.fixture
-def namespace_probe_witness(tmp_path, monkeypatch):
+def private_socket_root():
+    """Own a short socket base independently of pytest roots and TMPDIR."""
+    with TemporaryDirectory(prefix="ap-tests-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+@pytest.fixture
+def namespace_probe_witness(private_socket_root, monkeypatch):
     p = probe_module()
     clock = Clock()
     facts = NamespaceFacts(clock)
@@ -221,12 +231,13 @@ def namespace_probe_witness(tmp_path, monkeypatch):
     monkeypatch.setattr(p, "_witness_environment", lambda: p.WitnessEnvironment(
         observations=facts, service=service, now=clock.now, sleep=clock.sleep,
     ))
-    root = tmp_path / str(uuid4())
+    # The child appends a UUID and leg name; pytest roots can exceed sun_path.
+    root = private_socket_root / str(uuid4())
     root.mkdir(mode=0o700)
     config = p.prepare_config(root, backend_executable="/fake/doubletake",
                               supervisor=facts.supervisor, boot_id=facts.boot)
     return SimpleNamespace(module=p, config=config, facts=facts, inner=inner, clock=clock,
-                           service_calls=service_calls,
+                           service_calls=service_calls, socket_root=private_socket_root,
                            namespace=lambda argv: Ok(value=facts.supervisor))
 
 
@@ -363,7 +374,7 @@ def test_probe_socket_idle_confirmation_and_termination_bounds(probe_fake_clock,
 
 
 @pytest.fixture
-def recording_probe_processes(namespace_probe_witness, monkeypatch, tmp_path_factory):
+def recording_probe_processes(namespace_probe_witness, monkeypatch):
     """Full build_runtime graph; the outer fake executes real run in a thread."""
     c = namespace_probe_witness
     from dbus_next.aio import MessageBus
@@ -433,10 +444,9 @@ def recording_probe_processes(namespace_probe_witness, monkeypatch, tmp_path_fac
     c.outer = Outer()
     c.outer_unshare = c.outer.outer_unshare
     c.runtime = None
-    tmp_path = tmp_path_factory.mktemp("p")
-    runtime_root = tmp_path / "r"
+    runtime_root = c.socket_root / "r"
     runtime_root.mkdir(mode=0o700)
-    c.runtime_config = composition.RuntimeConfig(state_root=tmp_path / "s", runtime_root=runtime_root, live=False)
+    c.runtime_config = composition.RuntimeConfig(state_root=c.socket_root / "s", runtime_root=runtime_root, live=False)
 
     async def build(*, activate=True):
         monkeypatch.setattr(composition, "_OWNED_DAEMON_EPOCH_ACTIVE", activate)
@@ -698,11 +708,11 @@ async def test_parent_archives_only_two_verified_terminal_leg_receipts(recording
 
 
 def test_production_main_uses_same_child_seam_and_requires_complete_files(
-    namespace_probe_witness, monkeypatch, tmp_path_factory,
+    namespace_probe_witness, monkeypatch,
 ):
     c = namespace_probe_witness
     from airplay_linux.process import linux
-    root = tmp_path_factory.mktemp("m") / str(uuid4())
+    root = c.socket_root / str(uuid4())
     root.mkdir(mode=0o700)
     monkeypatch.setattr(c.module, "_namespace_identity", c.namespace)
     monkeypatch.setattr(c.module.shutil, "which", lambda _: "/fake/doubletake")
@@ -712,3 +722,26 @@ def test_production_main_uses_same_child_seam_and_requires_complete_files(
     assert c.module.main(argv) == 0
     assert len(c.inner.launches) == 2
     assert decode_probe_verdict((root / "verdict.json").read_bytes()).failure is None
+
+
+def test_credential_probe_file_passes_with_deep_basetemp(tmp_path):
+    """Run every probe assertion with a temp root longer than an AF_UNIX path."""
+    nested_basetemp = os.environ.get("_AIRPLAY_CREDENTIAL_PROBE_DEEP_BASETEMP")
+    if nested_basetemp is not None:
+        # The child runs this test too; verify its actual root without recursing.
+        assert len(os.fsencode(nested_basetemp)) > 108
+        assert tmp_path.is_relative_to(Path(nested_basetemp))
+        return
+
+    deep_basetemp = tmp_path / ("deep-" + "x" * 120) / "pytest"
+    deep_basetemp.parent.mkdir()
+    assert len(os.fsencode(deep_basetemp)) > 108
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(Path(__file__).resolve()),
+         "--basetemp", str(deep_basetemp), "-q", "--tb=short", "--color=no"],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "_AIRPLAY_CREDENTIAL_PROBE_DEEP_BASETEMP": str(deep_basetemp),
+             "TMPDIR": str(deep_basetemp.parent)},
+        capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

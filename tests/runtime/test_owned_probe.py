@@ -5,6 +5,7 @@ from airplay_linux import runtime as composition
 from airplay_linux.domain.resources import Err, ErrorCode
 from tests.process.test_credential_probe import (  # shared offline boundaries, real graph
     namespace_probe_witness,
+    private_socket_root,
     recording_probe_processes,
 )
 

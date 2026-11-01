@@ -21,7 +21,11 @@ from airplay_linux.domain.resources import CapabilityReport, Err, ErrorCode, Ok
 from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.runtime import RuntimeConfig, build_runtime
-from tests.process.test_credential_probe import namespace_probe_witness, recording_probe_processes
+from tests.process.test_credential_probe import (
+    namespace_probe_witness,
+    private_socket_root,
+    recording_probe_processes,
+)
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
 
@@ -168,7 +172,7 @@ async def test_process_observations_classify_direct_and_unshare_daemon_launches(
 
 
 async def test_activation_reaches_the_owned_lifecycle_after_bootstrap(
-    tmp_path, monkeypatch, offline_boundaries, active=True,
+    private_socket_root, monkeypatch, offline_boundaries, active=True,
 ):
     from airplay_linux.backend.contract import CredentialProofVerdict
     from airplay_linux.process.launcher import ProductionLaunchCapability
@@ -176,9 +180,9 @@ async def test_activation_reaches_the_owned_lifecycle_after_bootstrap(
     if not active:
         monkeypatch.setattr(composition, "_OWNED_DAEMON_EPOCH_ACTIVE", False)
     recorder = ProcessRecorder()
-    root = tmp_path / "r"
+    root = private_socket_root / "r"
     root.mkdir(mode=0o700)
-    config = RuntimeConfig(state_root=tmp_path / "s", runtime_root=root, live=False)
+    config = RuntimeConfig(state_root=private_socket_root / "s", runtime_root=root, live=False)
     passed = CredentialProofVerdict(
         service_leg="passed", backend_positive_leg="passed",
         backend_negative_leg="passed", failure=None,
@@ -263,9 +267,9 @@ async def test_activation_reaches_the_owned_lifecycle_after_bootstrap(
 
 
 @pytest.mark.asyncio
-async def test_phase_guard_blocks_eligible_production_launch(tmp_path, monkeypatch, offline_boundaries):
+async def test_phase_guard_blocks_eligible_production_launch(private_socket_root, monkeypatch, offline_boundaries):
     await test_activation_reaches_the_owned_lifecycle_after_bootstrap(
-        tmp_path, monkeypatch, offline_boundaries, active=False,
+        private_socket_root, monkeypatch, offline_boundaries, active=False,
     )
 
 

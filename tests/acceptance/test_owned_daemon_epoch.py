@@ -36,6 +36,7 @@ from airplay_linux.process.procfs import TerminationEvidence
 from airplay_linux.runtime import RuntimeConfig, build_runtime
 from airplay_linux.testing.builders import context, target
 from tests.acceptance.test_no_production_spawn import ProcessRecorder, offline_boundaries
+from tests.process.test_credential_probe import private_socket_root
 from tests.process.test_ownership import EndpointEvidence
 from tests.transport.test_doubletake import (
     Harness as TransportHarness,
@@ -596,10 +597,10 @@ async def test_legacy_fixture_selects_handshake_authority():
     assert isinstance(refused, Err) and refused.error.code is ErrorCode.ownership_mismatch
 
 
-async def test_crash_restart_requires_reconciliation_and_new_generation(tmp_path, monkeypatch):
+async def test_crash_restart_requires_reconciliation_and_new_generation(private_socket_root, monkeypatch):
     from airplay_linux.testing.adapters import SequenceIds
     from tests.process import test_owned_launcher as identities
-    c = identities.OwnedCase(tmp_path, monkeypatch)
+    c = identities.OwnedCase(private_socket_root, monkeypatch)
     try:
         first = await c.registry.ensure()
         assert isinstance(first, Ok), first

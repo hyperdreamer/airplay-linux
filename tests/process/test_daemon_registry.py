@@ -22,6 +22,7 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.procfs import IdentityEvidence, IdentityState, OwnedProcessScan
 from airplay_linux.testing.adapters import FakeProcess, MemoryDaemonStore, SequenceIds
+from tests.process.test_credential_probe import private_socket_root
 
 APP = ProcessIdentity(pid=100, start_ticks=10)
 SUPERVISOR = ProcessIdentity(pid=200, start_ticks=20)
@@ -183,8 +184,8 @@ def run_async(test):
 
 
 @pytest.fixture
-def harness(tmp_path):
-    h = Harness(tmp_path)
+def harness(private_socket_root):
+    h = Harness(private_socket_root)
     try:
         yield h
     finally:
@@ -682,9 +683,9 @@ async def test_private_runtime_rejects_symlink_directory_and_socket(harness, tmp
 
 
 @pytest.fixture
-def application_daemon_identity_cases(tmp_path, monkeypatch):
+def application_daemon_identity_cases(private_socket_root, monkeypatch):
     from test_owned_launcher import candidate_failure_cases
-    yield from candidate_failure_cases.__wrapped__(tmp_path, monkeypatch)
+    yield from candidate_failure_cases.__wrapped__(private_socket_root, monkeypatch)
 
 
 async def test_receipt_joins_application_and_observed_daemon_instance_without_token(application_daemon_identity_cases):
@@ -845,7 +846,7 @@ async def test_supervisor_intent_recovery_terminalises_without_resignalling(appl
     for changed in (None, "identity", "uid", "supervisor", "socket_name", "receipt", "runtime", "entry", "socket_inode", "peer", "fd_holder")
     if (stage == "bound" and changed != "supervisor") or (stage == "pre_bind" and changed not in {"entry", "socket_inode", "peer", "fd_holder"})
 ])
-async def test_every_owned_termination_passes_strict_true(tmp_path, monkeypatch, path, stage, changed):
+async def test_every_owned_termination_passes_strict_true(private_socket_root, monkeypatch, path, stage, changed):
     """Exercise each production caller and its real synchronous post-open verifier."""
     from types import SimpleNamespace
     from airplay_linux.process.procfs import termination_evidence_complete
@@ -855,16 +856,16 @@ async def test_every_owned_termination_passes_strict_true(tmp_path, monkeypatch,
 
     fixture = None
     if path == "namespace_probe":
-        c = namespace_probe_witness.__wrapped__(tmp_path, monkeypatch)
+        c = namespace_probe_witness.__wrapped__(private_socket_root, monkeypatch)
         process, facts = c.inner, c.facts
         if stage == "pre_bind":
             facts.bound_after = 4.0
     elif path == "supervisor":
-        fixture = public_supervisor_case.__wrapped__(tmp_path, monkeypatch)
+        fixture = public_supervisor_case.__wrapped__(private_socket_root, monkeypatch)
         c = next(fixture)
         process, facts = c.process, c.facts
     else:
-        c = OwnedCase(tmp_path, monkeypatch)
+        c = OwnedCase(private_socket_root, monkeypatch)
         process, facts = c.process, c.facts
 
     observations = []
