@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 
 PATCHES = Path(__file__).parents[2] / "vendor" / "doubletake"
@@ -23,6 +27,15 @@ def test_carried_patch_chain_is_parseable() -> None:
 
 def test_complete_token_requires_complete_producer(tmp_path) -> None:
     """Execute the carried producer with offline Variant and size boundaries."""
+    go = shutil.which("go")
+    if go is None:
+        pytest.fail(
+            "Go toolchain is required for the executable carried-source producer proof. "
+            "Install Go and ensure `go` is on PATH, then rerun this test; "
+            "the proof is mandatory for complete verification.",
+            pytrace=False,
+        )
+
     producer = (PATCHES / "0001-capture-report-selected-source.patch").read_text()
     propagation = (PATCHES / "0002-status-report-selected-source.patch").read_text()
     capabilities = (PATCHES / "0003-capability-tokens.patch").read_text()
@@ -123,7 +136,7 @@ func TestCarriedPortalStreamSource(t *testing.T) {
 }
 """)
     result = subprocess.run(
-        ["go", "test", "-count=1", "-run", "^TestCarriedPortalStreamSource$", "-v", "."],
+        [go, "test", "-count=1", "-run", "^TestCarriedPortalStreamSource$", "-v", "."],
         cwd=tmp_path,
         env={
             **os.environ, "GOPROXY": "off", "GOSUMDB": "off",
@@ -136,3 +149,40 @@ func TestCarriedPortalStreamSource(t *testing.T) {
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_producer_proof_reports_missing_go_with_git_available(tmp_path) -> None:
+    """Missing Go is an actionable failure, not a launch error or a skipped gate."""
+    git = shutil.which("git")
+    assert git is not None, "Git is required for the carried-patch parser proof"
+    commands = tmp_path / "bin"
+    commands.mkdir()
+    (commands / "git").symlink_to(git)
+    path = str(commands)
+    assert shutil.which("git", path=path) is not None
+    assert shutil.which("go", path=path) is None
+
+    test_file = Path(__file__).resolve()
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "pytest",
+            f"{test_file}::test_carried_patch_chain_is_parseable",
+            f"{test_file}::test_complete_token_requires_complete_producer",
+            "--basetemp", str(tmp_path / "pytest"),
+            "-q", "-rA", "--tb=short", "--color=no",
+        ],
+        cwd=PATCHES.parents[1],
+        env={**os.environ, "PATH": path},
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    assert "Go toolchain is required" in output, output
+    assert "Install Go" in output, output
+    assert "PATH" in output, output
+    assert "FileNotFoundError" not in output, output
+    assert "1 failed, 1 passed" in output, output
+    assert "PASSED tests/backend/test_carried_source_patch.py::test_carried_patch_chain_is_parseable" in output, output

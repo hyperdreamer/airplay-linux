@@ -31,6 +31,16 @@ applies to `main`, and passes their test suite, so the door is open to revisit.
 - adds `-capabilities`, printing the complete stable machine-readable token list
   (`capabilities-v1`, `status-source`, `status-source-complete`) and exiting 0
 
+## Python test-suite prerequisite
+
+The default Python suite executes the carried source producer with `go test`, so it also
+requires a Go toolchain with `go` on `PATH`, even when not rebuilding the backend. Install Go
+and expose its executable on `PATH` before running pytest. A missing toolchain deliberately
+fails the producer proof with setup instructions; this proof is mandatory for complete
+verification. The separate Git patch-parser proof remains mandatory and does not require Go.
+The producer proof uses only local fixtures and the Go standard library, with network module
+and toolchain downloads disabled; it needs neither GStreamer nor a live backend.
+
 ## How to build
 
 Requires Go >= 1.21 (verified with 1.27.3) and the GStreamer plugins the project already needs.
