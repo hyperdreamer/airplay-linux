@@ -281,6 +281,9 @@ tasks:
     tier: "frontier"
     depends_on: ["T-001"]
     ownership:
+      - "src/airplay_linux/capture/__init__.py"
+      - "tests/capture/test_source.py"
+      - "tests/transport/test_doubletake.py"
       - "vendor/doubletake/0001-capture-report-selected-source.patch"
       - "vendor/doubletake/0002-status-report-selected-source.patch"
       - "vendor/doubletake/0003-capability-tokens.patch"
