@@ -26,12 +26,12 @@ from airplay_linux.backend.control import (
     UnsupportedControl,
 )
 from airplay_linux.capture.physical import KscreenConnectorInventory, PhysicalCaptureProvider
-from airplay_linux.capture.portal import PortalClient
 from airplay_linux.diagnostics.activity import ActivityLog
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.discovery.identity import IdentityResolver
 from airplay_linux.discovery.zeroconf_adapter import AzcMdnsClient, ZeroconfDiscovery
 from airplay_linux.display.association import KScreenOutputVerifier
+from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.display.creation import DisplayCreator
 from airplay_linux.display.helper import VirtualHelper
 from airplay_linux.display.kde import KdeVirtualDisplayProvider
@@ -71,6 +71,13 @@ from airplay_linux.trust.keyring import BackendKeyringStore
 
 if TYPE_CHECKING:
     from airplay_linux.capture.source import ReportedSourceVerifier
+
+
+def PortalClient(*args: Any, **kwargs: Any):
+    """Instantiate the portal client without importing optional D-Bus bindings."""
+    from airplay_linux.capture.portal import PortalClient as _PortalClient
+    return _PortalClient(*args, **kwargs)
+
 
 # Only Task 9 may activate the graph once every lifecycle seam is installed.
 # This is deliberately independent of pure launch/capability eligibility.
@@ -354,16 +361,22 @@ async def _compose_production(
         proof = await installation.credential_proof()
         if isinstance(proof, Ok) and type(proof.value) is CredentialProofVerdict:
             credential_proof = proof.value
+    source_inventory = KScreenInventory(process)
+    source_verifier = (
+        installation.source_verifier
+        if installation is not None
+        else KScreenReportedSourceVerifier(
+            source_inventory, physical_inventory_available=True,
+        )
+    )
     features = derive_composition_capabilities(
-        probed, launcher, credential_proof,
-        installation.source_verifier if installation is not None else None,
-        launcher.ambient_socket(),
+        probed, launcher, credential_proof, source_verifier, launcher.ambient_socket(),
     )
 
     resolver = IdentityResolver()
     discovery = ZeroconfDiscovery(resolver, clock, AzcMdnsClient(clock))
     portal = PortalClient()
-    connectors = KscreenConnectorInventory(process)
+    connectors = KscreenConnectorInventory(source_inventory)
     capture = PhysicalCaptureProvider(portal, connectors, features, ids=ids)
 
     helper = VirtualHelper(process, clock)
@@ -444,6 +457,7 @@ async def _compose_production(
         clock,
         scheduler,
         ids,
+        source_verifier=source_verifier,
     )
     # DoubleTakeTransport owns the only control that is bound to a concrete
     # receiver/daemon lease. Rebind the real store to that control immediately;

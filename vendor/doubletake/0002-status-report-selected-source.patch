@@ -2,7 +2,7 @@ diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
 index 0a82965..407af34 100644
 --- a/internal/airplay/capture.go
 +++ b/internal/airplay/capture.go
-@@ -185,6 +185,8 @@ type CapturePreparation struct {
+@@ -201,6 +201,8 @@ type CapturePreparation struct {
  
  	pwNodeID   uint32
  	pwFd       *os.File
@@ -11,7 +11,7 @@ index 0a82965..407af34 100644
  	portal     pipeWirePortalSession
  	streamSize [2]int
  }
-@@ -340,7 +342,12 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+@@ -356,7 +358,12 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
  	if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
  		return nil, err
  	}
@@ -25,12 +25,13 @@ index 0a82965..407af34 100644
  	if err != nil {
  		return nil, fmt.Errorf("screencast portal: %w", err)
  	}
-@@ -393,6 +400,15 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
+@@ -409,6 +416,16 @@ func PrepareTestCapture(ctx context.Context, cfg CaptureConfig) (*CapturePrepara
  
  // Start launches the prepared encoder using the supplied nominal receiver
  // canvas. Zero dimensions leave the captured source at its native size.
-+// Source reports which display the portal selected, when the reply carried a
-+// usable identity. It is available once the preparation has been created.
++// Source reports only a complete source identity from the portal. It is
++// unavailable for the legacy capture path, or whenever 0001 could not prove
++// type, positive dimensions, and both signed coordinates.
 +func (p *CapturePreparation) Source() (SourceInfo, bool) {
 +	if p == nil || !p.hasSource {
 +		return SourceInfo{}, false

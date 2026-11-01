@@ -137,6 +137,8 @@ class OutputInfo:
     virtual: bool | None
     observation_subject: str | None = field(default=None, compare=False, repr=False)
     observation_sequence: int | None = field(default=None, compare=False, repr=False)
+    connected: bool = False
+    output_type: int | str | None = None
 
     @property
     def identity(self) -> OutputIdentity:
@@ -171,6 +173,8 @@ class _Record:
     output_id: str | None
     connector: str
     enabled: bool | None
+    connected: bool | None
+    output_type: int | str | None
     position: tuple[int, int] | None
     scale: float | None
     size: Size | None
@@ -390,11 +394,17 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
         current_mode_id = _current_mode(entry.get("currentModeId"))
         preferred = _preferred_modes(entry.get("preferredModes"))
         enabled = entry.get("enabled")
+        connected = entry.get("connected")
+        output_type = entry.get("type")
+        if type(output_type) not in (int, str):
+            output_type = None
         records.append(
             _Record(
                 output_id=output_id,
                 connector=connector,
                 enabled=enabled if type(enabled) is bool else None,
+                connected=connected if type(connected) is bool else None,
+                output_type=output_type,
                 position=_position_value(entry.get("pos")),
                 scale=_scale_value(entry.get("scale")),
                 size=_size_value(entry.get("size"))
@@ -517,6 +527,8 @@ def _outputs(
                 virtual=record.virtual,
                 observation_subject=observation_subject,
                 observation_sequence=observation_sequence,
+                connected=record.connected is True,
+                output_type=record.output_type,
             ),
         )
     outputs.sort(key=lambda output: int(output.output_id))

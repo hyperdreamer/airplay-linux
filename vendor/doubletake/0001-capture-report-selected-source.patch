@@ -2,7 +2,7 @@ diff --git a/internal/airplay/capture.go b/internal/airplay/capture.go
 index 13bc64d..0a82965 100644
 --- a/internal/airplay/capture.go
 +++ b/internal/airplay/capture.go
-@@ -45,6 +45,68 @@ type CaptureConfig struct {
+@@ -45,6 +45,84 @@ type CaptureConfig struct {
  
  	RestoreToken     string
  	SaveRestoreToken func(string) error
@@ -40,38 +40,54 @@ index 13bc64d..0a82965 100644
 +// caller can refuse an unverifiable capture rather than assume one.
 +func portalStreamSource(properties map[string]dbus.Variant) (SourceInfo, bool) {
 +	var info SourceInfo
-+	usable := false
 +	if properties == nil {
 +		return info, false
 +	}
-+	if v, ok := properties["source_type"]; ok {
-+		if sourceType, ok := v.Value().(uint32); ok {
-+			info.Type = sourceType
-+			usable = true
++	typeValue, ok := properties["source_type"]
++	if !ok {
++		return info, false
++	}
++	sourceType, ok := typeValue.Value().(uint32)
++	if !ok || sourceType == 0 {
++		return info, false
++	}
++	width, height, ok := portalStreamDimensions(properties)
++	if !ok || width <= 0 || height <= 0 {
++		return info, false
++	}
++	positionValue, ok := properties["position"]
++	if !ok {
++		return info, false
++	}
++	position, ok := positionValue.Value().([]interface{})
++	if !ok || len(position) != 2 {
++		return info, false
++	}
++	var x, y int
++	switch rawX := position[0].(type) {
++	case int32:
++		rawY, ok := position[1].(int32)
++		if !ok {
++			return info, false
 +		}
-+	}
-+	if width, height, ok := portalStreamDimensions(properties); ok {
-+		info.Width, info.Height = width, height
-+		usable = true
-+	}
-+	if v, ok := properties["position"]; ok {
-+		if pos, ok := v.Value().([]interface{}); ok && len(pos) == 2 {
-+			if x, ok := pos[0].(int32); ok {
-+				if y, ok2 := pos[1].(int32); ok2 {
-+					info.X, info.Y = int(x), int(y)
-+				}
-+			} else if x, ok := pos[0].(int64); ok {
-+				if y, ok2 := pos[1].(int64); ok2 {
-+					info.X, info.Y = int(x), int(y)
-+				}
-+			}
++		x, y = int(rawX), int(rawY)
++	case int64:
++		rawY, ok := position[1].(int64)
++		if !ok {
++			return info, false
 +		}
++		x, y = int(rawX), int(rawY)
++	default:
++		return info, false
 +	}
-+	return info, usable
++	info = SourceInfo{
++		Type: sourceType, Width: width, Height: height, X: x, Y: y,
++	}
++	return info, true
  }
  
  // ValidateHWAccel checks a capture encoder preference. An empty value keeps the
-@@ -278,7 +340,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
+@@ -278,7 +356,7 @@ func PrepareCapture(ctx context.Context, cfg CaptureConfig) (*CapturePreparation
  	if err := probeWaylandDisplay(ctx, os.Getenv("WAYLAND_DISPLAY")); err != nil {
  		return nil, err
  	}
@@ -80,7 +96,7 @@ index 13bc64d..0a82965 100644
  	if err != nil {
  		return nil, fmt.Errorf("screencast portal: %w", err)
  	}
-@@ -2436,7 +2498,7 @@ func normalizeContext(ctx context.Context) context.Context {
+@@ -2436,7 +2514,7 @@ func normalizeContext(ctx context.Context) context.Context {
  // permission and returns a PipeWire node ID, an fd for the portal's PipeWire remote,
  // the retained portal session (which must stay open for capture and retries), and a
  // fresh restore token when the portal grants persistence.
@@ -89,7 +105,7 @@ index 13bc64d..0a82965 100644
  	ctx = normalizeContext(ctx)
  	conn, err := dbus.ConnectSessionBus()
  	if err != nil {
-@@ -2636,6 +2698,15 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
+@@ -2636,6 +2714,15 @@ func requestScreencast(ctx context.Context, restoreToken string, showCursor bool
  			dbg("[CAPTURE] portal stream properties did not contain a usable size: %#v", streamProperties)
  		}
  	}

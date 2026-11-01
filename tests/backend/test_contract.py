@@ -14,7 +14,10 @@ import pytest
 
 from airplay_linux.backend.contract import (
     BackendFeatures,
+    BackendSource,
     DevicesReply,
+    StatusReply,
+    _decode_source,
     decode_devices,
     decode_status,
     features_from_help,
@@ -25,6 +28,60 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
+
+
+def test_source_position_must_be_present_and_integral():
+    from airplay_linux.backend.contract import BackendStream
+
+    source = {"Type": 1, "Width": 1920, "Height": 1080, "X": 0, "Y": -1080}
+    decoded = _decode_source(source)
+    assert decoded == BackendSource(type=1, width=1920, height=1080, x=0, y=-1080)
+    assert BackendStream(
+        device="DP-1", target="192.0.2.1", state="streaming",
+        has_audio=False, audio_muted=False,
+    ).source is None
+    for axis in ("X", "Y"):
+        missing = {key: value for key, value in source.items() if key != axis}
+        assert isinstance(_decode_source(missing), Err)
+        for bad in (None, True, False, "0", 0.5):
+            assert isinstance(_decode_source({**source, axis: bad}), Err)
+    for invalid in (
+        None,
+        [],
+        {**source, "extra": 1},
+        {**source, "Width": 0},
+        {**source, "Type": 0},
+        {**source, "Type": 2**32},
+    ):
+        assert isinstance(_decode_source(invalid), Err)
+
+
+def test_status_stream_source_uses_the_published_go_field_names():
+    decoded = decode_status({
+        "ok": True, "state": "streaming", "has_audio": False, "audio_muted": False,
+        "device": "DP-1", "device_ip": "192.0.2.1",
+        "streams": [{
+            "device": "DP-1", "device_ip": "192.0.2.1", "state": "streaming",
+            "has_audio": False, "audio_muted": False,
+            "source": {"Type": 1, "Width": 1920, "Height": 1080, "X": -1920, "Y": 0},
+        }],
+    })
+    assert isinstance(decoded, StatusReply)
+    assert decoded.streams[0].source == BackendSource(
+        type=1, width=1920, height=1080, x=-1920, y=0,
+    )
+
+    sender = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    for tokens, complete in (
+        (frozenset({"capabilities-v1", "status-source"}), False),
+        (frozenset({"capabilities-v1", "status-source", "status-source-complete"}), True),
+        (frozenset({"capabilities-v1", "status-source-complete"}), False),
+    ):
+        features = features_from_help(sender, ctl, advertised=tokens)
+        assert features.source_reporting is complete or "status-source" in tokens
+        assert features.source_reporting_complete is complete
+        assert type(features.source_reporting_complete) is bool
 
 
 def test_legacy_help_does_not_prove_safe_sources_or_pairing():
@@ -861,7 +918,9 @@ def test_owned_control_is_composition_only(composition_capability_cases):
         for tokens in (frozenset(), _ADVERTISEMENT, owned_tokens):
             decoded = features_from_help(sender, _CTL, advertised=tokens)
             assert decoded.owned_daemon_control is False
-            assert decoded.source_reporting_complete is False
+            assert decoded.source_reporting_complete is (
+                sender == _SOURCE_SENDER and tokens == owned_tokens
+            )
             assert decoded.foreground_control is False
             assert decoded.owner_handshake is False
             assert decoded.keyring is False
@@ -874,7 +933,7 @@ def test_owned_control_is_composition_only(composition_capability_cases):
     assert isinstance(raw, Ok)
     assert raw.value.profile == "doubletake-0.5+source"
     assert raw.value.owned_daemon_control is False, "raw probe must never grant ownership"
-    assert raw.value.source_reporting_complete is False
+    assert raw.value.source_reporting_complete is True
     assert raw.value.foreground_control is False
     assert raw.value.owner_handshake is False
     assert raw.value.keyring is False
@@ -905,7 +964,7 @@ def test_owned_control_is_composition_only(composition_capability_cases):
         (raw.value, cases.inventory), (complete, None), (complete, cases.empty_inventory),
     ):
         refused = derive_composition_capabilities(evidence, cases.eligible, passed, verifier, None)
-        assert refused.physical_source is False
+        assert refused.physical_source is (verifier is cases.inventory)
         assert refused.owned_daemon_control is True
 
 

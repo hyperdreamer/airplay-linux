@@ -80,6 +80,7 @@ _PINNED_050_SOURCE_SENDER_FLAGS: Final[frozenset[str]] = _PINNED_050_SENDER_FLAG
 _PINNED_050_SOURCE_PROFILE: Final[str] = "doubletake-0.5+source"
 _CAPABILITY_SCHEMA_TOKEN: Final[str] = "capabilities-v1"
 _STATUS_SOURCE_TOKEN: Final[str] = "status-source"
+_STATUS_SOURCE_COMPLETE_TOKEN: Final[str] = "status-source-complete"
 
 
 def _diagnostic(code: ErrorCode, *, command: str | None = None) -> Diagnostic:
@@ -168,6 +169,22 @@ class CredentialProofVerdict:
 
 
 @dataclass(frozen=True, kw_only=True)
+class BackendSource:
+    """The backend's typed portal source geometry, without raw JSON."""
+
+    type: int
+    width: int
+    height: int
+    x: int
+    y: int
+
+    def __post_init__(self) -> None:
+        for name in ("type", "width", "height", "x", "y"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"source {name} must be an integer")
+
+
+@dataclass(frozen=True, kw_only=True)
 class BackendStream:
     """The safe subset of one published status stream."""
 
@@ -176,6 +193,7 @@ class BackendStream:
     state: str
     has_audio: bool
     audio_muted: bool
+    source: BackendSource | None = None
     credential_kind: str | None = None
 
     def __post_init__(self) -> None:
@@ -189,6 +207,8 @@ class BackendStream:
                 raise TypeError(f"{name} must be a boolean")
         if self.credential_kind is not None and self.credential_kind not in _CREDENTIAL_KINDS:
             raise ValueError("unknown credential kind")
+        if self.source is not None and not isinstance(self.source, BackendSource):
+            raise TypeError("source must be a BackendSource or None")
 
     @property
     def device_ip(self) -> str:
@@ -358,6 +378,25 @@ def _credential(data: dict[str, Any], name: str = "credential_kind") -> str | No
 _INVALID = object()
 
 
+def _decode_source(value: object) -> BackendSource | Err:
+    """Project the complete source object and reject ambiguous evidence."""
+    data = _exact_dict(value)
+    fields = {"Type", "Width", "Height", "X", "Y"}
+    if data is None or set(data) != fields:
+        return _incompatible()
+    if any(type(data[name]) is not int for name in fields):
+        return _incompatible()
+    if not 1 <= data["Type"] <= 2**32 - 1 or data["Width"] <= 0 or data["Height"] <= 0:
+        return _incompatible()
+    try:
+        return BackendSource(
+            type=data["Type"], width=data["Width"], height=data["Height"],
+            x=data["X"], y=data["Y"],
+        )
+    except (TypeError, ValueError):
+        return _incompatible()
+
+
 def _decode_stream(value: object) -> BackendStream | None:
     data = _exact_dict(value)
     if data is None:
@@ -370,6 +409,12 @@ def _decode_stream(value: object) -> BackendStream | None:
     has_audio = _required_bool(data, "has_audio")
     audio_muted = _required_bool(data, "audio_muted")
     credential = _credential(data)
+    source: BackendSource | None = None
+    if "source" in data:
+        decoded_source = _decode_source(data["source"])
+        if isinstance(decoded_source, Err):
+            return None
+        source = decoded_source
     if (
         device is None
         or target is None
@@ -386,6 +431,7 @@ def _decode_stream(value: object) -> BackendStream | None:
             state=state,
             has_audio=has_audio,
             audio_muted=audio_muted,
+            source=source,
             credential_kind=credential,
         )
     except (TypeError, ValueError):
@@ -760,6 +806,11 @@ def features_from_help(
         )
         and ctl_matches
     )
+    source_complete = patched_surface and {
+        _CAPABILITY_SCHEMA_TOKEN,
+        _STATUS_SOURCE_TOKEN,
+        _STATUS_SOURCE_COMPLETE_TOKEN,
+    } <= set(advertised)
     if patched_surface and not {
         _CAPABILITY_SCHEMA_TOKEN,
         _STATUS_SOURCE_TOKEN,
@@ -816,6 +867,7 @@ def features_from_help(
         revoke_pairing=False,
         query_modes=False,
         source_reporting=patched_surface,
+        source_reporting_complete=source_complete,
     )
 
 
@@ -940,6 +992,7 @@ __all__ = [
     "BackendDevice",
     "BackendFeatures",
     "BackendReply",
+    "BackendSource",
     "BackendStream",
     "CredentialProofVerdict",
     "DevicesReply",
