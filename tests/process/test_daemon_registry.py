@@ -679,3 +679,160 @@ async def test_private_runtime_rejects_symlink_directory_and_socket(harness, tmp
     assert isinstance(refused, Err)
     assert marker.read_text() == 'preserved'
     assert not h.process.terminated
+
+
+@pytest.fixture
+def application_daemon_identity_cases(tmp_path, monkeypatch):
+    from test_owned_launcher import candidate_failure_cases
+    yield from candidate_failure_cases.__wrapped__(tmp_path, monkeypatch)
+
+
+async def test_receipt_joins_application_and_observed_daemon_instance_without_token(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    r = await c.current()
+    assert r.instance_uuid != r.launch_uuid != r.daemon_instance_uuid
+    assert r.instance_uuid != r.daemon_instance_uuid
+    assert r.daemon_instance_uuid == c.record.instance_uuid
+    assert c.record.owner_token == 'unused'
+    payload = (c.root / 'daemon/receipts' / (str(r.launch_uuid) + '.json')).read_bytes()
+    assert b'owner_token' not in payload and b'unused' not in payload
+    assert 'unused' not in repr(r)
+    assert isinstance(await c.registry._join_receipt(replace(r, daemon_instance_uuid=r.instance_uuid)), Err)
+    assert c.configs[0]['launch_uuid'] == str(r.launch_uuid)
+    assert c.configs[0]['endpoint_generation'] == r.endpoint_generation
+    assert 'owner_token' not in c.configs[0]
+
+
+@pytest.mark.parametrize('pipe', [None, 'stale', 'conflicting'])
+async def test_restart_reconstructs_unique_observation_gap_without_config_pipe(application_daemon_identity_cases, monkeypatch, pipe):
+    import json
+    from test_owned_launcher import Crash, DAEMON
+    from airplay_linux.process import daemon_registry as module
+    c = application_daemon_identity_cases
+    c.hooks['supervisor-publication'] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    assert (await c.current()).daemon_instance_uuid is None
+    c.reopen()
+    def forbidden_pipe(*args, **kwargs):
+        raise AssertionError('restart required original launch pipe')
+
+    monkeypatch.setattr(module, 'config_pipe', forbidden_pipe)
+    rfd, wfd = os.pipe()
+    payload = json.dumps({'launch_uuid': str(UUID(int=999)), 'endpoint_generation': 999,
+                          'daemon_instance_uuid': str(UUID(int=998))}).encode()
+    os.write(wfd, payload)
+    os.close(wfd)
+    if pipe is not None:
+        monkeypatch.setenv('AIRPLAY_LINUX_CONFIG_FD', str(rfd if pipe == 'conflicting' else -1))
+    else:
+        monkeypatch.delenv('AIRPLAY_LINUX_CONFIG_FD', raising=False)
+    try:
+        assert await c.registry.reconcile_previous() == Ok(value=None)
+        assert os.read(rfd, 4096) == payload
+    finally:
+        os.close(rfd)
+    assert c.process.terminated == [DAEMON]
+    receipt = await c.current()
+    assert receipt.state == 'stopped'
+    assert receipt.daemon_instance_uuid == c.record.instance_uuid
+
+
+@pytest.mark.parametrize('count', [0, 2, 3])
+async def test_observation_join_refuses_ambiguous_restart_records(application_daemon_identity_cases, monkeypatch, count):
+    from test_owned_launcher import Crash
+    c = application_daemon_identity_cases
+    c.hooks['supervisor-publication'] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    if count == 0:
+        assert await c.store.delete(c.record.instance_uuid) == Ok(value=None)
+    else:
+        for index in range(count - 1):
+            assert await c.store.write(replace(c.record, instance_uuid=InstanceId(UUID(int=1111 + index)),
+                                              lifecycle='stopping')) == Ok(value=None)
+    monkeypatch.setenv('AIRPLAY_LINUX_CONFIG_FD', '-1')
+    c.reopen()
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert c.process.terminated == []
+    assert (await c.current()).state == 'reserved'
+    assert len(c.process.spawned) == 1
+
+
+async def test_missing_cleanup_intent_is_rederived_without_authorising_teardown(application_daemon_identity_cases):
+    from test_owned_launcher import DAEMON
+    c = application_daemon_identity_cases
+    c.facts.on_peer = lambda: setattr(c.facts, 'peer_pid', 999)
+    assert isinstance(await c.launch(), Err)
+    receipt = await c.current()
+    path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen = path.read_bytes()
+    assert receipt.state == 'failed'
+    assert not (await c.cleanup.all()).value
+    c.reopen()
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert len((await c.cleanup.all()).value) == 1
+    assert not c.process.terminated
+    assert c.process.identity(DAEMON.pid) == DAEMON
+    assert (await c.current()) == receipt
+    assert isinstance(await c.launch(), Err) and len(c.process.spawned) == 1
+    c.absence()
+    # This receipt never pinned the mismatched entry; an independent removal is
+    # required as well as child absence before an outcome can complete.
+    (c.runtime / 'daemon.sock').unlink()
+    c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    completion = (await c.cleanup.all()).value[0]
+    assert completion.outcome == 'stopped'
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value == (completion,)
+    assert path.read_bytes() == frozen and not c.process.terminated
+
+
+@pytest.mark.parametrize('absence', ['present', 'absent', 'unreadable', 'mismatched'])
+@pytest.mark.parametrize('boundary', [None, 'cleanup-intent-publication', 'terminal-write', 'cleanup-intent-completion'])
+async def test_supervisor_intent_recovery_terminalises_without_resignalling(application_daemon_identity_cases, absence, boundary):
+    from test_owned_launcher import APP_ID, DAEMON, Crash
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    intent = SupervisorReleaseIntent(
+        schema_version=1, launch_uuid=receipt.launch_uuid, instance_uuid=APP_ID,
+        app=receipt.app, supervisor=receipt.supervisor, daemon=receipt.daemon,
+        reason='application-exited', intent_at=1.0,
+    )
+    await c.supervisor_intents(str(c.runtime)).write(intent)
+    before = (c.runtime / 'release-intent.json').read_bytes()
+    c.reopen()
+    if absence == 'absent':
+        c.absence()
+    elif absence == 'unreadable':
+        c.unreadable.add(DAEMON.pid)
+    elif absence == 'mismatched':
+        c.process.register(replace(DAEMON, start_ticks=999), {})
+    if boundary is not None and (absence == 'absent' or boundary != 'cleanup-intent-completion'):
+        c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            await c.registry.reconcile_previous()
+        assert boundary in c.events
+        c.reopen()
+    result = await c.registry.reconcile_previous()
+    assert isinstance(result, Ok if absence == 'absent' else Err)
+    assert c.process.terminated == []
+    assert (await c.current()).state == ('stopped' if absence == 'absent' else 'failed')
+    assert len((await c.cleanup.all()).value) == 1
+    failed = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen = failed.read_bytes()
+    c.unreadable.clear()
+    c.process.exit(c.process.identity(DAEMON.pid) or DAEMON)
+    c.absence()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    completion = (await c.cleanup.all()).value[0]
+    assert completion.outcome == 'stopped'
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value == (completion,)
+    assert failed.read_bytes() == frozen
+    assert (c.runtime / 'release-intent.json').read_bytes() == before
+    assert c.process.terminated == []

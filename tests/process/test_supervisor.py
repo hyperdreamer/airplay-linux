@@ -21,7 +21,7 @@ from airplay_linux.backend.control import (
 )
 from airplay_linux.domain.operations import InstanceId, ProcessIdentity
 from airplay_linux.domain.records import DaemonRecord
-from airplay_linux.domain.resources import Ok
+from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.process.procfs import (
@@ -415,3 +415,306 @@ def test_real_parent_death_releases_child_and_ends_supervisor(tmp_path):
         assert asyncio.run(child.store.all()).value[0].lifecycle == 'stopping'
     finally:
         child.close()
+
+
+@pytest.fixture
+def public_supervisor_case(tmp_path, monkeypatch):
+    from test_owned_launcher import candidate_failure_cases, SUPERVISOR
+    from airplay_linux.domain.records import DaemonReservation
+    fixture = candidate_failure_cases.__wrapped__(tmp_path, monkeypatch)
+    c = next(fixture)
+
+    async def create():
+        r = await c.current()
+        reservation = DaemonReservation(**{n: getattr(r, n) for n in (
+            'schema_version', 'launch_uuid', 'instance_uuid', 'app', 'owner_uid', 'boot_id',
+            'runtime_directory', 'runtime_device', 'runtime_inode', 'endpoint_generation',
+            'socket_name', 'protocol_version',
+        )})
+        store = c.supervisor_intents(str(c.runtime))
+        write = store.write
+
+        async def observe(intent):
+            result = await write(intent)
+            if isinstance(result, Ok):
+                c.hit('intent-durable')
+            return result
+
+        store.write = observe
+        return DaemonSupervisor(
+            app=r.app, instance_uuid=c.record.instance_uuid, runtime_directory=c.runtime,
+            config_fd=-1, process=c.process, store=c.store, reservation=reservation,
+            receipts=c.receipts, supervisor_intents=store, inspect_process=c.facts.identity,
+            own_identity=lambda: SUPERVISOR, observations=c.facts, receipt_source=c.source,
+        )
+
+    async def launch_supervised(intent_store=None):
+        from test_owned_launcher import APP, DAEMON
+        from airplay_linux.process import supervisor as module
+        loop = asyncio.get_running_loop()
+        monkeypatch.setattr(loop, 'add_signal_handler', lambda *args: None)
+        monkeypatch.setattr(module, '_parent_death_signal', lambda sig: c.events.append('parent-protection'))
+        monkeypatch.setattr(module, '_parent_matches', lambda app: c.process.identity(app.pid) == app)
+        if intent_store is None:
+            intent_store = c.supervisor_intents(str(c.runtime))
+            write = intent_store.write
+
+            async def observe(intent):
+                result = await write(intent)
+                if isinstance(result, Ok):
+                    c.hit('intent-durable')
+                return result
+
+            intent_store.write = observe
+        runner = DaemonSupervisor(
+            app=APP, instance_uuid=InstanceId(UUID(int=1001)), runtime_directory=c.runtime,
+            config_fd=-1, process=c.process, store=c.store, receipts=c.receipts,
+            supervisor_intents=intent_store, inspect_process=c.facts.identity,
+            own_identity=lambda: SUPERVISOR, observations=c.facts, receipt_source=c.source,
+        )
+        task = None
+
+        async def spawn(spec):
+            nonlocal task
+            c.process.spawned.append(spec)
+            if '--launch-owned-child' in spec.argv:
+                assert spec.argv[-6:] == c.launcher.argv(str(c.runtime / 'daemon.sock'))
+                assert not spec.pass_fds and 'AIRPLAY_LINUX_CONFIG_FD' not in spec.env
+                c.process.register(DAEMON, spec.env)
+                c.record = replace((await c.store.all()).value[0], daemon=DAEMON)
+                c.bind()
+                return Ok(value=DAEMON)
+            assert (await c.current()).state == 'reserved'
+            runner.config_fd = os.dup(spec.pass_fds[0])
+            c.process.register(SUPERVISOR, spec.env)
+            task = asyncio.create_task(runner._run())
+            return Ok(value=SUPERVISOR)
+
+        c.process.spawn = spawn
+        assert isinstance(await c.launch(), Ok)
+        assert task is not None and not task.done()
+        return runner, task
+
+    c.supervisor = create
+    c.launch_supervised = launch_supervised
+    yield c
+    try:
+        next(fixture)
+    except StopIteration:
+        pass
+
+
+async def test_public_config_and_fixture_record_schema_preserve_identity_channels(public_supervisor_case):
+    from test_owned_launcher import APP_ID
+    from airplay_linux.storage.codecs import decode_daemon, encode_daemon
+    c = public_supervisor_case
+    assert isinstance(await c.launch(), Ok)
+    config = c.configs[0]
+    assert set(config) == {'mode', 'launch_uuid', 'endpoint_generation', 'protocol_version',
+                           'record_root', 'executable', 'features'}
+    assert c.record.instance_uuid not in {APP_ID, UUID(config['launch_uuid'])}
+    fixture_record = replace(c.record, owner_token='fixture-only-token')
+    assert decode_daemon(encode_daemon(fixture_record)) == fixture_record
+
+
+def test_delivered_daemon_record_codec_compatibility_control():
+    from airplay_linux.storage.codecs import RecordError, decode_daemon, encode_daemon
+    record = DaemonRecord(
+        schema_version=1, instance_uuid=INSTANCE, owner_token='fixture-token',
+        app=ProcessIdentity(pid=100, start_ticks=10), supervisor=None, daemon=None,
+        protocol_version='v1', socket_path='/run/private/daemon.sock', lifecycle='starting',
+        runtime_directory='/run/private',
+    )
+    payload = encode_daemon(record)
+    assert decode_daemon(payload + b'\n') == record
+    assert decode_daemon(payload[:-1] + b',"owner_token":"fixture-token"}') == record
+    for invalid in (replace(record, schema_version=2), replace(record, owner_token='')):
+        with pytest.raises(RecordError):
+            encode_daemon(invalid)
+    missing = json.loads(payload)
+    del missing['daemon']
+    with pytest.raises(RecordError):
+        decode_daemon(json.dumps(missing).encode())
+    assert b'fixture-token' in payload
+    assert set(json.loads(payload)) == {
+        'schema', 'version', 'schema_version', 'instance_uuid', 'owner_token', 'app',
+        'supervisor', 'daemon', 'protocol_version', 'socket_path', 'lifecycle', 'runtime_directory',
+    }
+
+
+async def test_failed_launch_release_after_app_death_records_cleanup_intent_only(public_supervisor_case):
+    from test_owned_launcher import APP, DAEMON, FEATURES as PUBLIC
+    c = public_supervisor_case
+    c.bind_on_spawn = False
+    c.hooks['supervisor-publication'] = lambda: c.unreadable.add(DAEMON.pid)
+    assert isinstance(await c.launch(), Err)
+    c.unreadable.clear()
+    receipt = await c.current()
+    path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen = path.read_bytes()
+    c.process.exit(APP)
+    supervisor = await c.supervisor()
+    assert isinstance(await supervisor._request_release(c.record, PUBLIC), Err)
+    assert not (c.runtime / 'release-intent.json').exists() and not c.process.terminated
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert len((await c.cleanup.all()).value) == 1
+    c.absence()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value[0].outcome == 'stopped'
+    assert path.read_bytes() == frozen
+
+
+async def test_ready_app_death_publishes_release_intent_observes_death_and_recovers_terminal_receipt(public_supervisor_case):
+    from test_owned_launcher import APP, DAEMON
+    c = public_supervisor_case
+    supervisor, task = await c.launch_supervised()
+    receipt = await c.current()
+    assert receipt.state == 'ready' and c.process.identity(DAEMON.pid) == DAEMON
+    c.process.exit(APP)
+    assert await asyncio.wait_for(task, 1.0) == 0
+    assert c.process.terminated == [DAEMON] and c.process.identity(DAEMON.pid) is None
+    assert (await c.current()) == receipt
+    payload = (c.runtime / 'release-intent.json').read_bytes()
+    assert c.events.index('intent-durable') < c.events.index('signal')
+    assert c.events.index('parent-protection') < c.events.index('signal')
+    assert c.process.strict_terminations[0].stage == 'bound'
+    c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.current()).state == 'stopped'
+    assert (await c.cleanup.all()).value[0].outcome == 'stopped'
+    assert (c.runtime / 'release-intent.json').read_bytes() == payload
+    assert c.process.terminated == [DAEMON]
+
+
+@pytest.mark.parametrize('origin', ['detached', 'bound'])
+async def test_detached_and_bound_app_death_publish_release_intent_before_signal(public_supervisor_case, origin):
+    from test_owned_launcher import APP, DAEMON, Crash, FEATURES as PUBLIC
+    c = public_supervisor_case
+    if origin == 'detached':
+        c.bind_on_spawn = False
+    c.hooks['after-detached-write' if origin == 'detached' else 'status-poll'] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    assert (await c.current()).state == origin
+    c.process.exit(APP)
+    supervisor = await c.supervisor()
+    assert await supervisor._request_release(c.record, PUBLIC) == Ok(value=None)
+    assert c.events.index('intent-durable') < c.events.index('signal')
+    assert c.process.strict_terminations[0].stage == ('pre_bind' if origin == 'detached' else 'bound')
+    assert c.process.identity(DAEMON.pid) is None
+    c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.current()).state == 'stopped' and len(c.process.terminated) == 1
+
+
+@pytest.mark.parametrize('case', ['valid', 'live-app', 'unreadable-app', 'wrong-daemon',
+                                  'wrong-supervisor', 'wrong-launch', 'stopping', 'failed',
+                                  'stopped', 'no-receipt', 'reserved', 'detached', 'bound',
+                                  'parent-mismatch', 'wrong-application'])
+async def test_supervisor_release_intent_requires_app_absence_and_matching_own_daemon(public_supervisor_case, case):
+    from test_owned_launcher import APP, Crash
+    c = public_supervisor_case
+    boundary = {'reserved': 'supervisor-publication', 'detached': 'after-detached-write',
+                'bound': 'status-poll', 'wrong-daemon': 'supervisor-publication',
+                'wrong-supervisor': 'supervisor-publication'}.get(case)
+    if boundary:
+        c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            await c.launch()
+    else:
+        assert isinstance(await c.launch(), Ok)
+    supervisor = await c.supervisor()
+    receipt = await c.current()
+    if case != 'live-app':
+        c.process.exit(APP)
+    if case == 'unreadable-app':
+        c.unreadable.add(APP.pid)
+    if case == 'parent-mismatch':
+        c.process.register(replace(APP, start_ticks=999), {})
+    record = replace(c.record, app=replace(APP, start_ticks=999)) if case == 'wrong-application' else c.record
+    if case in {'wrong-daemon', 'wrong-supervisor'}:
+        field = case.removeprefix('wrong-')
+        record = replace(record, **{field: replace(getattr(record, field), start_ticks=999)})
+        # A valid live identity cannot substitute for the supervisor's own
+        # observation/identity channel just because its stage proof would pass.
+        c.process.register(getattr(record, field), {})
+        if case == 'wrong-supervisor':
+            assert await c.store.write(record) == Ok(value=None)
+    if case == 'wrong-launch':
+        supervisor._reservation = replace(supervisor._reservation, launch_uuid=UUID(int=777))
+    if case in {'stopping', 'failed', 'stopped'}:
+        await c.receipts.write(replace(receipt, state=case,
+                                     failure=ErrorCode.daemon_failed if case == 'failed' else None))
+    if case == 'no-receipt':
+        (c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')).unlink()
+    result = await supervisor._publish_release_intent(
+        record, 'parent-mismatch' if case == 'parent-mismatch' else 'application-exited',
+    )
+    eligible = case in {'valid', 'no-receipt', 'reserved', 'detached', 'bound', 'parent-mismatch'}
+    assert isinstance(result, Ok if eligible else Err)
+    assert (c.runtime / 'release-intent.json').exists() is eligible
+    assert not c.process.terminated
+    if case == 'no-receipt':
+        assert not (await c.receipts.all()).value
+        assert isinstance(await c.registry.reconcile_previous(), Err)
+        assert not (await c.receipts.all()).value
+
+
+@pytest.mark.parametrize('step', ['write', 'fsync', 'rename', 'directory_fsync'])
+async def test_release_intent_unavailable_refuses_without_signals_and_exits(public_supervisor_case, step, capsys):
+    from test_owned_launcher import APP, FEATURES as PUBLIC
+    from airplay_linux.storage.atomic import PosixFilesystem
+    from airplay_linux.storage.repositories import JsonSupervisorReleaseIntentStore
+    c = public_supervisor_case
+
+    class Fault(PosixFilesystem):
+        reached = False
+
+        def fail(self, name):
+            if step == name:
+                self.reached = True
+                raise OSError('injected')
+
+        def write(self, parent, name, payload):
+            self.fail('write')
+            return super().write(parent, name, payload)
+
+        def fsync_file(self, parent, name):
+            self.fail('fsync')
+            return super().fsync_file(parent, name)
+
+        def replace(self, *args):
+            self.fail('rename')
+            return super().replace(*args)
+
+        def fsync_directory(self, fd):
+            self.fail('directory_fsync')
+            return super().fsync_directory(fd)
+
+    fault = Fault()
+    store = JsonSupervisorReleaseIntentStore(AtomicFiles(c.runtime, fault))
+    supervisor, task = await c.launch_supervised(store)
+    c.process.exit(APP)
+    assert await asyncio.wait_for(task, 1.0) == 1
+    assert fault.reached and not c.process.terminated
+    assert 'parent-protection' in c.events
+    assert supervisor.cleanup_required == 'intent-unavailable'
+    assert '"reason":"intent-unavailable"' in capsys.readouterr().err
+    assert isinstance(await supervisor._request_release(c.record, PUBLIC), Err)
+    c.absence()
+    assert isinstance(await supervisor._request_release(c.record, PUBLIC), Err)
+    assert not c.process.terminated
+    assert supervisor.cleanup_required == 'intent-unavailable'
+
+
+async def test_supervisor_observation_alone_is_not_release_intent(public_supervisor_case):
+    from test_owned_launcher import APP, FEATURES as PUBLIC
+    c = public_supervisor_case
+    assert isinstance(await c.launch(), Ok)
+    c.process.exit(APP)
+    record = replace(c.record, lifecycle='stopping')
+    await c.store.write(record)
+    supervisor = await c.supervisor()
+    assert await supervisor._request_release(record, PUBLIC) == Ok(value=None)
+    assert (c.runtime / 'release-intent.json').is_file()
+    assert c.events.index('intent-durable') < c.events.index('signal')
