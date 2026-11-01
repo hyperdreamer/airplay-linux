@@ -29,8 +29,9 @@ index 0a82965..407af34 100644
  
  // Start launches the prepared encoder using the supplied nominal receiver
  // canvas. Zero dimensions leave the captured source at its native size.
-+// Source reports which display the portal selected, when the reply carried a
-+// usable identity. It is available once the preparation has been created.
++// Source reports only a complete source identity from the portal. It is
++// unavailable for the legacy capture path, or whenever 0001 could not prove
++// type, positive dimensions, and both signed coordinates.
 +func (p *CapturePreparation) Source() (SourceInfo, bool) {
 +	if p == nil || !p.hasSource {
 +		return SourceInfo{}, false

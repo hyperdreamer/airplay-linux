@@ -18,17 +18,18 @@ applies to `main`, and passes their test suite, so the door is open to revisit.
 `vendor/doubletake/0001-capture-report-selected-source.patch`
 - adds `airplay.SourceInfo{Type, Width, Height, X, Y}` with `IsMonitor()`
 - parses `source_type`, `position` and `size` from the ScreenCast portal reply
+- invokes the callback only when all five fields are present and valid; missing position is not converted to `(0,0)`
 - adds optional `CaptureConfig.OnSource func(SourceInfo)`; nil keeps existing behaviour
 - covers both portal paths, because `PrepareCapture` is the single request site
-
-`vendor/doubletake/0003-capability-tokens.patch` (stacks on 0001+0002)
-- adds `-capabilities`, printing a stable machine-readable token list (`capabilities-v1`, `status-source`) and
-  exiting 0
 
 `vendor/doubletake/0002-status-report-selected-source.patch` (stacks on 0001)
 - `CapturePreparation.Source()` exposes the decoded source
 - `videoCaptureGroup` records it under the daemon mutex
 - `StreamInfo.Source` is reported as an optional `source` object in `ctl status`
+
+`vendor/doubletake/0003-capability-tokens.patch` (stacks on 0001+0002)
+- adds `-capabilities`, printing the complete stable machine-readable token list
+  (`capabilities-v1`, `status-source`, `status-source-complete`) and exiting 0
 
 ## How to build
 
@@ -40,6 +41,7 @@ cd doubletake
 git checkout v0.5.0            # or main; both verified
 git apply /path/to/vendor/doubletake/0001-capture-report-selected-source.patch
 git apply /path/to/vendor/doubletake/0002-status-report-selected-source.patch
+git apply /path/to/vendor/doubletake/0003-capability-tokens.patch
 go build -o "$HOME/.local/bin/doubletake" ./cmd/doubletake
 go build -o "$HOME/.local/bin/doubletake-ctl" ./cmd/doubletake-ctl
 ```
@@ -47,17 +49,29 @@ go build -o "$HOME/.local/bin/doubletake-ctl" ./cmd/doubletake-ctl
 Verification performed when the patches were carried (Go 1.27.3):
 `go build ./...` OK, `go vet` clean, `go test -count=1 ./...` passes
 (`internal/airplay` 11.4 s, `internal/daemon` 13.4 s).
+The full-chain binary identity check is:
+
+```sh
+sha256sum "$HOME/.local/bin/doubletake" "$HOME/.local/bin/doubletake-ctl"
+"$HOME/.local/bin/doubletake" -capabilities
+```
+
+The expected capability output is exactly three lines, in order:
+`capabilities-v1`, `status-source`, `status-source-complete`.
 
 ## Installed locally (this machine)
 
-Built from the two patches applied to upstream `main` (commit of the work tree: `0d69465`,
-branch `streaminfo-source`) with Go 1.27.3, and installed ahead of the packaged binaries:
+The currently installed `/home/bin` binaries predate the third patch. Their recorded identity is:
 
 ```text
-/home/bin/doubletake       10532199 bytes   (patched; /usr/bin/doubletake is the packaged 6476312)
-/home/bin/doubletake-ctl    6924757 bytes
-/home/bin/airplay-linux    -> ~/.venvs/airplay-linux/bin/airplay-linux   (the application)
+/home/bin/doubletake       sha256 22187a1802f36a2d6eae56e2fc891722d3ef10de9bd237d7da77c40c263324e6
+/home/bin/doubletake-ctl   sha256 6da625901b5e0629437378ec404d5869791fc1e5e19ed87b26ee31b14872d4fe
 ```
+
+They print only `capabilities-v1` and `status-source`, so they are intentionally **not** a valid
+full-chain installation. After rebuilding with all three patches, replace this block with the two
+new SHA-256 values from the identity command above and require all three capability lines before
+using Mirror mode.
 
 `/home/bin` precedes `/usr/bin` on this account's `PATH`, so `doubletake` and `doubletake-ctl`
 now resolve to the patched builds **for this user**. The packaged files are untouched.
@@ -67,16 +81,15 @@ To remove the application: `rm /home/bin/airplay-linux && rm -rf ~/.venvs/airpla
 To reinstall the application after repo changes:
 `~/.venvs/airplay-linux/bin/pip install --force-reinstall /data/home/guest/Development/airplay-linux`.
 
-Isolated verification of the installed patched build (network namespace, loopback only, private socket,
+Isolated verification of the installed pre-third-patch build (network namespace, loopback only, private socket,
 temporary credentials, process killed afterwards): the daemon logs `[daemon] listening on <path>`,
 `ctl status` returns `{"ok": true, "state": "idle", "has_audio": false, "audio_muted": false}`, killing the
 process removes the socket, and `--help` is identical to the packaged build except the `Usage of <argv0>:`
-line.
+line. This verifies the old binary's containment only; it does not make it eligible for source verification.
 
 Because `--help` is otherwise unchanged and the probe normalises that `Usage of <argv0>:` line, the
-capability probe still resolves the patched build to profile `doubletake-0.5` with the same withheld flags.
-That is the point of the next section: installing the patch changes nothing observable to the application
-until the build advertises what it can do.
+capability probe resolves a full-chain build to profile `doubletake-0.5+source` only after all three
+tokens are observed.
 
 ## How the application recognises it
 
@@ -84,22 +97,23 @@ Recognition requires **both** halves, and neither alone is enough:
 
 - the sender `--help` surface must match the patched build (`tests/fixtures/backend/doubletake-0.5-source-help.txt`,
   which differs from the pinned fixture by exactly the `-capabilities` row);
-- `doubletake -capabilities` must exit 0 and print `capabilities-v1` and `status-source`.
+- `doubletake -capabilities` must exit 0 and print all three tokens: `capabilities-v1`, `status-source`,
+  and `status-source-complete`.
 
-When both hold the profile becomes `doubletake-0.5+source` with `source_reporting=True`. That flag states only that the
-build reports which display it captured. It deliberately does **not** set `physical_source`, `owner_handshake`,
-`foreground_control` or `keyring`: reporting a source is not proving it is the physical monitor we asked for, and the
-verification that consumes the report belongs to the owned-daemon work, not to this patch.
+When both hold the profile becomes `doubletake-0.5+source` with `source_reporting_complete=True`. That flag states
+that the build reports a complete display identity. It deliberately does **not** set `physical_source`,
+`owner_handshake`, `foreground_control` or `keyring`: reporting a source is not proving it is the physical monitor
+we asked for. The verifier consumes the report against one fresh KScreen inventory before Mirror mode opens.
 
 An extra flag without the tokens fails closed, tokens without the matching surface fail closed, a partial token set fails
 closed, and tokens printed on a non-zero exit are ignored.
 
 ## What is still missing on our side
 
-The capability probe in `backend/contract.py` derives support from documented `--help` evidence only,
-and the administrative help text is unchanged by these patches. Until a patched build advertises the
-capability in a way the probe can verify, `physical_source` stays false and Mirror stays gated — that
-recognition step is task T1 of `owned-daemon-control-v2`, not something to assume.
+The capability probe in `backend/contract.py` derives source-reporting support from the documented `--help`
+evidence and the complete three-token output. Until a patched build advertises the third token,
+`source_reporting_complete` and `physical_source` stay false and Mirror stays gated. A two-token installation is
+therefore deliberately refused even though it can still return a partial `source` object.
 
 ## Licensing
 

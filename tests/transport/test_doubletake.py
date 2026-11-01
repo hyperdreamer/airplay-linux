@@ -10,7 +10,7 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.backend.contract import AckReply, StatusReply
+from airplay_linux.backend.contract import AckReply, BackendSource, BackendStream, StatusReply
 from airplay_linux.backend.control import (
     ApplicationContractProfile, BackendNotice, BackendNoticeKind, BackendOperation,
     PublishedDoubletakeControl, PublishedDoubletakeProfile,
@@ -193,8 +193,18 @@ class Control:
         return [call for call in self.journal.calls("request") if call["operation"] is operation]
 
 
+class SourceVerifier:
+    def __init__(self, result=Ok(value=None)):
+        self.calls = []
+        self.result = result
+
+    async def verify(self, requested, reported):
+        self.calls.append((requested, reported))
+        return self.result
+
+
 class Harness:
-    def __init__(self, tmp_path, **features):
+    def __init__(self, tmp_path, source_verifier=None, **features):
         self.features = replace(ApplicationContractProfile(socket_path="/run/private/daemon.sock").features, **features)
         self.registry = Registry()
         self.controls = {}
@@ -210,6 +220,7 @@ class Harness:
         self.transport = DoubleTakeTransport(
             self.factory, self.registry, self.capture, self.credentials, self.receivers,
             self.fences, self.features, self.clock, self.scheduler, SequenceIds(100),
+            source_verifier=source_verifier,
         )
         self.a = target()
         self.b = target("b", address="192.0.2.11")
@@ -239,6 +250,63 @@ class Harness:
         result = await self.start(receiver, **kwargs)
         assert isinstance(result, Ok), result
         return result.value
+
+
+def _source_status(receiver, source):
+    stream = BackendStream(
+        device="Receiver", target=receiver.canonical_host, state="streaming",
+        has_audio=False, audio_muted=False, source=source,
+    )
+    return Ok(value=StatusReply(
+        state="streaming", device="Receiver", target=receiver.canonical_host,
+        has_audio=False, audio_muted=False, needs_credential=False,
+        credential_kind=None, streams=(stream,),
+    ))
+
+
+@pytest.mark.asyncio
+async def test_physical_stream_requires_fresh_backend_source_verification(tmp_path):
+    verifier = SourceVerifier()
+    harness = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    harness.control.results[BackendOperation.status].append(
+        _source_status(
+            harness.a,
+            BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+        )
+    )
+
+    result = await harness.start()
+
+    assert isinstance(result, Ok), result
+    assert verifier.calls == [("DP-1", BackendSource(
+        type=1, width=1920, height=1080, x=0, y=0,
+    ))]
+    assert len(harness.control.calls(BackendOperation.status)) == 1
+
+
+@pytest.mark.asyncio
+async def test_physical_stream_source_refusal_disconnects_before_returning_error(tmp_path):
+    verifier = SourceVerifier(Err(error=diagnostic(ErrorCode.unsupported_source)))
+    harness = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    harness.control.results[BackendOperation.status].append(
+        _source_status(
+            harness.a,
+            BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+        )
+    )
+
+    result = await harness.start()
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.unsupported_source
+    assert harness.control.calls(BackendOperation.disconnect)
+    assert harness.transport._streams == {}
 
 
 def contract_status(record, *, address="192.0.2.10", muted=False):

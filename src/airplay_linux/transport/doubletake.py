@@ -13,8 +13,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import Parameter, signature
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
-from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply
+from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
     Handshake, ModesPayload, MutePayload, requires_dispatch_fence,
@@ -43,6 +44,10 @@ from airplay_linux.trust.fences import TrustFenceRegistry
 from airplay_linux.trust.keyring import KeyringPairingPort
 
 from .targets import TargetRegistry
+
+if TYPE_CHECKING:
+    from airplay_linux.capture.source import ReportedSourceVerifier
+
 
 CONTROL_TIMEOUT = 5.0
 SHUTDOWN_TIMEOUT = 15.0
@@ -299,11 +304,13 @@ class DoubleTakeTransport:
         registry: DaemonRegistry, capture: CapturePort, credentials: CredentialStore,
         receivers: ReceiverStore, fences: TrustFenceRegistry, features: BackendFeatures,
         clock: Clock, scheduler: Scheduler, ids: IdFactory,
+        *, source_verifier: ReportedSourceVerifier | None = None,
     ) -> None:
         self._control_factory = control_factory
         self._registry, self._capture = registry, capture
         self._fences, self._features = fences, features
         self._clock, self._scheduler, self._ids = clock, scheduler, ids
+        self._source_verifier = source_verifier
         self._targets = TargetRegistry()
         self._daemons: dict[InstanceId, _Daemon] = {}
         self._unusable: set[InstanceId] = set()
@@ -626,6 +633,34 @@ class DoubleTakeTransport:
             self._retired.pop(stream.handle, None)
         stream.released = True
 
+    async def _verify_reported_source(self, stream: _Stream) -> Result[None]:
+        verifier = self._source_verifier
+        if verifier is None:
+            return Ok(value=None)
+        if self._features.source_reporting_complete is not True:
+            return _failure(ErrorCode.unsupported_source)
+        daemon = stream.daemon
+        if daemon is None or not daemon.alive or not daemon.authenticated:
+            return _failure(ErrorCode.stale_event)
+        status = await _safe(
+            daemon.control.request(
+                BackendOperation.status, None, EmptyPayload(), None,
+            ),
+            ErrorCode.unsupported_source,
+        )
+        if isinstance(status, Err) or not isinstance(status.value, StatusReply):
+            return _failure(ErrorCode.unsupported_source)
+        matches = tuple(
+            item for item in status.value.streams
+            if item.target == stream.target.canonical_host
+        )
+        if len(matches) != 1:
+            return _failure(ErrorCode.unsupported_source)
+        try:
+            return await verifier.verify(stream.source.connector, matches[0].source)
+        except Exception:
+            return _failure(ErrorCode.unsupported_source)
+
     async def _start(self, stream: _Stream) -> Result[StreamHandle]:
         if isinstance(stream.source, PhysicalMonitorSource):
             verified = await _safe(self._capture.verify(stream.source), ErrorCode.unsupported_source)
@@ -661,13 +696,24 @@ class DoubleTakeTransport:
                 return self._failed(stream, result)
             checked = self._current(stream.target, stream.context)
             if _ack(result, BackendOperation.connect, stream.target) and isinstance(checked, Ok) and not stream.abandoned and stream.daemon.alive:
-                stream.ready = result.value.state == "streaming"
-                if stream.ready:
-                    self._emit(stream, TransportEventKind.ready)
-                return Ok(value=stream.handle)
-            failure = result if isinstance(result, Err) else (
-                checked if isinstance(checked, Err) else _failure(ErrorCode.stale_event if stream.abandoned else ErrorCode.transport_failed)
-            )
+                source_checked = (
+                    await self._verify_reported_source(stream)
+                    if isinstance(stream.source, PhysicalMonitorSource)
+                    else Ok(value=None)
+                )
+                if isinstance(source_checked, Err):
+                    failure = source_checked
+                else:
+                    stream.ready = result.value.state == "streaming"
+                    if stream.ready:
+                        self._emit(stream, TransportEventKind.ready)
+                    return Ok(value=stream.handle)
+            else:
+                failure = result if isinstance(result, Err) else (
+                    checked if isinstance(checked, Err) else _failure(
+                        ErrorCode.stale_event if stream.abandoned else ErrorCode.transport_failed
+                    )
+                )
         # Source provenance is local verification plus the affirmed feature;
         # the exact request ack supplies connect acceptance only.
         cleaned = await self._stop_owned(stream, stream.context)

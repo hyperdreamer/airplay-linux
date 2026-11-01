@@ -16,15 +16,13 @@ the next attempt reacquires permission through the portal.
 from __future__ import annotations
 
 import asyncio
-import json
-import re
 from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.operations import LeaseId
-from airplay_linux.domain.ports import CommandOutput, CommandSpec, IdFactory, ProcessPort
+from airplay_linux.domain.ports import IdFactory, ProcessPort
 from airplay_linux.domain.resources import (
     Err,
     ErrorCode,
@@ -32,58 +30,16 @@ from airplay_linux.domain.resources import (
     PhysicalMonitorSource,
     Result,
 )
-
-from .portal import PortalClient, PortalMonitor
-
-#: Read-only inventory probe; it never changes a display configuration.
-KSCREEN_PROBE: Final[tuple[str, ...]] = ("kscreen-doctor", "-j")
-INVENTORY_TIMEOUT: Final[float] = 5.0
-
-#: ``KScreen::Output::Type`` members that denote a physical monitor connector.
-#: An absent, ``Unknown`` (0), television, or out-of-range value is unproven origin
-#: and is never reported as physical.
-PHYSICAL_OUTPUT_TYPES: Final[frozenset[int]] = frozenset(
-    {
-        1,  # VGA
-        2,  # DVI
-        3,  # DVII
-        4,  # DVIA
-        5,  # DVID
-        6,  # HDMI
-        7,  # Panel
-        14,  # DisplayPort
-    }
+from airplay_linux.display.inventory import (
+    INVENTORY_TIMEOUT,
+    KSCREEN_PROBE,
+    KScreenInventory,
+    _is_physical_connector,
+    _is_physical_output_type,
 )
 
-#: Textual spellings of the same enum, for a schema that serialises the connector
-#: type by name instead of by value.  A name outside this set -- notably
-#: ``Virtual`` or ``Unknown`` -- is not physical evidence.
-PHYSICAL_OUTPUT_TYPE_NAMES: Final[frozenset[str]] = frozenset(
-    {
-        "vga",
-        "dvi",
-        "dvii",
-        "dvi-i",
-        "dvia",
-        "dvid",
-        "hdmi",
-        "panel",
-        "displayport",
-    }
-)
-
-_CONNECTOR_NAME: Final[re.Pattern[str]] = re.compile(
-    r"[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+){0,3}"
-)
-_NON_PHYSICAL_MARKERS: Final[tuple[str, ...]] = (
-    "virtual",
-    "window",
-    "screen-cast",
-    "screencast",
-    "region",
-    "workspace",
-)
-
+if TYPE_CHECKING:
+    from .portal import PortalClient, PortalMonitor
 
 class InventoryProbeError(RuntimeError):
     """The read-only connector probe produced no verified inventory.
@@ -96,29 +52,6 @@ class InventoryProbeError(RuntimeError):
 
 def _failure(code: ErrorCode) -> Err:
     return Err(error=diagnostic(code))
-
-
-def _is_physical_connector(connector: object) -> bool:
-    """A real output connector name, never a window/region/virtual identity."""
-    if type(connector) is not str or not 1 <= len(connector) <= 64:
-        return False
-    lowered = connector.casefold()
-    if any(marker in lowered for marker in _NON_PHYSICAL_MARKERS):
-        return False
-    return _CONNECTOR_NAME.fullmatch(connector) is not None
-
-
-def _is_physical_output_type(output_type: object) -> bool:
-    """Whether a KScreen output type positively identifies physical hardware.
-
-    Absence of a virtual marker is not evidence of a physical origin: only a
-    known physical connector type from the installed schema is accepted.
-    """
-    if type(output_type) is int:
-        return output_type in PHYSICAL_OUTPUT_TYPES
-    if type(output_type) is str:
-        return output_type.casefold() in PHYSICAL_OUTPUT_TYPE_NAMES
-    return False
 
 
 def _physical_connectors(connectors: object) -> tuple[str, ...]:
@@ -148,6 +81,11 @@ def is_physical_descriptor(source: object, connectors: tuple[str, ...]) -> bool:
     return connector in connectors
 
 
+def _portal_monitor_type():
+    from .portal import PortalMonitor
+    return PortalMonitor
+
+
 class _UuidFactory:
     def new(self):
         return uuid4()
@@ -167,49 +105,27 @@ class KscreenConnectorInventory:
     always means a successfully verified empty inventory.
     """
 
-    def __init__(self, process: ProcessPort, *, timeout: float = INVENTORY_TIMEOUT) -> None:
-        self._process = process
-        self._timeout = timeout
+    def __init__(self, process: ProcessPort | KScreenInventory, *, timeout: float = INVENTORY_TIMEOUT) -> None:
+        self._inventory = process if isinstance(process, KScreenInventory) else KScreenInventory(
+            process, timeout=timeout,
+        )
+        self._process = self._inventory._process
+        self._timeout = self._inventory._timeout
 
     async def __call__(self) -> tuple[str, ...]:
-        try:
-            result = await self._process.run(
-                CommandSpec(argv=KSCREEN_PROBE, env={}), self._timeout
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            raise InventoryProbeError("the connector probe could not run") from error
-        if not isinstance(result, Ok) or type(result.value) is not CommandOutput:
-            raise InventoryProbeError("the connector probe returned no output")
-        output = result.value
-        if output.exit_code != 0:
-            raise InventoryProbeError("the connector probe did not succeed")
-        try:
-            document = json.loads(output.stdout)
-        except (TypeError, ValueError) as error:
-            raise InventoryProbeError("the connector probe output is not JSON") from error
-        if type(document) is not dict:
-            raise InventoryProbeError("the connector probe output is not an object")
-        outputs = document.get("outputs")
-        if type(outputs) is not list:
-            raise InventoryProbeError("the connector probe output has no outputs")
-
+        observed = await self._inventory.observe_connectors()
+        if isinstance(observed, Err):
+            raise InventoryProbeError("the connector probe did not produce a verified layout")
         selected: list[str] = []
-        for entry in outputs:
-            if type(entry) is not dict:
-                continue
-            connector = entry.get("name")
-            if not _is_physical_connector(connector):
-                continue
-            if entry.get("enabled") is not True:
-                continue
-            if entry.get("connected") is not True:
-                continue
-            if not _is_physical_output_type(entry.get("type")):
-                continue
-            if connector not in selected:
-                selected.append(connector)
+        for output in observed.value:
+            if (
+                output.enabled
+                and output.connected
+                and _is_physical_connector(output.connector)
+                and _is_physical_output_type(output.output_type)
+                and output.connector not in selected
+            ):
+                selected.append(output.connector)
         return tuple(selected)
 
 
@@ -317,13 +233,14 @@ class PhysicalCaptureProvider:
                 return acquired
 
             monitor = acquired.value
+            monitor_type = _portal_monitor_type()
             if (
-                type(monitor) is not PortalMonitor
+                type(monitor) is not monitor_type
                 or monitor.connector != connector
                 or monitor.source_type != "physical_monitor"
             ):
                 self._restore_tokens.pop(connector, None)
-                if type(monitor) is PortalMonitor:
+                if type(monitor) is monitor_type:
                     released = await self._release_exact(monitor)
                     if isinstance(released, Err):
                         # The refused source still owns a live session: report the
