@@ -57,6 +57,138 @@ async def test_execution_entry_points_refuse_before_lookup(offline_boundary_trip
     assert c.attempted == ["backend" if name == "doubletake" else "ctl"]
 
 
+@pytest.mark.parametrize("name", ("doubletake", "doubletake-ctl"))
+@pytest.mark.parametrize("program", (
+    "true;{command}",
+    "true&&{command}",
+    "false||{command}",
+    "if true;then {command};fi",
+    "true\n{command}",
+    "true|{command}",
+    "({command})",
+    "{{ {command}; }}",
+    "true & {command}",
+    "/bin/sh -c '{command}'",
+))
+@pytest.mark.parametrize("entry", ("subprocess", "shell_argv", "explicit_shell", "asyncio"))
+async def test_compound_shell_boundaries_refuse_before_child_creation(
+    offline_boundary_tripwires, monkeypatch, name, program, entry,
+):
+    import asyncio
+
+    c = offline_boundary_tripwires
+    monkeypatch.setenv("PATH", str(c.root / "absent"))
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("shell boundary reached child creation before refusal")
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", unexpected_child)
+    command = f"{name} {'-daemonize' if name == 'doubletake' else '-status'}"
+    script = program.format(command=command)
+    with pytest.raises(c.refusal_type):
+        if entry == "subprocess":
+            subprocess.run(script, shell=True, capture_output=True, check=False)
+        elif entry == "shell_argv":
+            subprocess.run((script, "shell-argument"), shell=True, capture_output=True, check=False)
+        elif entry == "explicit_shell":
+            subprocess.run(("/bin/sh", "-c", script), capture_output=True, check=False)
+        else:
+            await asyncio.create_subprocess_shell(script)
+    assert c.attempted == ["backend" if name == "doubletake" else "ctl"]
+
+
+@pytest.mark.parametrize("program", (
+    'command=doubletake; "$command" -daemonize',
+    'command=doubletake-ctl; "$command" -status',
+    'eval "true; doubletake -daemonize"',
+    'eval "true; doubletake-ctl -status"',
+    'printf "%s" "$(doubletake -daemonize)"',
+    'printf "%s" "`doubletake-ctl -status`"',
+    "doubleta?e -daemonize",
+    "double{take,take-ctl} -status",
+    ". /absent/shell-program",
+    "/bin/sh /absent/shell-program",
+))
+def test_unsupported_shell_evaluation_refuses_before_child_creation(
+    offline_boundary_tripwires, monkeypatch, program,
+):
+    c = offline_boundary_tripwires
+    monkeypatch.setenv("PATH", str(c.root / "absent"))
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("unsupported shell evaluation reached child creation before refusal")
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", unexpected_child)
+    with pytest.raises(c.refusal_type):
+        subprocess.run(program, shell=True, capture_output=True, check=False)
+    assert c.attempted
+
+
+@pytest.mark.parametrize(("program", "output"), (
+    ("true;printf offline", "offline"),
+    ("true&&printf offline", "offline"),
+    ("if true;then printf offline;fi", "offline"),
+    ("(printf offline)", "offline"),
+    ("printf '%s' 'doubletake -daemonize'", "doubletake -daemonize"),
+))
+def test_unrelated_shell_programs_remain_available(offline_boundary_tripwires, program, output):
+    result = subprocess.run(program, shell=True, capture_output=True, text=True, check=True)
+    assert result.stdout == output
+    assert offline_boundary_tripwires.attempted == []
+
+
+@pytest.mark.parametrize("name", ("doubletake", "doubletake-ctl"))
+def test_compound_shell_permits_marked_private_shims(
+    offline_boundary_tripwires, tmp_path, monkeypatch, name,
+):
+    shim = tmp_path / name
+    shim.write_text(
+        f"#!/bin/sh\n# private test-only shim: {name}\n# fake_doubletake.py\nprintf private\n",
+    )
+    shim.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    result = subprocess.run(f"true;{name} -status", shell=True, capture_output=True, text=True, check=True)
+    assert result.stdout == "private"
+    assert offline_boundary_tripwires.attempted == []
+
+
+@pytest.mark.parametrize("name", ("doubletake", "doubletake-ctl"))
+@pytest.mark.parametrize("program", (
+    "/usr/bin/env -u PATH {command}",
+    "/usr/bin/env -i {command}",
+    "command -p {command}",
+    "read PATH;{command}",
+))
+def test_shell_cannot_retarget_a_permitted_private_shim(
+    offline_boundary_tripwires, tmp_path, monkeypatch, name, program,
+):
+    c = offline_boundary_tripwires
+    shim = tmp_path / name
+    shim.write_text(f"#!/bin/sh\n# private test-only shim: {name}\n# fake_doubletake.py\nexit 0\n")
+    shim.chmod(0o700)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("shell changed executable lookup before refusal")
+
+    monkeypatch.setattr(subprocess.Popen, "_execute_child", unexpected_child)
+    with pytest.raises(c.refusal_type):
+        subprocess.run(program.format(command=f"{name} -status"), shell=True, capture_output=True, check=False)
+    assert c.attempted == ["backend"]
+
+
+@pytest.mark.parametrize("name", ("doubletake", "doubletake-ctl"))
+@pytest.mark.parametrize("flag", ("--help", "--version", "-capabilities"))
+def test_direct_read_only_observations_remain_available(offline_boundary_tripwires, tmp_path, name, flag):
+    # This is deliberately unmarked: only the exact observation argv permits it.
+    executable = tmp_path / name
+    executable.write_text("#!/bin/sh\nprintf observation\n")
+    executable.chmod(0o700)
+    result = subprocess.run((executable, flag), capture_output=True, text=True, check=True)
+    assert result.stdout == "observation"
+    assert offline_boundary_tripwires.attempted == []
+
+
 @pytest.mark.parametrize("entry", ("constructor", "capability_probe"))
 async def test_session_bus_refuses_before_address_lookup(offline_boundary_tripwires, monkeypatch, entry):
     from dbus_next.aio import MessageBus

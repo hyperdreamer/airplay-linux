@@ -114,6 +114,35 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         attempted.append(boundary)
         raise OfflineBoundaryRefusal(f"unmarked live boundary attempted: {boundary}")
 
+    def check_shell(program, *, env=None):
+        if opted_in:
+            return
+        program = os.fsdecode(program)
+        # Support literal shell programs, not expansion or evaluation that can
+        # manufacture executable names. shlex is a lexer, not a shell parser.
+        if any(marker in program for marker in ("$", "`", "*", "?", "[", "]", "<<", "\\\n")):
+            refuse("backend")
+        lexer = shlex.shlex(program, posix=True, punctuation_chars=";&|()<>")
+        lexer.whitespace_split = True
+        try:
+            words = list(lexer)
+        except ValueError:
+            refuse("backend")
+        for word in words:
+            # These can evaluate another program or change private PATH lookup.
+            if (word in {"eval", "source", ".", "cd", "pushd", "popd", "unset", "alias", "PATH"}
+                    or ("=" in word and word.split("=", 1)[0].isidentifier())
+                    or (word not in {"{", "}"} and ("{" in word or "}" in word))):
+                refuse("backend")
+        # Conservatively inspect every word, including commands after shell
+        # operators/keywords and nested shell/env/exec/unshare invocations.
+        # Shell arguments never receive the direct read-only observation bypass.
+        for index, word in enumerate(words):
+            if (Path(word).name in {"env", "command"} and index + 1 < len(words)
+                    and words[index + 1].startswith("-") and words[index + 1] != "--"):
+                refuse("backend")
+            check_process(words[index:], env=env, observation=False)
+
     def check_process(argv, *, env=None, observation=True):
         if isinstance(argv, (str, bytes)):
             argv = shlex.split(os.fsdecode(argv))
@@ -123,8 +152,12 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
             return
         executable = os.fsdecode(argv[0])
         name = Path(executable).name
-        if name in {"sh", "bash", "dash"} and len(argv) > 2 and argv[1] == "-c":
-            check_process(argv[2], env=env, observation=False)
+        if name in {"sh", "bash", "dash"}:
+            if len(argv) > 2 and argv[1] == "-c":
+                check_shell(argv[2], env=env)
+            else:
+                # Script files, stdin and other shell option forms are opaque.
+                refuse("backend")
             return
         if name in {"env", "exec"}:
             index = 1
@@ -184,12 +217,17 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         return await spawn(self, spec)
 
     def guarded_popen(self, args, *positional, **kwargs):
-        observation = not kwargs.get("shell", False)
-        check_process(args, env=kwargs.get("env"), observation=observation)
+        shell = kwargs.get("shell", positional[7] if len(positional) > 7 else False)
+        env = kwargs.get("env")
+        if shell:
+            program = args[0] if isinstance(args, (tuple, list)) and args else args
+            check_shell(program, env=env)
+        else:
+            check_process(args, env=env)
         executable = kwargs.get("executable", positional[1] if len(positional) > 1 else None)
         if executable is not None:
-            tail = args[1:] if isinstance(args, (tuple, list)) else ()
-            check_process((executable, *tail), env=kwargs.get("env"), observation=observation)
+            tail = ("-c", program) if shell else args[1:] if isinstance(args, (tuple, list)) else ()
+            check_process((executable, *tail), env=env, observation=not shell)
         return popen_init(self, args, *positional, **kwargs)
 
     construct_bus = MessageBus.__init__
