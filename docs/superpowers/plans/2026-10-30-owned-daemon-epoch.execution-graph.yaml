@@ -404,7 +404,9 @@ tasks:
       - "src/airplay_linux/policy/capabilities.py"
       - "src/airplay_linux/transport/doubletake.py"
       - "src/airplay_linux/process/daemon_registry.py"
+      - "src/airplay_linux/process/ownership.py"
       - "src/airplay_linux/process/supervisor.py"
+      - "README.md"
       - "docs/backend-fork.md"
       - "tests/backend/test_control.py"
       - "tests/transport/test_doubletake.py"
@@ -413,6 +415,7 @@ tasks:
       - "tests/acceptance/test_no_production_spawn.py"
       - "tests/process/test_credential_probe.py"
       - "tests/acceptance/test_owned_daemon_epoch.py"
+      - "tests/runtime/test_owned_probe.py"
     resources: []
     produces:
       - name: "activation.complete_composition"
