@@ -751,6 +751,10 @@ class DoubleTakeTransport:
                 return self._failed(stream, result)
             checked = self._current(stream.target, stream.context)
             if _ack(result, BackendOperation.connect, stream.target) and isinstance(checked, Ok) and not stream.abandoned and stream.daemon.alive:
+                if isinstance(stream.source, VirtualOutputSource) and result.value.state == "connecting":
+                    # Preserve the virtual acquisition contract: the caller owns
+                    # this handle while waiting for a separate readiness event.
+                    return Ok(value=stream.handle)
                 if result.value.state != "streaming":
                     failure = _failure(ErrorCode.unsupported_source)
                 else:

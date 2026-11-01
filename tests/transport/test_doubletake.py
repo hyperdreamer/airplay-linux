@@ -1010,9 +1010,39 @@ async def test_cancelled_start_before_capture_finishes_cannot_acquire_backend_re
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("state", [None, "idle", "discovering", "connecting", "pin_required"])
+async def test_virtual_connecting_returns_owned_handle_without_claiming_readiness(tmp_path):
+    h = Harness(tmp_path)
+    b = await h.handle(h.b, ctx=context(lease=2))
+    h.events.clear()
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+
+    result = await h.start(source=virtual_handle().source)
+
+    assert isinstance(result, Ok), result
+    assert result.value.lease_id == context().transport_lease_id
+    assert h.transport._streams[result.value.lease_id].handle == result.value
+    assert h.transport._streams[result.value.lease_id].ready is False
+    assert h.transport._streams[b.lease_id].handle == b
+    assert h.control.connected == {h.a.receiver_id, h.b.receiver_id}
+    assert h.events == []
+    assert h.control.calls(BackendOperation.disconnect) == []
+    assert h.control.calls(BackendOperation.start_audio) == []
+    assert isinstance(await h.transport.stop_stream(result.value, context()), Ok)
+    assert h.control.connected == {h.b.receiver_id}
+    assert h.control.calls(BackendOperation.disconnect)[0]["target"]["receiver_id"] == h.a.receiver_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source,state", [
+    (physical(), state) for state in (None, "idle", "discovering", "connecting", "pin_required")
+] + [
+    (virtual_handle().source, state) for state in (None, "idle", "discovering", "pin_required")
+])
 @pytest.mark.parametrize("cleanup", ["confirmed", "rejected", "timeout"])
-async def test_connect_acceptance_without_streaming_does_not_claim_video_readiness(tmp_path, state, cleanup):
+async def test_connect_acceptance_without_streaming_does_not_claim_video_readiness(tmp_path, source, state, cleanup):
     h = Harness(tmp_path)
     b = await h.handle(h.b, ctx=context(lease=2))
     h.events.clear()
@@ -1028,7 +1058,7 @@ async def test_connect_acceptance_without_streaming_does_not_claim_video_readine
     elif cleanup == "timeout":
         gate = h.control.gates[(BackendOperation.disconnect, h.a.receiver_id)] = Gate()
 
-    pending = asyncio.create_task(h.start())
+    pending = asyncio.create_task(h.start(source=source))
     if cleanup == "timeout":
         await asyncio.wait_for(gate.entered.wait(), timeout=1.0)
         h.scheduler.advance(5.0)
