@@ -16,9 +16,11 @@ import shutil
 import stat
 import sys
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -135,6 +137,30 @@ def _same_root(root: Path, probe_uuid: UUID, descriptor: int) -> None:
         os.close(fresh)
 
 
+@contextmanager
+def _short_runtime_root(probe_uuid: UUID) -> Iterator[tuple[Path, int]]:
+    """Bound socket paths independently of state home and TMPDIR.
+
+    Receipts, verdicts and HOME/XDG files remain in the durable record root.
+    TemporaryDirectory uses symlink-resistant cleanup on every exit path.
+    """
+    with TemporaryDirectory(prefix="ap-", dir="/tmp") as directory:
+        parent = Path(directory)
+        descriptor = _open_directory(parent)
+        try:
+            _private(os.fstat(descriptor))
+            os.mkdir(str(probe_uuid), 0o700, dir_fd=descriptor)
+            os.fsync(descriptor)
+            root = parent / str(probe_uuid)
+            root_descriptor = open_probe_root(root, probe_uuid)
+            try:
+                yield root, root_descriptor
+            finally:
+                os.close(root_descriptor)
+        finally:
+            os.close(descriptor)
+
+
 def _read_file(directory: int, name: str, limit: int) -> bytes:
     descriptor = os.open(name, _FILE_FLAGS, dir_fd=directory)
     try:
@@ -203,31 +229,40 @@ class _ProbeFiles(AtomicFiles):
 
 def prepare_config(
     record_root: Path, *, backend_executable: str, supervisor: ProcessIdentity, boot_id: str,
+    runtime_root: Path | None = None,
 ) -> ProbeConfig:
-    """Create leg reservations inside the parent-created root, in the child."""
+    """Create UUID-bound socket legs and durable leg file directories in the child."""
     probe_uuid = UUID(record_root.name)
+    runtime_root = record_root if runtime_root is None else runtime_root
     descriptor = open_probe_root(record_root, probe_uuid)
     reservations = []
     instance = InstanceId(uuid4())
     try:
-        for leg in ("positive", "negative"):
-            os.mkdir(leg, 0o700, dir_fd=descriptor)
-            entered = os.open(leg, _DIR_FLAGS, dir_fd=descriptor)
-            try:
-                info = os.fstat(entered)
-                _private(info)
-                reservation = DaemonReservation(
-                    schema_version=1, launch_uuid=uuid4(), instance_uuid=instance,
-                    app=supervisor, owner_uid=os.getuid(), boot_id=boot_id,
-                    runtime_directory=str(record_root / leg), runtime_device=info.st_dev,
-                    runtime_inode=info.st_ino, endpoint_generation=1, socket_name="daemon.sock",
-                    protocol_version="v1",
-                )
-                encode_daemon_reservation(reservation)
-                reservations.append(reservation)
-            finally:
-                os.close(entered)
-        os.fsync(descriptor)
+        runtime_descriptor = open_probe_root(runtime_root, probe_uuid)
+        try:
+            for leg in ("positive", "negative"):
+                os.mkdir(leg, 0o700, dir_fd=runtime_descriptor)
+                if runtime_root != record_root:
+                    os.mkdir(leg, 0o700, dir_fd=descriptor)
+                entered = os.open(leg, _DIR_FLAGS, dir_fd=runtime_descriptor)
+                try:
+                    info = os.fstat(entered)
+                    _private(info)
+                    reservation = DaemonReservation(
+                        schema_version=1, launch_uuid=uuid4(), instance_uuid=instance,
+                        app=supervisor, owner_uid=os.getuid(), boot_id=boot_id,
+                        runtime_directory=str(runtime_root / leg), runtime_device=info.st_dev,
+                        runtime_inode=info.st_ino, endpoint_generation=1, socket_name="daemon.sock",
+                        protocol_version="v1",
+                    )
+                    encode_daemon_reservation(reservation)
+                    reservations.append(reservation)
+                finally:
+                    os.close(entered)
+            os.fsync(runtime_descriptor)
+            os.fsync(descriptor)
+        finally:
+            os.close(runtime_descriptor)
     finally:
         os.close(descriptor)
     return ProbeConfig(probe_uuid=probe_uuid, reservations=tuple(reservations),
@@ -242,9 +277,12 @@ def _validate_config(config: ProbeConfig, supervisor: ProcessIdentity) -> None:
              and "\0" not in config.backend_executable)
     positive, negative = config.reservations
     _require(positive.launch_uuid != negative.launch_uuid)
+    runtime_root = Path(positive.runtime_directory).parent
+    descriptor = open_probe_root(runtime_root, config.probe_uuid)
+    os.close(descriptor)
     for reservation, leg in zip(config.reservations, ("positive", "negative"), strict=True):
         encode_daemon_reservation(reservation)
-        _require(reservation.runtime_directory == str(config.record_root / leg)
+        _require(reservation.runtime_directory == str(runtime_root / leg)
                  and reservation.app == supervisor and reservation.owner_uid == os.getuid()
                  and reservation.socket_name == "daemon.sock")
         _require(len(os.fsencode(reservation.runtime_directory + "/daemon.sock")) < 108,
@@ -254,6 +292,11 @@ def _validate_config(config: ProbeConfig, supervisor: ProcessIdentity) -> None:
             info = os.fstat(entered)
             _private(info)
             _require((info.st_dev, info.st_ino) == (reservation.runtime_device, reservation.runtime_inode))
+        finally:
+            os.close(entered)
+        entered = _open_directory(config.record_root / leg)
+        try:
+            _private(os.fstat(entered))
         finally:
             os.close(entered)
 
@@ -335,14 +378,19 @@ class _Leg:
             os.close(entered)
 
     def _no_credentials_file(self) -> bool:
-        # All backend file locations are overridden into this leg's private
-        # directory. Refuse every unexpected entry, including symlinks, instead
-        # of guessing which backend credential filename a future build uses.
-        entered = _open_directory(Path(self.receipt.runtime_directory))
-        try:
-            return all(name == self.receipt.socket_name for name in os.listdir(entered))
-        finally:
-            os.close(entered)
+        # Refuse every unexpected entry in both locations. HOME/XDG files live
+        # under the state root so failures retain them after socket-root cleanup.
+        runtime = Path(self.receipt.runtime_directory)
+        for directory in {runtime, self.config.record_root / self.leg}:
+            entered = _open_directory(directory)
+            try:
+                _private(os.fstat(entered))
+                allowed = {self.receipt.socket_name} if directory == runtime else set()
+                if not set(os.listdir(entered)) <= allowed:
+                    return False
+            finally:
+                os.close(entered)
+        return True
 
     async def _bind(self) -> bool:
         history = self._receipt_source()
@@ -464,10 +512,11 @@ class _Leg:
         try:
             await self._write()
             directory = self.receipt.runtime_directory
+            files_directory = str(self.config.record_root / self.leg)
             overlay = {
                 OWNER_TOKEN_ENV: str(self.receipt.launch_uuid), RUNTIME_DIRECTORY_ENV: directory,
-                "HOME": directory, "XDG_CONFIG_HOME": directory, "XDG_DATA_HOME": directory,
-                "XDG_CACHE_HOME": directory,
+                "HOME": files_directory, "XDG_CONFIG_HOME": files_directory,
+                "XDG_DATA_HOME": files_directory, "XDG_CACHE_HOME": files_directory,
             }
             if self.leg == "negative":
                 overlay["DBUS_SESSION_BUS_ADDRESS"] = UNREACHABLE_BUS
@@ -587,7 +636,7 @@ class CredentialServiceProbe:
             os.fsync(located.parent)
         return self._record_root / "daemon" / "probe" / str(probe_uuid)
 
-    def _archive(self, root: Path, probe_uuid: UUID, descriptor: int) -> None:
+    def _archive(self, root: Path, probe_uuid: UUID, descriptor: int, runtime_root: Path) -> None:
         _same_root(root, probe_uuid, descriptor)
         entered = os.open("receipts", _DIR_FLAGS, dir_fd=descriptor)
         try:
@@ -607,7 +656,7 @@ class CredentialServiceProbe:
             by_leg = {Path(record.runtime_directory).name: record for record in records}
             _require(set(by_leg) == {"positive", "negative"})
             for leg, receipt in by_leg.items():
-                _require(receipt.runtime_directory == str(root / leg) and receipt.socket_name == "daemon.sock"
+                _require(receipt.runtime_directory == str(runtime_root / leg) and receipt.socket_name == "daemon.sock"
                          and receipt.daemon is not None and receipt.supervisor is not None)
             _require(by_leg["positive"].status_state == "idle"
                      and by_leg["positive"].credential_service == "keyring_proven"
@@ -642,25 +691,27 @@ class CredentialServiceProbe:
             probe_uuid = uuid4()
             root = self._create_root(probe_uuid)
             descriptor = open_probe_root(root, probe_uuid)
-            socket_path = str(root / "positive" / "daemon.sock")
-            _require(len(os.fsencode(socket_path)) < 108, ErrorCode.dependency_incompatible)
-            result = await self._process.run(CommandSpec(argv=(
-                self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
-                "--socket", socket_path, "--record-root", str(root),
-            ), env={}), timeout=30.0)
-            if isinstance(result, Err):
-                return result
-            decoded = read_probe_verdict(root, probe_uuid, descriptor, result.value)
-            if isinstance(decoded, Err):
-                return decoded
-            verdict = decoded.value
-            proof = CredentialProofVerdict(
-                service_leg=verdict.service_leg, backend_positive_leg=verdict.backend_positive_leg,
-                backend_negative_leg=verdict.backend_negative_leg, failure=verdict.failure,
-            )
-            if proof.proven:
-                self._archive(root, probe_uuid, descriptor)
-            return Ok(value=proof)
+            with _short_runtime_root(probe_uuid) as (runtime_root, runtime_descriptor):
+                socket_path = str(runtime_root / "positive" / "daemon.sock")
+                _require(len(os.fsencode(socket_path)) < 108, ErrorCode.dependency_incompatible)
+                result = await self._process.run(CommandSpec(argv=(
+                    self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
+                    "--socket", socket_path, "--record-root", str(root),
+                ), env={}), timeout=30.0)
+                _same_root(runtime_root, probe_uuid, runtime_descriptor)
+                if isinstance(result, Err):
+                    return result
+                decoded = read_probe_verdict(root, probe_uuid, descriptor, result.value)
+                if isinstance(decoded, Err):
+                    return decoded
+                verdict = decoded.value
+                proof = CredentialProofVerdict(
+                    service_leg=verdict.service_leg, backend_positive_leg=verdict.backend_positive_leg,
+                    backend_negative_leg=verdict.backend_negative_leg, failure=verdict.failure,
+                )
+                if proof.proven:
+                    self._archive(root, probe_uuid, descriptor, runtime_root)
+                return Ok(value=proof)
         except (OSError, StorageError, RecordError, _Refused, ValueError, TypeError) as error:
             return _err(error.code if isinstance(error, _Refused) else ErrorCode.persistence_failed)
         finally:
@@ -688,13 +739,15 @@ def main(argv: list[str] | None = None) -> int:
     arguments = parser.parse_args(argv)
     try:
         root = Path(arguments.record_root)
-        _require(arguments.socket == str(root / "positive" / "daemon.sock"))
+        runtime_root = Path(arguments.socket).parent.parent
+        _require(arguments.socket == str(runtime_root / "positive" / "daemon.sock"))
         identity = _namespace_identity(("unshare", "-rn"))
         _require(isinstance(identity, Ok))
         backend = shutil.which("doubletake")
         boot = EndpointObservations.boot_id()
         _require(backend is not None and boot is not None, ErrorCode.dependency_incompatible)
-        config = prepare_config(root, backend_executable=backend, supervisor=identity.value, boot_id=boot)
+        config = prepare_config(root, backend_executable=backend, supervisor=identity.value,
+                                boot_id=boot, runtime_root=runtime_root)
         from airplay_linux.process.linux import LinuxProcessRunner
         run(config, process=LinuxProcessRunner(), namespace=_namespace_identity)
         descriptor = open_probe_root(root, config.probe_uuid)

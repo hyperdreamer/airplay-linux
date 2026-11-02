@@ -9,6 +9,7 @@ import os
 import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -25,7 +26,7 @@ from airplay_linux.domain.resources import CapabilityReport, Err, ErrorCode, Ok
 from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process import ownership
 from airplay_linux.process.procfs import IdentityEvidence, IdentityState
-from airplay_linux.storage.atomic import AtomicFiles
+from airplay_linux.storage.atomic import AtomicFiles, state_root
 from airplay_linux.storage.codecs import RecordError, decode_probe_verdict, encode_probe_verdict
 from airplay_linux.testing.adapters import ProbeProcessRecorder
 
@@ -136,6 +137,7 @@ class InnerProcess(ProbeProcessRecorder):
         self.terminate_error = None
         self.termination_deadlines = []
         self.before_signal = []
+        self.record_root = None
 
     async def spawn(self, spec):
         result = await super().spawn(spec)
@@ -156,7 +158,7 @@ class InnerProcess(ProbeProcessRecorder):
             self.facts.peers[path] = identity
         if leg == "negative" and not self.negative_hangs:
             if self.negative_file:
-                (Path(path).parent / "credentials.json").write_text("temporary fake data")
+                (Path(spec.env["HOME"]) / "credentials.json").write_text("temporary fake data")
             def finish():
                 observation.exit_code = self.negative_code
                 observation.socket_exists = path in self.facts.entries
@@ -189,7 +191,7 @@ class InnerProcess(ProbeProcessRecorder):
         # again after this hook, before FakeProcess records any signal.
         if self.on_post_open is not None:
             self.on_post_open()
-        self.before_signal.append((Path(runtime_directory).parent / "receipts" /
+        self.before_signal.append(((self.record_root or Path(runtime_directory).parent) / "receipts" /
                                    f"{owner_uuid}.json").read_bytes())
         if self.terminate_error is not None:
             return Err(error=composition.diagnostic(self.terminate_error))
@@ -395,8 +397,12 @@ def recording_probe_processes(namespace_probe_witness, monkeypatch):
             if Path(spec.argv[0]).name == "unshare":
                 c.events.append("witness")
                 root = Path(spec.argv[spec.argv.index("--record-root") + 1])
+                runtime_root = Path(spec.argv[spec.argv.index("--socket") + 1]).parent.parent
                 c.config = c.module.prepare_config(root, backend_executable="/fake/doubletake",
-                                                   supervisor=c.facts.supervisor, boot_id=c.facts.boot)
+                                                   supervisor=c.facts.supervisor, boot_id=c.facts.boot,
+                                                   runtime_root=runtime_root)
+                c.inner.record_root = root
+                c.probe_runtime_root = runtime_root
                 await asyncio.to_thread(c.module.run, c.config, process=c.inner,
                                         namespace=c.namespace)
                 if c.after_child is not None:
@@ -459,6 +465,47 @@ def recording_probe_processes(namespace_probe_witness, monkeypatch):
     return c
 
 
+@pytest.mark.parametrize("environment,old_socket_bytes", [
+    ({"HOME": "/home/abc"}, 107),
+    ({"HOME": "/home/user"}, 108),
+    ({"HOME": "/home/henry"}, 109),
+    ({"HOME": "/home/henry", "XDG_STATE_HOME": "/srv/desktop/users/henry/persistent/application-state"}, 138),
+], ids=["short-control-107", "home-user-108", "home-henry-109", "long-xdg-state-home"])
+async def test_default_state_layout_reaches_production_probe_process_boundary(
+    recording_probe_processes, environment, old_socket_bytes,
+):
+    """A-1: the real parent/child witness must work at ordinary state-root lengths."""
+    c = recording_probe_processes
+    suffix = Path("daemon/probe") / str(UUID(int=1)) / "positive/daemon.sock"
+    configured = state_root(environment)
+    assert len(os.fsencode(configured / suffix)) == old_socket_bytes
+    # Preserve the exact default path length without writing anyone's real home.
+    padding = len(os.fsencode(configured)) - len(os.fsencode(c.socket_root)) - 1
+    assert padding > 0
+    root = c.socket_root / ("s" * padding)
+    assert len(os.fsencode(root / suffix)) == old_socket_bytes
+    c.runtime_config = replace(c.runtime_config, state_root=root)
+    runtime = await c.build_complete_production_and_probe()
+    try:
+        assert len(c.outer_unshare) == 1, "A-1: state layout blocked the production process boundary"
+        assert len(c.inner_launches) == 2
+        assert runtime.deps.transport._features.keyring is True
+        paths = [item.argv[item.argv.index("-socket") + 1]
+                 for item in c.inner.invocations if item.kind == "direct_backend"]
+        assert all(len(os.fsencode(path)) < 108 for path in paths)
+        assert c.probe_runtime_root.name == str(c.config.probe_uuid)
+        assert not c.probe_runtime_root.parent.exists()
+        assert not c.config.record_root.exists()
+        archive = root / "archives/probe" / str(c.config.probe_uuid)
+        assert len(list((archive / "receipts").glob("*.json"))) == 2
+        assert decode_probe_verdict((archive / "verdict.json").read_bytes()).failure is None
+        print(f"A-1 {environment}: old_socket_bytes={old_socket_bytes}, "
+              f"runtime_socket_bytes={[len(os.fsencode(path)) for path in paths]}, "
+              "outer_calls=1, inner_launches=2, keyring=True")
+    finally:
+        await runtime.shutdown()
+
+
 async def test_probe_run_seam_observes_outer_unshare_and_inner_backend_launch(recording_probe_processes):
     c = recording_probe_processes
     runtime = await c.build_complete_production_and_probe()
@@ -479,6 +526,7 @@ async def test_probe_run_seam_observes_outer_unshare_and_inner_backend_launch(re
     assert {path.stem for path in (archive / "receipts").glob("*.json")} == {
         str(positive.launch_uuid), str(negative.launch_uuid)}
     assert not c.config.record_root.exists()
+    assert not c.probe_runtime_root.parent.exists()
     assert c.events == ["witness", "derive", "registry"]
     assert runtime.registry._process is c.outer
     await runtime.shutdown()
@@ -639,6 +687,7 @@ async def test_parent_failed_verdict_and_archive_failure_retain_originals(record
     runtime = await c.build_complete_production_and_probe()
     assert len(c.inner_launches) == 2
     assert c.config.record_root.is_dir()
+    assert not c.probe_runtime_root.parent.exists()
     assert (c.config.record_root / "verdict.json").is_file()
     assert len(list((c.config.record_root / "receipts").glob("*.json"))) == 2
     assert runtime.deps.transport._features.keyring is False
@@ -657,7 +706,7 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
     elif leg == "positive":
         c.inner.confirmation_fails = True
     elif leg == "negative":
-        c.inner.negative_code = 0
+        c.inner.negative_file = True
     else:
         c.inner.terminate_error = ErrorCode.cleanup_timeout
     runtime = await c.build_complete_production_and_probe()
@@ -665,6 +714,7 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
         assert len(c.outer_unshare) == 1
         assert len(c.inner_launches) == {"service": 0, "positive": 2, "negative": 2, "cleanup": 1}[leg]
         assert c.config.record_root.is_dir()
+        assert not c.probe_runtime_root.parent.exists()
         assert not runtime.deps.transport._features.keyring
         if leg == "cleanup":
             assert not (c.config.record_root / "verdict.json").exists()
@@ -672,6 +722,8 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
             verdict = decode_probe_verdict((c.config.record_root / "verdict.json").read_bytes())
             assert verdict.failure is not None
             assert leg in runtime.gated_capabilities["owned_daemon_control"]
+        if leg == "negative":
+            assert (c.config.record_root / "negative" / "credentials.json").read_text() == "temporary fake data"
         refused = await runtime.registry.ensure()
         assert isinstance(refused, Err) and refused.error.code is ErrorCode.dependency_incompatible
     finally:
@@ -707,21 +759,148 @@ async def test_parent_archives_only_two_verified_terminal_leg_receipts(recording
         await runtime.shutdown()
 
 
+@pytest.mark.parametrize("separate_runtime", [False, True], ids=["colocated-control", "short-runtime"])
 def test_production_main_uses_same_child_seam_and_requires_complete_files(
-    namespace_probe_witness, monkeypatch,
+    namespace_probe_witness, monkeypatch, separate_runtime,
 ):
     c = namespace_probe_witness
     from airplay_linux.process import linux
     root = c.socket_root / str(uuid4())
     root.mkdir(mode=0o700)
+    runtime_root = root
+    if separate_runtime:
+        runtime_root = c.socket_root / "sockets" / root.name
+        runtime_root.mkdir(mode=0o700, parents=True)
+    c.inner.record_root = root
     monkeypatch.setattr(c.module, "_namespace_identity", c.namespace)
     monkeypatch.setattr(c.module.shutil, "which", lambda _: "/fake/doubletake")
     monkeypatch.setattr(ownership.EndpointObservations, "boot_id", staticmethod(lambda: c.facts.boot))
     monkeypatch.setattr(linux, "LinuxProcessRunner", lambda: c.inner)
-    argv = ["--socket", str(root / "positive/daemon.sock"), "--record-root", str(root)]
+    argv = ["--socket", str(runtime_root / "positive/daemon.sock"), "--record-root", str(root)]
     assert c.module.main(argv) == 0
     assert len(c.inner.launches) == 2
     assert decode_probe_verdict((root / "verdict.json").read_bytes()).failure is None
+
+
+@pytest.mark.parametrize("damage", ["mode", "replacement"])
+async def test_runtime_root_change_refuses_before_archiving_original_evidence(recording_probe_processes, damage):
+    c = recording_probe_processes
+
+    def tamper():
+        root = c.probe_runtime_root
+        if damage == "mode":
+            root.chmod(0o755)
+        else:
+            root.rename(root.with_name("replaced"))
+            root.mkdir(mode=0o700)
+
+    c.after_child = tamper
+    runtime = await c.build_complete_production_and_probe()
+    try:
+        assert len(c.inner_launches) == 2
+        assert not runtime.deps.transport._features.keyring
+        assert c.config.record_root.is_dir()
+        assert len(list((c.config.record_root / "receipts").glob("*.json"))) == 2
+        assert (c.config.record_root / "verdict.json").is_file()
+        assert not c.probe_runtime_root.parent.exists()
+    finally:
+        await runtime.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["process_refusal", "process_error", "cancelled"])
+async def test_short_runtime_cleanup_preserves_durable_evidence_on_dispatch_failure(tmp_path, failure):
+    p = probe_module()
+    observed = {}
+
+    class Recorder:
+        async def run(self, spec, timeout):
+            records = Path(spec.argv[spec.argv.index("--record-root") + 1])
+            sockets = Path(spec.argv[spec.argv.index("--socket") + 1]).parent.parent
+            observed.update(records=records, sockets=sockets)
+            assert records.name == sockets.name
+            for directory in (records, sockets, sockets.parent):
+                assert directory.stat().st_uid == os.getuid()
+                assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+            AtomicFiles(records).write("receipts/retained.json", b"retained child evidence")
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            if failure == "process_error":
+                raise OSError("recorded process failure")
+            return Err(error=composition.diagnostic(ErrorCode.daemon_failed))
+
+    probe = p.CredentialServiceProbe(process=Recorder(), record_root=tmp_path / "state", unshare="unshare")
+    if failure == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await probe.check()
+    else:
+        assert isinstance(await probe.check(), Err)
+    assert not observed["sockets"].parent.exists()
+    assert (observed["records"] / "receipts/retained.json").read_bytes() == b"retained child evidence"
+
+
+async def test_caller_cancellation_leaves_witness_running_until_cleanup(tmp_path):
+    p = probe_module()
+    entered, finish = asyncio.Event(), asyncio.Event()
+    observed = []
+
+    class Recorder:
+        async def run(self, spec, timeout):
+            observed.append(Path(spec.argv[spec.argv.index("--socket") + 1]).parent.parent)
+            entered.set()
+            await finish.wait()
+            return Err(error=composition.diagnostic(ErrorCode.daemon_failed))
+
+    probe = p.CredentialServiceProbe(process=Recorder(), record_root=tmp_path / "state", unshare="unshare")
+    caller = asyncio.create_task(probe.check())
+    await asyncio.wait_for(entered.wait(), 1)
+    try:
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        assert observed[0].is_dir()
+    finally:
+        finish.set()
+        assert isinstance(await probe.check(), Err)
+    assert not observed[0].parent.exists()
+    assert len(observed) == 1
+
+
+@pytest.mark.parametrize("damage", ["mode", "owner", "symlink"])
+def test_short_runtime_parent_must_be_owned_private_and_not_symlinked(monkeypatch, damage):
+    p = probe_module()
+    parents = []
+    original_fstat = os.fstat
+
+    @contextmanager
+    def damaged_parent(**kwargs):
+        assert kwargs == {"prefix": "ap-", "dir": "/tmp"}
+        with TemporaryDirectory(**kwargs) as directory:
+            parent = Path(directory)
+            parents.append(parent)
+            if damage == "mode":
+                parent.chmod(0o755)
+            elif damage == "owner":
+                identity = parent.stat().st_ino
+                def wrong_owner(descriptor):
+                    info = original_fstat(descriptor)
+                    if info.st_ino == identity:
+                        return SimpleNamespace(st_uid=os.getuid() + 1, st_mode=info.st_mode)
+                    return info
+                monkeypatch.setattr(os, "fstat", wrong_owner)
+            else:
+                (parent / "real").mkdir(mode=0o700)
+                (parent / "link").symlink_to(parent / "real", target_is_directory=True)
+                directory = str(parent / "link")
+            try:
+                yield directory
+            finally:
+                monkeypatch.setattr(os, "fstat", original_fstat)
+
+    monkeypatch.setattr(p, "TemporaryDirectory", damaged_parent)
+    with pytest.raises((p._Refused, OSError)):
+        with p._short_runtime_root(uuid4()):
+            pytest.fail("unsafe runtime parent was accepted")
+    assert len(parents) == 1 and not parents[0].exists()
 
 
 def test_credential_probe_file_passes_with_deep_basetemp(tmp_path):

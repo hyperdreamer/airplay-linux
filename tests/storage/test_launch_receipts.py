@@ -452,6 +452,7 @@ def public_storage_graph(tmp_path, monkeypatch):
                    audio_probe=SimpleNamespace(check=audio), keyring_probe=affirmative,
                    dbus=SimpleNamespace(interfaces=blocked))
     monkeypatch.setattr(EnvironmentProbe, "from_environment", classmethod(environment))
+    monkeypatch.setattr(runtime_module, "_resolve_unshare", lambda: "/offline/unshare")
     root = tmp_path / "runtime"
     root.mkdir(mode=0o700)
     return SimpleNamespace(recorder=recorder, module=runtime_module,
@@ -478,6 +479,12 @@ async def test_malformed_receipt_cannot_reach_launch_writer(tmp_path, monkeypatc
     built = await graph.module.build_runtime(graph.config, overrides={"process": process})
     assert isinstance(built, Ok)
     runtime = built.value
+    # A-1: bootstrap reaches the recorder; malformed storage must add no requests.
+    witness_calls = tuple(process.unshare)
+    assert len(witness_calls) == 1
+    assert witness_calls[0][1] == "-rn"
+    assert witness_calls[0][3:5] == ("-m", "airplay_linux.process.credential_probe")
+    assert not runtime.deps.transport._features.keyring
     assert runtime.registry._process is process
     files = AtomicFiles(graph.config.state_root)
     store = repositories.JsonLaunchReceiptStore(files)
@@ -500,7 +507,7 @@ async def test_malformed_receipt_cannot_reach_launch_writer(tmp_path, monkeypatc
         assert await runtime.shutdown() == Ok(value=None)
     finally:
         assert process.launches == []
-        assert process.unshare == []
+        assert tuple(process.unshare) == witness_calls
         assert process.signals == []
         assert unlinks == []
     assert ("doubletake", "--help") in process.observations

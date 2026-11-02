@@ -76,6 +76,7 @@ async def test_source_preparation_cannot_activate_production(tmp_path, monkeypat
         return Ok(value=None)
 
     monkeypatch.setattr(EnvironmentProbe, "check", check)
+    monkeypatch.setattr(composition, "_resolve_unshare", lambda: "/offline/unshare")
     monkeypatch.setattr(composition, "PortalClient", lambda: SimpleNamespace())
     monkeypatch.setattr(composition, "AzcMdnsClient", lambda clock: SimpleNamespace())
     monkeypatch.setattr(composition, "PipeWirePortalAudioProbe", lambda: SimpleNamespace())
@@ -87,6 +88,14 @@ async def test_source_preparation_cannot_activate_production(tmp_path, monkeypat
 
     assert isinstance(result, Ok), result
     runtime = result.value
+    # A-1: short sockets now reach this recording seam during bootstrap.
+    witness_calls = tuple(argv for argv in process.argvs if argv and argv[0] == "unshare")
+    assert len(witness_calls) == 1
+    assert witness_calls[0][1] == "-rn"
+    assert witness_calls[0][3:5] == ("-m", "airplay_linux.process.credential_probe")
+    assert not runtime.deps.transport._features.keyring
+    refused = await runtime.registry.ensure()
+    assert isinstance(refused, Err) and refused.error.code is ErrorCode.dependency_incompatible
     source_verifier = runtime.deps.transport._source_verifier
     assert source_verifier is not None
     assert source_verifier.inventory is runtime.deps.capture._connectors._inventory
@@ -102,5 +111,5 @@ async def test_source_preparation_cannot_activate_production(tmp_path, monkeypat
     assert isinstance(shutdown, Ok), shutdown
     assert process.spawns == 0
     assert not any("-daemonize" in argv for argv in process.argvs)
-    assert not any(argv and argv[0] == "unshare" for argv in process.argvs)
+    assert tuple(argv for argv in process.argvs if argv and argv[0] == "unshare") == witness_calls
     assert process.argvs.count(("kscreen-doctor", "-j")) == 1
