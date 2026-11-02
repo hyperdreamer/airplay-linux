@@ -55,7 +55,7 @@ generation before replacement.
 Mirror requires every activation prerequisite: owned daemon control, durable receipts, endpoint
 verification, strict teardown, shared authority, a credential-service witness and the wired source
 verifier. Missing prerequisites produce a named `dependency_incompatible` refusal with no backend
-launch. The credential witness uses one private network/mount namespace and two isolated backend
+launch. The credential witness uses private user/network namespaces and two isolated backend
 legs before registry construction; its file-backed evidence must prove the service, positive and
 negative legs. Public admission requires `owned_daemon_control`, `keyring` and `multi_target`.
 
