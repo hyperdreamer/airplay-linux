@@ -364,9 +364,10 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
     """Parse one ``kscreen-doctor -j`` document into per-output evidence.
 
     The document shape is strict because a partial layout cannot serve as a
-    baseline: ``outputs`` must be a list. An entry without a connector name
-    refuses the read: silently omitting it would hide missing authorship evidence
-    and make a partial layout look complete. Duplicate ids or names are refused.
+    baseline: ``outputs`` must be a list of objects. A non-object entry or an
+    entry without a connector name refuses the read: silently omitting it would
+    hide missing authorship evidence and make a partial layout look complete.
+    Duplicate ids or names are refused.
     """
     if not isinstance(raw, Mapping):
         raise KScreenParseError("layout document is not an object")
@@ -378,7 +379,7 @@ def _parse_records(raw: object) -> tuple[_Record, ...]:
     seen_connectors: set[str] = set()
     for entry in entries:
         if not isinstance(entry, Mapping):
-            continue
+            raise KScreenParseError("KScreen output entry is not an object")
         connector = entry.get("name")
         if type(connector) is not str or not connector:
             raise _OutputNameUnavailable("KScreen output has no JSON name")

@@ -185,15 +185,23 @@ remains separate. Mirror additionally requires `multi_target` and physical-sourc
 Source acquisition and credential-challenge polling share the same five-second deadline.
 Connect/status credential challenges disconnect only that target without pairing or prompting.
 
-The reconciled top-level contract retains master's **T5a** requirements: position is the primary
-identity key, scale-aware size is corroboration, each stream uses its own requested connector,
-and missing source/position, ambiguity, scale disagreement, non-monitor or virtual/owned output
-evidence refuses verification. T5a defaults to observe only; T7 remains the single activation
-boundary that may act on observations. The epoch's existing verifier compares exact size and
-position and does not yet implement the new T5a scale-aware typed observation/diagnostics mode.
-Preserving that new task in the contract does not certify it delivered. The delivery reconciliation
-report records this remaining contract/implementation gap; the patched backend alone cannot
-satisfy it, and a green regression suite is not T5a acceptance evidence.
+The delivered **T5a** verifier reads geometry and origin from one fresh KScreen document for
+each check. Explicit position is the primary identity key across all enabled outputs; size
+corroborates the unique match using `round(reported.width / scale)` and
+`round(reported.height / scale)` against its current-mode size. Each stream is checked against
+its own requested connector. Missing source/position, ambiguous position, scale disagreement,
+non-monitor type, virtual or helper-owned outputs, and unproved physical origin produce typed
+refusal reasons. A non-object output entry refuses the entire inventory read with
+`inventory_unavailable`; no partial layout is accepted. Unknown enabled state or unreadable
+enabled-output geometry/scale also prevents verification.
+
+The verifier returns `Result[SourceObservation]`: success retains the reported source and matched
+connector; `SourceVerificationRefusal` retains a refused observation and its `SourceRefusal`
+reason. Observation itself performs no stream mutation. The activated **T7** transport consumes
+these results before publishing ready: successful ready events carry the verified connector and
+reported geometry, and failed events carry the sanitized refusal reason in the diagnostic detail.
+Exact-target cleanup follows a start refusal; unconfirmed disconnect takes `cleanup_timeout`
+precedence and retains the cleanup obligation.
 
 These checks establish cooperative same-user ownership, not protection against a malicious
 process with the same UID. Missing, unreadable, conflicting or stale evidence refuses control

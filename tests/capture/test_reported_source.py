@@ -99,7 +99,7 @@ def test_missing_enabled_field_survives_inventory_projection_and_refuses():
     assert _reason(result) is SourceRefusal.UNREADABLE_LAYOUT
 
 
-def test_known_disabled_duplicate_does_not_create_ambiguity_through_inventory():
+def test_disabled_geometry_match_does_not_create_ambiguity():
     verifier = KScreenReportedSourceVerifier(
         KScreenInventory(_InventoryProcess(_enabled_field_document(
             duplicate_enabled=False,
@@ -215,6 +215,24 @@ def _inventory_document(*entries):
         for index, (name, enabled, connected, output_type, position, size, scale)
         in enumerate(entries)
     ]}
+
+
+def test_non_object_output_refuses_partial_layout_through_inventory():
+    document = _inventory_document(
+        ("DP-1", True, True, 14, (0, 0), (1920, 1080), 1),
+    )
+    document["outputs"].append("unreadable-entry")
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(_InventoryProcess(document)),
+        physical_inventory_available=True,
+    )
+
+    result = asyncio.run(verifier.verify("DP-1", _reported()))
+
+    assert _reason(result) is SourceRefusal.INVENTORY_UNAVAILABLE
+    assert verifier.last_observation is not None
+    assert not verifier.last_observation.accepted
+    assert verifier.last_observation.matched_connector is None
 
 
 def test_two_stream_observations_are_independent_and_typed():
