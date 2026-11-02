@@ -12,26 +12,28 @@ the runtime instead of substituting a permissive fake.
 from __future__ import annotations
 
 import asyncio
+import inspect
+import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
-from airplay_linux.backend.contract import BackendFeatures, probe_backend
+from airplay_linux.backend.contract import BackendFeatures, CredentialProofVerdict, probe_backend
 from airplay_linux.backend.control import (
     PublishedDoubletakeControl,
     PublishedDoubletakeProfile,
     UnsupportedControl,
 )
 from airplay_linux.capture.physical import KscreenConnectorInventory, PhysicalCaptureProvider
-from airplay_linux.capture.portal import PortalClient
 from airplay_linux.diagnostics.activity import ActivityLog
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.discovery.identity import IdentityResolver
 from airplay_linux.discovery.zeroconf_adapter import AzcMdnsClient, ZeroconfDiscovery
 from airplay_linux.display.association import KScreenOutputVerifier
+from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.display.creation import DisplayCreator
 from airplay_linux.display.helper import VirtualHelper
 from airplay_linux.display.kde import KdeVirtualDisplayProvider
@@ -40,10 +42,16 @@ from airplay_linux.display.locking import CreationLock
 from airplay_linux.display.recovery import DisplayRecovery
 from airplay_linux.display.removal import DisplayRemover
 from airplay_linux.domain.operations import InstanceId, OperationContext
+from airplay_linux.domain.ports import ProcessPort
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 from airplay_linux.policy.audio import PipeWirePortalAudioProbe
 from airplay_linux.policy.capabilities import EnvironmentProbe
+from airplay_linux.process.authority import SharedRootAuthority
+from airplay_linux.process.credential_probe import CredentialServiceProbe
+from airplay_linux.process.ownership import EvidenceAuthority, verify_owned_endpoint
 from airplay_linux.process.daemon_registry import DaemonRegistry
+from airplay_linux.process.launcher import LaunchCapability, ProductionLaunchCapability
+from airplay_linux.process.procfs import TerminationEvidence
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.session import Handler, ManagerDeps, Route, SessionManager
 from airplay_linux.session.audio import build_audio_handlers, compose_audio_handlers
@@ -58,20 +66,141 @@ from airplay_linux.session.shutdown import ShutdownCoordinator
 from airplay_linux.session.virtual import build_virtual_handlers, compose_virtual_handlers
 from airplay_linux.storage import (
     AtomicFiles,
+    JsonDaemonCleanupIntentStore,
     JsonDaemonStore,
+    JsonLaunchReceiptStore,
+    JsonSupervisorReleaseIntentStore,
     JsonOwnershipStore,
     JsonReceiverStore,
     JsonSessionStore,
+    RecordError,
+    StorageError,
+    decode_launch_receipt,
 )
+from airplay_linux.storage.repositories import LAUNCH_RECEIPT_DIRECTORY, _lifecycle_all
 from airplay_linux.transport.doubletake import DoubleTakeTransport
 from airplay_linux.trust.fences import TrustFenceRegistry
 from airplay_linux.trust.keyring import BackendKeyringStore
+
+if TYPE_CHECKING:
+    from airplay_linux.capture.source import ReportedSourceVerifier
+
+
+def PortalClient(*args: Any, **kwargs: Any):
+    """Instantiate the portal client without importing optional D-Bus bindings."""
+    from airplay_linux.capture.portal import PortalClient as _PortalClient
+    return _PortalClient(*args, **kwargs)
+
+
+# Only Task 9 may activate the graph once every lifecycle seam is installed.
+# This is deliberately independent of pure launch/capability eligibility.
+_OWNED_DAEMON_EPOCH_ACTIVE = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class _OwnedDaemonInstallation:
+    """Inert installed lifecycle dependencies, separate from permission to run."""
+
+    source_verifier: ReportedSourceVerifier | None = field(repr=False)
+    credential_proof: Callable[[], Awaitable[Result[CredentialProofVerdict]]] | None = field(repr=False)
+    receipts: JsonLaunchReceiptStore | None = field(default=None, repr=False)
+    endpoint_verifier: Callable | None = field(default=None, repr=False)
+    strict_teardown: Callable | None = field(default=None, repr=False)
+    shared_authority: SharedRootAuthority | None = field(default=None, repr=False)
+    ownership: EvidenceAuthority | None = field(default=None, repr=False)
+    source_inventory: KScreenInventory | None = field(default=None, repr=False)
+
+
+def _install_owned_daemon_epoch(
+    config: RuntimeConfig, *, process: ProcessPort, launcher: LaunchCapability,
+) -> _OwnedDaemonInstallation:
+    # Construction opens neither the shared authority nor a namespace. Task 9
+    # still owns the sole production activation switch.
+    files = AtomicFiles(config.state_root)
+    inventory = KScreenInventory(process)
+    probe = CredentialServiceProbe(process=process, record_root=config.state_root, unshare="unshare")
+
+    def receipt_snapshot():
+        try:
+            return Ok(value=_lifecycle_all(
+                files, LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt,
+            ))
+        except (OSError, RecordError, StorageError):
+            return Err(error=diagnostic(ErrorCode.persistence_failed))
+
+    # Install the evidence authority with the inert capability snapshot. The
+    # composition root replaces that snapshot after all activation evidence is
+    # known; construction itself never authorizes a child process.
+    ownership = EvidenceAuthority(
+        receipts=receipt_snapshot,
+        process=process,
+        evidence_factory=TerminationEvidence,
+        features=PublishedDoubletakeProfile(socket_path="").features,
+    )
+    return _OwnedDaemonInstallation(
+        source_verifier=KScreenReportedSourceVerifier(inventory, physical_inventory_available=True),
+        credential_proof=probe.check, receipts=JsonLaunchReceiptStore(files),
+        endpoint_verifier=verify_owned_endpoint, strict_teardown=process.terminate,
+        shared_authority=SharedRootAuthority(files), ownership=ownership,
+        source_inventory=inventory,
+    )
+
+
+def _resolve_unshare() -> str | None:
+    return shutil.which("unshare")
+
+
+def _probe_bootstrap(installation: _OwnedDaemonInstallation | None, launcher: LaunchCapability) -> str | None:
+    """Ordered pre-keyring eligibility; a fixed missing-evidence label or None."""
+    if not (launcher.production_graph and launcher.available() and launcher.ambient_socket() is None):
+        return "owned daemon control"
+    if installation is None or installation.source_verifier is None:
+        return "source verifier"
+    if installation.receipts is None:
+        return "receipt production"
+    if not callable(installation.endpoint_verifier):
+        return "endpoint verifier"
+    if not callable(installation.strict_teardown):
+        return "strict teardown"
+    parameters = inspect.signature(installation.strict_teardown).parameters
+    if not ({"strict", "evidence", "revalidate"} <= parameters.keys()
+            or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())):
+        return "strict teardown"
+    # These are installation prerequisites even though the isolated child must
+    # never acquire the application's authority or consult registry compatibility.
+    if installation.shared_authority is None:
+        return "shared authority"
+    if installation.ownership is None:
+        return "ownership authority"
+    if not callable(installation.credential_proof):
+        return "credential proof producer"
+    if _resolve_unshare() is None:
+        return "unshare"
+    return None
+
+
+def derive_composition_capabilities(
+    probed: BackendFeatures, launcher: LaunchCapability,
+    credential_proof: CredentialProofVerdict,
+    source_verifier: ReportedSourceVerifier | None, ambient_socket: str | None,
+) -> BackendFeatures:
+    """Combine captured evidence without probing or authorizing execution."""
+    owned = launcher.production_graph and launcher.available() and ambient_socket is None
+    reporting = probed.source_reporting_complete
+    verifier = source_verifier is not None
+    inventory = verifier and source_verifier.physical_inventory_available
+    return replace(
+        probed, owned_daemon_control=owned,
+        physical_source=bool(reporting and verifier and inventory), keyring=credential_proof.proven,
+    )
+
 
 #: Dependency names :func:`build_runtime` accepts as test overrides. Kept explicit
 #: so an unknown keyword fails loudly instead of silently wiring the real adapter.
 OVERRIDABLE = frozenset(
     {
         "deps",
+        "process",
         "capabilities",
         "transport",
         "pairing",
@@ -238,7 +367,12 @@ def _unavailable_features() -> BackendFeatures:
     )
 
 
-def _capability_gates(report: Any) -> dict[str, str]:
+def _capability_gates(
+    report: Any, *, features: BackendFeatures | None = None,
+    installation: _OwnedDaemonInstallation | None = None,
+    credential_proof: CredentialProofVerdict | None = None,
+    probe_gate: str | None = None,
+) -> dict[str, str]:
     gated: dict[str, str] = {}
     labels = {
         "environment": "desktop environment is not proven for the supported capability set",
@@ -258,29 +392,80 @@ def _capability_gates(report: Any) -> dict[str, str]:
     # helper or supporting environment evidence is unavailable.
     if getattr(report, "remembered_pairing", False) is not True:
         gated["remembered_trust"] = "keyring capability was not proven by the environment probe"
+    if features is not None:
+        if probe_gate is not None:
+            gated["owned_daemon_control"] = probe_gate
+            gated["ownership_authority"] = f"EvidenceAuthority: {probe_gate}"
+        if not features.source_reporting_complete:
+            gated["source_reporting_complete"] = "complete selected-source reporting is not proven"
+        verifier = installation.source_verifier if installation is not None else None
+        if verifier is None:
+            gated["source_verifier"] = "reported-source verifier is not installed"
+        elif not verifier.physical_inventory_available:
+            gated["physical_inventory"] = "physical monitor inventory is unavailable"
+        if credential_proof is not None:
+            for name in ("service_leg", "backend_positive_leg", "backend_negative_leg"):
+                leg = getattr(credential_proof, name)
+                if leg != "passed":
+                    gated[f"credential_{name}"] = leg
+        if features.profile in {"doubletake-0.5", "doubletake-0.5+source"}:
+            authority = installation.ownership if installation is not None else None
+            authority_name = "EvidenceAuthority" if isinstance(authority, EvidenceAuthority) else "unavailable"
+            details = [f"authority={authority_name}"]
+            details.extend(
+                f"credential-{label}={getattr(credential_proof, name, 'not_run')}"
+                for label, name in (
+                    ("service", "service_leg"), ("positive", "backend_positive_leg"),
+                    ("negative", "backend_negative_leg"),
+                )
+            )
+            details.extend((
+                f"source-verifier={'wired' if verifier is not None else 'missing'}",
+                f"source-complete={features.source_reporting_complete}",
+                f"physical-inventory={bool(verifier is not None and verifier.physical_inventory_available)}",
+            ))
+            gated["owned_daemon_startup"] = "; ".join(details)
+            for name in (
+                "foreground_control", "owner_handshake", "target_bound_pairing",
+                "provisional_commit", "cancel_pairing", "revoke_pairing", "audio_restart", "query_modes",
+            ):
+                if not features.supports(name):
+                    gated[name] = "not affirmed by the public backend"
     return gated
 
 
-def _control_factory(process: LinuxProcessRunner, features: BackendFeatures):
+def _control_factory(
+    process: ProcessPort, features: BackendFeatures,
+    ownership: EvidenceAuthority | None = None,
+):
+    public = ownership is not None and features.profile in {"doubletake-0.5", "doubletake-0.5+source"}
+
     def make(record) -> PublishedDoubletakeControl:
         profile = PublishedDoubletakeProfile(
             socket_path=record.socket_path,
             name=features.profile,
             version=features.version,
             features=features,
-            owner_token=record.owner_token,
-            instance_uuid=record.instance_uuid,
-            protocol_version=record.protocol_version,
+            owner_token=None if public else record.owner_token,
+            instance_uuid=None if public else record.instance_uuid,
+            protocol_version=None if public else record.protocol_version,
         )
-        return PublishedDoubletakeControl(process, profile)
+        return PublishedDoubletakeControl(
+            process, profile,
+            record=record if public else None,
+            authority=ownership if public else None,
+        )
 
     return make
 
 
-async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
+async def _compose_production(
+    config: RuntimeConfig, *, process: ProcessPort | None = None,
+) -> _ProductionGraph:
     """Construct all real adapters, leaving unsupported evidence gated."""
 
-    process = LinuxProcessRunner()
+    if process is None:
+        process = LinuxProcessRunner()
     clock = _SystemClock()
     scheduler = _SystemScheduler()
     ids = _SystemIds()
@@ -292,12 +477,54 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     daemons = JsonDaemonStore(files)
 
     backend = await probe_backend(process)
-    features = backend.value if isinstance(backend, Ok) else _unavailable_features()
+    probed = backend.value if isinstance(backend, Ok) else _unavailable_features()
+    launcher = ProductionLaunchCapability(probed, config.runtime_root, production_graph=True)
+    installation = _install_owned_daemon_epoch(config, process=process, launcher=launcher)
+    credential_proof = CredentialProofVerdict(
+        service_leg="not_run", backend_positive_leg="not_run",
+        backend_negative_leg="not_run", failure=None,
+    )
+    # This closed boundary precedes every owned-backend/probe dispatch. Pure
+    # all-passed inputs or an eligible launcher cannot substitute for activation.
+    probe_gate = "production activation"
+    if _OWNED_DAEMON_EPOCH_ACTIVE:
+        probe_gate = _probe_bootstrap(installation, launcher)
+        if probe_gate is None:
+            proof = await installation.credential_proof()
+            if isinstance(proof, Ok) and type(proof.value) is CredentialProofVerdict:
+                credential_proof = proof.value
+                if not credential_proof.proven:
+                    probe_gate = next((name for name, leg in (
+                        ("credential service leg", credential_proof.service_leg),
+                        ("credential positive leg", credential_proof.backend_positive_leg),
+                        ("credential negative leg", credential_proof.backend_negative_leg),
+                    ) if leg != "passed"), "credential proof")
+            else:
+                probe_gate = "credential proof files"
+    source_inventory = (
+        installation.source_inventory
+        if installation is not None and installation.source_inventory is not None
+        else KScreenInventory(process)
+    )
+    source_verifier = (
+        installation.source_verifier
+        if installation is not None
+        else KScreenReportedSourceVerifier(
+            source_inventory, physical_inventory_available=True,
+        )
+    )
+    features = derive_composition_capabilities(
+        probed, launcher, credential_proof, source_verifier, launcher.ambient_socket(),
+    )
+    if installation.ownership is not None:
+        # EvidenceAuthority keeps the receipt snapshot and process boundary from
+        # installation; only its capability view depends on the completed gates.
+        installation.ownership._features = features
 
     resolver = IdentityResolver()
     discovery = ZeroconfDiscovery(resolver, clock, AzcMdnsClient(clock))
     portal = PortalClient()
-    connectors = KscreenConnectorInventory(process)
+    connectors = KscreenConnectorInventory(source_inventory)
     capture = PhysicalCaptureProvider(portal, connectors, features, ids=ids)
 
     helper = VirtualHelper(process, clock)
@@ -305,7 +532,33 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     output_verifier = KScreenOutputVerifier(helper, observer, ownerships)
     creation_lock = CreationLock(config.runtime_root)
     app_instance_uuid = InstanceId(uuid4())
+    cleanup_intents = JsonDaemonCleanupIntentStore(files)
 
+    def supervisor_intents(runtime: str):
+        return JsonSupervisorReleaseIntentStore(AtomicFiles(Path(runtime)))
+
+    control_factory = _control_factory(process, features, installation.ownership)
+    registry = DaemonRegistry(
+        process=process,
+        store=daemons,
+        control_factory=control_factory,
+        features=features,
+        runtime_directory=config.runtime_root,
+        record_root=config.state_root,
+        ids=ids,
+        clock=clock,
+        scheduler=scheduler,
+        app_instance_uuid=app_instance_uuid,
+        receipts=installation.receipts,
+        cleanup_intents=cleanup_intents,
+        supervisor_intents=supervisor_intents,
+        authority=installation.shared_authority,
+        launcher=launcher,
+        ownership=installation.ownership,
+    )
+
+    fences = TrustFenceRegistry()
+    credentials = BackendKeyringStore(UnsupportedControl(), features)
     transport_ref: dict[str, DoubleTakeTransport] = {}
 
     async def transport_released(record, context: OperationContext) -> Result[None]:
@@ -353,22 +606,10 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     )
     display = KdeVirtualDisplayProvider(creator, recovery, remover, observer, helper)
 
-    registry = DaemonRegistry(
-        process=process,
-        store=daemons,
-        control_factory=_control_factory(process, features),
-        features=features,
-        runtime_directory=config.runtime_root,
-        record_root=config.state_root,
-        ids=ids,
-        clock=clock,
-        scheduler=scheduler,
-    )
-
-    fences = TrustFenceRegistry()
-    credentials = BackendKeyringStore(UnsupportedControl(), features)
+    # The registry is the lifecycle owner; transport and keyring share its
+    # record-bound public control factory.
     transport = DoubleTakeTransport(
-        _control_factory(process, features),
+        control_factory,
         registry,
         capture,
         credentials,
@@ -378,6 +619,7 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
         clock,
         scheduler,
         ids,
+        source_verifier=source_verifier,
     )
     # DoubleTakeTransport owns the only control that is bound to a concrete
     # receiver/daemon lease. Rebind the real store to that control immediately;
@@ -420,7 +662,10 @@ async def _compose_production(config: RuntimeConfig) -> _ProductionGraph:
     startup = StartupRecovery(
         manager, deps, registry, credential_loader=credentials.load_credential_ref,
     )
-    gated = _capability_gates(report)
+    gated = _capability_gates(
+        report, features=features, installation=installation,
+        credential_proof=credential_proof, probe_gate=probe_gate,
+    )
     return _ProductionGraph(deps, manager, registry, startup, persistence, report, gated)
 
 
@@ -570,7 +815,7 @@ async def build_runtime(
         raise TypeError("individual runtime adapter overrides require a deps override")
 
     if deps_override is None:
-        graph = await _compose_production(config)
+        graph = await _compose_production(config, process=provided.get("process"))
         deps = graph.deps
         registry = graph.registry
         startup = graph.startup
@@ -624,4 +869,5 @@ __all__ = [
     "build_runtime",
     "compose_handlers",
     "compose_manager",
+    "derive_composition_capabilities",
 ]

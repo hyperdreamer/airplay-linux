@@ -3,6 +3,16 @@
 Status: **P1 satisfied; P2 still blocks phase 4.** Phase 1–3 may proceed. `physical_source` may not become `True`
 until T5a and T7 are delivered (`P2` is then the only remaining external prerequisite).
 
+> **Amended for run `pm-run-20261030-040814-aefef9c0` (epoch 1).** The run recorded P1 satisfied locally by the
+> carried source-reporting patches (measured then: `capabilities-v1`, `status-source`; see the design's §12 and
+> `docs/backend-fork.md`), consistent with the PR-76 delivery recorded below. Those two tokens alone do not prove
+> complete source reporting or physical identity; this epoch requires the additional `status-source-complete` token
+> and source verification. The operator authorised Amendment 1 (`2026-10-30-owned-daemon-control-amendment-1.md`,
+> reply: `A`), which changes exactly one admission precondition list — the `connect` gate — and keeps every pairing
+> operation, remembered trust and every other gate closed. Read the amendment with this plan; where they differ on
+> `connect`, the amendment governs. T5a's source-verification semantics and T7's single activation boundary remain
+> authoritative.
+
 ## External preconditions
 
 - **P1 — source identity (satisfied 2026-10-31).** The sender reports which output each stream captured.

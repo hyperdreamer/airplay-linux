@@ -4,146 +4,204 @@
 
 Mirror mode promises to send **one chosen physical monitor**. Upstream `doubletake` reads the
 selected stream's size from the ScreenCast portal reply and discards the other source metadata;
-its daemon `status` reply exposes no captured-source information. This patch retains the portal's
-optional `source_type`, `size` and `position` per capture group and reports them per stream, so the
-application has evidence to compare with compositor outputs. Refusing to guess is a design rule
-here, not a preference.
+its daemon `status` reply exposes no captured-source information. The carried chain retains the
+portal's `source_type`, `size` and `position` per capture group and reports them per stream, so the
+application has evidence to compare with compositor outputs. Refusing to guess is a design rule.
 
-That evidence is partial. Portal `source_type=1` means MONITOR; on KDE this also covers regions
-and existing virtual outputs, so `IsMonitor()` does not prove that a source is physical or owned
-by us. Portal size and position use compositor coordinates, which need not be pixels. `x` and `y`
-are usable only when `has_position` is true: an absent or malformed position must remain distinct
-from a genuine `(0,0)`. The sender must correlate this metadata with compositor output identity
-and ownership, and refuse ambiguous matches or any output our own helper created.
+That evidence is partial in its guarantees. Portal `source_type=1` means MONITOR; on KDE this also
+covers regions and existing virtual outputs, so `IsMonitor()` does not prove that a source is
+physical or owned by us. Portal size and position use compositor coordinates, which need not be
+pixels. `x` and `y` are usable only when `has_position` is true: an absent or malformed position
+must remain distinct from a genuine `(0,0)`. The sender must correlate metadata with compositor
+output identity and ownership, refusing ambiguous matches and any output our own helper created.
 
-We raised it upstream as `omarroth/doubletake#76`. We closed it once because we needed the
-capability for a shipping product and did not want it gated on review timing; the maintainer then
-said they are open to merging it and asked for the source to be reported **per stream**, because a
-daemon can serve several streams whose captures differ. The PR is reopened with exactly that shape:
-the reported source belongs to the stream's own capture group, so different captures report
-different sources and streams sharing one capture report that capture's source.
+We raised source reporting upstream as `omarroth/doubletake#76`. It was closed once because the
+product needed the capability without waiting for review; the maintainer then said they were open
+to merging it and asked for reporting **per stream**. The reopened PR has that shape: the source
+belongs to the stream's own capture group, so different captures report different sources and
+streams sharing one capture report that capture's source.
 
-## Upstream status (2026-10-31)
+## Historical upstream status (2026-10-31)
 
-`omarroth/doubletake#76` is open at `2b5f1b0` with four commits (capture layer, parser tests,
-per-stream status, and the optional-position/production-handoff follow-up), based on `main` at
-`5e2f1cb`. The maintainer has said they are open to merging it. The fork branch `streaminfo-source`
-tracks the PR head, so a patched build can be rebuilt from it directly. The follow-up was pushed
-as a descendant commit to preserve the reopened PR's history.
+The recorded PR-76 head is `2b5f1b0`, with four commits (capture layer, parser tests, per-stream
+status, and the optional-position/production-handoff follow-up), based on `main` at `5e2f1cb`.
+The recorded fork branch is `streaminfo-source`; the follow-up was pushed as a descendant commit
+to preserve the reopened PR's history. This is historical provenance, not a fresh upstream check.
+
+PR-76 can report partial metadata, with `has_position=false` when position is unavailable. The
+reconciled local chain below is deliberately stricter: it omits `source` unless type, positive
+dimensions and both signed coordinates are valid. It preserves PR-76's lowercase JSON keys,
+explicit position availability and per-stream attribution. It is therefore **not byte-identical**
+to PR-76 and requires the third local capability token before application activation.
 
 ## What the patches do
 
 `vendor/doubletake/0001-capture-report-selected-source.patch`
-- adds `airplay.SourceInfo{Type, Width, Height, X, Y}` with `IsMonitor()`
-- parses `source_type`, `position` and `size` from the ScreenCast portal reply
-- adds optional `CaptureConfig.OnSource func(SourceInfo)`; nil keeps existing behaviour
-- covers both portal paths, because `PrepareCapture` is the single request site
+
+- adds `airplay.SourceInfo{Type, Width, Height, X, Y, HasPosition}` with `IsMonitor()`;
+- parses `source_type`, `position` and `size` from the ScreenCast portal reply;
+- invokes the callback only when type, positive dimensions and both signed coordinates are valid;
+  missing or malformed position is never converted to `(0,0)`;
+- serialises lowercase keys `type`, `width`, `height`, `x`, `y`, `has_position`;
+  `HasPosition` is set true only after a valid coordinate pair, including a genuine `(0,0)`;
+- adds optional `CaptureConfig.OnSource func(SourceInfo)`; nil keeps existing behaviour;
+- covers both portal paths through the single request site in `PrepareCapture`;
+- calls `OnSource` after portal selection, before opening the PipeWire remote, so the callback
+  does not prove that preparation or capture subsequently succeeded.
 
 `vendor/doubletake/0002-status-report-selected-source.patch` (stacks on 0001)
 
-- `CapturePreparation.Source()` exposes the decoded, potentially partial metadata
-- `videoCaptureGroup` records it under the daemon mutex
-- `StreamInfo.Source` is reported as an optional `source` object in `ctl status`, read per stream
-  from that stream's own capture group and omitted when no decoded type or usable size was reported
-- `SourceInfo` serialises with lowercase keys (`type`, `width`, `height`, `x`, `y`, `has_position`)
-- `HasPosition` is false for missing or malformed position and true for a valid coordinate pair,
-  including `(0,0)`; its JSON key is always present when `source` is present
-- documents the limits of source type and compositor coordinates; `OnSource` runs after portal
-  selection, before opening the PipeWire remote, so a callback does not prove setup succeeded
+- retains the complete decoded source in `CapturePreparation.Source()`;
+- records it on `videoCaptureGroup` under the daemon mutex;
+- reports optional `StreamInfo.Source` in `ctl status` from **that stream's own capture group**;
+- omits `source` for incomplete metadata and the legacy capture path;
+- retains comments explaining that metadata alone does not prove physical identity or ownership.
 
 `vendor/doubletake/0003-capability-tokens.patch` (stacks on 0001+0002)
-- adds `-capabilities`, printing a stable machine-readable token list (`capabilities-v1`, `status-source`) and
-  exiting 0
+
+- adds `-capabilities`, printing exactly `capabilities-v1`, `status-source`,
+  `status-source-complete`, one token per line in that order, and exiting 0 before constructing a daemon.
+
+The Python status decoder consumes exactly the six lowercase fields above and requires
+`has_position` to be the boolean `true`. Missing or false availability, malformed coordinates,
+uppercase legacy objects and partial objects refuse; no missing value becomes an origin.
+The typed `BackendSource` represents only complete geometry admitted by that decoder.
+
+## Python test-suite prerequisite
+
+The default Python suite executes the carried source producer with `go test`, so a Go toolchain
+with `go` on `PATH` is required even when not rebuilding the backend. Install Go and expose its
+executable before running pytest. Missing Go deliberately fails with setup instructions; this
+proof is mandatory. The separate Git patch-parser proof is also mandatory and does not need Go.
+The producer proof compiles the actual carried declarations with local Variant/size boundaries,
+uses only the standard library, and disables network module and toolchain downloads. It checks
+missing/malformed/real-zero/signed positions and feeds the producer's actual JSON to the Python
+status decoder. It needs neither GStreamer nor a live backend.
 
 ## How to build
 
-Requires Go >= 1.25 (verified with 1.27.3) and the GStreamer plugins the project already needs.
+Requires Go >= 1.25 (verified with 1.27.3) and the project's GStreamer development libraries.
 
 ```sh
 git clone https://github.com/omarroth/doubletake
 cd doubletake
-git checkout v0.5.0            # or main; both verified
-git apply /path/to/vendor/doubletake/0001-capture-report-selected-source.patch
-git apply /path/to/vendor/doubletake/0002-status-report-selected-source.patch
-git apply /path/to/vendor/doubletake/0003-capability-tokens.patch
-go build -o "$HOME/.local/bin/doubletake" ./cmd/doubletake
-go build -o "$HOME/.local/bin/doubletake-ctl" ./cmd/doubletake-ctl
+git checkout c896e3689ab85c3ed520e502308dedfbb5a4c221 # v0.5.0, activation rebuild base
+git apply --check --whitespace=error-all /path/to/vendor/doubletake/0001-capture-report-selected-source.patch
+git apply --whitespace=error-all /path/to/vendor/doubletake/0001-capture-report-selected-source.patch
+git apply --check --whitespace=error-all /path/to/vendor/doubletake/0002-status-report-selected-source.patch
+git apply --whitespace=error-all /path/to/vendor/doubletake/0002-status-report-selected-source.patch
+git apply --check --whitespace=error-all /path/to/vendor/doubletake/0003-capability-tokens.patch
+git apply --whitespace=error-all /path/to/vendor/doubletake/0003-capability-tokens.patch
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -o ./doubletake ./cmd/doubletake
+CGO_ENABLED=1 go build -trimpath -buildvcs=false -o ./doubletake-ctl ./cmd/doubletake-ctl
+sha256sum ./doubletake ./doubletake-ctl
+./doubletake -capabilities
 ```
 
-Re-verified 2026-10-31 against upstream `main` (`5e2f1cb`) with Go 1.27.3: all three patches apply
-cleanly with strict whitespace checks to both that revision and `v0.5.0`; the patched tree passes
-`go build ./...`, `go vet ./...`, and `go test -count=1 ./...`. Its capture and daemon source files
-are byte-identical to PR #76 at `2b5f1b0`; patch 0003 adds the local capability advertisement.
+## Reconciled rebuild identity (2026-11-02)
 
-The PR additionally passes `go test -race -count=1 ./...` and includes the parser/status tests and
-three production-path integration tests. These exercise a private D-Bus portal through real
-capture preparation, group creation and status, using synthetic video at the GStreamer source
-boundary. They cover distinct groups, a joining stream retaining the original group's source,
-missing metadata, and known versus unknown position in status JSON. Disposable-copy mutations
-that drop the portal callback, preparation retention, accessor result, group storage or position
-availability all fail the integration tests. Those tests require `dbus-daemon` and GStreamer
-software-encoding/RTP elements and skip when dependencies are absent. The vendored patches carry
-product code only.
+Each patch was checked and applied in 0001 → 0002 → 0003 order to a clean archive of the pinned
+v0.5.0 commit. That exact tree passed `go build ./...`, `go vet ./...` and
+`go test -count=1 ./...` (four tested packages, two packages without tests). The two explicit
+binary-build commands above also passed. Verification used Go 1.27.3 linux/amd64, `CGO_ENABLED=1`,
+`GOPROXY=off`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, cached modules in `/tmp/gopath`, and
+GStreamer 1.28.8. No source changes from the reference checkout were included.
+
+The actual artifacts are `/tmp/delivery-reconcile.GMO4Nx/doubletake` and
+`/tmp/delivery-reconcile.GMO4Nx/doubletake-ctl`; the clean patched source is in
+`/tmp/delivery-reconcile.GMO4Nx/reapply` and the command output in
+`/tmp/delivery-reconcile.GMO4Nx/go-verification.log`. These temporary artifacts were not installed.
+
+```text
+base v0.5.0 commit   c896e3689ab85c3ed520e502308dedfbb5a4c221
+0001 sha256         622ecded534be335557b61332cd66d57cecfdea869abc00f5e58f6f75a84d687
+0002 sha256         0927e2d24abf63f413441a3a291c545288eb09e7b3dca102d3f328bb4b764dc7
+0003 sha256         482e7ec85940b35381686730ae248b491065bfc66d28ec449b62717e0d803567
+doubletake sha256   68737ed1e5b2830e11a787b09e7446c3840e51cc2cc90bbd441d0dacb949f43a
+doubletake-ctl      7bdadb77479dd5e4acde0d31776162082a7d497cf106037ed8fbf10588e64d30
+```
+
+The rebuilt sender exited 0 with exactly the three capability lines above. This switch exits
+before daemon construction; it launched no daemon, opened no control socket and contacted no
+receiver or session bus. Hashes identify this particular build; compiler and native library
+differences can change binary hashes. The earlier epoch's activation-build hashes do not identify
+this reconciled chain and have been superseded here.
+
+The 2026-10-31 PR record separately reported race-enabled parser/status and private-portal
+production-path tests (distinct groups, joining streams, missing metadata, and position
+availability). Those historical PR checks are not evidence that this stricter chain is identical
+to the PR. The carried patches contain product code; the mandatory local producer/consumer proof
+is in `tests/backend/test_carried_source_patch.py`.
 
 ## Installed locally (this machine)
 
-Built from the three patches applied to upstream `main` with Go 1.27.3, matching PR #76 (fork
-branch `streaminfo-source`, commit `2b5f1b0`), and installed ahead of the packaged binaries:
+The installed `/home/bin` binaries predate the third token. Their hashes were rechecked during
+this reconciliation and remain:
 
 ```text
-/home/bin/doubletake       10552847 bytes   (patched; /usr/bin/doubletake is the packaged 6476312)
-/home/bin/doubletake-ctl    6942725 bytes
-/home/bin/doubletake.prev   10549231 bytes   the previous patched builds, kept for a one-command revert
-/home/bin/doubletake-ctl.prev 6943093 bytes
-/home/bin/airplay-linux    -> ~/.venvs/airplay-linux/bin/airplay-linux   (the application)
+/home/bin/doubletake       sha256 22187a1802f36a2d6eae56e2fc891722d3ef10de9bd237d7da77c40c263324e6
+/home/bin/doubletake-ctl   sha256 6da625901b5e0629437378ec404d5869791fc1e5e19ed87b26ee31b14872d4fe
 ```
 
-`/home/bin` precedes `/usr/bin` on this account's `PATH`, so `doubletake` and `doubletake-ctl`
-now resolve to the patched builds **for this user**. The packaged files are untouched.
+They print only `capabilities-v1` and `status-source`, so they are **not** a valid full-chain
+installation. Installing the reconciled artifacts remains a separate operator action; require
+all three capability lines before considering Mirror. Reporting metadata alone proves no
+physical-output guarantee.
 
-To revert the backend shadowing: `rm /home/bin/doubletake /home/bin/doubletake-ctl`, or restore the
-previous patched builds by moving the two `.prev` files back over them.
-To remove the application: `rm /home/bin/airplay-linux && rm -rf ~/.venvs/airplay-linux`.
-To reinstall the application after repo changes:
-`~/.venvs/airplay-linux/bin/pip install --force-reinstall /data/home/guest/Development/airplay-linux`.
+`/home/bin` precedes `/usr/bin` on this account's `PATH`; the packaged files are untouched.
+To revert shadowing, remove `/home/bin/doubletake` and `/home/bin/doubletake-ctl`, or restore the
+previous patched builds from their `.prev` files. `/home/bin/airplay-linux` points to the
+application in `~/.venvs/airplay-linux`.
 
-Isolated verification of the installed patched build (private socket in a temporary directory,
-temporary credentials, process killed afterwards; the 2026-10-31 probe did not use a separate
-network namespace): the daemon logs `[daemon] listening on <path>`, `ctl status` returns
-`{"ok": true, "state": "idle", "has_audio": false, "audio_muted": false}`, killing the process
-removes the socket, `-capabilities` prints `capabilities-v1` and `status-source`, and `--help` is
-identical to the packaged build except its `Usage of <argv0>:` line and the `-capabilities` row.
-
-The help surface retains the packaged build's options plus `-capabilities`. Recognition uses both
-that help surface and the tokens, as described below. Reporting source metadata alone does not
-establish the physical-output guarantees required by Mirror mode.
+Historical containment checks are separate observations: the epoch recorded a loopback-only
+network-namespace probe of the older build; master's 2026-10-31 installed-build probe used a
+private socket and temporary credentials without a separate network namespace. Both recorded an
+idle status and socket removal after process termination. Neither is a live receiver acceptance
+run for this reconciled build. The latter recorded a help surface differing from the packaged
+build by the `Usage of <argv0>:` line and the added `-capabilities` row.
 
 ## How the application recognises it
 
-Recognition requires **both** halves, and neither alone is enough:
+Recognition requires both the matching sender/ctl help surface and capability advertisement:
 
-- the sender `--help` surface must match the patched build (`tests/fixtures/backend/doubletake-0.5-source-help.txt`,
-  which differs from the pinned fixture by exactly the `-capabilities` row);
-- `doubletake -capabilities` must exit 0 and print `capabilities-v1` and `status-source`.
+- sender help matches `tests/fixtures/backend/doubletake-0.5-source-help.txt`, which differs from
+  the pinned fixture by the `-capabilities` row;
+- `doubletake -capabilities` exits 0 and advertises `capabilities-v1` plus `status-source` for
+  `source_reporting=True` and profile `doubletake-0.5+source`;
+- the additional `status-source-complete` token is required for `source_reporting_complete=True`
+  and Mirror eligibility. A two-token profile can be recognised but is ineligible for Mirror.
 
-When both hold the profile becomes `doubletake-0.5+source` with `source_reporting=True`. That flag states only that the
-build reports portal source metadata per stream. It deliberately does **not** set `physical_source`, `owner_handshake`,
-`foreground_control` or `keyring`: reporting a source is not proving it is the physical monitor we asked for, and the
-verification that consumes the report belongs to the owned-daemon work, not to this patch.
+These tokens never set `physical_source`, `owned_daemon_control`, `owner_handshake`,
+`foreground_control` or `keyring` in the public probe. Composition derives its own evidence. An
+extra flag without tokens, tokens without the matching help surface, incomplete token evidence,
+or tokens on a non-zero exit cannot grant complete reporting.
 
-An extra flag without the tokens fails closed, tokens without the matching surface fail closed, a partial token set fails
-closed, and tokens printed on a non-zero exit are ignored.
+## Activation in the application
 
-## What is still missing on our side
+The epoch supplies receipt-backed `EvidenceAuthority`, shared root authority, strict pidfd
+teardown, the isolated credential-service witness and a fresh KScreen source verifier. Public
+transport admission uses `owned_daemon_control` and `keyring`; fixture-only handshake admission
+remains separate. Mirror additionally requires `multi_target` and physical-source evidence.
+Source acquisition and credential-challenge polling share the same five-second deadline.
+Connect/status credential challenges disconnect only that target without pairing or prompting.
 
-The profile recognises the reporting capability, but the application does not yet consume the
-per-stream `source` object. Verification must compare available metadata with compositor output
-identity and ownership, including rejection of the helper's own virtual outputs. `physical_source`
-stays false and Mirror stays gated until those checks are implemented; neither the capability
-token nor `IsMonitor()` is sufficient evidence.
+The reconciled top-level contract retains master's **T5a** requirements: position is the primary
+identity key, scale-aware size is corroboration, each stream uses its own requested connector,
+and missing source/position, ambiguity, scale disagreement, non-monitor or virtual/owned output
+evidence refuses verification. T5a defaults to observe only; T7 remains the single activation
+boundary that may act on observations. The epoch's existing verifier compares exact size and
+position and does not yet implement the new T5a scale-aware typed observation/diagnostics mode.
+Preserving that new task in the contract does not certify it delivered. The delivery reconciliation
+report records this remaining contract/implementation gap; the patched backend alone cannot
+satisfy it, and a green regression suite is not T5a acceptance evidence.
+
+These checks establish cooperative same-user ownership, not protection against a malicious
+process with the same UID. Missing, unreadable, conflicting or stale evidence refuses control
+and teardown and retains cleanup obligations. See README for the full refusal and residual
+guarantee disclosure. No live receiver acceptance run is claimed.
 
 ## Licensing
 
 `doubletake` is LGPL-3.0. These files are our own diffs, not copies of its source. Distributing a
-*modified binary* would bring LGPL obligations with it (source availability for the modified work),
-so treat a locally built patched binary as a development dependency until that is settled.
+modified binary brings LGPL obligations, including source availability for the modified work;
+treat a locally built patched binary as a development dependency until that is settled.

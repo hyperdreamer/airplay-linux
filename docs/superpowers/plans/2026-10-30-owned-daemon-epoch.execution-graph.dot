@@ -1,0 +1,53 @@
+digraph execution_graph {
+  rankdir=LR;
+  node [shape=box, style=rounded, fontname="monospace"];
+  subgraph cluster_acceptance {
+    label="acceptance";
+    T-010 [label="T10 Establish default offline tripwires and kill the complete mutation matrix"];
+  }
+  subgraph cluster_activation {
+    label="activation";
+    T-009 [label="T9 Activate every public consumer in one commit under Amendment 1"];
+  }
+  subgraph cluster_capability {
+    label="capability";
+    T-001 [label="T1 Add owned_daemon_control plumbing and pure composition derivation"];
+  }
+  subgraph cluster_launch {
+    label="launch";
+    T-005 [label="T5 Serialize shared-root writers and preserve durable authority ownership"];
+    T-006 [label="T6 Build the isolated idle launcher and every crash/release workflow"];
+  }
+  subgraph cluster_probe {
+    label="probe";
+    T-008 [label="T8 Prove credential service through one isolated file-backed witness"];
+  }
+  subgraph cluster_receipts {
+    label="receipts";
+    T-002 [label="T2 Add versioned lifecycle codecs and immutable receipt stores"];
+  }
+  subgraph cluster_source {
+    label="source";
+    T-007 [label="T7 Prepare complete source production, fresh inventory and wired verification"];
+  }
+  subgraph cluster_teardown {
+    label="teardown";
+    T-004 [label="T4 Enforce stage-specific pidfd teardown and cleanup-outcome writing"];
+  }
+  subgraph cluster_verifier {
+    label="verifier";
+    T-003 [label="T3 Verify owned endpoints with anchored entries and fresh peer evidence"];
+  }
+  T-001 -> T-005;
+  T-002 -> T-005;
+  T-003 -> T-005;
+  T-004 -> T-005;
+  T-005 -> T-006;
+  T-001 -> T-007;
+  T-005 -> T-008;
+  T-007 -> T-008;
+  T-006 -> T-009;
+  T-007 -> T-009;
+  T-008 -> T-009;
+  T-009 -> T-010;
+}

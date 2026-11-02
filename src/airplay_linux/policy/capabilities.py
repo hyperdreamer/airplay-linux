@@ -92,16 +92,18 @@ KDE_PLASMA_6_WAYLAND: Final[str] = DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value
 
 #: Backend operations every stream start needs before any backend I/O.
 #: ``DoubleTakeTransport._admit`` refuses with ``dependency_incompatible``
-#: unless all three are proven, so these are admission prerequisites, not
-#: optional niceties. ``keyring`` here is the backend's keyring *operation*; it
-#: is not the desktop Secret Service probe used for remembered pairing.
+#: unless public owned-daemon control and keyring evidence are proven. Fixture
+#: profiles retain their foreground/handshake comparison inside the transport.
 ADMISSION_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = (
+    "owned_daemon_control",
+    "keyring",
+)
+
+LEGACY_ADMISSION_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = (
     "foreground_control",
     "owner_handshake",
     "keyring",
 )
-
-#: The additional backend operation a start needs once the daemon is admitted.
 #: ``DoubleTakeTransport.start_stream`` refuses with ``unsupported_operation``
 #: without it. Pairing does not need it, so it must not gate trust operations.
 START_BACKEND_CAPABILITIES: Final[tuple[str, ...]] = ("multi_target",)
@@ -403,9 +405,17 @@ class EnvironmentProbe:
             else:
                 note(_incompatible("doubletake backend contract"))
 
-        admitted = backend is not None and all(
+        public_admitted = backend is not None and all(
             backend.supports(name) for name in ADMISSION_BACKEND_CAPABILITIES
         )
+        fixture_admitted = backend is not None and all(
+            backend.supports(name) for name in LEGACY_ADMISSION_BACKEND_CAPABILITIES
+        )
+        # The public activated graph uses owned-daemon evidence. Delivered
+        # fixture profiles retain their foreground/handshake admission so the
+        # policy probe remains a useful contract fixture while activation
+        # keeps those legacy flags false.
+        admitted = public_admitted or fixture_admitted
         mode_ready = admitted and all(
             backend.supports(name) for name in START_BACKEND_CAPABILITIES
         )
@@ -416,9 +426,14 @@ class EnvironmentProbe:
             backend.supports(name) for name in PAIRING_BACKEND_CAPABILITIES
         )
         if backend is not None:
-            # Name every missing prerequisite exactly, so a user sees which
-            # backend operation to fix instead of a generic transport failure.
-            for name in ADMISSION_BACKEND_CAPABILITIES + START_BACKEND_CAPABILITIES:
+            if not public_admitted and not fixture_admitted:
+                # Report both public and fixture admission evidence when no
+                # path is usable; this keeps the exact missing legacy details
+                # used by the delivered policy diagnostics.
+                for name in ADMISSION_BACKEND_CAPABILITIES + LEGACY_ADMISSION_BACKEND_CAPABILITIES:
+                    if not backend.supports(name):
+                        note(_incompatible(name))
+            for name in START_BACKEND_CAPABILITIES:
                 if not backend.supports(name):
                     note(_incompatible(name))
             if not physical_source:

@@ -1,17 +1,8 @@
-"""Physical-monitor mirror capture: portal selection, verification, release.
-
-Import from here rather than the adapter-private portal monitor type: callers
-only ever see :class:`~airplay_linux.domain.resources.PhysicalMonitorSource`.
-"""
+"""Physical-monitor mirror capture adapters."""
 
 from __future__ import annotations
 
-from .physical import (
-    KscreenConnectorInventory,
-    PhysicalCaptureProvider,
-    is_physical_descriptor,
-)
-from .portal import PortalClient
+from typing import Any
 
 __all__ = [
     "KscreenConnectorInventory",
@@ -19,3 +10,17 @@ __all__ = [
     "PortalClient",
     "is_physical_descriptor",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"KscreenConnectorInventory", "PhysicalCaptureProvider", "is_physical_descriptor"}:
+        from .physical import KscreenConnectorInventory, PhysicalCaptureProvider, is_physical_descriptor
+        return {
+            "KscreenConnectorInventory": KscreenConnectorInventory,
+            "PhysicalCaptureProvider": PhysicalCaptureProvider,
+            "is_physical_descriptor": is_physical_descriptor,
+        }[name]
+    if name == "PortalClient":
+        from .portal import PortalClient
+        return PortalClient
+    raise AttributeError(name)

@@ -22,6 +22,7 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.process.daemon_registry import DaemonRegistry
 from airplay_linux.process.procfs import IdentityEvidence, IdentityState, OwnedProcessScan
 from airplay_linux.testing.adapters import FakeProcess, MemoryDaemonStore, SequenceIds
+from tests.process.test_credential_probe import private_socket_root
 
 APP = ProcessIdentity(pid=100, start_ticks=10)
 SUPERVISOR = ProcessIdentity(pid=200, start_ticks=20)
@@ -183,8 +184,8 @@ def run_async(test):
 
 
 @pytest.fixture
-def harness(tmp_path):
-    h = Harness(tmp_path)
+def harness(private_socket_root):
+    h = Harness(private_socket_root)
     try:
         yield h
     finally:
@@ -232,6 +233,18 @@ async def test_incompatible_backend_is_never_launched(harness):
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.dependency_incompatible
     assert not harness.process.spawned and not harness.store.records
+
+
+@run_async
+async def test_public_profile_with_fixture_flags_cannot_select_foreground_launch(harness):
+    h = harness
+    h.registry._features = replace(
+        FEATURES, profile='doubletake-0.5+source', owned_daemon_control=True,
+    )
+    result = await h.start()
+    assert isinstance(result, Err) and result.error.code is ErrorCode.dependency_incompatible
+    assert not h.process.spawned
+    assert not h.store.records
 
 
 @run_async
@@ -468,6 +481,185 @@ async def test_failed_launches_consume_restart_budget_and_success_does_not_reset
 
 
 @run_async
+@pytest.mark.parametrize('states', [
+    (('reserved', 1), ('ready', 1)),
+    (('reserved', 1), ('stopped', 2)),
+    (('failed', 4),),
+    (('ready', 3),),
+])
+async def test_receipt_obligations_block_legacy_cleanup_and_replacement(harness, states):
+    from types import SimpleNamespace
+    from airplay_linux.domain.records import LaunchReceipt
+
+    h = harness
+    started = await h.start()
+    assert isinstance(started, Ok)
+    r = started.value
+    receipts = []
+    for index, (state, generation) in enumerate(states):
+        receipts.append(LaunchReceipt(
+            schema_version=1, launch_uuid=UUID(int=index + 20),
+            instance_uuid=InstanceId(UUID(int=10)), app=APP, owner_uid=os.getuid(),
+            boot_id=h.registry._authority.boot_id(), runtime_directory=r.runtime_directory,
+            runtime_device=0, runtime_inode=1, endpoint_generation=generation,
+            socket_name='daemon.sock', protocol_version='v1', state=state,
+            daemon_instance_uuid=None if state == 'reserved' else r.instance_uuid,
+            supervisor=None if state == 'reserved' else SUPERVISOR,
+            daemon=None if state == 'reserved' else DAEMON,
+            entry_device=None, entry_inode=None, socket_inode=None,
+            peer_pid=None, peer_start_ticks=None, peer_uid=None,
+            status_state=None, credential_service='unknown',
+            failure=ErrorCode.daemon_failed if state == 'failed' else None, updated_at=1.0,
+        ))
+
+    async def all_receipts():
+        return Ok(value=tuple(receipts))
+
+    h.registry._receipts = SimpleNamespace(all=all_receipts)
+    before = (h.registry._record_root / 'daemon/authority.owner').read_bytes()
+    for operation in (h.registry.ensure, h.registry.restart, h.registry.shutdown):
+        refused = await operation()
+        assert isinstance(refused, Err)
+        assert not h.process.terminated
+        assert len(h.process.spawned) == 1
+        assert Path(r.socket_path).exists()
+        assert (h.registry._record_root / 'daemon/authority.owner').read_bytes() == before
+    assert h.notices[-1].kind == 'cleanup_required'
+
+
+@run_async
+async def test_supervisor_intent_without_receipt_is_retained_without_signals(harness):
+    from types import SimpleNamespace
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+
+    h = harness
+    started = await h.start()
+    assert isinstance(started, Ok)
+    intent = SupervisorReleaseIntent(
+        schema_version=1, launch_uuid=UUID(int=99), instance_uuid=InstanceId(UUID(int=10)),
+        app=APP, supervisor=SUPERVISOR, daemon=DAEMON,
+        reason='application-exited', intent_at=1.0,
+    )
+
+    async def read_intent():
+        return Ok(value=intent)
+
+    h.registry._supervisor_intents = lambda runtime: SimpleNamespace(read=read_intent)
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err)
+    assert not h.process.terminated
+    assert h.store.records
+    assert (h.registry._record_root / 'daemon/authority.owner').exists()
+
+
+@run_async
+async def test_missing_observation_does_not_clear_owner_or_abandon_live_daemon(harness):
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    h.store.records.clear()
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err) and refused.error.code is ErrorCode.ownership_mismatch
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    assert h.process.identity(DAEMON.pid) == DAEMON
+    assert (h.registry.runtime_directory / 'daemon.sock').exists()
+
+
+@run_async
+async def test_orphan_endpoint_retains_owner_without_an_observation(harness):
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    h.registry._record = None
+    h.store.records.clear()
+    refused = await h.registry.reconcile_previous()
+    assert isinstance(refused, Err) and refused.error.code is ErrorCode.stale_socket
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    assert (h.registry.runtime_directory / 'daemon.sock').exists()
+
+
+@run_async
+async def test_registry_exception_unlocks_and_retains_owner(harness):
+    import fcntl
+
+    h = harness
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+
+    async def broken():
+        raise RuntimeError('injected store failure')
+
+    h.store.all = broken
+    with pytest.raises(RuntimeError, match='injected store failure'):
+        await h.registry.shutdown()
+    assert owner_path.read_bytes() == before
+    descriptor = os.open(owner_path.with_name('authority.lock'), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+    assert not h.process.terminated
+
+
+@run_async
+async def test_shutdown_acquires_once_and_cancellation_unlocks(harness):
+    import fcntl
+
+    h = harness
+    assert hasattr(h.registry, '_authority'), 'registry missing shared-root authority'
+    assert isinstance(await h.start(), Ok)
+    owner_path = h.registry._record_root / 'daemon/authority.owner'
+    before = owner_path.read_bytes()
+    authority = h.registry._authority
+    acquire = authority.acquire
+    acquisitions = []
+
+    async def counted(instance):
+        acquisitions.append(instance)
+        return await acquire(instance)
+
+    authority.acquire = counted
+    entered = asyncio.Event()
+    all_records = h.store.all
+
+    async def paused():
+        entered.set()
+        await asyncio.Future()
+
+    h.store.all = paused
+    pending = asyncio.create_task(h.registry.shutdown())
+    await asyncio.wait_for(entered.wait(), 1.0)
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert len(acquisitions) == 1
+    assert owner_path.read_bytes() == before
+    assert not h.process.terminated
+    descriptor = os.open(owner_path.with_name('authority.lock'), os.O_RDWR)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(descriptor)
+    h.store.all = all_records
+    acquisitions.clear()
+    h.process.keep_alive = True
+    refused = await h.registry.shutdown()
+    assert isinstance(refused, Err)
+    assert len(acquisitions) == 1
+    assert owner_path.read_bytes() == before
+    h.process.keep_alive = False
+    acquisitions.clear()
+    assert await h.registry.shutdown() == Ok(value=None)
+    assert len(acquisitions) == 1
+    assert not owner_path.exists()
+
+
+@run_async
 async def test_private_runtime_rejects_symlink_directory_and_socket(harness, tmp_path):
     h = harness
     destination = tmp_path / 'elsewhere'
@@ -488,3 +680,304 @@ async def test_private_runtime_rejects_symlink_directory_and_socket(harness, tmp
     assert isinstance(refused, Err)
     assert marker.read_text() == 'preserved'
     assert not h.process.terminated
+
+
+@pytest.fixture
+def application_daemon_identity_cases(private_socket_root, monkeypatch):
+    from test_owned_launcher import candidate_failure_cases
+    yield from candidate_failure_cases.__wrapped__(private_socket_root, monkeypatch)
+
+
+async def test_receipt_joins_application_and_observed_daemon_instance_without_token(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    r = await c.current()
+    assert r.instance_uuid != r.launch_uuid != r.daemon_instance_uuid
+    assert r.instance_uuid != r.daemon_instance_uuid
+    assert r.daemon_instance_uuid == c.record.instance_uuid
+    assert c.record.owner_token == 'unused'
+    payload = (c.root / 'daemon/receipts' / (str(r.launch_uuid) + '.json')).read_bytes()
+    assert b'owner_token' not in payload and b'unused' not in payload
+    assert 'unused' not in repr(r)
+    assert isinstance(await c.registry._join_receipt(replace(r, daemon_instance_uuid=r.instance_uuid)), Err)
+    assert c.configs[0]['launch_uuid'] == str(r.launch_uuid)
+    assert c.configs[0]['endpoint_generation'] == r.endpoint_generation
+    assert 'owner_token' not in c.configs[0]
+
+
+@pytest.mark.parametrize('pipe', [None, 'stale', 'conflicting'])
+async def test_restart_reconstructs_unique_observation_gap_without_config_pipe(application_daemon_identity_cases, monkeypatch, pipe):
+    import json
+    from test_owned_launcher import Crash, DAEMON
+    from airplay_linux.process import daemon_registry as module
+    c = application_daemon_identity_cases
+    c.hooks['supervisor-publication'] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    assert (await c.current()).daemon_instance_uuid is None
+    c.reopen()
+    def forbidden_pipe(*args, **kwargs):
+        raise AssertionError('restart required original launch pipe')
+
+    monkeypatch.setattr(module, 'config_pipe', forbidden_pipe)
+    rfd, wfd = os.pipe()
+    payload = json.dumps({'launch_uuid': str(UUID(int=999)), 'endpoint_generation': 999,
+                          'daemon_instance_uuid': str(UUID(int=998))}).encode()
+    os.write(wfd, payload)
+    os.close(wfd)
+    if pipe is not None:
+        monkeypatch.setenv('AIRPLAY_LINUX_CONFIG_FD', str(rfd if pipe == 'conflicting' else -1))
+    else:
+        monkeypatch.delenv('AIRPLAY_LINUX_CONFIG_FD', raising=False)
+    try:
+        assert await c.registry.reconcile_previous() == Ok(value=None)
+        assert os.read(rfd, 4096) == payload
+    finally:
+        os.close(rfd)
+    assert c.process.terminated == [DAEMON]
+    receipt = await c.current()
+    assert receipt.state == 'stopped'
+    assert receipt.daemon_instance_uuid == c.record.instance_uuid
+
+
+@pytest.mark.parametrize('count', [0, 2, 3])
+async def test_observation_join_refuses_ambiguous_restart_records(application_daemon_identity_cases, monkeypatch, count):
+    from test_owned_launcher import Crash
+    c = application_daemon_identity_cases
+    c.hooks['supervisor-publication'] = lambda: (_ for _ in ()).throw(Crash())
+    with pytest.raises(Crash):
+        await c.launch()
+    if count == 0:
+        assert await c.store.delete(c.record.instance_uuid) == Ok(value=None)
+    else:
+        for index in range(count - 1):
+            assert await c.store.write(replace(c.record, instance_uuid=InstanceId(UUID(int=1111 + index)),
+                                              lifecycle='stopping')) == Ok(value=None)
+    monkeypatch.setenv('AIRPLAY_LINUX_CONFIG_FD', '-1')
+    c.reopen()
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert c.process.terminated == []
+    assert (await c.current()).state == 'reserved'
+    assert len(c.process.spawned) == 1
+
+
+async def test_missing_cleanup_intent_is_rederived_without_authorising_teardown(application_daemon_identity_cases):
+    from test_owned_launcher import DAEMON
+    c = application_daemon_identity_cases
+    c.facts.on_peer = lambda: setattr(c.facts, 'peer_pid', 999)
+    assert isinstance(await c.launch(), Err)
+    receipt = await c.current()
+    path = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen = path.read_bytes()
+    assert receipt.state == 'failed'
+    assert not (await c.cleanup.all()).value
+    c.reopen()
+    assert isinstance(await c.registry.reconcile_previous(), Err)
+    assert len((await c.cleanup.all()).value) == 1
+    assert not c.process.terminated
+    assert c.process.identity(DAEMON.pid) == DAEMON
+    assert (await c.current()) == receipt
+    assert isinstance(await c.launch(), Err) and len(c.process.spawned) == 1
+    c.absence()
+    # This receipt never pinned the mismatched entry; an independent removal is
+    # required as well as child absence before an outcome can complete.
+    (c.runtime / 'daemon.sock').unlink()
+    c.reopen()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    completion = (await c.cleanup.all()).value[0]
+    assert completion.outcome == 'stopped'
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value == (completion,)
+    assert path.read_bytes() == frozen and not c.process.terminated
+
+
+@pytest.mark.parametrize('absence', ['present', 'absent', 'unreadable', 'mismatched'])
+@pytest.mark.parametrize('boundary', [None, 'cleanup-intent-publication', 'terminal-write', 'cleanup-intent-completion'])
+async def test_supervisor_intent_recovery_terminalises_without_resignalling(application_daemon_identity_cases, absence, boundary):
+    from test_owned_launcher import APP_ID, DAEMON, Crash
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    intent = SupervisorReleaseIntent(
+        schema_version=1, launch_uuid=receipt.launch_uuid, instance_uuid=APP_ID,
+        app=receipt.app, supervisor=receipt.supervisor, daemon=receipt.daemon,
+        reason='application-exited', intent_at=1.0,
+    )
+    await c.supervisor_intents(str(c.runtime)).write(intent)
+    before = (c.runtime / 'release-intent.json').read_bytes()
+    c.reopen()
+    if absence == 'absent':
+        c.absence()
+    elif absence == 'unreadable':
+        c.unreadable.add(DAEMON.pid)
+    elif absence == 'mismatched':
+        c.process.register(replace(DAEMON, start_ticks=999), {})
+    if boundary is not None and (absence == 'absent' or boundary != 'cleanup-intent-completion'):
+        c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            await c.registry.reconcile_previous()
+        assert boundary in c.events
+        c.reopen()
+    result = await c.registry.reconcile_previous()
+    assert isinstance(result, Ok if absence == 'absent' else Err)
+    assert c.process.terminated == []
+    assert (await c.current()).state == ('stopped' if absence == 'absent' else 'failed')
+    assert len((await c.cleanup.all()).value) == 1
+    failed = c.root / 'daemon/receipts' / (str(receipt.launch_uuid) + '.json')
+    frozen = failed.read_bytes()
+    c.unreadable.clear()
+    c.process.exit(c.process.identity(DAEMON.pid) or DAEMON)
+    c.absence()
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    completion = (await c.cleanup.all()).value[0]
+    assert completion.outcome == 'stopped'
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value == (completion,)
+    assert failed.read_bytes() == frozen
+    assert (c.runtime / 'release-intent.json').read_bytes() == before
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("path", ["registry_stop", "registry_shutdown", "evidence", "supervisor", "namespace_probe"])
+@pytest.mark.parametrize(("stage", "changed"), [
+    (stage, changed)
+    for stage in ("pre_bind", "bound")
+    for changed in (None, "identity", "uid", "supervisor", "socket_name", "receipt", "runtime", "entry", "socket_inode", "peer", "fd_holder")
+    if (stage == "bound" and changed != "supervisor") or (stage == "pre_bind" and changed not in {"entry", "socket_inode", "peer", "fd_holder"})
+])
+async def test_every_owned_termination_passes_strict_true(private_socket_root, monkeypatch, path, stage, changed):
+    """Exercise each production caller and its real synchronous post-open verifier."""
+    from types import SimpleNamespace
+    from airplay_linux.process.procfs import termination_evidence_complete
+    from tests.process.test_credential_probe import namespace_probe_witness
+    from tests.process.test_supervisor import public_supervisor_case
+    from tests.process.test_owned_launcher import OwnedCase, Crash, APP
+
+    fixture = None
+    if path == "namespace_probe":
+        c = namespace_probe_witness.__wrapped__(private_socket_root, monkeypatch)
+        process, facts = c.inner, c.facts
+        if stage == "pre_bind":
+            facts.bound_after = 4.0
+    elif path == "supervisor":
+        fixture = public_supervisor_case.__wrapped__(private_socket_root, monkeypatch)
+        c = next(fixture)
+        process, facts = c.process, c.facts
+    else:
+        c = OwnedCase(private_socket_root, monkeypatch)
+        process, facts = c.process, c.facts
+
+    observations = []
+    real_terminate = process.terminate
+
+    async def observe(identity, owner_uuid, runtime, deadline, *, strict=False, evidence=None, revalidate=None):
+        assert strict is True
+        assert termination_evidence_complete(evidence)
+        assert evidence.stage == stage
+        assert evidence.expected_identity == identity
+        assert evidence.expected_socket_name == str(Path(runtime) / "daemon.sock")
+        assert deadline == 3.0
+        assert callable(revalidate)
+        assert revalidate() == Ok(value=evidence), "unchanged stage must pass before pidfd-open"
+        callback_calls = []
+
+        def after_open():
+            callback_calls.append(True)
+            if changed in {"identity", "uid", "supervisor"}:
+                identity_before = facts.identity
+
+                def altered(pid):
+                    value = identity_before(pid)
+                    selected = evidence.expected_supervisor if changed == "supervisor" else identity
+                    if pid == selected.pid:
+                        if changed == "uid":
+                            return replace(value, uid=value.uid + 1)
+                        return replace(value, identity=replace(selected, start_ticks=selected.start_ticks + 1))
+                    return value
+
+                monkeypatch.setattr(facts, "identity", altered)
+            elif changed == "socket_name":
+                monkeypatch.setattr(facts, "cmdline", lambda pid: b"doubletake\0-daemonize\0-socket\0/wrong.sock\0")
+            elif changed == "receipt":
+                receipt_path = next((c.config.record_root / "receipts").glob("*.json")) if path == "namespace_probe" else (
+                    c.root / "daemon/receipts" / f"{owner_uuid}.json"
+                )
+                receipt_path.write_bytes(receipt_path.read_bytes() + b" ")
+            elif changed == "runtime":
+                fstat = facts.fstat
+
+                def changed_directory(fd):
+                    value = fstat(fd)
+                    return SimpleNamespace(st_mode=value.st_mode, st_uid=value.st_uid,
+                                           st_dev=value.st_dev, st_ino=value.st_ino + 1)
+
+                monkeypatch.setattr(facts, "fstat", changed_directory)
+            elif changed == "entry":
+                stat = facts.stat
+
+                def changed_entry(*args, **kwargs):
+                    value = stat(*args, **kwargs)
+                    return SimpleNamespace(st_mode=value.st_mode, st_uid=value.st_uid,
+                                           st_dev=value.st_dev, st_ino=value.st_ino + 1)
+
+                monkeypatch.setattr(facts, "stat", changed_entry)
+            elif changed == "peer":
+                peer = facts.peer
+                monkeypatch.setattr(facts, "peer", lambda *args: (peer(*args)[0] + 1, os.getuid(), os.getgid()))
+            elif changed == "fd_holder":
+                monkeypatch.setattr(facts, "holds_socket", lambda pid, inode: False)
+            elif changed == "socket_inode":
+                rows = facts.unix_inodes
+                monkeypatch.setattr(facts, "unix_inodes", lambda name: tuple(inode + 1 for inode in rows(name)))
+            return revalidate()
+
+        # This injected process boundary models pidfd-open before invoking the
+        # production callback against independently changed kernel/durable facts.
+        result = await real_terminate(
+            identity, owner_uuid, runtime, deadline, strict=strict,
+            evidence=evidence, revalidate=after_open,
+        )
+        assert callback_calls == [True]
+        observations.append((evidence, result))
+        return result
+
+    monkeypatch.setattr(process, "terminate", observe)
+    try:
+        if path == "namespace_probe":
+            result = await c.module.run_backend_leg(c.config, "positive", process=process, supervisor=facts.supervisor)
+            assert result.cleanup_confirmed is (changed is None)
+        else:
+            if stage == "pre_bind":
+                c.bind_on_spawn = False
+                c.hooks["supervisor-publication"] = lambda: (_ for _ in ()).throw(Crash())
+                with pytest.raises(Crash):
+                    await c.registry.ensure()
+            else:
+                assert isinstance(await c.registry.ensure(), Ok)
+            if path == "supervisor":
+                process.exit(APP)
+                runner = await c.supervisor()
+                result = await runner._request_release(c.record, c.registry._features)
+            elif path == "evidence":
+                receipt = await c.current()
+                assert isinstance(await c.receipts.write(replace(receipt, state="stopping")), Ok)
+                result = await c.ownership.release(c.record)
+            elif path == "registry_stop":
+                result = await c.registry._stop_owned(c.record)
+            else:
+                result = await c.registry.shutdown()
+            assert isinstance(result, Ok if changed is None else Err), result
+        assert len(observations) == 1, "the owned caller must reach exactly one strict process boundary"
+        assert len(process.terminated) == (1 if changed is None else 0)
+        if changed is not None:
+            if path == "namespace_probe":
+                assert facts.entries, "uncertainty must retain the socket entry"
+            elif stage == "bound":
+                assert (Path(c.runtime) / "daemon.sock").exists()
+    finally:
+        if fixture is not None:
+            fixture.close()
+            c.close()
+        elif path != "namespace_probe":
+            c.close()

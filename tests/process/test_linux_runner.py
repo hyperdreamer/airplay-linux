@@ -25,11 +25,14 @@ import os
 import signal
 import sys
 import time
+from collections import deque
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain import ports
 from airplay_linux.domain.operations import ProcessIdentity
 from airplay_linux.domain.resources import Err, ErrorCode, Ok
@@ -41,9 +44,12 @@ from airplay_linux.process.linux import (
 from airplay_linux.process.procfs import (
     OWNER_TOKEN_ENV,
     RUNTIME_DIRECTORY_ENV,
+    IdentityEvidence,
     IdentityState,
+    TerminationEvidence,
     read_identity,
     read_identity_evidence,
+    termination_evidence_complete,
 )
 
 OWNER = UUID("22222222-2222-2222-2222-222222222222")
@@ -981,7 +987,413 @@ def test_a_closed_subscription_stops_receiving_exits():
     assert exits == []
 
 
-# --------------------------------------------------------------------------- ownership
+# --------------------------------------------------------------------------- strict owned termination
+
+
+@pytest.fixture
+def zero_device_bound_evidence():
+    from airplay_linux.storage import codecs
+    from tests.storage.test_reservation_codecs import receipt_states
+
+    receipt = codecs.decode_launch_receipt(
+        codecs.encode_launch_receipt(receipt_states()["bound"]),
+    )
+    assert receipt.entry_device == 0
+    return TerminationEvidence(
+        stage="bound",
+        expected_identity=receipt.daemon,
+        expected_uid=receipt.owner_uid,
+        expected_socket_name=receipt.socket_name,
+        expected_supervisor=receipt.supervisor,
+        expected_entry=(receipt.entry_device, receipt.entry_inode),
+        expected_socket_inode=receipt.socket_inode,
+    )
+
+
+def test_bound_termination_evidence_accepts_zero_device_receipt(zero_device_bound_evidence):
+    assert termination_evidence_complete(zero_device_bound_evidence)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ((-1, 92), (0, 0), (0, -1), (False, 92), (True, 92), (0, True), (0, False),
+     (0.0, 92), (0, 92.0), ("0", 92), (0, "92")),
+)
+def test_bound_termination_evidence_rejects_invalid_entry(zero_device_bound_evidence, entry):
+    assert not termination_evidence_complete(replace(zero_device_bound_evidence, expected_entry=entry))
+
+
+@pytest.fixture
+def strict_signal_observer(monkeypatch):
+    identity = ProcessIdentity(pid=8123, start_ticks=44_001)
+    evidence = TerminationEvidence(
+        stage="pre_bind",
+        expected_identity=identity,
+        expected_uid=os.getuid(),
+        expected_socket_name="daemon.sock",
+        expected_supervisor=ProcessIdentity(pid=8122, start_ticks=44_000),
+        expected_entry=None,
+        expected_socket_inode=None,
+    )
+
+    class Observer(LinuxProcessRunner):
+        def __init__(self) -> None:
+            super().__init__(proc_root=Path("/proc"))
+            self.identity_value = identity
+            self.evidence = evidence
+            self.pidfd_available = True
+            self.fresh_identity = identity
+            self.observed_uid = os.getuid()
+            self.observed_state = IdentityState.present
+            self.identity_results: deque[IdentityEvidence] = deque()
+            self.revalidations: deque[Ok | Err] = deque([Ok(value=evidence)])
+            self.wait_results = deque([True])
+            self.waits: list[tuple[ProcessIdentity, int | None, object, float]] = []
+            self.closed_pidfds: list[int] = []
+            self.events: list[str] = []
+            self.numeric_signals: list[tuple[int, int]] = []
+            self.pidfd_signals: list[tuple[int, int]] = []
+
+        def _classify(self, identity, owner_uuid, runtime_directory):  # type: ignore[override]
+            self.events.append("classify")
+            return "owned"
+
+        def _open_pidfd(self, pid: int):  # type: ignore[override]
+            self.events.append("open_pidfd")
+            return 73 if self.pidfd_available else None
+
+        def _read_strict_identity(self, identity):  # type: ignore[override]
+            self.events.append("read_identity")
+            if self.identity_results:
+                return self.identity_results.popleft()
+            return IdentityEvidence(
+                pid=identity.pid,
+                state=self.observed_state,
+                identity=(self.fresh_identity if self.observed_state in
+                          (IdentityState.present, IdentityState.terminated) else None),
+                parent=8122,
+                uid=self.observed_uid,
+            )
+
+        def _close_pidfd(self, pidfd: int | None) -> None:
+            if pidfd is not None:
+                self.events.append("close_pidfd")
+                self.closed_pidfds.append(pidfd)
+
+        async def _await_exit(self, identity, pidfd, child, timeout):  # type: ignore[override]
+            self.events.append("await_exit")
+            self.waits.append((identity, pidfd, child, timeout))
+            return self.wait_results.popleft()
+
+        def revalidate(self):
+            self.events.append("revalidate")
+            return self.revalidations.popleft()
+
+    observer = Observer()
+
+    def send_pidfd(pidfd, signum):
+        observer.events.append("signal")
+        observer.pidfd_signals.append((pidfd, signum))
+
+    def send_numeric(pid, signum):
+        observer.events.append("signal")
+        observer.numeric_signals.append((pid, signum))
+
+    monkeypatch.setattr(signal, "pidfd_send_signal", send_pidfd, raising=False)
+    monkeypatch.setattr(os, "kill", send_numeric)
+    return observer
+
+
+def test_strict_receipt_revalidation_after_pidfd_open_refuses_without_signals(
+    strict_signal_observer,
+):
+    s = strict_signal_observer
+    s.revalidations = deque([Err(error=diagnostic(ErrorCode.ownership_mismatch))])
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert s.events.index("open_pidfd") < s.events.index("revalidate")
+    assert s.events.index("revalidate") < s.events.index("close_pidfd")
+    assert s.numeric_signals == []
+    assert s.pidfd_signals == []
+
+
+def test_strict_no_pidfd_never_signals_numeric_pid(strict_signal_observer):
+    s = strict_signal_observer
+    s.pidfd_available = False
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err) and result.error.code == ErrorCode.dependency_incompatible
+    assert s.numeric_signals == s.pidfd_signals == []
+
+
+def test_strict_revalidates_identity_after_pidfd_open(strict_signal_observer):
+    s = strict_signal_observer
+    s.fresh_identity = ProcessIdentity(pid=s.identity_value.pid, start_ticks=44_002)
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert "revalidate" not in s.events
+    assert s.numeric_signals == []
+    assert s.pidfd_signals == []
+
+
+def test_strict_valid_candidate_signals_only_through_pidfd(strict_stage_observer):
+    s = strict_stage_observer
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert result == Ok(value=None)
+    assert s.pidfd_signals == [(73, signal.SIGTERM)]
+    assert s.numeric_signals == []
+    assert s.events == [
+        "classify", "open_pidfd", "read_identity", "revalidate", "signal", "await_exit", "close_pidfd",
+    ]
+    assert s.waits == [(s.identity_value, 73, None, 5.0)]
+    assert s.closed_pidfds == [73]
+
+
+def test_strict_zero_device_receipt_cleans_through_pidfd(strict_signal_observer, zero_device_bound_evidence):
+    s = strict_signal_observer
+    s.evidence = zero_device_bound_evidence
+    s.identity_value = s.evidence.expected_identity
+    s.fresh_identity = s.evidence.expected_identity
+    s.observed_uid = 1000
+    s.revalidations = deque([Ok(value=s.evidence)])
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert result == Ok(value=None)
+    assert s.pidfd_signals == [(73, signal.SIGTERM)]
+    assert s.numeric_signals == []
+    assert s.waits == [(s.identity_value, 73, None, 3.0)]
+    assert s.closed_pidfds == [73]
+
+
+@pytest.fixture(params=("pre_bind", "bound"))
+def strict_stage_observer(request, strict_signal_observer):
+    s = strict_signal_observer
+    if request.param == "bound":
+        s.evidence = replace(s.evidence, stage="bound", expected_entry=(8, 92), expected_socket_inode=93)
+    s.revalidations = deque([Ok(value=s.evidence)])
+    return s
+
+
+def test_strict_revalidates_uid_after_pidfd_open(strict_stage_observer):
+    s = strict_stage_observer
+    s.observed_uid = os.getuid() + 1
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert s.events == ["classify", "open_pidfd", "read_identity", "close_pidfd"]
+    assert s.closed_pidfds == [73]
+    assert s.numeric_signals == s.pidfd_signals == []
+    assert s.waits == []
+
+
+@pytest.mark.parametrize("state", (IdentityState.absent, IdentityState.unreadable, IdentityState.terminated))
+def test_strict_distinguishes_absent_and_unreadable_after_pidfd_open(strict_stage_observer, state):
+    s = strict_stage_observer
+    s.observed_state = state
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    if state is IdentityState.unreadable:
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.ownership_mismatch
+    else:
+        assert result == Ok(value=None)
+    assert s.numeric_signals == s.pidfd_signals == []
+    assert s.events == ["classify", "open_pidfd", "read_identity", "close_pidfd"]
+    assert s.closed_pidfds == [73]
+    assert s.waits == []
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    (
+        pytest.param(lambda e: replace(
+            e, stage="bound" if e.stage == "pre_bind" else "pre_bind",
+            expected_entry=(8, 92) if e.stage == "pre_bind" else None,
+            expected_socket_inode=93 if e.stage == "pre_bind" else None,
+        ), id="stage"),
+        pytest.param(lambda e: replace(e, expected_identity=replace(e.expected_identity, start_ticks=44_002)),
+                     id="daemon"),
+        pytest.param(lambda e: replace(e, expected_uid=e.expected_uid + 1), id="uid"),
+        pytest.param(lambda e: replace(e, expected_socket_name="other.sock"), id="socket-argv"),
+        pytest.param(lambda e: replace(e, expected_supervisor=ProcessIdentity(pid=8122, start_ticks=44_003)),
+                     id="supervisor"),
+        pytest.param(lambda e: replace(e, expected_entry=(8, 94)), id="entry"),
+        pytest.param(lambda e: replace(e, expected_socket_inode=95), id="kernel-inode"),
+    ),
+)
+def test_strict_changed_stage_fields_refuse_without_signals(strict_stage_observer, mutate):
+    s = strict_stage_observer
+    s.revalidations = deque([Ok(value=mutate(s.evidence))])
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.ownership_mismatch
+    assert s.events == ["classify", "open_pidfd", "read_identity", "revalidate", "close_pidfd"]
+    assert s.closed_pidfds == [73]
+    assert s.numeric_signals == s.pidfd_signals == []
+    assert s.waits == []
+
+
+def test_strict_term_timeout_escalates_through_same_pidfd_and_confirms_exit(strict_stage_observer):
+    s = strict_stage_observer
+    s.wait_results = deque([False, True])
+    s.revalidations = deque([Ok(value=s.evidence), Ok(value=s.evidence)])
+    s.kill_timeout = 1.25
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert result == Ok(value=None)
+    assert s.pidfd_signals == [(73, signal.SIGTERM), (73, signal.SIGKILL)]
+    assert s.numeric_signals == []
+    assert s.waits == [(s.identity_value, 73, None, 3.0), (s.identity_value, 73, None, 1.25)]
+    assert s.events == [
+        "classify", "open_pidfd", "read_identity", "revalidate", "signal", "await_exit",
+        "read_identity", "revalidate", "signal", "await_exit", "close_pidfd",
+    ]
+    assert s.closed_pidfds == [73]
+
+
+def test_strict_unconfirmed_exit_returns_cleanup_timeout(strict_stage_observer):
+    s = strict_stage_observer
+    s.wait_results = deque([False, False])
+    s.revalidations = deque([Ok(value=s.evidence), Ok(value=s.evidence)])
+    s.kill_timeout = 1.25
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    assert s.pidfd_signals == [(73, signal.SIGTERM), (73, signal.SIGKILL)]
+    assert s.numeric_signals == []
+    assert s.waits == [(s.identity_value, 73, None, 3.0), (s.identity_value, 73, None, 1.25)]
+    assert s.events == [
+        "classify", "open_pidfd", "read_identity", "revalidate", "signal", "await_exit",
+        "read_identity", "revalidate", "signal", "await_exit", "close_pidfd",
+    ]
+    assert s.closed_pidfds == [73]
+
+
+@pytest.mark.parametrize("changed_evidence", (False, True))
+def test_strict_revalidation_before_kill_refuses_and_closes_pidfd(strict_stage_observer, changed_evidence):
+    s = strict_stage_observer
+    s.wait_results = deque([False, True])
+    refused = (Ok(value=replace(s.evidence, expected_socket_name="replacement.sock"))
+               if changed_evidence else Err(error=diagnostic(ErrorCode.stale_socket)))
+    s.revalidations = deque([Ok(value=s.evidence), refused])
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    assert isinstance(result, Err)
+    assert result.error.code is (ErrorCode.ownership_mismatch if changed_evidence else ErrorCode.stale_socket)
+    assert s.pidfd_signals == [(73, signal.SIGTERM)]
+    assert s.numeric_signals == []
+    assert s.waits == [(s.identity_value, 73, None, 3.0)]
+    assert s.events == [
+        "classify", "open_pidfd", "read_identity", "revalidate", "signal", "await_exit",
+        "read_identity", "revalidate", "close_pidfd",
+    ]
+    assert s.closed_pidfds == [73]
+
+
+@pytest.mark.parametrize("state", (IdentityState.present, IdentityState.absent, IdentityState.unreadable))
+def test_strict_rechecks_uid_and_state_before_kill(strict_stage_observer, state):
+    s = strict_stage_observer
+    observed = IdentityEvidence(
+        pid=s.fresh_identity.pid, state=IdentityState.present,
+        identity=s.fresh_identity, uid=s.observed_uid,
+    )
+    s.identity_results = deque([
+        observed,
+        replace(observed, state=state, uid=s.observed_uid + 1),
+    ])
+    s.wait_results = deque([False, True])
+    result = run(s.terminate(
+        s.identity_value, OWNER, RUNTIME, 3.0,
+        strict=True, evidence=s.evidence, revalidate=s.revalidate,
+    ))
+    if state is IdentityState.absent:
+        assert result == Ok(value=None)
+    else:
+        assert isinstance(result, Err)
+        assert result.error.code is ErrorCode.ownership_mismatch
+    assert s.pidfd_signals == [(73, signal.SIGTERM)]
+    assert s.numeric_signals == []
+    assert s.waits == [(s.identity_value, 73, None, 3.0)]
+    assert s.events == [
+        "classify", "open_pidfd", "read_identity", "revalidate", "signal", "await_exit",
+        "read_identity", "close_pidfd",
+    ]
+    assert s.closed_pidfds == [73]
+
+
+@pytest.mark.parametrize(
+    ("label", "mutate"),
+    (
+        ("pre_bind_missing_supervisor", lambda e: replace(e, expected_supervisor=None)),
+        ("pre_bind_entry_present", lambda e: replace(e, expected_entry=(1, 2))),
+        ("pre_bind_inode_present", lambda e: replace(e, expected_socket_inode=3)),
+        ("pre_bind_ticks_invalid", lambda e: replace(
+            e, expected_identity=ProcessIdentity(pid=e.expected_identity.pid, start_ticks=-1),
+        )),
+        ("pre_bind_uid_invalid", lambda e: replace(e, expected_uid=-1)),
+        ("pre_bind_socket_argv_missing", lambda e: replace(e, expected_socket_name="")),
+        ("bound_entry_missing", lambda e: replace(
+            e, stage="bound", expected_entry=None, expected_socket_inode=3,
+        )),
+        ("bound_inode_missing", lambda e: replace(
+            e, stage="bound", expected_entry=(1, 2), expected_socket_inode=None,
+        )),
+    ),
+)
+def test_strict_incomplete_stage_evidence_refuses_before_pidfd(
+    strict_signal_observer, label, mutate,
+):
+    del label
+    s = strict_signal_observer
+    s.evidence = mutate(s.evidence)
+    result = run(
+        s.terminate(
+            s.identity_value, OWNER, RUNTIME, 5.0,
+            strict=True, evidence=s.evidence, revalidate=s.revalidate,
+        )
+    )
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.dependency_incompatible
+    assert "open_pidfd" not in s.events
+    assert s.numeric_signals == s.pidfd_signals == []
 
 
 def test_identity_of_a_foreign_pid_is_exact_and_not_owned():

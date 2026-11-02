@@ -5,13 +5,19 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import replace
+from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from airplay_linux.backend.contract import (
     BackendFeatures,
+    BackendSource,
     DevicesReply,
+    StatusReply,
+    _decode_source,
     decode_devices,
     decode_status,
     features_from_help,
@@ -22,6 +28,69 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
+
+
+def test_source_position_must_be_present_and_integral():
+    from airplay_linux.backend.contract import BackendStream
+
+    source = {"type": 1, "width": 1920, "height": 1080, "x": 0, "y": -1080, "has_position": True}
+    decoded = _decode_source(source)
+    assert decoded == BackendSource(type=1, width=1920, height=1080, x=0, y=-1080)
+    assert BackendStream(
+        device="DP-1", target="192.0.2.1", state="streaming",
+        has_audio=False, audio_muted=False,
+    ).source is None
+    for axis in ("x", "y"):
+        missing = {key: value for key, value in source.items() if key != axis}
+        assert isinstance(_decode_source(missing), Err)
+        for bad in (None, True, False, "0", 0.5):
+            assert isinstance(_decode_source({**source, axis: bad}), Err)
+    for invalid in (
+        None,
+        [],
+        {**source, "extra": 1},
+        {**source, "width": 0},
+        {**source, "type": 0},
+        {**source, "type": 2**32},
+    ):
+        assert isinstance(_decode_source(invalid), Err)
+
+
+def test_source_position_availability_is_required():
+    source = {"type": 1, "width": 1920, "height": 1080, "x": 0, "y": 0, "has_position": True}
+    assert _decode_source(source) == BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    assert isinstance(_decode_source({key: value for key, value in source.items() if key != "has_position"}), Err)
+    for unavailable in (False, None, 0, 1, "true", [], {}):
+        assert isinstance(_decode_source({**source, "has_position": unavailable}), Err)
+    assert isinstance(_decode_source({"Type": 1, "Width": 1920, "Height": 1080, "X": 0, "Y": 0}), Err)
+
+
+def test_status_stream_source_uses_the_published_go_field_names():
+    decoded = decode_status({
+        "ok": True, "state": "streaming", "has_audio": False, "audio_muted": False,
+        "device": "DP-1", "device_ip": "192.0.2.1",
+        "streams": [{
+            "device": "DP-1", "device_ip": "192.0.2.1", "state": "streaming",
+            "has_audio": False, "audio_muted": False,
+            "source": {"type": 1, "width": 1920, "height": 1080, "x": -1920, "y": 0, "has_position": True},
+        }],
+    })
+    assert isinstance(decoded, StatusReply)
+    assert decoded.streams[0].source == BackendSource(
+        type=1, width=1920, height=1080, x=-1920, y=0,
+    )
+
+    sender = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    for tokens, complete in (
+        (frozenset({"capabilities-v1", "status-source"}), False),
+        (frozenset({"capabilities-v1", "status-source", "status-source-complete"}), True),
+        (frozenset({"capabilities-v1", "status-source-complete"}), False),
+    ):
+        features = features_from_help(sender, ctl, advertised=tokens)
+        assert features.source_reporting is complete or "status-source" in tokens
+        assert features.source_reporting_complete is complete
+        assert type(features.source_reporting_complete) is bool
 
 
 def test_legacy_help_does_not_prove_safe_sources_or_pairing():
@@ -812,3 +881,204 @@ def test_probe_ignores_a_capability_banner_from_a_nonzero_exit():
     assert isinstance(result, Ok), result
     assert result.value.profile == "doubletake-unknown"
     assert result.value.source_reporting is False
+
+
+@pytest.fixture
+def composition_capability_cases():
+    """Captured launch and inventory evidence; no process or desktop I/O."""
+    class Launcher:
+        def __init__(self, *, production_graph=True, available=True, ambient=None):
+            self.production_graph = production_graph
+            self._available = available
+            self._ambient = ambient
+
+        def available(self):
+            return self._available
+
+        def ambient_socket(self):
+            return self._ambient
+
+        def argv(self, socket_path):
+            raise AssertionError("pure derivation must not build a launch")
+
+    return SimpleNamespace(
+        eligible=Launcher(), unavailable=Launcher(available=False),
+        nonproduction=Launcher(production_graph=False),
+        ambient=Launcher(ambient="/unowned/control.sock"),
+        inventory=SimpleNamespace(physical_inventory_available=True),
+        empty_inventory=SimpleNamespace(physical_inventory_available=False),
+    )
+
+
+def test_owned_control_is_composition_only(composition_capability_cases):
+    from airplay_linux.backend.contract import CredentialProofVerdict
+    from airplay_linux.runtime import derive_composition_capabilities
+
+    cases = composition_capability_cases
+    passed = CredentialProofVerdict(
+        service_leg="passed", backend_positive_leg="passed",
+        backend_negative_leg="passed", failure=None,
+    )
+    owned_tokens = frozenset({
+        "capabilities-v1", "status-source", "status-source-complete",
+        "owned_daemon_control", "foreground_control", "owner_handshake", "keyring",
+    })
+    for sender in ((FIXTURES / "doubletake-0.5-help.txt").read_text(), _SOURCE_SENDER):
+        for tokens in (frozenset(), _ADVERTISEMENT, owned_tokens):
+            decoded = features_from_help(sender, _CTL, advertised=tokens)
+            assert decoded.owned_daemon_control is False
+            assert decoded.source_reporting_complete is (
+                sender == _SOURCE_SENDER and tokens == owned_tokens
+            )
+            assert decoded.foreground_control is False
+            assert decoded.owner_handshake is False
+            assert decoded.keyring is False
+
+    process = _ProbeProcess([
+        _streams(stderr=_SOURCE_SENDER), _streams(stderr=_CTL, exit_code=2),
+        _streams(stdout="\n".join(owned_tokens)), _streams(stdout="doubletake 0.5.0\n"),
+    ])
+    raw = asyncio.run(probe_backend(process))
+    assert isinstance(raw, Ok)
+    assert raw.value.profile == "doubletake-0.5+source"
+    assert raw.value.owned_daemon_control is False, "raw probe must never grant ownership"
+    assert raw.value.source_reporting_complete is True
+    assert raw.value.foreground_control is False
+    assert raw.value.owner_handshake is False
+    assert raw.value.keyring is False
+
+    # Complete-source recognition is installed in Task 7. Its frozen output seam
+    # can already exercise every pure composition conjunct here.
+    complete = replace(raw.value, source_reporting_complete=True)
+    derived = derive_composition_capabilities(
+        complete, cases.eligible, passed, cases.inventory, None,
+    )
+    assert derived.owned_daemon_control is True
+    assert derived.physical_source is True
+    assert derived.keyring is True
+    assert derived.foreground_control is False
+    assert derived.owner_handshake is False
+    assert raw.value.physical_source is False
+
+    for launcher, ambient in (
+        (cases.unavailable, None), (cases.nonproduction, None),
+        (cases.ambient, cases.ambient.ambient_socket()),
+    ):
+        refused = derive_composition_capabilities(complete, launcher, passed, cases.inventory, ambient)
+        assert refused.owned_daemon_control is False
+        assert refused.physical_source is True
+        assert refused.keyring is True
+
+    for evidence, verifier in (
+        (raw.value, cases.inventory), (complete, None), (complete, cases.empty_inventory),
+    ):
+        refused = derive_composition_capabilities(evidence, cases.eligible, passed, verifier, None)
+        assert refused.physical_source is (verifier is cases.inventory)
+        assert refused.owned_daemon_control is True
+
+
+def test_composition_feature_defaults_require_exact_bools():
+    raw = features_from_help(_SOURCE_SENDER, _CTL, advertised=_ADVERTISEMENT)
+    for name in ("owned_daemon_control", "source_reporting_complete"):
+        assert getattr(raw, name) is False
+        assert raw.supports(name) is False
+        assert replace(raw, **{name: True}).supports(name) is True
+        for invalid in (0, 1, None, "true"):
+            with pytest.raises(TypeError, match="must be a boolean"):
+                replace(raw, **{name: invalid})
+
+
+def test_credential_proof_requires_three_passed_legs_and_consistent_failure(composition_capability_cases):
+    from airplay_linux.backend.contract import CredentialProofVerdict
+    from airplay_linux.runtime import derive_composition_capabilities
+
+    raw = features_from_help(_SOURCE_SENDER, _CTL, advertised=_ADVERTISEMENT)
+    for legs in product(("passed", "failed", "not_run"), repeat=3):
+        failure = ErrorCode.keyring_unavailable if "failed" in legs else None
+        verdict = CredentialProofVerdict(
+            service_leg=legs[0], backend_positive_leg=legs[1],
+            backend_negative_leg=legs[2], failure=failure,
+        )
+        assert verdict.proven is (legs == ("passed", "passed", "passed"))
+        result = derive_composition_capabilities(
+            raw, composition_capability_cases.eligible, verdict, None, None,
+        )
+        assert result.keyring is verdict.proven
+    for invalid in (True, 1, None, [], "unknown"):
+        with pytest.raises((TypeError, ValueError), match="credential proof"):
+            CredentialProofVerdict(
+                service_leg=invalid, backend_positive_leg="not_run",
+                backend_negative_leg="not_run", failure=None,
+            )
+    for legs, failure in (
+        (("failed", "not_run", "not_run"), None),
+        (("passed", "passed", "passed"), ErrorCode.keyring_unavailable),
+        (("not_run", "not_run", "not_run"), "keyring_unavailable"),
+    ):
+        with pytest.raises((TypeError, ValueError), match="credential proof"):
+            CredentialProofVerdict(
+                service_leg=legs[0], backend_positive_leg=legs[1],
+                backend_negative_leg=legs[2], failure=failure,
+            )
+
+
+def test_production_launcher_captures_eligibility_and_builds_only_private_argv(tmp_path, monkeypatch):
+    import os
+
+    from airplay_linux.process.launcher import ProductionLaunchCapability
+
+    raw = features_from_help(_SOURCE_SENDER, _CTL, advertised=_ADVERTISEMENT)
+    root = tmp_path / "r"
+    root.mkdir(mode=0o700)
+    launcher = ProductionLaunchCapability(raw, root, production_graph=True)
+    assert launcher.available() is True
+    assert launcher.ambient_socket() is None
+    assert str(root) not in repr(launcher)
+
+    def no_io(*args, **kwargs):
+        raise AssertionError("captured launch capability performed filesystem I/O")
+
+    monkeypatch.setattr(os, "open", no_io)
+    monkeypatch.setattr(os, "stat", no_io)
+    assert launcher.available() is True
+    assert launcher.argv(str(root / "daemon.sock")) == (
+        "doubletake", "-daemonize", "-socket", str(root / "daemon.sock"),
+        "-cred-backend", "keyring",
+    )
+    for path in (
+        "daemon.sock", str(tmp_path / "elsewhere.sock"), str(root),
+        str(root / ".." / "escape.sock"), str(root) + "/./daemon.sock",
+        str(root) + "//daemon.sock", str(root) + "/bad\0.sock", str(root / ("x" * 108)),
+    ):
+        with pytest.raises(ValueError, match="^invalid owned daemon socket path$"):
+            launcher.argv(path)
+
+
+def test_production_launcher_refuses_unproven_surface_root_or_origin(tmp_path):
+    from airplay_linux.process.launcher import ProductionLaunchCapability
+
+    raw = features_from_help(_SOURCE_SENDER, _CTL, advertised=_ADVERTISEMENT)
+    root = tmp_path / "r"
+    root.mkdir(mode=0o700)
+    public = features_from_help((FIXTURES / "doubletake-0.5-help.txt").read_text(), _CTL)
+    assert ProductionLaunchCapability(public, root, production_graph=True).available() is True
+    for evidence, path, kwargs in (
+        (features_from_help("-daemonize -socket -cred-backend", ""), root, {"production_graph": True}),
+        (raw, root, {"production_graph": False}),
+        (raw, root, {"production_graph": True, "ambient_socket": "/unowned/control.sock"}),
+        (raw, Path("relative"), {"production_graph": True}),
+        (raw, tmp_path / "missing", {"production_graph": True}),
+    ):
+        launcher = ProductionLaunchCapability(evidence, path, **kwargs)
+        assert launcher.available() is False
+    root.chmod(0o755)
+    assert ProductionLaunchCapability(raw, root, production_graph=True).available() is False
+    root.chmod(0o500)
+    assert ProductionLaunchCapability(raw, root, production_graph=True).available() is False
+    root.chmod(0o700)
+    link = tmp_path / "link"
+    link.symlink_to(root, target_is_directory=True)
+    assert ProductionLaunchCapability(raw, link, production_graph=True).available() is False
+    child = root / "child"
+    child.mkdir(mode=0o700)
+    assert ProductionLaunchCapability(raw, link / "child", production_graph=True).available() is False

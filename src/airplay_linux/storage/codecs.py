@@ -35,7 +35,7 @@ import math
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Final, NamedTuple, NoReturn
+from typing import Final, NamedTuple, NoReturn, TypeVar
 from uuid import UUID
 
 from airplay_linux.diagnostics import diagnostic
@@ -54,6 +54,12 @@ from airplay_linux.domain.operations import (
     StreamHandle,
 )
 from airplay_linux.domain.records import (
+    AuthorityOwner,
+    DaemonCleanupIntent,
+    DaemonReservation,
+    LaunchReceipt,
+    ProbeVerdict,
+    SupervisorReleaseIntent,
     DaemonRecord,
     LayoutSnapshot,
     OwnershipRecord,
@@ -1090,7 +1096,347 @@ CREDENTIAL_REFERENCE_CONFLICT: Final[_ResolvedInterfaceConflict] = _ResolvedInte
 )
 
 
+# --------------------------------------------------------------------------- strict lifecycle documents
+# These projections deliberately do not change legacy helpers/ingestion. In particular,
+# legacy ProcessCodec permits PID zero and legacy JSON tolerates duplicate/whitespace.
+
+DAEMON_RESERVATION_SCHEMA: Final = "airplay-linux/daemon-reservation"
+LAUNCH_RECEIPT_SCHEMA: Final = "airplay-linux/launch-receipt"
+DAEMON_CLEANUP_INTENT_SCHEMA: Final = "airplay-linux/daemon-cleanup-intent"
+SUPERVISOR_RELEASE_INTENT_SCHEMA: Final = "airplay-linux/supervisor-release-intent"
+AUTHORITY_OWNER_SCHEMA: Final = "airplay-linux/daemon-authority-owner/v1"
+PROBE_VERDICT_SCHEMA: Final = "airplay-linux/credential-service-proof"
+
+
+def _new_text(value: object, *, limit: int = MAX_TEXT) -> str:
+    text = _text(value, allow_empty=False)
+    if len(text) > limit:
+        _invalid()
+    try:
+        text.encode("utf-8")
+    except UnicodeError:
+        _invalid()
+    return text
+
+
+def _new_identifier(value: object) -> str:
+    return _new_text(value, limit=MAX_IDENTIFIER)
+
+
+def _new_uuid(value: object) -> UUID:
+    text = _new_identifier(value)
+    try:
+        parsed = UUID(text)
+    except (ValueError, TypeError, AttributeError):
+        _invalid()
+    if str(parsed) != text:
+        _invalid()
+    return parsed
+
+
+def _new_uuid_dump(value: object) -> str:
+    if type(value) is not UUID:
+        _invalid()
+    return str(value)
+
+
+_NEW_UUID = _Codec(dump=_new_uuid_dump, load=_new_uuid)
+
+
+def _new_boot(value: object) -> str:
+    return str(_new_uuid(value))
+
+
+def _new_path(value: object) -> str:
+    text = _new_text(value)
+    if not text.startswith("/") or any(part in {"", ".", ".."} for part in text.split("/")[1:]):
+        _invalid()
+    return text
+
+
+def _new_basename(value: object) -> str:
+    text = _new_identifier(value)
+    if "/" in text or text in {".", ".."}:
+        _invalid()
+    return text
+
+
+def _new_time(value: object) -> float:
+    return _number(value)
+
+
+_NEW_PROCESS_FIELDS = (
+    ("pid", _plain(lambda value: _integer(value, low=1, high=2**31 - 1))),
+    ("start_ticks", _plain(_integer)),
+)
+
+
+def _new_process_dump(value: object) -> object:
+    if type(value) is not ProcessIdentity:
+        _invalid()
+    return _fields_of(value, _NEW_PROCESS_FIELDS)
+
+
+def _new_process_load(value: object) -> ProcessIdentity:
+    return ProcessIdentity(**_object(value, _NEW_PROCESS_FIELDS))
+
+
+_NEW_PROCESS = _Codec(dump=_new_process_dump, load=_new_process_load)
+_NEW_VERSION = _plain(lambda value: _integer(value, low=1, high=1))
+_NEW_RESERVATION_FIELDS = (
+    ("schema_version", _NEW_VERSION),
+    ("launch_uuid", _NEW_UUID),
+    ("instance_uuid", _NEW_UUID),
+    ("app", _NEW_PROCESS),
+    ("owner_uid", _plain(_integer)),
+    ("boot_id", _plain(_new_boot)),
+    ("runtime_directory", _plain(_new_path)),
+    ("runtime_device", _plain(_integer)),
+    ("runtime_inode", _plain(lambda value: _integer(value, low=1))),
+    ("endpoint_generation", _plain(lambda value: _integer(value, low=1))),
+    ("socket_name", _plain(_new_basename)),
+    ("protocol_version", _plain(_new_identifier)),
+)
+_NEW_RECEIPT_FIELDS = _NEW_RESERVATION_FIELDS + (
+    ("state", _plain(_frozen(frozenset({"reserved", "detached", "bound", "ready", "stopping", "stopped", "failed"})))),
+    ("daemon_instance_uuid", _nullable(_NEW_UUID)),
+    ("supervisor", _nullable(_NEW_PROCESS)),
+    ("daemon", _nullable(_NEW_PROCESS)),
+    ("entry_device", _nullable(_plain(_integer))),
+    ("entry_inode", _nullable(_plain(lambda value: _integer(value, low=1)))),
+    ("socket_inode", _nullable(_plain(lambda value: _integer(value, low=1)))),
+    ("peer_pid", _nullable(_plain(lambda value: _integer(value, low=1, high=2**31 - 1)))),
+    ("peer_start_ticks", _nullable(_plain(_integer))),
+    ("peer_uid", _nullable(_plain(_integer))),
+    ("status_state", _nullable(_plain(_frozen(frozenset({"idle", "discovering", "connecting", "streaming", "pin_required"}))))),
+    ("credential_service", _plain(_frozen(frozenset({"keyring_proven", "file_refused", "unknown"})))),
+    ("failure", _nullable(_ERROR_CODE)),
+    ("updated_at", _plain(_new_time)),
+)
+
+
+def _new_outcome_dump(value: object) -> object:
+    if value is None or type(value) is str and value == "stopped":
+        return value
+    return _ERROR_CODE.dump(value)
+
+
+def _new_outcome_load(value: object) -> object:
+    if value is None or type(value) is str and value == "stopped":
+        return value
+    return _ERROR_CODE.load(value)
+
+
+_NEW_CLEANUP_FIELDS = (
+    ("launch_uuid", _NEW_UUID), ("reason", _ERROR_CODE), ("intent_at", _plain(_new_time)),
+    ("completed_at", _nullable(_plain(_new_time))),
+    ("outcome", _Codec(dump=_new_outcome_dump, load=_new_outcome_load)),
+)
+_NEW_SUPERVISOR_FIELDS = (
+    ("schema_version", _NEW_VERSION), ("launch_uuid", _NEW_UUID), ("instance_uuid", _NEW_UUID),
+    ("app", _NEW_PROCESS), ("supervisor", _NEW_PROCESS), ("daemon", _NEW_PROCESS),
+    ("reason", _plain(_frozen(frozenset({"application-exited", "parent-mismatch"})))),
+    ("intent_at", _plain(_new_time)),
+)
+_NEW_OWNER_FIELDS = (
+    ("schema", _plain(_frozen(frozenset({AUTHORITY_OWNER_SCHEMA})))),
+    ("instance_uuid", _NEW_UUID), ("app", _NEW_PROCESS),
+    ("boot_id", _plain(_new_boot)), ("acquired_at", _plain(_new_time)),
+)
+_NEW_LEG = _plain(_frozen(frozenset({"passed", "failed", "not_run"})))
+_NEW_VERDICT_FIELDS = (
+    ("schema", _plain(_frozen(frozenset({PROBE_VERDICT_SCHEMA})))), ("version", _NEW_VERSION),
+    ("service_leg", _NEW_LEG), ("backend_positive_leg", _NEW_LEG),
+    ("backend_negative_leg", _NEW_LEG), ("failure", _nullable(_ERROR_CODE)),
+)
+
+
+def _new_receipt_consistency(values: dict[str, object]) -> None:
+    state = values["state"]
+    identities = tuple(values[name] for name in ("daemon_instance_uuid", "supervisor", "daemon"))
+    endpoint = tuple(values[name] for name in (
+        "entry_device", "entry_inode", "socket_inode", "peer_pid", "peer_start_ticks", "peer_uid",
+    ))
+    has_identity = all(value is not None for value in identities)
+    has_endpoint = all(value is not None for value in endpoint)
+    # A lone complete group cannot conceal a partial sibling group.
+    if any(value is not None for value in identities) and not has_identity:
+        _invalid()
+    if any(value is not None for value in endpoint) and not has_endpoint:
+        _invalid()
+    if has_identity and values["daemon_instance_uuid"] in (values["instance_uuid"], values["launch_uuid"]):
+        _invalid()
+    if has_endpoint:
+        if not has_identity:
+            _invalid()
+        daemon = values["daemon"]
+        if (values["peer_pid"], values["peer_start_ticks"], values["peer_uid"]) != (
+            daemon.pid, daemon.start_ticks, values["owner_uid"],
+        ):
+            _invalid()
+    observed_status = values["status_state"] is not None or values["credential_service"] != "unknown"
+    if observed_status and not has_endpoint:
+        _invalid()
+    if state == "reserved" and (has_identity or has_endpoint or observed_status):
+        _invalid()
+    if state == "detached" and (not has_identity or has_endpoint or observed_status):
+        _invalid()
+    if state in {"bound", "ready"} and not has_endpoint:
+        _invalid()
+    if state == "ready" and (values["status_state"] != "idle" or values["credential_service"] != "keyring_proven"):
+        _invalid()
+    if (state == "failed") != (values["failure"] is not None):
+        _invalid()
+
+
+def _new_cleanup_consistency(values: dict[str, object]) -> None:
+    completed, outcome = values["completed_at"], values["outcome"]
+    if (completed is None) != (outcome is None):
+        _invalid()
+
+
+def _new_verdict_consistency(values: dict[str, object]) -> None:
+    legs = tuple(values[name] for name in ("service_leg", "backend_positive_leg", "backend_negative_leg"))
+    if "failed" in legs and values["failure"] is None:
+        _invalid()
+    if all(leg == "passed" for leg in legs) and values["failure"] is not None:
+        _invalid()
+
+
+def _new_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    document: dict[str, object] = {}
+    for name, value in pairs:
+        if name in document:
+            raise RecordError("malformed_json")
+        document[name] = value
+    return document
+
+
+def _new_json(payload: bytes, *, bounded_verdict: bool = False) -> dict[str, object]:
+    if type(payload) is not bytes or not payload or bounded_verdict and len(payload) > MAX_TEXT:
+        raise RecordError("malformed_json")
+    try:
+        text = payload.decode("utf-8")
+        decoder = json.JSONDecoder(object_pairs_hook=_new_pairs, parse_constant=lambda value: _invalid())
+        document, end = decoder.raw_decode(text, len(text) - len(text.lstrip(" \t\n\r")))
+        if end != len(text):
+            raise RecordError("malformed_json")
+    except (ValueError, UnicodeError, RecursionError):
+        raise RecordError("malformed_json") from None
+    if type(document) is not dict:
+        raise RecordError("not_an_object")
+    return document
+
+
+_NewRecord = TypeVar("_NewRecord")
+
+
+def _new_members(
+    document: dict[str, object], schema: str,
+    fields: tuple[tuple[str, _Codec], ...], envelope: bool,
+) -> dict[str, object]:
+    expected = {name for name, _ in fields} | ({"schema", "version"} if envelope else set())
+    if set(document) - expected:
+        raise RecordError("unknown_field")
+    if expected - set(document):
+        raise RecordError("missing_field")
+    if type(document["schema"]) is not str or document["schema"] != schema:
+        raise RecordError("unknown_schema")
+    if "version" in expected and (type(document["version"]) is not int or document["version"] != 1):
+        raise RecordError("unknown_version")
+    return _object({name: document[name] for name, _ in fields}, fields)
+
+
+def _new_encode(
+    record: object, cls: type[_NewRecord], schema: str,
+    fields: tuple[tuple[str, _Codec], ...], *, envelope: bool = True,
+    consistency: Callable[[dict[str, object]], None] | None = None,
+) -> bytes:
+    if type(record) is not cls:
+        _invalid()
+    # Each leaf is validated before projection dereferences an identity or enum.
+    document = _fields_of(record, fields)
+    if envelope:
+        document = {"schema": schema, "version": 1, **document}
+    values = _new_members(document, schema, fields, envelope)
+    if consistency is not None:
+        consistency(values)
+    try:
+        raw = json.dumps(document, separators=(",", ":"), sort_keys=True, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, OverflowError):
+        _invalid()
+    if cls is ProbeVerdict and len(raw) > MAX_TEXT:
+        _invalid()
+    return raw
+
+
+def _new_decode(
+    payload: bytes, cls: type[_NewRecord], schema: str,
+    fields: tuple[tuple[str, _Codec], ...], *, envelope: bool = True,
+    consistency: Callable[[dict[str, object]], None] | None = None,
+) -> _NewRecord:
+    document = _new_json(payload, bounded_verdict=cls is ProbeVerdict)
+    values = _new_members(document, schema, fields, envelope)
+    if consistency is not None:
+        consistency(values)
+    return cls(**values)
+
+
+def encode_daemon_reservation(record: DaemonReservation) -> bytes:
+    return _new_encode(record, DaemonReservation, DAEMON_RESERVATION_SCHEMA, _NEW_RESERVATION_FIELDS)
+
+
+def decode_daemon_reservation(payload: bytes) -> DaemonReservation:
+    return _new_decode(payload, DaemonReservation, DAEMON_RESERVATION_SCHEMA, _NEW_RESERVATION_FIELDS)
+
+
+def encode_launch_receipt(record: LaunchReceipt) -> bytes:
+    return _new_encode(record, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+
+
+def decode_launch_receipt(payload: bytes) -> LaunchReceipt:
+    return _new_decode(payload, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+
+
+def encode_daemon_cleanup_intent(record: DaemonCleanupIntent) -> bytes:
+    return _new_encode(record, DaemonCleanupIntent, DAEMON_CLEANUP_INTENT_SCHEMA, _NEW_CLEANUP_FIELDS, consistency=_new_cleanup_consistency)
+
+
+def decode_daemon_cleanup_intent(payload: bytes) -> DaemonCleanupIntent:
+    return _new_decode(payload, DaemonCleanupIntent, DAEMON_CLEANUP_INTENT_SCHEMA, _NEW_CLEANUP_FIELDS, consistency=_new_cleanup_consistency)
+
+
+def encode_supervisor_release_intent(record: SupervisorReleaseIntent) -> bytes:
+    return _new_encode(record, SupervisorReleaseIntent, SUPERVISOR_RELEASE_INTENT_SCHEMA, _NEW_SUPERVISOR_FIELDS)
+
+
+def decode_supervisor_release_intent(payload: bytes) -> SupervisorReleaseIntent:
+    return _new_decode(payload, SupervisorReleaseIntent, SUPERVISOR_RELEASE_INTENT_SCHEMA, _NEW_SUPERVISOR_FIELDS)
+
+
+def encode_authority_owner(record: AuthorityOwner) -> bytes:
+    return _new_encode(record, AuthorityOwner, AUTHORITY_OWNER_SCHEMA, _NEW_OWNER_FIELDS, envelope=False)
+
+
+def decode_authority_owner(payload: bytes) -> AuthorityOwner:
+    return _new_decode(payload, AuthorityOwner, AUTHORITY_OWNER_SCHEMA, _NEW_OWNER_FIELDS, envelope=False)
+
+
+def encode_probe_verdict(record: ProbeVerdict) -> bytes:
+    return _new_encode(record, ProbeVerdict, PROBE_VERDICT_SCHEMA, _NEW_VERDICT_FIELDS, envelope=False, consistency=_new_verdict_consistency)
+
+
+def decode_probe_verdict(payload: bytes) -> ProbeVerdict:
+    return _new_decode(payload, ProbeVerdict, PROBE_VERDICT_SCHEMA, _NEW_VERDICT_FIELDS, envelope=False, consistency=_new_verdict_consistency)
+
+
 __all__ = [
+    "DAEMON_RESERVATION_SCHEMA", "LAUNCH_RECEIPT_SCHEMA", "DAEMON_CLEANUP_INTENT_SCHEMA",
+    "SUPERVISOR_RELEASE_INTENT_SCHEMA", "AUTHORITY_OWNER_SCHEMA", "PROBE_VERDICT_SCHEMA",
+    "encode_daemon_reservation", "decode_daemon_reservation", "encode_launch_receipt", "decode_launch_receipt",
+    "encode_daemon_cleanup_intent", "decode_daemon_cleanup_intent",
+    "encode_supervisor_release_intent", "decode_supervisor_release_intent",
+    "encode_authority_owner", "decode_authority_owner", "encode_probe_verdict", "decode_probe_verdict",
     "CREDENTIAL_REFERENCE_CONFLICT",
     "DAEMON_SCHEMA",
     "DESIRED_STATES",

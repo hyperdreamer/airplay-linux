@@ -13,11 +13,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from inspect import Parameter, signature
 from functools import lru_cache
+from typing import TYPE_CHECKING
 
-from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply
+from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
-    Handshake, ModesPayload, MutePayload, requires_dispatch_fence,
+    Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
@@ -44,7 +45,13 @@ from airplay_linux.trust.keyring import KeyringPairingPort
 
 from .targets import TargetRegistry
 
+if TYPE_CHECKING:
+    from airplay_linux.capture.source import ReportedSourceVerifier
+
+
 CONTROL_TIMEOUT = 5.0
+SOURCE_TIMEOUT = 5.0
+SOURCE_POLL_INTERVAL = 0.1
 SHUTDOWN_TIMEOUT = 15.0
 
 
@@ -92,11 +99,34 @@ def _request_accepts_dispatch_fence(method: object) -> bool:
     )
 
 
+@lru_cache(maxsize=None)
+def _request_accepts_ownership_proof(method: object) -> bool:
+    try:
+        parameters = signature(method).parameters
+    except (TypeError, ValueError):
+        return False
+    candidate = parameters.get("ownership_proof")
+    if candidate is not None and candidate.kind in {
+        Parameter.POSITIONAL_OR_KEYWORD, Parameter.KEYWORD_ONLY,
+        Parameter.VAR_KEYWORD,
+    }:
+        return True
+    return any(
+        parameter.kind is Parameter.VAR_KEYWORD for parameter in parameters.values()
+    )
+
 def _accepts_dispatch_fence(control: object) -> bool:
     method = getattr(control, "request", None)
     if method is None:
         return False
     return _request_accepts_dispatch_fence(getattr(method, "__func__", method))
+
+
+def _accepts_ownership_proof(control: object) -> bool:
+    method = getattr(control, "request", None)
+    if method is None:
+        return False
+    return _request_accepts_ownership_proof(getattr(method, "__func__", method))
 
 
 async def _safe(operation: Awaitable, code: ErrorCode = ErrorCode.transport_failed):
@@ -132,6 +162,7 @@ class _Subscription:
 class _Daemon:
     record: DaemonRecord
     control: BackendControl
+    ownership_proof: OwnershipProof | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     authenticated: bool = False
     alive: bool = True
@@ -299,11 +330,13 @@ class DoubleTakeTransport:
         registry: DaemonRegistry, capture: CapturePort, credentials: CredentialStore,
         receivers: ReceiverStore, fences: TrustFenceRegistry, features: BackendFeatures,
         clock: Clock, scheduler: Scheduler, ids: IdFactory,
+        *, source_verifier: ReportedSourceVerifier | None = None,
     ) -> None:
         self._control_factory = control_factory
         self._registry, self._capture = registry, capture
         self._fences, self._features = fences, features
         self._clock, self._scheduler, self._ids = clock, scheduler, ids
+        self._source_verifier = source_verifier
         self._targets = TargetRegistry()
         self._daemons: dict[InstanceId, _Daemon] = {}
         self._unusable: set[InstanceId] = set()
@@ -408,12 +441,15 @@ class DoubleTakeTransport:
         task.add_done_callback(finished)
         return task
 
-    async def _wait(self, task: asyncio.Task, code: ErrorCode, abandon=None, *, timeout=CONTROL_TIMEOUT):
+    async def _wait(
+        self, task: asyncio.Task, code: ErrorCode, abandon=None, *, timeout=CONTROL_TIMEOUT,
+        timeout_until: asyncio.Future | None = None,
+    ):
         loop = asyncio.get_running_loop()
         deadline = loop.create_future()
 
         def expired():
-            if task.done() or deadline.done():
+            if task.done() or deadline.done() or (timeout_until is not None and timeout_until.done()):
                 return
             if abandon is not None:
                 abandon()
@@ -422,8 +458,17 @@ class DoubleTakeTransport:
         scheduled = self._scheduler.call_at(self._clock.now() + timeout, expired)
         realtime = loop.call_later(timeout, expired)
         try:
-            done, _ = await asyncio.wait((task, deadline), return_when=asyncio.FIRST_COMPLETED)
-            return task.result() if task in done else _failure(code)
+            waiting = (task, deadline) if timeout_until is None else (task, deadline, timeout_until)
+            done, _ = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+            if task in done:
+                return task.result()
+            if deadline in done:
+                return _failure(code)
+            # Connect has answered. Its admission timer must not preempt the
+            # bounded source wait or the exact-target cleanup that now owns time.
+            scheduled.cancel()
+            realtime.cancel()
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             if abandon is not None:
                 abandon()
@@ -432,6 +477,8 @@ class DoubleTakeTransport:
             scheduled.cancel()
             realtime.cancel()
             deadline.cancel()
+            if timeout_until is not None and not timeout_until.done():
+                timeout_until.cancel()
 
     def _current(self, target: ReceiverTarget, context: OperationContext) -> Result[None]:
         checked = self._targets.require_current(target)
@@ -447,7 +494,15 @@ class DoubleTakeTransport:
         checked = self._current(target, context)
         if isinstance(checked, Err):
             return checked
-        if not (self._features.foreground_control and self._features.owner_handshake and self._features.keyring):
+        if self._features.profile in {"doubletake-0.5", "doubletake-0.5+source"}:
+            admitted = self._features.owned_daemon_control and self._features.keyring
+        else:
+            admitted = (
+                self._features.foreground_control
+                and self._features.owner_handshake
+                and self._features.keyring
+            )
+        if not admitted:
             return _failure(ErrorCode.dependency_incompatible)
         ensured = await _safe(self._registry.ensure(), ErrorCode.daemon_failed)
         if isinstance(ensured, Err):
@@ -477,16 +532,25 @@ class DoubleTakeTransport:
             if not daemon.alive:
                 return _failure(ErrorCode.daemon_failed)
             if not daemon.authenticated:
-                proof = await _safe(daemon.control.handshake(record.owner_token, record.instance_uuid), ErrorCode.ownership_mismatch)
+                proof = await _safe(
+                    daemon.control.handshake(record.owner_token, record.instance_uuid),
+                    ErrorCode.ownership_mismatch,
+                )
                 if isinstance(proof, Err):
                     return proof
-                h = proof.value
-                owner = h.owner_token.reveal_for_backend() if isinstance(h, Handshake) and isinstance(h.owner_token, SensitiveText) else getattr(h, "owner_token", None)
-                if not isinstance(h, Handshake) or (
-                    h.instance_uuid != record.instance_uuid or owner != record.owner_token
-                    or h.daemon != record.daemon or h.protocol_version != record.protocol_version
-                ):
-                    return _failure(ErrorCode.ownership_mismatch)
+                value = proof.value
+                if isinstance(value, OwnershipProof):
+                    if value.kind != "evidence" or value.daemon != record.daemon:
+                        return _failure(ErrorCode.ownership_mismatch)
+                    daemon.ownership_proof = value
+                else:
+                    h = value
+                    owner = h.owner_token.reveal_for_backend() if isinstance(h, Handshake) and isinstance(h.owner_token, SensitiveText) else getattr(h, "owner_token", None)
+                    if not isinstance(h, Handshake) or (
+                        h.instance_uuid != record.instance_uuid or owner != record.owner_token
+                        or h.daemon != record.daemon or h.protocol_version != record.protocol_version
+                    ):
+                        return _failure(ErrorCode.ownership_mismatch)
                 daemon.authenticated = True
             checked = self._current(target, context)
             if isinstance(checked, Err):
@@ -527,12 +591,14 @@ class DoubleTakeTransport:
             # a replacement admitted during the adapter's awaited ownership
             # revalidation would otherwise receive the command.
             return _failure(ErrorCode.dependency_incompatible)
+        request_kwargs: dict[str, object] = {}
         if fenced:
-            result = await _safe(daemon.control.request(
-                operation, target, payload, context, dispatch_fence=fence,
-            ))
-        else:
-            result = await _safe(daemon.control.request(operation, target, payload, context))
+            request_kwargs["dispatch_fence"] = fence
+        if _accepts_ownership_proof(daemon.control):
+            request_kwargs["ownership_proof"] = daemon.ownership_proof
+        result = await _safe(daemon.control.request(
+            operation, target, payload, context, **request_kwargs,
+        ))
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
         checked = self._targets.require_cleanup(target) if cleanup else self._current(target, context)
@@ -603,7 +669,8 @@ class DoubleTakeTransport:
             audio=AudioState.Starting if audio_policy.enabled else AudioState.Disabled,
         )
         self._streams[lease] = stream
-        acquisition = self._spawn(self._start(stream))
+        connected = asyncio.get_running_loop().create_future()
+        acquisition = self._spawn(self._start(stream, connected))
 
         def abandon() -> None:
             stream.abandoned = True
@@ -613,7 +680,9 @@ class DoubleTakeTransport:
             if acquisition.done() and stream.handle is not None and not stream.released:
                 self._spawn(self._abandon_completed(stream))
 
-        return await self._wait(acquisition, ErrorCode.transport_failed, abandon)
+        return await self._wait(
+            acquisition, ErrorCode.transport_failed, abandon, timeout_until=connected,
+        )
 
     async def _abandon_completed(self, stream: _Stream) -> Result[None]:
         cleaned = await self._stop_owned(stream, stream.context)
@@ -626,7 +695,81 @@ class DoubleTakeTransport:
             self._retired.pop(stream.handle, None)
         stream.released = True
 
-    async def _start(self, stream: _Stream) -> Result[StreamHandle]:
+    async def _verify_reported_source(self, stream: _Stream) -> Result[None]:
+        verifier = self._source_verifier
+        if verifier is None:
+            return Ok(value=None)
+        if self._features.source_reporting_complete is not True:
+            return _failure(ErrorCode.unsupported_source)
+        daemon = stream.daemon
+        if daemon is None or not daemon.alive or not daemon.authenticated:
+            return _failure(ErrorCode.stale_event)
+        deadline = self._clock.now() + SOURCE_TIMEOUT
+        polling = self._spawn(self._poll_reported_source(stream, deadline))
+        try:
+            return await self._wait(polling, ErrorCode.unsupported_source, timeout=SOURCE_TIMEOUT)
+        finally:
+            # Status and inventory reads confer no acquisition authority. Retire
+            # the poll on expiry so a late reply cannot publish or start a poll.
+            if not polling.done():
+                polling.cancel()
+
+    async def _poll_reported_source(self, stream: _Stream, deadline: float) -> Result[None]:
+        loop = asyncio.get_running_loop()
+        while self._clock.now() < deadline:
+            daemon = stream.daemon
+            if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
+                return _failure(ErrorCode.stale_event)
+            checked = self._current(stream.target, stream.context)
+            if isinstance(checked, Err):
+                return checked
+            status = await _safe(
+                daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
+                ErrorCode.unsupported_source,
+            )
+            if self._clock.now() >= deadline:
+                break
+            if isinstance(status, Ok) and isinstance(status.value, StatusReply):
+                matches = tuple(
+                    item for item in status.value.streams
+                    if item.target == stream.target.canonical_host
+                )
+                if (
+                    status.value.target == stream.target.canonical_host
+                    and (
+                        status.value.state == "pin_required"
+                        or status.value.needs_credential
+                        or status.value.credential_kind is not None
+                    )
+                ) or any(
+                    item.state == "pin_required" or item.credential_kind is not None
+                    for item in matches
+                ):
+                    return _failure(ErrorCode.dependency_incompatible)
+                if len(matches) == 1 and matches[0].source is not None:
+                    verified = await _safe(
+                        self._source_verifier.verify(stream.source.connector, matches[0].source),
+                        ErrorCode.unsupported_source,
+                    )
+                    return verified if self._clock.now() < deadline else _failure(ErrorCode.unsupported_source)
+            # Every read shares the same absolute deadline; incomplete or foreign
+            # observations cannot extend it or certify the requested connector.
+            wake = loop.create_future()
+
+            def tick():
+                if not wake.done():
+                    wake.set_result(None)
+
+            scheduled = self._scheduler.call_at(
+                min(self._clock.now() + SOURCE_POLL_INTERVAL, deadline), tick,
+            )
+            try:
+                await wake
+            finally:
+                scheduled.cancel()
+        return _failure(ErrorCode.unsupported_source)
+
+    async def _start(self, stream: _Stream, connected: asyncio.Future) -> Result[StreamHandle]:
         if isinstance(stream.source, PhysicalMonitorSource):
             verified = await _safe(self._capture.verify(stream.source), ErrorCode.unsupported_source)
             if isinstance(verified, Err):
@@ -653,6 +796,8 @@ class DoubleTakeTransport:
             result = await self._request(
                 stream.daemon, BackendOperation.connect, stream.target, ConnectPayload(), stream.context,
             )
+            if not connected.done():
+                connected.set_result(None)
             if isinstance(result, Err) and result.error.code in (
                 ErrorCode.receiver_rejected, ErrorCode.unsupported_source,
                 ErrorCode.unsupported_operation,
@@ -661,16 +806,42 @@ class DoubleTakeTransport:
                 return self._failed(stream, result)
             checked = self._current(stream.target, stream.context)
             if _ack(result, BackendOperation.connect, stream.target) and isinstance(checked, Ok) and not stream.abandoned and stream.daemon.alive:
-                stream.ready = result.value.state == "streaming"
-                if stream.ready:
-                    self._emit(stream, TransportEventKind.ready)
-                return Ok(value=stream.handle)
-            failure = result if isinstance(result, Err) else (
-                checked if isinstance(checked, Err) else _failure(ErrorCode.stale_event if stream.abandoned else ErrorCode.transport_failed)
-            )
+                if isinstance(stream.source, VirtualOutputSource) and result.value.state == "connecting":
+                    # Preserve the virtual acquisition contract: the caller owns
+                    # this handle while waiting for a separate readiness event.
+                    return Ok(value=stream.handle)
+                if self._features.owned_daemon_control and result.value.state == "pin_required":
+                    failure = _failure(ErrorCode.dependency_incompatible)
+                elif result.value.state != "streaming":
+                    failure = _failure(ErrorCode.unsupported_source)
+                else:
+                    source_checked = (
+                        await self._verify_reported_source(stream)
+                        if isinstance(stream.source, PhysicalMonitorSource)
+                        else Ok(value=None)
+                    )
+                    checked = self._current(stream.target, stream.context)
+                    if isinstance(source_checked, Err):
+                        failure = source_checked
+                    elif isinstance(checked, Err):
+                        failure = checked
+                    elif stream.abandoned or not stream.daemon.alive:
+                        failure = _failure(ErrorCode.stale_event)
+                    else:
+                        stream.ready = True
+                        self._emit(stream, TransportEventKind.ready)
+                        return Ok(value=stream.handle)
+            else:
+                failure = result if isinstance(result, Err) else (
+                    checked if isinstance(checked, Err) else _failure(
+                        ErrorCode.stale_event if stream.abandoned else ErrorCode.transport_failed
+                    )
+                )
         # Source provenance is local verification plus the affirmed feature;
         # the exact request ack supplies connect acceptance only.
-        cleaned = await self._stop_owned(stream, stream.context)
+        cleaned = await self._wait(
+            self._spawn(self._stop_owned(stream, stream.context)), ErrorCode.cleanup_timeout,
+        )
         return self._failed(stream, cleaned if isinstance(cleaned, Err) else failure)
 
     def _owned(self, handle: StreamHandle, context: OperationContext | None = None) -> Result[_Stream]:

@@ -18,7 +18,7 @@ index 20053db..f268585 100644
 +		// Stable, machine-readable tokens a supervisor can check before relying on
 +		// an optional operation. One token per line; the schema line comes first so a
 +		// newer consumer can tell an unknown format from an absent capability.
-+		for _, token := range []string{"capabilities-v1", "status-source"} {
++		for _, token := range []string{"capabilities-v1", "status-source", "status-source-complete"} {
 +			fmt.Println(token)
 +		}
 +		return

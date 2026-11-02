@@ -16,6 +16,8 @@ import signal
 import socket
 import stat
 import sys
+import time
+from typing import Literal, TYPE_CHECKING
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -29,15 +31,34 @@ from airplay_linux.backend.control import (
 )
 from airplay_linux.domain.operations import InstanceId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandSpec, DaemonStore, ProcessPort
-from airplay_linux.domain.records import DaemonRecord
-from airplay_linux.domain.resources import Err, Ok
+from airplay_linux.diagnostics import diagnostic
+from airplay_linux.domain.records import DaemonRecord, DaemonReservation, LaunchReceipt, SupervisorReleaseIntent
+from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.process.procfs import (
     OWNER_TOKEN_ENV, RUNTIME_DIRECTORY_ENV, IdentityState, read_identity,
     read_identity_evidence,
 )
 from airplay_linux.storage.atomic import AtomicFiles, StorageError
-from airplay_linux.storage.repositories import JsonDaemonStore
+from airplay_linux.storage.repositories import (
+    JsonDaemonStore, JsonLaunchReceiptStore, JsonSupervisorReleaseIntentStore,
+)
+
+if TYPE_CHECKING:
+    from airplay_linux.domain.ports import LaunchReceiptStore, SupervisorReleaseIntentStore
+    from airplay_linux.process.ownership import EndpointObservations
+    from airplay_linux.process.procfs import IdentityEvidence
+
+
+_RESERVATION_FIELDS = (
+    'schema_version', 'launch_uuid', 'instance_uuid', 'app', 'owner_uid', 'boot_id',
+    'runtime_directory', 'runtime_device', 'runtime_inode', 'endpoint_generation',
+    'socket_name', 'protocol_version',
+)
+
+
+def _refused(code: ErrorCode = ErrorCode.ownership_mismatch):
+    return Err(error=diagnostic(code))
 
 CONFIG_FD_ENV = 'AIRPLAY_LINUX_CONFIG_FD'
 CONFIG_LIMIT = 4096
@@ -173,6 +194,13 @@ class DaemonSupervisor:
         runtime_directory: Path, config_fd: int, process: ProcessPort | None = None,
         store: DaemonStore | None = None,
         control_factory: Callable[[DaemonRecord], BackendControl] | None = None,
+        reservation: DaemonReservation | None = None,
+        receipts: LaunchReceiptStore | None = None,
+        supervisor_intents: SupervisorReleaseIntentStore | None = None,
+        inspect_process: Callable[[int], IdentityEvidence] = read_identity_evidence,
+        own_identity: Callable[[], ProcessIdentity | None] | None = None,
+        observations: EndpointObservations | None = None,
+        receipt_source: Callable[[], Result[tuple[LaunchReceipt, ...]]] | None = None,
     ) -> None:
         self.app = app
         self.instance_uuid = instance_uuid
@@ -181,6 +209,15 @@ class DaemonSupervisor:
         self._process = process if process is not None else LinuxProcessRunner()
         self._store = store
         self._control_factory = control_factory
+        self._reservation = reservation
+        self._receipts = receipts
+        self._supervisor_intents = supervisor_intents
+        self._inspect = inspect_process
+        self._own_identity = own_identity or (lambda: read_identity(os.getpid()))
+        self._observations = observations
+        self._receipt_source = receipt_source
+        self._receipt_files: AtomicFiles | None = None
+        self.cleanup_required: str | None = None
 
     def run(self) -> int:
         try:
@@ -197,6 +234,8 @@ class DaemonSupervisor:
         _parent_death_signal(signal.SIGTERM)
         config = _read_config(self.config_fd)
         features = BackendFeatures(**config['features'])
+        if config.get('mode') == 'owned-daemon':
+            return await self._run_owned(config, features, stopping)
         if not (features.foreground_control and features.owner_handshake and features.keyring):
             return 1
         if not _parent_matches(self.app):
@@ -284,7 +323,260 @@ class DaemonSupervisor:
         finally:
             subscription.close()
 
-    async def _request_release(self, record: DaemonRecord, features: BackendFeatures) -> None:
+    def _snapshot(self) -> Result[tuple[LaunchReceipt, ...]]:
+        if self._receipt_source is not None:
+            return self._receipt_source()
+        from airplay_linux.storage.codecs import RecordError, decode_launch_receipt
+        from airplay_linux.storage.repositories import _lifecycle_all, LAUNCH_RECEIPT_DIRECTORY
+        if self._receipt_files is None:
+            return _refused()
+        try:
+            return Ok(value=_lifecycle_all(self._receipt_files, LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt))
+        except (StorageError, RecordError):
+            return _refused(ErrorCode.persistence_failed)
+
+    def _intent_snapshot(self) -> Result[SupervisorReleaseIntent | None]:
+        from airplay_linux.storage.codecs import RecordError, decode_supervisor_release_intent
+        from airplay_linux.storage.repositories import SUPERVISOR_RELEASE_INTENT_NAME
+        try:
+            payload = AtomicFiles(self.runtime_directory).read(SUPERVISOR_RELEASE_INTENT_NAME)
+            return Ok(value=None if payload is None else decode_supervisor_release_intent(payload))
+        except (StorageError, RecordError):
+            return _refused(ErrorCode.persistence_failed)
+
+    def _public_authority(self, features: BackendFeatures):
+        from airplay_linux.process.ownership import EvidenceAuthority
+        from airplay_linux.process.procfs import TerminationEvidence
+        return EvidenceAuthority(
+            receipts=self._snapshot, process=self._process, evidence_factory=TerminationEvidence,
+            observations=self._observations, features=features, reservation=self._reservation,
+            supervisor_intent=self._intent_snapshot,
+        )
+
+    def _app_absence(self) -> str | None:
+        evidence = self._inspect(self.app.pid)
+        if evidence.state in {IdentityState.absent, IdentityState.terminated}:
+            return 'application-exited'
+        if evidence.state is IdentityState.present and evidence.identity != self.app:
+            return 'parent-mismatch'
+        return None
+
+    async def _publish_release_intent(
+        self, record: DaemonRecord, reason: Literal['application-exited', 'parent-mismatch'],
+    ) -> Result[SupervisorReleaseIntent]:
+        reservation = self._reservation
+        if (
+            reservation is None or self._receipts is None or self._supervisor_intents is None
+            or self._store is None or reason != self._app_absence()
+            or record.app != self.app or record.instance_uuid != self.instance_uuid
+            or record.supervisor is None or record.supervisor != self._own_identity()
+            or record.daemon is None or reservation.app != self.app
+            or record.runtime_directory != reservation.runtime_directory
+            or record.socket_path != str(Path(reservation.runtime_directory) / reservation.socket_name)
+            or record.protocol_version != reservation.protocol_version
+        ):
+            return _refused()
+        observations = await self._store.all()
+        if isinstance(observations, Err):
+            return observations
+        matches = [r for r in observations.value if r.app == self.app
+                   and r.runtime_directory == record.runtime_directory
+                   and r.lifecycle in {'starting', 'running', 'stopping'}]
+        if len(matches) != 1 or any(getattr(matches[0], n) != getattr(record, n) for n in (
+            'instance_uuid', 'app', 'supervisor', 'daemon', 'runtime_directory', 'socket_path', 'protocol_version',
+        )):
+            return _refused()
+        child = self._inspect(record.daemon.pid)
+        parent = self._inspect(record.supervisor.pid)
+        if (
+            child.state is not IdentityState.present or child.identity != record.daemon
+            or child.parent != record.supervisor.pid or child.uid != reservation.owner_uid
+            or parent.state is not IdentityState.present or parent.identity != record.supervisor
+            or parent.uid != reservation.owner_uid
+        ):
+            return _refused()
+        receipts = await self._receipts.all()
+        if isinstance(receipts, Err):
+            return receipts
+        endpoint = [r for r in receipts.value if r.runtime_directory == record.runtime_directory
+                    and r.socket_name == reservation.socket_name]
+        selected = [r for r in endpoint if r.launch_uuid == reservation.launch_uuid]
+        if endpoint:
+            maximum = max(r.endpoint_generation for r in endpoint)
+            live = [r for r in endpoint if r.state not in {'failed', 'stopped'}]
+            if len(selected) != 1 or len(live) != 1 or live[0] != selected[0]:
+                return _refused()
+            r = selected[0]
+            if (r.endpoint_generation != maximum or r.state not in {'reserved', 'detached', 'bound', 'ready'}
+                or any(getattr(r, n) != getattr(reservation, n) for n in _RESERVATION_FIELDS)
+                or r.daemon_instance_uuid not in {None, record.instance_uuid}
+                or r.supervisor not in {None, record.supervisor} or r.daemon not in {None, record.daemon}):
+                return _refused()
+        # With no receipt, only the reservation captured from the launch pipe's
+        # original durable reservation can supply these fields. Never fabricate it.
+        with private_directory(self.runtime_directory) as fd:
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) != (reservation.runtime_device, reservation.runtime_inode):
+                return _refused()
+        previous = await self._supervisor_intents.read()
+        if isinstance(previous, Err):
+            return previous
+        intent = SupervisorReleaseIntent(
+            schema_version=1, launch_uuid=reservation.launch_uuid,
+            instance_uuid=reservation.instance_uuid, app=self.app,
+            supervisor=record.supervisor, daemon=record.daemon, reason=reason, intent_at=time.monotonic(),
+        )
+        if previous.value is not None:
+            old = previous.value
+            if replace(old, intent_at=intent.intent_at) != intent:
+                return _refused()
+            intent = old
+        written = await self._supervisor_intents.write(intent)
+        return written if isinstance(written, Err) else Ok(value=intent)
+
+    def _intent_unavailable(self, result):
+        self.cleanup_required = 'intent-unavailable'
+        sys.stderr.write('{"kind":"cleanup_required","reason":"intent-unavailable"}\n')
+        return result
+
+    async def _release_owned(self, record: DaemonRecord, features: BackendFeatures) -> Result[None]:
+        from airplay_linux.process import ownership
+        authority = self._public_authority(features)
+        snapshot = self._snapshot()
+        if isinstance(snapshot, Err):
+            return snapshot
+        selected = [r for r in snapshot.value if r.launch_uuid == self._reservation.launch_uuid]
+        origin = selected[0] if len(selected) == 1 else None
+        if origin is None or origin.state in {'reserved', 'detached', 'bound', 'ready'}:
+            reason = self._app_absence()
+            if reason is None:
+                return _refused()
+            published = await self._publish_release_intent(record, reason)
+            if isinstance(published, Err):
+                return self._intent_unavailable(published)
+        elif origin.state != 'stopping':
+            return _refused()
+        # Reuse the verifier's exact receipt joins and anchored stage checks,
+        # including its synchronous callback after pidfd open. A bound socket
+        # during the observation/receipt gap still requires the full endpoint
+        # chain; a missing receipt never supplies invented reservation fields.
+        try:
+            receipt = authority._select(record, cleanup=True)
+            reservation = receipt if receipt is not None else self._reservation
+            authority._intent(reservation, receipt, record)
+
+            def stage():
+                authority._unchanged(receipt, record)
+                authority._intent(reservation, receipt, record)
+                if ((receipt is not None and receipt.entry_inode is not None)
+                        or socket_info(record) is not None):
+                    # No stored bound fields yet: let the verifier independently
+                    # capture them, then compare the complete evidence on repeat.
+                    bound = receipt if receipt is not None and receipt.entry_inode is not None else None
+                    return authority._stage(reservation, bound, record, stage='bound')
+                return authority._stage(reservation, receipt, record, stage='pre_bind')
+
+            evidence = stage()
+
+            def revalidate():
+                try:
+                    fresh = stage()
+                    return Ok(value=fresh) if fresh == evidence else _refused()
+                except (ownership._Refusal, OSError):
+                    return _refused()
+
+            terminated = await self._process.terminate(
+                record.daemon, reservation.launch_uuid, reservation.runtime_directory,
+                TERMINATION_GRACE, strict=True, evidence=evidence, revalidate=revalidate,
+            )
+            if isinstance(terminated, Err):
+                return terminated
+            death = self._inspect(record.daemon.pid)
+            if death.state not in {IdentityState.absent, IdentityState.terminated}:
+                return _refused(ErrorCode.cleanup_timeout)
+            if death.state is IdentityState.terminated and (death.identity != record.daemon or death.uid != reservation.owner_uid):
+                return _refused()
+            authority._clean(reservation, receipt, record, evidence.expected_entry)
+            return Ok(value=None)
+        except ownership._Refusal as refusal:
+            return _refused(refusal.code)
+        except OSError:
+            return _refused()
+
+    async def _run_owned(self, config: dict, features: BackendFeatures, stopping: asyncio.Event) -> int:
+        if not (features.owned_daemon_control and features.keyring) or not _parent_matches(self.app):
+            return 1
+        if 'owner_token' in config or type(config.get('endpoint_generation')) is not int:
+            return 1
+        self._receipt_files = AtomicFiles(Path(config['record_root']))
+        self._receipts = self._receipts or JsonLaunchReceiptStore(self._receipt_files)
+        self._store = self._store or JsonDaemonStore(self._receipt_files)
+        self._supervisor_intents = self._supervisor_intents or JsonSupervisorReleaseIntentStore(AtomicFiles(self.runtime_directory))
+        receipts, records = await self._receipts.all(), await self._store.all()
+        if isinstance(receipts, Err) or isinstance(records, Err):
+            return 1
+        launch = UUID(config['launch_uuid'])
+        candidates = [r for r in receipts.value if r.launch_uuid == launch]
+        if len(candidates) != 1:
+            return 1
+        r = candidates[0]
+        self._reservation = DaemonReservation(**{n: getattr(r, n) for n in _RESERVATION_FIELDS})
+        matches = [o for o in records.value if o.app == self.app and o.runtime_directory == str(self.runtime_directory)]
+        if (len(matches) != 1 or matches[0].instance_uuid != self.instance_uuid
+            or matches[0].lifecycle != 'starting' or matches[0].supervisor is not None or matches[0].daemon is not None
+            or r.state != 'reserved' or r.app != self.app or r.endpoint_generation != config['endpoint_generation']
+            or r.protocol_version != config['protocol_version'] or r.runtime_directory != str(self.runtime_directory)
+            or max(o.endpoint_generation for o in receipts.value if o.runtime_directory == r.runtime_directory) != r.endpoint_generation
+            or any(o.launch_uuid != launch and o.runtime_directory == r.runtime_directory and o.state not in {'failed', 'stopped'} for o in receipts.value)):
+            return 1
+        record = matches[0]
+        identity = self._own_identity()
+        if identity is None or socket_info(record) is not None:
+            return 1
+        record = replace(record, supervisor=identity)
+        if isinstance(await self._store.write(record), Err) or stopping.is_set() or not _parent_matches(self.app):
+            return 1
+        from airplay_linux.process.launcher import ProductionLaunchCapability
+        capability = ProductionLaunchCapability(features, self.runtime_directory,
+            executable=config['executable'], production_graph=True)
+        exits = set()
+        subscription = self._process.subscribe(lambda event: exits.add(event.identity))
+        try:
+            child = await self._process.spawn(CommandSpec(
+                argv=(sys.executable, '-m', 'airplay_linux.process.supervisor', '--launch-owned-child',
+                      str(identity.pid), str(identity.start_ticks), '--', *capability.argv(record.socket_path)),
+                env=module_environment(launch, str(self.runtime_directory)),
+            ))
+            if isinstance(child, Err):
+                return 1
+            record = replace(record, daemon=child.value)
+            published = await self._store.write(record)
+            if isinstance(published, Err):
+                return 1
+            while not stopping.is_set() and child.value not in exits and _parent_matches(self.app):
+                try:
+                    await asyncio.wait_for(stopping.wait(), 0.05)
+                except TimeoutError:
+                    pass
+            observed = replace(record, lifecycle='stopping')
+            if isinstance(await self._store.write(observed), Err):
+                return 1
+            if child.value in exits:
+                return 1
+            result = await self._request_release(observed, features)
+            return 0 if isinstance(result, Ok) else 1
+        finally:
+            subscription.close()
+
+    async def _request_release(self, record: DaemonRecord, features: BackendFeatures) -> Result[None]:
+        if features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}:
+            if self._reservation is None:
+                return _refused(ErrorCode.dependency_incompatible)
+            return await self._release_owned(record, features)
+        await self._request_fixture_release(record, features)
+        return Ok(value=None)
+
+    async def _request_fixture_release(self, record: DaemonRecord, features: BackendFeatures) -> None:
         control = None
         try:
             before = socket_info(record)
@@ -339,7 +631,7 @@ class DaemonSupervisor:
                     pass
 
 
-def _launch_child(arguments: list[str]) -> int:
+def _launch_child(arguments: list[str], *, owned: bool = False) -> int:
     if len(arguments) < 5 or arguments[2] != '--':
         return 1
     parent = ProcessIdentity(pid=int(arguments[0]), start_ticks=int(arguments[1]))
@@ -348,8 +640,9 @@ def _launch_child(arguments: list[str]) -> int:
     _parent_death_signal(signal.SIGKILL)
     if not _parent_matches(parent):
         return 1
-    descriptor = int(os.environ[CONFIG_FD_ENV])
-    os.set_inheritable(descriptor, True)
+    if not owned:
+        descriptor = int(os.environ[CONFIG_FD_ENV])
+        os.set_inheritable(descriptor, True)
     argv = arguments[3:]
     os.execvpe(argv[0], argv, os.environ)
     return 1
@@ -358,6 +651,8 @@ def _launch_child(arguments: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     try:
+        if arguments and arguments[0] == '--launch-owned-child':
+            return _launch_child(arguments[1:], owned=True)
         if arguments and arguments[0] == '--launch-child':
             return _launch_child(arguments[1:])
         parser = argparse.ArgumentParser(description='Own one private foreground AirPlay daemon')
