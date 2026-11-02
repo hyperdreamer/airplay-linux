@@ -37,7 +37,7 @@ class MonitoredOutput:
     """One output as observed in the same JSON document as its geometry."""
 
     name: str
-    enabled: bool
+    enabled: bool | None
     connected: bool
     output_type: int | str | None
     size: Size | None
@@ -195,7 +195,7 @@ class KScreenInventory:
         for record in records:
             monitored = MonitoredOutput(
                 name=record.connector,
-                enabled=record.enabled is True,
+                enabled=record.enabled,
                 connected=record.connected is True,
                 output_type=record.output_type,
                 size=record.size,

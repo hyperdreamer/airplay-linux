@@ -22,7 +22,7 @@ from airplay_linux.domain.resources import Err, Ok, Size
 
 
 def _output(
-    name: str = "DP-1", *, enabled: bool = True, connected: bool = True,
+    name: str = "DP-1", *, enabled: bool | None = True, connected: bool = True,
     output_type: int | str | None = 14, size: Size | None = Size(width=1920, height=1080),
     position: tuple[int, int] | None = (0, 0), virtual: bool | None = False,
     scale: float | None = 1.0, output_id: str | None = "1",
@@ -67,11 +67,46 @@ def test_enabled_foreign_or_virtual_geometry_collision_refuses():
         assert _reason(result) is SourceRefusal.AMBIGUOUS_POSITION
 
 
-def test_disabled_geometry_match_does_not_create_ambiguity():
-    result = verify_reported_source(
-        "DP-1", _reported(),
-        (_output(), _output("HDMI-1", enabled=False, connected=True)),
+def _enabled_field_document(*, duplicate_enabled=None, include_duplicate_enabled=True):
+    def output(name: str, *, enabled: bool | None = None, include_enabled: bool = True):
+        record = {
+            "id": 1 if name == "DP-1" else 2, "name": name, "connected": True,
+            "type": 14 if name == "DP-1" else 6,
+            "pos": {"x": 0, "y": 0},
+            "size": {"width": 1920, "height": 1080}, "scale": 1,
+        }
+        if include_enabled:
+            record["enabled"] = enabled
+        return record
+
+    return {"outputs": [
+        output("DP-1", enabled=True),
+        output(
+            "HDMI-1", enabled=duplicate_enabled,
+            include_enabled=include_duplicate_enabled,
+        ),
+    ]}
+
+
+def test_missing_enabled_field_survives_inventory_projection_and_refuses():
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(_InventoryProcess(_enabled_field_document(
+            include_duplicate_enabled=False,
+        ))),
+        physical_inventory_available=True,
     )
+    result = asyncio.run(verifier.verify("DP-1", _reported()))
+    assert _reason(result) is SourceRefusal.UNREADABLE_LAYOUT
+
+
+def test_known_disabled_duplicate_does_not_create_ambiguity_through_inventory():
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(_InventoryProcess(_enabled_field_document(
+            duplicate_enabled=False,
+        ))),
+        physical_inventory_available=True,
+    )
+    result = asyncio.run(verifier.verify("DP-1", _reported()))
     assert isinstance(result, Ok)
     assert result.value.matched_connector == "DP-1"
 

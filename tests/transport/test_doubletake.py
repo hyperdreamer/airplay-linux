@@ -10,13 +10,15 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.backend.contract import AckReply, BackendSource, BackendStream, StatusReply
+from airplay_linux.backend.contract import AckReply, BackendSource, BackendStream, StatusReply, decode_status
+from airplay_linux.capture.source import SourceRefusal, verify_reported_source
+from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.backend.control import (
     ApplicationContractProfile, BackendNotice, BackendNoticeKind, BackendOperation,
     PublishedDoubletakeControl, PublishedDoubletakeProfile,
 )
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.messages import MutePayload, TransportEventKind
+from airplay_linux.domain.messages import MutePayload, SourceVerificationPayload, TransportEventKind
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.records import DaemonRecord
@@ -200,6 +202,8 @@ class SourceVerifier:
 
     async def verify(self, requested, reported):
         self.calls.append((requested, reported))
+        if reported is None or reported.has_position is not True:
+            return verify_reported_source(requested, reported, ())
         return self.result
 
 
@@ -253,15 +257,120 @@ class Harness:
 
 
 def _source_status(receiver, source):
-    stream = BackendStream(
-        device="Receiver", target=receiver.canonical_host, state="streaming",
-        has_audio=False, audio_muted=False, source=source,
+    stream = {
+        "device": "Receiver", "device_ip": receiver.canonical_host,
+        "state": "streaming", "has_audio": False, "audio_muted": False,
+    }
+    if source is not None:
+        stream["source"] = {
+            "type": source.type, "width": source.width, "height": source.height,
+            "has_position": source.has_position,
+        }
+        if source.x is not None and source.y is not None:
+            stream["source"].update(x=source.x, y=source.y)
+    decoded = decode_status({
+        "ok": True, "state": "streaming", "has_audio": False,
+        "audio_muted": False, "device": "Receiver",
+        "device_ip": receiver.canonical_host, "streams": [stream],
+    })
+    assert isinstance(decoded, StatusReply), decoded
+    return Ok(value=decoded)
+
+
+class _KScreenProcess:
+    def __init__(self, document):
+        self.document = document
+
+    async def run(self, spec, timeout, stdin=None):
+        return Ok(value=CommandOutput(
+            exit_code=0, stdout=json.dumps(self.document).encode(), stderr=b"",
+        ))
+
+
+def _production_source_verifier(*, unknown_enabled_output=False):
+    outputs = [{
+        "id": 1, "name": "DP-1", "enabled": True, "connected": True,
+        "type": 14, "pos": {"x": 0, "y": 0},
+        "size": {"width": 1920, "height": 1080}, "scale": 1,
+    }]
+    if unknown_enabled_output:
+        outputs.append({
+            "id": 2, "name": "HDMI-1", "connected": True,
+            "type": 6, "pos": {"x": 0, "y": 0},
+            "size": {"width": 1920, "height": 1080}, "scale": 1,
+        })
+    return KScreenReportedSourceVerifier(
+        KScreenInventory(_KScreenProcess({"outputs": outputs})),
+        physical_inventory_available=True,
     )
-    return Ok(value=StatusReply(
-        state="streaming", device="Receiver", target=receiver.canonical_host,
-        has_audio=False, audio_muted=False, needs_credential=False,
-        credential_kind=None, streams=(stream,),
-    ))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("reported", "reason", "unknown_enabled_output"),
+    [
+        (None, SourceRefusal.MISSING_SOURCE, False),
+        (
+            BackendSource(
+                type=1, width=1920, height=1080, x=None, y=None, has_position=False,
+            ),
+            SourceRefusal.MISSING_POSITION, False,
+        ),
+        (
+            BackendSource(type=1, width=1920, height=1080, x=0, y=0),
+            SourceRefusal.UNREADABLE_LAYOUT, True,
+        ),
+    ],
+)
+async def test_typed_source_refusals_reach_transport_diagnostic(
+    tmp_path, reported, reason, unknown_enabled_output,
+):
+    verifier = _production_source_verifier(unknown_enabled_output=unknown_enabled_output)
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    if reason is SourceRefusal.MISSING_SOURCE:
+        assert not pending.done()
+        h.scheduler.advance(5.0)
+        await _drain_transport()
+    result = await pending
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.unsupported_source
+    assert result.error.detail == reason.value
+    assert verifier.last_observation is not None
+    assert verifier.last_observation.reason is reason
+    failures = [event for event in h.events if event.kind is TransportEventKind.failed]
+    assert failures and failures[-1].payload.diagnostic.detail == reason.value
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+
+
+@pytest.mark.asyncio
+async def test_verified_source_geometry_is_observable_on_ready_event(tmp_path):
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+
+    result = await h.start()
+
+    assert isinstance(result, Ok), result
+    assert result.value.source_connector == "DP-1"
+    ready = next(event for event in h.events if event.kind is TransportEventKind.ready)
+    assert isinstance(ready.payload, SourceVerificationPayload)
+    assert ready.payload.connector == "DP-1"
+    assert (ready.payload.source_type, ready.payload.width, ready.payload.height) == (1, 1920, 1080)
+    assert (ready.payload.x, ready.payload.y) == (0, 0)
+    assert not hasattr(ready.payload, "token")
+    assert not hasattr(ready.payload, "socket_path")
 
 
 async def _drain_transport():
@@ -296,7 +405,8 @@ async def test_reported_source_waits_for_exact_target_evidence(tmp_path, incompl
     await _drain_transport()
     assert len(h.control.calls(BackendOperation.status)) == 1
     assert not pending.done()
-    assert verifier.calls == []
+    expected_before_retry = [("DP-1", None)] if incomplete == "absent_source" else []
+    assert verifier.calls == expected_before_retry
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
 
     h.scheduler.advance(0.099)
@@ -307,7 +417,10 @@ async def test_reported_source_waits_for_exact_target_evidence(tmp_path, incompl
 
     assert isinstance(result, Ok), result
     assert len(h.control.calls(BackendOperation.status)) == 2
-    assert verifier.calls == [("DP-1", source)]
+    expected_calls = [("DP-1", source)]
+    if incomplete == "absent_source":
+        expected_calls.insert(0, ("DP-1", None))
+    assert verifier.calls == expected_calls
     assert any(event.kind is TransportEventKind.ready for event in h.events)
     assert h.scheduler.pending() == ()
 
@@ -414,7 +527,7 @@ async def test_reported_source_credential_challenge_refuses_complete_geometry(
     await _drain_transport()
 
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
-    assert verifier.calls == []
+    assert verifier.calls == [("DP-1", None)]
     if cleanup == "timeout":
         assert disconnect.entered.is_set()
         assert not pending.done()
@@ -514,7 +627,7 @@ async def test_source_and_challenge_share_one_post_connect_deadline(tmp_path, fi
     assert pending.done(), "alternating source/challenge observations reset the shared deadline"
     assert_error(await pending, ErrorCode.unsupported_source)
     assert len(h.control.calls(BackendOperation.status)) == 50
-    assert verifier.calls == []
+    assert len(verifier.calls) == 25
     assert len(h.control.calls(BackendOperation.disconnect)) == 1
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
     assert h.transport._streams == {}
@@ -699,7 +812,7 @@ async def test_reported_source_deadline_does_not_reset_after_incomplete_reads(tm
         physical_source=True, source_reporting_complete=True,
     )
     h.control.results[BackendOperation.status].extend([
-        _source_status(h.a, None), _source_status(h.b, None),
+        Ok(value=AckReply(operation="status")), _source_status(h.b, None),
         _source_status(h.a, BackendSource(type=1, width=1920, height=1080, x=0, y=0)),
     ])
     pending = asyncio.create_task(h.start())

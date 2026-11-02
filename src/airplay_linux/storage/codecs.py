@@ -564,7 +564,7 @@ def _load_handle(value: object) -> DisplayHandle:
 
 HandleCodec = _Codec(dump=_dump_handle, load=_load_handle)
 
-_STREAM_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
+_LEGACY_STREAM_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
     ("receiver_id", _plain(_record_receiver)),
     ("endpoint_generation", _plain(_integer)),
     ("endpoint_fingerprint", _plain(_identifier)),
@@ -572,6 +572,10 @@ _STREAM_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
     ("daemon_instance_uuid", _UUID),
     ("lease_id", _UUID),
     ("start_operation_id", _UUID),
+)
+_STREAM_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
+    *_LEGACY_STREAM_FIELDS,
+    ("source_connector", _nullable(_plain(_identifier))),
 )
 
 
@@ -582,7 +586,11 @@ def _dump_stream(value: object) -> object:
 
 
 def _load_stream(value: object) -> StreamHandle:
-    fields = _object(value, _STREAM_FIELDS)
+    if type(value) is dict and set(value) == {name for name, _ in _LEGACY_STREAM_FIELDS}:
+        fields = _object(value, _LEGACY_STREAM_FIELDS)
+        fields["source_connector"] = None
+    else:
+        fields = _object(value, _STREAM_FIELDS)
     fields["daemon_instance_uuid"] = InstanceId(UUID(str(fields["daemon_instance_uuid"])))
     fields["lease_id"] = LeaseId(UUID(str(fields["lease_id"])))
     fields["start_operation_id"] = OperationId(UUID(str(fields["start_operation_id"])))

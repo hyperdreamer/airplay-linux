@@ -163,6 +163,7 @@ def rich_snapshot() -> SessionSnapshot:
             daemon_instance_uuid=InstanceId(UUID(int=9)),
             lease_id=LeaseId(UUID(int=12)),
             start_operation_id=OperationId(UUID(int=11)),
+            source_connector="DP-1",
         ),
         last_error=diagnostic(ErrorCode.transport_failed, t.receiver_id),
         reconnect_attempt=2,
@@ -1167,6 +1168,14 @@ def test_a_symlinked_record_is_neither_written_nor_read(tmp_path: Path):
 def test_a_complete_session_record_round_trips():
     snapshot = rich_snapshot()
     assert decode_session(encode_session(snapshot)) == snapshot
+
+
+def test_legacy_session_stream_without_source_connector_decodes_strictly():
+    snapshot = rich_snapshot()
+    document = json.loads(encode_session(snapshot))
+    document["stream"].pop("source_connector")
+    legacy = replace(snapshot, stream=replace(snapshot.stream, source_connector=None))
+    assert decode_session(json.dumps(document).encode()) == legacy
 
 
 def test_a_minimal_session_record_round_trips():

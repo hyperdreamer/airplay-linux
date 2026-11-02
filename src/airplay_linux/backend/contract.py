@@ -175,16 +175,24 @@ class BackendSource:
     type: int
     width: int
     height: int
-    x: int
-    y: int
+    x: int | None
+    y: int | None
     has_position: bool = True
 
     def __post_init__(self) -> None:
-        for name in ("type", "width", "height", "x", "y"):
+        for name in ("type", "width", "height"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"source {name} must be an integer")
+        for name in ("x", "y"):
+            value = getattr(self, name)
+            if value is not None and type(value) is not int:
+                raise TypeError(f"source {name} must be an integer or None")
+        if (self.x is None) != (self.y is None):
+            raise TypeError("source coordinates must both be present or absent")
         if type(self.has_position) is not bool:
             raise TypeError("source has_position must be a boolean")
+        if self.has_position and self.x is None:
+            raise TypeError("source position requires both coordinates")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -382,21 +390,28 @@ _INVALID = object()
 
 
 def _decode_source(value: object) -> BackendSource | Err:
-    """Project the complete source object and reject ambiguous evidence."""
+    """Project available source fields without manufacturing position evidence."""
     data = _exact_dict(value)
-    fields = {"type", "width", "height", "x", "y"}
-    if data is None or set(data) != fields | {"has_position"}:
+    fields = {"type", "width", "height", "x", "y", "has_position"}
+    required = {"type", "width", "height"}
+    if data is None or not required <= set(data) or set(data) - fields or "has_position" not in data:
         return _incompatible()
-    if data["has_position"] is not True:
+    has_position = data["has_position"]
+    if type(has_position) is not bool:
         return _incompatible()
-    if any(type(data[name]) is not int for name in fields):
+    has_x, has_y = "x" in data, "y" in data
+    if has_x != has_y or (has_position and not has_x):
+        return _incompatible()
+    if any(type(data[name]) is not int for name in required):
+        return _incompatible()
+    if has_x and (type(data["x"]) is not int or type(data["y"]) is not int):
         return _incompatible()
     if not 1 <= data["type"] <= 2**32 - 1 or data["width"] <= 0 or data["height"] <= 0:
         return _incompatible()
     try:
         return BackendSource(
             type=data["type"], width=data["width"], height=data["height"],
-            x=data["x"], y=data["y"], has_position=data["has_position"],
+            x=data.get("x"), y=data.get("y"), has_position=has_position,
         )
     except (TypeError, ValueError):
         return _incompatible()

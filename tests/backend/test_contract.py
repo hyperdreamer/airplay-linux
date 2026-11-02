@@ -60,9 +60,46 @@ def test_source_position_availability_is_required():
     source = {"type": 1, "width": 1920, "height": 1080, "x": 0, "y": 0, "has_position": True}
     assert _decode_source(source) == BackendSource(type=1, width=1920, height=1080, x=0, y=0)
     assert isinstance(_decode_source({key: value for key, value in source.items() if key != "has_position"}), Err)
-    for unavailable in (False, None, 0, 1, "true", [], {}):
+    positionless = _decode_source({
+        "type": 1, "width": 1920, "height": 1080, "has_position": False,
+    })
+    assert positionless == BackendSource(
+        type=1, width=1920, height=1080, x=None, y=None, has_position=False,
+    )
+    assert isinstance(_decode_source({**source, "has_position": False}), BackendSource)
+    for unavailable in (None, 0, 1, "true", [], {}):
         assert isinstance(_decode_source({**source, "has_position": unavailable}), Err)
     assert isinstance(_decode_source({"Type": 1, "Width": 1920, "Height": 1080, "X": 0, "Y": 0}), Err)
+
+
+def test_status_stream_source_absence_and_positionless_source_are_preserved():
+    status = {
+        "ok": True, "state": "streaming", "has_audio": False, "audio_muted": False,
+        "device": "DP-1", "device_ip": "192.0.2.1",
+        "streams": [{
+            "device": "DP-1", "device_ip": "192.0.2.1", "state": "streaming",
+            "has_audio": False, "audio_muted": False,
+        }],
+    }
+    absent = decode_status(status)
+    assert isinstance(absent, StatusReply)
+    assert absent.streams[0].source is None
+
+    positionless_status = {
+        **status,
+        "streams": [{
+            **status["streams"][0],
+            "source": {
+                "type": 1, "width": 1920, "height": 1080,
+                "has_position": False,
+            },
+        }],
+    }
+    positionless = decode_status(positionless_status)
+    assert isinstance(positionless, StatusReply)
+    assert positionless.streams[0].source == BackendSource(
+        type=1, width=1920, height=1080, x=None, y=None, has_position=False,
+    )
 
 
 def test_status_stream_source_uses_the_published_go_field_names():

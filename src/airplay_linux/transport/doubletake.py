@@ -16,7 +16,9 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
-from airplay_linux.capture.source import SourceVerificationRefusal
+from airplay_linux.capture.source import (
+    SourceObservation, SourceRefusal, SourceVerificationRefusal,
+)
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
     Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
@@ -25,7 +27,7 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.messages import (
     EmptyPayload as EventEmpty, FailurePayload, MutePayload as EventMute,
-    TransportEvent, TransportEventKind,
+    SourceVerificationPayload, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import (
     ChallengeId, InstanceId, LeaseId, OperationContext, PairingChallenge,
@@ -195,6 +197,7 @@ class _Stream:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ready: bool = False
     muted: bool = False
+    source_observation: SourceObservation | None = None
     abandoned: bool = False
     released: bool = False
 
@@ -730,6 +733,7 @@ class DoubleTakeTransport:
 
     async def _poll_reported_source(self, stream: _Stream, deadline: float) -> Result[None]:
         loop = asyncio.get_running_loop()
+        last_missing_source: SourceVerificationRefusal | None = None
         while self._clock.now() < deadline:
             daemon = stream.daemon
             if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
@@ -760,11 +764,32 @@ class DoubleTakeTransport:
                     for item in matches
                 ):
                     return _failure(ErrorCode.dependency_incompatible)
-                if len(matches) == 1 and matches[0].source is not None:
+                if len(matches) == 1:
                     verified = await _safe_source_verification(
                         self._source_verifier.verify(stream.source.connector, matches[0].source),
                     )
-                    return verified if self._clock.now() < deadline else _failure(ErrorCode.unsupported_source)
+                    if self._clock.now() >= deadline:
+                        return _failure(ErrorCode.unsupported_source)
+                    if isinstance(verified, SourceVerificationRefusal):
+                        if verified.observation.reason is SourceRefusal.MISSING_SOURCE:
+                            last_missing_source = verified
+                        else:
+                            return verified
+                    elif isinstance(verified, Err):
+                        return verified
+                    elif isinstance(verified, Ok):
+                        observation = verified.value
+                        if (
+                            isinstance(observation, SourceObservation)
+                            and observation.accepted
+                            and observation.matched_connector is not None
+                            and observation.reported is not None
+                        ):
+                            stream.source_observation = observation
+                            stream.handle = replace(
+                                stream.handle, source_connector=observation.matched_connector,
+                            )
+                        return verified
             # Every read shares the same absolute deadline; incomplete or foreign
             # observations cannot extend it or certify the requested connector.
             wake = loop.create_future()
@@ -780,7 +805,7 @@ class DoubleTakeTransport:
                 await wake
             finally:
                 scheduled.cancel()
-        return _failure(ErrorCode.unsupported_source)
+        return last_missing_source or _failure(ErrorCode.unsupported_source)
 
     async def _start(self, stream: _Stream, connected: asyncio.Future) -> Result[StreamHandle]:
         if isinstance(stream.source, PhysicalMonitorSource):
@@ -842,7 +867,22 @@ class DoubleTakeTransport:
                         failure = _failure(ErrorCode.stale_event)
                     else:
                         stream.ready = True
-                        self._emit(stream, TransportEventKind.ready)
+                        observation = stream.source_observation
+                        payload = EventEmpty()
+                        if (
+                            observation is not None
+                            and observation.matched_connector is not None
+                            and observation.reported is not None
+                        ):
+                            payload = SourceVerificationPayload(
+                                connector=observation.matched_connector,
+                                source_type=observation.reported.type,
+                                width=observation.reported.width,
+                                height=observation.reported.height,
+                                x=observation.reported.x,
+                                y=observation.reported.y,
+                            )
+                        self._emit(stream, TransportEventKind.ready, payload)
                         return Ok(value=stream.handle)
             else:
                 failure = result if isinstance(result, Err) else (

@@ -114,9 +114,14 @@ class StreamHandle:
     daemon_instance_uuid: InstanceId
     lease_id: LeaseId
     start_operation_id: OperationId
+    source_connector: str | None = None
 
     def __post_init__(self) -> None:
         _validate_generation("endpoint_generation", self.endpoint_generation)
+        if self.source_connector is not None and (
+            type(self.source_connector) is not str or not self.source_connector
+        ):
+            raise TypeError("source connector must be non-empty text or None")
 
 
 @dataclass(frozen=True, kw_only=True)

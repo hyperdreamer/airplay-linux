@@ -180,11 +180,35 @@ class MutePayload:
 
 
 @dataclass(frozen=True, kw_only=True)
+class SourceVerificationPayload:
+    """Sanitized, positively verified physical source evidence."""
+
+    connector: str
+    source_type: int
+    width: int
+    height: int
+    x: int
+    y: int
+
+    def __post_init__(self) -> None:
+        if type(self.connector) is not str or not self.connector:
+            raise TypeError("source connector must be non-empty text")
+        for name in ("source_type", "width", "height", "x", "y"):
+            if type(getattr(self, name)) is not int:
+                raise TypeError(f"source {name} must be an integer")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("source dimensions must be positive")
+
+
+@dataclass(frozen=True, kw_only=True)
 class ChallengePayload:
     challenge: ChallengeView
 
 
-TransportPayload: TypeAlias = EmptyPayload | FailurePayload | ModePayload | MutePayload | ChallengePayload
+TransportPayload: TypeAlias = (
+    EmptyPayload | FailurePayload | ModePayload | MutePayload | ChallengePayload
+    | SourceVerificationPayload
+)
 
 
 @dataclass(frozen=True, kw_only=True)
