@@ -8,6 +8,7 @@ import os
 import socket
 from dataclasses import replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -167,9 +168,9 @@ class Control:
 
 
 class OwnedCase:
-    def __init__(self, tmp_path, monkeypatch):
+    def __init__(self, tmp_path, monkeypatch, runtime_root=None):
         self.root = tmp_path
-        self.runtime = tmp_path / 'r'
+        self.runtime = Path(runtime_root) if runtime_root is not None else tmp_path / 'r'
         self.runtime.mkdir(mode=0o700, exist_ok=True)
         self.events = []
         self.configs = []
@@ -311,9 +312,10 @@ def candidate_failure_cases(tmp_path, monkeypatch):
     monkeypatch.setattr(LinuxProcessRunner, 'run', forbidden)
     monkeypatch.setattr(LinuxProcessRunner, 'spawn', forbidden)
     monkeypatch.setattr(MessageBus, 'connect', forbidden)
-    c = OwnedCase(tmp_path, monkeypatch)
-    yield c
-    c.close()
+    with TemporaryDirectory(prefix='oe-', dir='/tmp') as directory:
+        c = OwnedCase(tmp_path, monkeypatch, runtime_root=Path(directory))
+        yield c
+        c.close()
 
 
 async def test_pre_bind_verification_failure_observes_exact_child_death(candidate_failure_cases):
