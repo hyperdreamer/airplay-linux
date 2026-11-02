@@ -303,6 +303,16 @@ def test_peer_start_ticks_must_equal_receipt(owned_endpoint_evidence):
     assert_no_effects(e)
 
 
+def test_receipt_peer_start_ticks_mismatch_refuses_without_side_effects(owned_endpoint_evidence):
+    e = owned_endpoint_evidence
+    assert isinstance(verify(e), Ok), "unchanged positive control"
+    e.receipt = replace(e.receipt, peer_start_ticks=31)
+    assert e.identities[130].identity == ProcessIdentity(pid=130, start_ticks=30)
+    assert_refused(verify(e), ErrorCode.ownership_mismatch)
+    assert e.termination_calls == []
+    assert_no_effects(e)
+
+
 def test_duplicate_unix_path_rows_refuse(owned_endpoint_evidence):
     e = owned_endpoint_evidence
     assert isinstance(verify(e), Ok)

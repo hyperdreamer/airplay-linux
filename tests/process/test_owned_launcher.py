@@ -441,7 +441,7 @@ async def test_stopping_from_reserved_and_failed_persists_intent_before_signal(c
     'status-poll', 'stopping-write', 'signal', 'exit-proof', 'unlink',
     'after-ready-write', 'cleanup-intent-publication', 'cleanup-intent-completion',
 ])
-async def test_each_actual_crash_boundary_retains_safe_outcome(candidate_failure_cases, boundary):
+async def test_each_actual_crash_boundary_retains_safe_outcome(candidate_failure_cases, boundary, monkeypatch):
     c = candidate_failure_cases
     if boundary in {'cleanup-intent-publication', 'cleanup-intent-completion'}:
         c.status = 'streaming'
@@ -451,9 +451,67 @@ async def test_each_actual_crash_boundary_retains_safe_outcome(candidate_failure
         operation = c.stop
     else:
         operation = c.launch
-    c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
-    with pytest.raises(Crash):
-        await operation()
+    if boundary == 'after-ready-write':
+        from airplay_linux.process import daemon_registry
+
+        reached = asyncio.Event()
+        resume = asyncio.Event()
+        write = c.receipts.write
+        loop = asyncio.get_running_loop()
+
+        class DeadlineLoop:
+            def time(self):
+                return 0.0
+
+            def __getattr__(self, name):
+                return getattr(loop, name)
+
+        class RegistryAsyncio:
+            def get_running_loop(self):
+                return DeadlineLoop()
+
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+        async def pause_after_ready(receipt):
+            result = await write(receipt)
+            if receipt.state == 'ready' and isinstance(result, Ok):
+                reached.set()
+                await resume.wait()
+                raise Crash()
+            return result
+
+        c.receipts.write = pause_after_ready
+        # Virtualize only the registry's polling clock; real asyncio deadlines
+        # and the ownership/status checks remain in force.
+        with monkeypatch.context() as patch:
+            patch.setattr(daemon_registry, 'asyncio', RegistryAsyncio())
+            task = asyncio.create_task(operation())
+            waiting = asyncio.create_task(reached.wait())
+            try:
+                completed, _ = await asyncio.wait(
+                    {task, waiting}, timeout=8, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if task in completed:
+                    pytest.fail(f'launch returned before ready-write barrier: {await task!r}')
+                assert waiting in completed, 'launch did not reach ready-write barrier'
+                assert not task.done()
+                assert (await c.current()).state == 'ready'
+                assert boundary in c.events
+                assert not any(n.kind == 'ready' for n in c.notices)
+                resume.set()
+                with pytest.raises(Crash):
+                    await task
+            finally:
+                resume.set()
+                if not task.done():
+                    task.cancel()
+                waiting.cancel()
+                await asyncio.gather(task, waiting, return_exceptions=True)
+    else:
+        c.hooks[boundary] = lambda: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            await operation()
     assert boundary in c.events
     assert not c.registry._authority_lease
     assert not any(n.kind == 'ready' for n in c.notices)
@@ -500,7 +558,7 @@ async def test_isolated_launcher_is_unreachable_from_guarded_production(candidat
     assert [n.kind for n in c.notices] == ['ready']
     # Invoke the real build_runtime proof, including its independently checked
     # bus/process tripwires and final run/spawn recorder.
-    from test_no_production_spawn import offline_boundaries, test_phase_guard_blocks_eligible_production_launch
+    from tests.acceptance.test_no_production_spawn import offline_boundaries, test_phase_guard_blocks_eligible_production_launch
     tripwire = offline_boundaries.__wrapped__(monkeypatch)
     production = tmp_path / 'production'
     production.mkdir()

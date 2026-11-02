@@ -60,7 +60,7 @@ def gone(identity):
     return evidence.state in {IdentityState.absent, IdentityState.terminated}
 
 
-def fake_daemon(tmp_path, *, ignore_term=False, exit_immediately=False):
+def fake_daemon(tmp_path, *, ignore_term=False, exit_immediately=False, ready_barrier=False):
     executable = tmp_path / 'fake-daemon'
     executable.write_text(f'''#!{sys.executable}
 import json, os, signal, socket, sys, time
@@ -74,8 +74,17 @@ def terminate(signum, frame):
     open(os.path.join(os.path.dirname(path), 'term'), 'w').write('received')
     {'return' if ignore_term else 'raise SystemExit(0)'}
 signal.signal(signal.SIGTERM, terminate)
-with open(os.path.join(os.path.dirname(path), 'ready.json'), 'w') as target:
-    json.dump({{'pid': os.getpid(), 'config': config, 'argv': sys.argv}}, target)
+runtime = os.path.dirname(path)
+payload = json.dumps({{'pid': os.getpid(), 'config': config, 'argv': sys.argv}})
+with open(os.path.join(runtime, 'ready.json.tmp'), 'w') as target:
+    target.write(payload[:1])
+    target.flush()
+    if {ready_barrier!r}:
+        open(os.path.join(runtime, 'ready-partial'), 'w').close()
+        with open(os.path.join(runtime, 'ready-continue'), 'rb') as barrier:
+            assert barrier.read(1) == b'1'
+    target.write(payload[1:])
+os.replace(os.path.join(runtime, 'ready.json.tmp'), os.path.join(runtime, 'ready.json'))
 {'raise SystemExit(7)' if exit_immediately else 'time.sleep(60)'}
 ''')
     executable.chmod(0o700)
@@ -229,14 +238,17 @@ while True:
 
 class Running:
     def __init__(self, tmp_path, *, ignore_term=False, exit_immediately=False,
-                 dead_app=False, incompatible=False, external_app=False):
+                 dead_app=False, incompatible=False, external_app=False, ready_barrier=False):
         self.runtime = tmp_path / 'private'
         self.runtime.mkdir(mode=0o700)
+        if ready_barrier:
+            os.mkfifo(self.runtime / 'ready-continue')
         self.store = JsonDaemonStore(AtomicFiles(tmp_path))
         self.daemon = None
         self.app_process = None
         self.supervisor = None
-        executable = fake_daemon(tmp_path, ignore_term=ignore_term, exit_immediately=exit_immediately)
+        executable = fake_daemon(tmp_path, ignore_term=ignore_term, exit_immediately=exit_immediately,
+                                 ready_barrier=ready_barrier)
         config_read, config_write = os.pipe()
         app = read_identity(os.getpid())
         if external_app:
@@ -309,8 +321,23 @@ time.sleep(60)
 
     def wait_ready(self):
         path = self.runtime / 'ready.json'
-        wait_until(path.exists)
-        data = json.loads(path.read_text())
+        data = None
+
+        def published():
+            nonlocal data
+            try:
+                if not path.is_file():
+                    return False
+                content = path.read_text()
+            except FileNotFoundError:
+                return False
+            if not content:
+                return False
+            data = json.loads(content)
+            return True
+
+        wait_until(published)
+        assert data is not None
         self.daemon = read_identity(data['pid'])
         return data
 
@@ -334,6 +361,41 @@ time.sleep(60)
             self.app_process.kill()
             self.app_process.wait(timeout=2)
             self.app_process.stdin.close()
+
+
+def test_wait_ready_requires_nonempty_published_content(tmp_path, monkeypatch):
+    child = Running.__new__(Running)
+    child.runtime = tmp_path
+    ready = tmp_path / 'ready.json'
+    payload = {'pid': os.getpid(), 'config': {}, 'argv': []}
+
+    def observe(predicate, timeout=8.0):
+        assert not predicate()
+        ready.write_text('')
+        assert not predicate()
+        ready.write_text(json.dumps(payload))
+        assert predicate()
+
+    monkeypatch.setattr(sys.modules[__name__], 'wait_until', observe)
+    assert child.wait_ready() == payload
+    assert child.daemon == read_identity(os.getpid())
+
+
+def test_fake_daemon_publishes_ready_atomically(tmp_path):
+    child = Running(tmp_path, ready_barrier=True)
+    gate = os.open(child.runtime / 'ready-continue', os.O_RDWR | os.O_NONBLOCK)
+    try:
+        wait_until((child.runtime / 'ready-partial').exists)
+        assert not (child.runtime / 'ready.json').exists()
+        assert (child.runtime / 'ready.json.tmp').read_text() == '{'
+        os.write(gate, b'1')
+        data = child.wait_ready()
+        assert data['pid'] == child.daemon.pid
+        assert not (child.runtime / 'ready.json.tmp').exists()
+    finally:
+        os.write(gate, b'1')
+        os.close(gate)
+        child.close()
 
 
 def test_supervisor_publishes_exact_pairs_and_config_never_enters_argv(tmp_path):
