@@ -57,6 +57,8 @@ UNREACHABLE_BUS = "unix:path=/nonexistent/airplay-credential-probe-bus"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 _RUNTIME_OBLIGATION = "runtime-cleanup.json"
+_RUNTIME_LIFECYCLE = "runtime-lifecycle.json"
+_BACKEND_DISPATCH = "backend-dispatch.json"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -142,32 +144,50 @@ def _same_root(root: Path, probe_uuid: UUID, descriptor: int) -> None:
         os.close(fresh)
 
 
-@contextmanager
-def _short_runtime_root(probe_uuid: UUID) -> Iterator[tuple[Path, int]]:
-    """Bound socket paths independently of state home and TMPDIR.
+@dataclass
+class _RuntimeAllocation:
+    root: Path
+    descriptor: int
+    retained: bool = False
 
-    Exiting closes descriptors only. The caller must durably record this path
-    before dispatch and explicitly remove it after confirmed exact cleanup.
+
+@contextmanager
+def _short_runtime_root(
+    probe_uuid: UUID, record_root: Path | None = None,
+) -> Iterator[_RuntimeAllocation]:
+    """Own the pinned empty allocation until durable dispatch publication.
+
+    Only the caller's explicit retention transfer allows this tree to outlive
+    the context. Before that point no namespace/backend dispatch is permitted.
     """
     parent = Path(mkdtemp(prefix="ap-", dir="/tmp"))
-    descriptor = _open_directory(parent)
-    root_descriptor = None
-    retained = False
+    descriptor = None
+    allocation = None
     try:
+        descriptor = _open_directory(parent)
         _private(os.fstat(descriptor))
         os.mkdir(str(probe_uuid), 0o700, dir_fd=descriptor)
         os.fsync(descriptor)
+        temporary = _open_directory(parent.parent)
+        try:
+            os.fsync(temporary)
+        finally:
+            os.close(temporary)
         root = parent / str(probe_uuid)
-        root_descriptor = open_probe_root(root, probe_uuid)
-        retained = True
-        yield root, root_descriptor
+        allocation = _RuntimeAllocation(root, open_probe_root(root, probe_uuid))
+        yield allocation
     finally:
-        if root_descriptor is not None:
-            os.close(root_descriptor)
-        os.close(descriptor)
-        if not retained:
-            # No caller could dispatch a child before yield.
-            shutil.rmtree(parent)
+        try:
+            if allocation is not None and not allocation.retained:
+                _reclaim_undispatched(record_root, allocation)
+            elif allocation is None:
+                # Nothing was handed to a caller, so no dispatch was possible.
+                shutil.rmtree(parent)
+        finally:
+            if allocation is not None:
+                os.close(allocation.descriptor)
+            if descriptor is not None:
+                os.close(descriptor)
 
 
 def _runtime_binding(root: Path, descriptor: int) -> dict:
@@ -175,7 +195,6 @@ def _runtime_binding(root: Path, descriptor: int) -> dict:
     try:
         _private(os.fstat(parent))
         info, outer = os.fstat(descriptor), os.fstat(parent)
-        os.fsync(parent)
         return dict(schema="airplay-linux/probe-runtime-cleanup/v1", runtime_root=str(root),
                     runtime_device=info.st_dev, runtime_inode=info.st_ino,
                     parent_device=outer.st_dev, parent_inode=outer.st_ino)
@@ -187,14 +206,12 @@ def _binding_bytes(binding: dict) -> bytes:
     return json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _read_runtime_binding(descriptor: int, probe_uuid: UUID) -> dict:
-    payload = _read_file(descriptor, _RUNTIME_OBLIGATION, 4096)
-    binding = json.loads(payload)
+def _validate_runtime_binding(binding: dict, probe_uuid: UUID) -> dict:
     _require(type(binding) is dict and set(binding) == {
         "schema", "runtime_root", "runtime_device", "runtime_inode", "parent_device", "parent_inode",
     })
     _require(binding["schema"] == "airplay-linux/probe-runtime-cleanup/v1"
-             and type(binding["runtime_root"]) is str and _binding_bytes(binding) == payload)
+             and type(binding["runtime_root"]) is str)
     for key in ("runtime_device", "runtime_inode", "parent_device", "parent_inode"):
         _require(type(binding[key]) is int and binding[key] >= (0 if key.endswith("device") else 1))
     root = Path(binding["runtime_root"])
@@ -204,48 +221,195 @@ def _read_runtime_binding(descriptor: int, probe_uuid: UUID) -> dict:
     return binding
 
 
+def _read_runtime_binding(descriptor: int, probe_uuid: UUID) -> dict:
+    payload = _read_file(descriptor, _RUNTIME_OBLIGATION, 4096)
+    binding = _validate_runtime_binding(json.loads(payload), probe_uuid)
+    _require(_binding_bytes(binding) == payload)
+    return binding
+
+
 def _same_runtime(binding: dict, descriptor: int) -> None:
     root = Path(binding["runtime_root"])
     _same_root(root, UUID(root.name), descriptor)
     _require(_runtime_binding(root, descriptor) == binding)
 
 
-def _remove_runtime(binding: dict, descriptor: int) -> None:
-    """Remove only empty, still-pinned directories after strict cleanup proof."""
-    _same_runtime(binding, descriptor)
-    root = Path(binding["runtime_root"])
+def _new_lifecycle(binding: dict, dispatch: str = "allocated") -> dict:
+    return dict(schema="airplay-linux/probe-runtime-lifecycle/v1", binding=binding,
+                dispatch=dispatch, removal=None)
+
+
+def _write_lifecycle(record_root: Path, lifecycle: dict) -> None:
+    AtomicFiles(record_root).write(_RUNTIME_LIFECYCLE, _binding_bytes(lifecycle))
+
+
+def _record_completion(record_root: Path, lifecycle: dict, dispatch: str) -> None:
+    lifecycle["dispatch"] = dispatch
+    try:
+        _write_lifecycle(record_root, lifecycle)
+    except (OSError, StorageError):
+        # The ProcessPort completion is exact evidence we cannot obtain again.
+        # Preserve it across one failed/uncertain publication before reporting
+        # that failure. A later instance then needs no nonexistent child receipt.
+        _write_lifecycle(record_root, lifecycle)
+        raise
+
+
+def _read_lifecycle(descriptor: int, probe_uuid: UUID) -> dict:
+    payload = _read_file(descriptor, _RUNTIME_LIFECYCLE, 4096)
+    lifecycle = json.loads(payload)
+    _require(type(lifecycle) is dict and set(lifecycle) == {"schema", "binding", "dispatch", "removal"})
+    _require(lifecycle["schema"] == "airplay-linux/probe-runtime-lifecycle/v1"
+             and type(lifecycle["dispatch"]) is str
+             and lifecycle["dispatch"] in {"allocated", "dispatching", "no_child", "complete"}
+             and _binding_bytes(lifecycle) == payload)
+    _validate_runtime_binding(lifecycle["binding"], probe_uuid)
+    removal = lifecycle["removal"]
+    if removal is not None:
+        _require(type(removal) is dict and set(removal) == {"step", "legs"}
+                 and type(removal["step"]) is int and 0 <= removal["step"] <= 4
+                 and type(removal["legs"]) is dict and set(removal["legs"]) <= {"positive", "negative"})
+        for pin in removal["legs"].values():
+            _require(type(pin) is list and len(pin) == 2 and type(pin[0]) is int
+                     and pin[0] >= 0 and type(pin[1]) is int and pin[1] > 0)
+    return lifecycle
+
+
+def _pin(descriptor: int) -> list[int]:
+    info = os.fstat(descriptor)
+    _private(info)
+    return [info.st_dev, info.st_ino]
+
+
+def _missing(parent: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    return False
+
+
+def _remove_empty(parent: int, name: str, pin: list[int] | None) -> None:
+    """Finish a previously authorised removal, including its directory sync."""
+    try:
+        entered = os.open(name, _DIR_FLAGS, dir_fd=parent)
+    except FileNotFoundError:
+        pass
+    else:
+        try:
+            _require(pin is not None and _pin(entered) == pin and not os.listdir(entered))
+            current = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            _require([current.st_dev, current.st_ino] == pin)
+            os.rmdir(name, dir_fd=parent)
+        finally:
+            os.close(entered)
+    # An absent entry may be the result of a crash just after rmdir. Sync it on
+    # every retry; ENOENT never bypasses durability or permits another entry.
+    os.fsync(parent)
+
+
+def _prepare_removal(record_root: Path, lifecycle: dict, descriptor: int) -> None:
+    """Persist exact empty-directory pins BEFORE the first destructive step."""
+    _same_runtime(lifecycle["binding"], descriptor)
     _require(set(os.listdir(descriptor)) <= {"positive", "negative"})
+    legs = {}
     for leg in os.listdir(descriptor):
         entered = os.open(leg, _DIR_FLAGS, dir_fd=descriptor)
         try:
-            _private(os.fstat(entered))
+            legs[leg] = _pin(entered)
             _require(not os.listdir(entered))
-            current = os.stat(leg, dir_fd=descriptor, follow_symlinks=False)
-            pinned = os.fstat(entered)
-            _require((current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino))
-            os.rmdir(leg, dir_fd=descriptor)
         finally:
             os.close(entered)
-    _same_runtime(binding, descriptor)
-    parent = _open_directory(root.parent)
+    lifecycle["removal"] = dict(step=0, legs=legs)
+    _write_lifecycle(record_root, lifecycle)
+
+
+def _remove_runtime(record_root: Path, lifecycle: dict, *, undispatched: bool = False) -> None:
+    """Replay durable removal intent; never reopen a directory already removed.
+
+    step identifies the NEXT removal: positive, negative, UUID root, outer
+    parent. Every step is already durable before rmdir and advances only after
+    fsync. Missing entries at that step are retried as absence, not failures.
+    """
+    binding, removal = lifecycle["binding"], lifecycle["removal"]
+    _require(removal is not None)
+    root = Path(binding["runtime_root"])
+
+    def advance(step):
+        removal["step"] = step
+        try:
+            _write_lifecycle(record_root, lifecycle)
+        except (OSError, StorageError):
+            # Before dispatch, this context still owns the empty allocation.
+            # A journal outage cannot require leaking it. Keep attempting each
+            # progress publication so an interrupted reclaim remains recoverable.
+            if not undispatched:
+                raise
+
     temporary = _open_directory(root.parent.parent)
+    parent = descriptor = None
     try:
-        pinned = os.fstat(parent)
-        current = os.stat(root.name, dir_fd=parent, follow_symlinks=False)
-        _require((pinned.st_dev, pinned.st_ino) == (binding["parent_device"], binding["parent_inode"])
-                 and (current.st_dev, current.st_ino) == (binding["runtime_device"], binding["runtime_inode"]))
-        os.rmdir(root.name, dir_fd=parent)
-        os.fsync(parent)
-        current = os.stat(root.parent.name, dir_fd=temporary, follow_symlinks=False)
-        _require((current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino))
-        os.rmdir(root.parent.name, dir_fd=temporary)
-        os.fsync(temporary)
+        try:
+            parent = os.open(root.parent.name, _DIR_FLAGS, dir_fd=temporary)
+        except FileNotFoundError:
+            _require(removal["step"] >= 3)
+            os.fsync(temporary)
+            advance(4)
+        else:
+            _require(_pin(parent) == [binding["parent_device"], binding["parent_inode"]]
+                     and removal["step"] < 4)
+            if removal["step"] <= 2:
+                try:
+                    descriptor = os.open(root.name, _DIR_FLAGS, dir_fd=parent)
+                except FileNotFoundError:
+                    _require(removal["step"] == 2)
+                else:
+                    _require(_pin(descriptor) == [binding["runtime_device"], binding["runtime_inode"]])
+                    for step, leg in enumerate(("positive", "negative")):
+                        if removal["step"] <= step:
+                            _same_runtime(binding, descriptor)
+                            _remove_empty(descriptor, leg, removal["legs"].get(leg))
+                            advance(step + 1)
+                        else:
+                            _require(_missing(descriptor, leg))
+                _remove_empty(parent, root.name, [binding["runtime_device"], binding["runtime_inode"]])
+                advance(3)
+            else:
+                _require(_missing(parent, root.name))
+                os.fsync(parent)
+            _remove_empty(temporary, root.parent.name, [binding["parent_device"], binding["parent_inode"]])
+            advance(4)
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
         os.close(temporary)
-        os.close(parent)
+    # The journal is deleted LAST: if obligation deletion or its fsync fails,
+    # a fresh instance can still finish from the durable parent-removed step.
+    files = AtomicFiles(record_root)
+    files.delete(_RUNTIME_OBLIGATION)
+    files.delete(_RUNTIME_LIFECYCLE)
 
 
-def _recover_runtime(record_root: Path, binding: dict) -> None:
+def _reclaim_undispatched(record_root: Path | None, allocation: _RuntimeAllocation) -> None:
+    """Publication failed before dispatch: the pinned allocation is still ours."""
+    binding = _runtime_binding(allocation.root, allocation.descriptor)
+    lifecycle = _new_lifecycle(binding)
+    if record_root is None:
+        raise _Refused()
+    try:
+        _prepare_removal(record_root, lifecycle, allocation.descriptor)
+    except (OSError, StorageError):
+        # Only a failed publication after all pin/emptiness checks can use the
+        # in-memory intent. No child can exist: retention has not transferred
+        # and the caller has not crossed its first dispatch/await boundary.
+        if lifecycle["removal"] is None:
+            raise
+    _remove_runtime(record_root, lifecycle, undispatched=True)
+
+
+def _recover_runtime(record_root: Path, lifecycle: dict) -> None:
     """Prove exact absence before unlinking; failed receipts grant no signals.
 
     Recovery runs outside the old user/network namespace. Directory ownership
@@ -253,10 +417,18 @@ def _recover_runtime(record_root: Path, binding: dict) -> None:
     pins remain unchanged. Unreadable/live children or supervisors retain all
     evidence and block another witness, including an uncertain spawn gap.
     """
+    if lifecycle["removal"] is not None:
+        _remove_runtime(record_root, lifecycle)
+        return
+    binding = lifecycle["binding"]
     root = Path(binding["runtime_root"])
     descriptor = open_probe_root(root, UUID(root.name))
     try:
         _same_runtime(binding, descriptor)
+        if lifecycle["dispatch"] in {"allocated", "no_child", "complete"}:
+            _prepare_removal(record_root, lifecycle, descriptor)
+            _remove_runtime(record_root, lifecycle)
+            return
         receipts = _lifecycle_all(_ProbeFiles(record_root), LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt)
         _require(bool(receipts) and len(receipts) <= 2)
         legs = [Path(receipt.runtime_directory).name for receipt in receipts]
@@ -287,6 +459,7 @@ def _recover_runtime(record_root: Path, binding: dict) -> None:
                 try:
                     entry = io.stat(receipt.socket_name, dir_fd=entered, follow_symlinks=False)
                 except FileNotFoundError:
+                    io.fsync(entered)
                     continue
                 _require(stat.S_ISSOCK(entry.st_mode) and entry.st_uid == os.getuid()
                          and (entry.st_dev, entry.st_ino) == (receipt.entry_device, receipt.entry_inode))
@@ -305,8 +478,8 @@ def _recover_runtime(record_root: Path, binding: dict) -> None:
             finally:
                 os.close(entered)
         absent()
-        _remove_runtime(binding, descriptor)
-        AtomicFiles(record_root).delete(_RUNTIME_OBLIGATION)
+        _prepare_removal(record_root, lifecycle, descriptor)
+        _remove_runtime(record_root, lifecycle)
     finally:
         os.close(descriptor)
 
@@ -669,6 +842,13 @@ class _Leg:
             }
             if self.leg == "negative":
                 overlay["DBUS_SESSION_BUS_ADDRESS"] = UNREACHABLE_BUS
+            # This durable child-side gate precedes EVERY backend dispatch.
+            # Only an observed outer completion/exec refusal plus its confirmed
+            # absence can prove that no backend child was ever dispatched.
+            AtomicFiles(self.config.record_root).write(_BACKEND_DISPATCH, _binding_bytes({
+                "schema": "airplay-linux/probe-backend-dispatch/v1",
+                "probe_uuid": str(self.config.probe_uuid),
+            }))
             result = await self.process.spawn(CommandSpec(
                 argv=(self.config.backend_executable, "-daemonize", "-socket",
                       directory + "/" + self.receipt.socket_name, "-cred-backend", "keyring"),
@@ -841,10 +1021,26 @@ class CredentialServiceProbe:
             descriptor = open_probe_root(root, probe_uuid)
             try:
                 try:
-                    binding = _read_runtime_binding(descriptor, probe_uuid)
+                    lifecycle = _read_lifecycle(descriptor, probe_uuid)
                 except FileNotFoundError:
-                    continue
-                _recover_runtime(root, binding)
+                    try:
+                        binding = _read_runtime_binding(descriptor, probe_uuid)
+                    except FileNotFoundError:
+                        # Finish a journal deletion that was visible but whose
+                        # containing-directory sync failed on the last attempt.
+                        os.fsync(descriptor)
+                        continue
+                    # A-2 obligations have no dispatch journal: missing receipts
+                    # are NEVER absence evidence for this legacy/uncertain case.
+                    lifecycle = _new_lifecycle(binding, "dispatching")
+                else:
+                    try:
+                        binding = _read_runtime_binding(descriptor, probe_uuid)
+                    except FileNotFoundError:
+                        pass  # Allocation publication or final discharge gap.
+                    else:
+                        _require(binding == lifecycle["binding"])
+                _recover_runtime(root, lifecycle)
                 _same_root(root, probe_uuid, descriptor)
             finally:
                 os.close(descriptor)
@@ -857,25 +1053,52 @@ class CredentialServiceProbe:
             probe_uuid = uuid4()
             root = self._create_root(probe_uuid)
             descriptor = open_probe_root(root, probe_uuid)
-            with _short_runtime_root(probe_uuid) as (runtime_root, runtime_descriptor):
+            with _short_runtime_root(probe_uuid, root) as allocation:
+                runtime_root, runtime_descriptor = allocation.root, allocation.descriptor
                 socket_path = str(runtime_root / "positive" / "daemon.sock")
                 _require(len(os.fsencode(socket_path)) < 108, ErrorCode.dependency_incompatible)
                 binding = _runtime_binding(runtime_root, runtime_descriptor)
+                lifecycle = _new_lifecycle(binding)
                 _same_root(root, probe_uuid, descriptor)
+                # Allocation is recoverable even if obligation publication fails.
+                # Retention transfers only after BOTH files and dispatch intent
+                # have confirmed durability. No await/dispatch precedes this.
+                _write_lifecycle(root, lifecycle)
                 AtomicFiles(root).write(_RUNTIME_OBLIGATION, _binding_bytes(binding))
+                lifecycle["dispatch"] = "dispatching"
+                _write_lifecycle(root, lifecycle)
+                allocation.retained = True
                 result = await self._process.run(CommandSpec(argv=(
                     self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
                     "--socket", socket_path, "--record-root", str(root),
                 ), env={}), timeout=30.0)
-                _same_root(runtime_root, probe_uuid, runtime_descriptor)
+                _same_runtime(binding, runtime_descriptor)
+                completed = isinstance(result, Ok) and type(result.value.exit_code) is int
+                not_started = isinstance(result, Err) and result.error.code is ErrorCode.dependency_missing
+                if completed or not_started:
+                    _same_root(root, probe_uuid, descriptor)
+                    if AtomicFiles(root).read(_BACKEND_DISPATCH) is None:
+                        # The outer process is finished (or exec never began),
+                        # AND the mandatory child dispatch gate was never crossed.
+                        # A missing receipt by itself never reaches this branch.
+                        receipts = _lifecycle_all(_ProbeFiles(root), LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt)
+                        _require(all(receipt.daemon is None for receipt in receipts))
+                        _record_completion(root, lifecycle, "no_child")
                 if isinstance(result, Err):
+                    if lifecycle["dispatch"] == "no_child":
+                        _prepare_removal(root, lifecycle, runtime_descriptor)
+                        _remove_runtime(root, lifecycle)
                     return result
                 decoded = read_probe_verdict(root, probe_uuid, descriptor, result.value)
                 if isinstance(decoded, Err):
+                    if lifecycle["dispatch"] == "no_child":
+                        _prepare_removal(root, lifecycle, runtime_descriptor)
+                        _remove_runtime(root, lifecycle)
                     return decoded
                 verdict = decoded.value
-                _remove_runtime(binding, runtime_descriptor)
-                AtomicFiles(root).delete(_RUNTIME_OBLIGATION)
+                _record_completion(root, lifecycle, "complete")
+                _prepare_removal(root, lifecycle, runtime_descriptor)
+                _remove_runtime(root, lifecycle)
                 proof = CredentialProofVerdict(
                     service_leg=verdict.service_leg, backend_positive_leg=verdict.backend_positive_leg,
                     backend_negative_leg=verdict.backend_negative_leg, failure=verdict.failure,
