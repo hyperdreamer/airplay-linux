@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -308,6 +309,20 @@ def _remove_empty(parent: int, name: str, pin: list[int] | None) -> None:
     os.fsync(parent)
 
 
+def _retire_empty_probe(root: Path, probe_uuid: UUID, descriptor: int) -> None:
+    """Caller holds the probe-parent lock; preserve every remaining artifact."""
+    _same_root(root, probe_uuid, descriptor)
+    if os.listdir(descriptor):
+        return
+    os.fsync(descriptor)
+    parent = _open_directory(root.parent)
+    try:
+        _private(os.fstat(parent))
+        _remove_empty(parent, root.name, _pin(descriptor))
+    finally:
+        os.close(parent)
+
+
 def _prepare_removal(record_root: Path, lifecycle: dict, descriptor: int) -> None:
     """Persist exact empty-directory pins BEFORE the first destructive step."""
     _same_runtime(lifecycle["binding"], descriptor)
@@ -407,6 +422,12 @@ def _reclaim_undispatched(record_root: Path | None, allocation: _RuntimeAllocati
         if lifecycle["removal"] is None:
             raise
     _remove_runtime(record_root, lifecycle, undispatched=True)
+    probe_uuid = UUID(record_root.name)
+    descriptor = open_probe_root(record_root, probe_uuid)
+    try:
+        _retire_empty_probe(record_root, probe_uuid, descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _recover_runtime(record_root: Path, lifecycle: dict) -> None:
@@ -957,6 +978,18 @@ class CredentialServiceProbe:
             self._task = asyncio.create_task(self._check())
         return await asyncio.shield(self._task)
 
+    def _lock_probes(self) -> int:
+        # Lock the parent BEFORE mkdir, and retain the shared open description
+        # through dispatch/cleanup. Recovery cannot mistake a paused creator's
+        # fresh empty UUID directory for a discharged one. No lock file remains.
+        with AtomicFiles(self._record_root)._directory(("daemon", "probe"), create=True) as located:
+            _require(located.parent is not None and not located.missing)
+            try:
+                fcntl.flock(located.parent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise _Refused() from None
+            return os.dup(located.parent)
+
     def _create_root(self, probe_uuid: UUID) -> Path:
         files = AtomicFiles(self._record_root)
         with files._directory(("daemon", "probe"), create=True) as located:
@@ -1029,6 +1062,7 @@ class CredentialServiceProbe:
                         # Finish a journal deletion that was visible but whose
                         # containing-directory sync failed on the last attempt.
                         os.fsync(descriptor)
+                        _retire_empty_probe(root, probe_uuid, descriptor)
                         continue
                     # A-2 obligations have no dispatch journal: missing receipts
                     # are NEVER absence evidence for this legacy/uncertain case.
@@ -1042,13 +1076,17 @@ class CredentialServiceProbe:
                         _require(binding == lifecycle["binding"])
                 _recover_runtime(root, lifecycle)
                 _same_root(root, probe_uuid, descriptor)
+                _retire_empty_probe(root, probe_uuid, descriptor)
             finally:
                 os.close(descriptor)
 
     async def _check(self) -> Result[CredentialProofVerdict]:
-        descriptor = None
+        descriptor = lock_descriptor = None
         try:
             _require(type(self._unshare) is str and bool(self._unshare), ErrorCode.dependency_incompatible)
+            lock_descriptor = self._lock_probes()
+            # Also confirm a prior retirement whose parent fsync was interrupted.
+            os.fsync(lock_descriptor)
             self._recover_pending()
             probe_uuid = uuid4()
             root = self._create_root(probe_uuid)
@@ -1088,17 +1126,20 @@ class CredentialServiceProbe:
                     if lifecycle["dispatch"] == "no_child":
                         _prepare_removal(root, lifecycle, runtime_descriptor)
                         _remove_runtime(root, lifecycle)
+                        _retire_empty_probe(root, probe_uuid, descriptor)
                     return result
                 decoded = read_probe_verdict(root, probe_uuid, descriptor, result.value)
                 if isinstance(decoded, Err):
                     if lifecycle["dispatch"] == "no_child":
                         _prepare_removal(root, lifecycle, runtime_descriptor)
                         _remove_runtime(root, lifecycle)
+                        _retire_empty_probe(root, probe_uuid, descriptor)
                     return decoded
                 verdict = decoded.value
                 _record_completion(root, lifecycle, "complete")
                 _prepare_removal(root, lifecycle, runtime_descriptor)
                 _remove_runtime(root, lifecycle)
+                _retire_empty_probe(root, probe_uuid, descriptor)
                 proof = CredentialProofVerdict(
                     service_leg=verdict.service_leg, backend_positive_leg=verdict.backend_positive_leg,
                     backend_negative_leg=verdict.backend_negative_leg, failure=verdict.failure,
@@ -1109,8 +1150,12 @@ class CredentialServiceProbe:
         except (OSError, StorageError, RecordError, _Refused, ValueError, TypeError) as error:
             return _err(error.code if isinstance(error, _Refused) else ErrorCode.persistence_failed)
         finally:
-            if descriptor is not None:
-                os.close(descriptor)
+            try:
+                if descriptor is not None:
+                    os.close(descriptor)
+            finally:
+                if lock_descriptor is not None:
+                    os.close(lock_descriptor)
 
 
 def _namespace_identity(argv: tuple[str, ...]) -> Result[ProcessIdentity]:

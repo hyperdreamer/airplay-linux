@@ -1,10 +1,13 @@
 """A-3/A-4/A-5: public fresh-instance recovery at durable lifecycle boundaries."""
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -36,11 +39,15 @@ async def test_pre_child_failure_then_fresh_instance_success(recording_probe_pro
             return Err(error=diagnostic(ErrorCode.dependency_missing))
 
     state = c.runtime_config.state_root
-    first = await c.module.CredentialServiceProbe(
-        process=PreChildFailure(), record_root=state, unshare="/fake/unshare",
-    ).check()
-    assert isinstance(first, Err)
+    for _ in range(3):
+        first = await c.module.CredentialServiceProbe(
+            process=PreChildFailure(), record_root=state, unshare="/fake/unshare",
+        ).check()
+        assert isinstance(first, Err)
     assert not c.inner_launches
+    assert len(roots) == 3
+    # Count record UUIDs before either fixture can reclaim temporary trees.
+    assert list((state / "daemon/probe").iterdir()) == [], "A-7: empty probe records accumulated"
     second = await c.module.CredentialServiceProbe(
         process=c.outer, record_root=state, unshare="/fake/unshare",
     ).check()
@@ -48,6 +55,123 @@ async def test_pre_child_failure_then_fresh_instance_success(recording_probe_pro
     assert len(c.outer_unshare) == 1 and len(c.inner_launches) == 2
     assert all(not root.parent.exists() for root in roots)
     assert not list(state.rglob("runtime-cleanup.json"))
+
+
+@pytest.mark.parametrize("artifact", [
+    None, "runtime-lifecycle.json", "runtime-cleanup.json", "receipts", "cleanup-intents",
+    ".runtime-lifecycle.json.tmp", "backend-dispatch.json", "verdict.json",
+])
+async def test_recovery_retires_only_completely_empty_probe_records(tmp_path, monkeypatch, artifact):
+    p = probe_module()
+    state = tmp_path / "state"
+    root = state / "daemon/probe" / str(uuid4())
+    root.mkdir(mode=0o700, parents=True)
+    if artifact in {"receipts", "cleanup-intents"}:
+        (root / artifact).mkdir(mode=0o700)
+    elif artifact is not None:
+        (root / artifact).write_bytes(b"retained evidence")
+    original_rmdir, original_fsync = os.rmdir, os.fsync
+    retired, synced = [], []
+
+    def track_removal(path, *args, **kwargs):
+        original_rmdir(path, *args, **kwargs)
+        if path == root.name:
+            retired.append(path)
+
+    def track_sync(descriptor):
+        if retired and os.readlink(f"/proc/self/fd/{descriptor}") == str(root.parent):
+            synced.append(descriptor)
+        return original_fsync(descriptor)
+
+    class PreChildExit:
+        async def run(self, spec, timeout):
+            return Ok(value=CommandOutput(exit_code=1, stdout=b"", stderr=b""))
+
+    monkeypatch.setattr(os, "rmdir", track_removal)
+    monkeypatch.setattr(os, "fsync", track_sync)
+    result = await p.CredentialServiceProbe(process=PreChildExit(), record_root=state, unshare="unshare").check()
+    assert isinstance(result, Err)
+    if artifact is None:
+        assert not root.exists(), "A-7: recovery stranded an empty UUID directory"
+        assert retired == [root.name] and synced, "record retirement must fsync its parent after rmdir"
+    else:
+        assert root.is_dir() and (root / artifact).exists()
+        if (root / artifact).is_file():
+            assert (root / artifact).read_bytes() == b"retained evidence"
+        assert not retired
+
+
+async def test_recovery_cannot_retire_a_probe_between_mkdir_and_lifecycle(tmp_path, monkeypatch):
+    p = probe_module()
+    state = tmp_path / "state"
+    original_create = p.CredentialServiceProbe._create_root
+    observed = []
+
+    class PreChildExit:
+        async def run(self, spec, timeout):
+            return Ok(value=CommandOutput(exit_code=1, stdout=b"", stderr=b""))
+
+    def check_competitor():
+        return asyncio.run(p.CredentialServiceProbe(
+            process=PreChildExit(), record_root=state, unshare="unshare",
+        ).check())
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        def pause_after_mkdir(self, probe_uuid):
+            root = original_create(self, probe_uuid)
+            if not observed:
+                observed.append(root)
+                assert list(root.iterdir()) == []
+                competitor = executor.submit(check_competitor).result(timeout=5)
+                assert root.is_dir() and list(root.iterdir()) == []
+                assert isinstance(competitor, Err) and competitor.error.code is ErrorCode.ownership_mismatch
+            return root
+
+        monkeypatch.setattr(p.CredentialServiceProbe, "_create_root", pause_after_mkdir)
+        result = await p.CredentialServiceProbe(
+            process=PreChildExit(), record_root=state, unshare="unshare",
+        ).check()
+    assert isinstance(result, Err)
+    assert len(observed) == 1
+    assert list((state / "daemon/probe").iterdir()) == []
+
+
+async def test_concurrent_recovery_preserves_live_binding_and_lifecycle(tmp_path):
+    p = probe_module()
+    state = tmp_path / "state"
+    entered, finish = asyncio.Event(), asyncio.Event()
+    records = []
+
+    class LiveOuter:
+        async def run(self, spec, timeout):
+            root = Path(spec.argv[spec.argv.index("--record-root") + 1])
+            records.append(root)
+            entered.set()
+            await finish.wait()
+            return Ok(value=CommandOutput(exit_code=1, stdout=b"", stderr=b""))
+
+    class NoDispatch:
+        async def run(self, spec, timeout):
+            pytest.fail("concurrent recovery dispatched over a live probe")
+
+    active = asyncio.create_task(p.CredentialServiceProbe(
+        process=LiveOuter(), record_root=state, unshare="unshare",
+    ).check())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        root, = records
+        evidence = {name: (root / name).read_bytes()
+                    for name in ("runtime-cleanup.json", "runtime-lifecycle.json")}
+        assert json.loads(evidence["runtime-lifecycle.json"])["dispatch"] == "dispatching"
+        competitor = await p.CredentialServiceProbe(
+            process=NoDispatch(), record_root=state, unshare="unshare",
+        ).check()
+        assert isinstance(competitor, Err) and competitor.error.code is ErrorCode.ownership_mismatch
+        assert root.is_dir()
+        assert all((root / name).read_bytes() == payload for name, payload in evidence.items())
+    finally:
+        finish.set()
+        await active
 
 
 class RecoveryCrash(RuntimeError):
