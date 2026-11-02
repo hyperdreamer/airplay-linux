@@ -6,10 +6,10 @@ import hashlib
 import importlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
-from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,7 +27,10 @@ from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process import ownership
 from airplay_linux.process.procfs import IdentityEvidence, IdentityState
 from airplay_linux.storage.atomic import AtomicFiles, state_root
-from airplay_linux.storage.codecs import RecordError, decode_probe_verdict, encode_probe_verdict
+from airplay_linux.storage.codecs import (
+    RecordError, decode_daemon_cleanup_intent, decode_launch_receipt, decode_probe_verdict,
+    encode_probe_verdict,
+)
 from airplay_linux.testing.adapters import ProbeProcessRecorder
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
@@ -69,10 +72,13 @@ class NamespaceFacts(ownership.EndpointObservations):
         self.bound_after = 0.0
         self.boot = str(UUID(int=333))
         self.supervisor = ProcessIdentity(pid=3000, start_ticks=30)
+        self.supervisor_present = True
 
     def identity(self, pid):
         self.checked.append(("identity", pid))
         if pid == self.supervisor.pid:
+            if not self.supervisor_present:
+                return IdentityEvidence(pid=pid, state=IdentityState.absent)
             return IdentityEvidence(pid=pid, state=IdentityState.present,
                                     identity=self.supervisor, parent=2999, uid=os.getuid())
         identity = self.process.identity(pid)
@@ -208,6 +214,25 @@ class InnerProcess(ProbeProcessRecorder):
                     observation.exit_code = -15
                     observation.socket_exists = False
         return result
+
+
+@pytest.fixture(autouse=True)
+def fake_probe_runtime_directories(monkeypatch):
+    """Only test fakes launch here; reclaim their deliberately retained trees."""
+    p = probe_module()
+    original = p.mkdtemp
+    parents = []
+
+    def tracked(**kwargs):
+        directory = original(**kwargs)
+        parents.append(Path(directory))
+        return directory
+
+    monkeypatch.setattr(p, "mkdtemp", tracked)
+    yield
+    for parent in parents:
+        if parent.exists():
+            shutil.rmtree(parent)
 
 
 @pytest.fixture
@@ -714,7 +739,8 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
         assert len(c.outer_unshare) == 1
         assert len(c.inner_launches) == {"service": 0, "positive": 2, "negative": 2, "cleanup": 1}[leg]
         assert c.config.record_root.is_dir()
-        assert not c.probe_runtime_root.parent.exists()
+        assert c.probe_runtime_root.parent.exists() is (leg == "cleanup")
+        assert (c.config.record_root / "runtime-cleanup.json").exists() is (leg == "cleanup")
         assert not runtime.deps.transport._features.keyring
         if leg == "cleanup":
             assert not (c.config.record_root / "verdict.json").exists()
@@ -726,6 +752,121 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
             assert (c.config.record_root / "negative" / "credentials.json").read_text() == "temporary fake data"
         refused = await runtime.registry.ensure()
         assert isinstance(refused, Err) and refused.error.code is ErrorCode.dependency_incompatible
+    finally:
+        await runtime.shutdown()
+
+
+async def test_cleanup_timeout_retains_pinned_runtime_and_obligation_until_exact_absence(
+    recording_probe_processes, monkeypatch,
+):
+    """A-2: unconfirmed teardown must preserve the socket and all cleanup evidence."""
+    c = recording_probe_processes
+    c.inner.terminate_error = ErrorCode.cleanup_timeout
+    runtime = await c.build_complete_production_and_probe()
+    try:
+        launch, = c.inner_launches
+        root = c.config.record_root
+        sockets = c.probe_runtime_root
+        assert c.inner.identity(launch.identity.pid) == launch.identity
+        assert sockets.is_dir(), "A-2: runtime tree was removed while its exact child was live"
+        receipt_path = root / "receipts" / f"{launch.launch_uuid}.json"
+        receipt_bytes = receipt_path.read_bytes()
+        receipt = decode_launch_receipt(receipt_bytes)
+        assert receipt.state == "failed" and receipt.failure is ErrorCode.cleanup_timeout
+        assert receipt.daemon == launch.identity
+        assert Path(receipt.runtime_directory).stat().st_ino == receipt.runtime_inode
+        intent_path = root / "cleanup-intents" / f"{launch.launch_uuid}.json"
+        intent_bytes = intent_path.read_bytes()
+        assert decode_daemon_cleanup_intent(intent_bytes).outcome is ErrorCode.cleanup_timeout
+        obligation = root / "runtime-cleanup.json"
+        obligation_bytes = obligation.read_bytes()
+        binding = json.loads(obligation_bytes)
+        assert binding["runtime_root"] == str(sockets)
+        assert binding["runtime_inode"] == sockets.stat().st_ino
+        assert not (root / "verdict.json").exists()
+        assert not runtime.deps.transport._features.keyring
+
+        # Reopen the production parent. A retained live or unreadable child must
+        # block another namespace launch, without re-signalling a failed receipt.
+        monkeypatch.setattr(c.module, "EndpointObservations", lambda: c.facts)
+        c.facts.supervisor_present = False
+        for unreadable in (False, True):
+            c.facts.unreadable = unreadable
+            probe = c.module.CredentialServiceProbe(
+                process=c.outer, record_root=c.runtime_config.state_root, unshare="/fake/unshare",
+            )
+            assert isinstance(await probe.check(), Err)
+            assert len(c.outer_unshare) == 1
+            assert sockets.is_dir() and obligation.read_bytes() == obligation_bytes
+            assert receipt_path.read_bytes() == receipt_bytes
+            assert intent_path.read_bytes() == intent_bytes
+        c.facts.unreadable = False
+        c.inner.exit(launch.identity, -9)
+        c.facts.rows[receipt.runtime_directory + "/daemon.sock"] = ()
+        c.inner.terminate_error = None
+        socket_path = receipt.runtime_directory + "/daemon.sock"
+        entry = c.facts.entries[socket_path]
+        original_peer = c.facts.peer
+        original_boot = c.facts.boot
+        for damaged in ("live_supervisor", "wrong_boot", "replaced_entry", "listening_entry"):
+            if damaged == "live_supervisor":
+                c.facts.supervisor_present = True
+            elif damaged == "wrong_boot":
+                c.facts.boot = str(uuid4())
+            elif damaged == "replaced_entry":
+                c.facts.entries[socket_path] = SimpleNamespace(
+                    st_mode=entry.st_mode, st_uid=entry.st_uid, st_dev=entry.st_dev, st_ino=entry.st_ino + 1,
+                )
+            else:
+                c.facts.peer = lambda *args: (launch.identity.pid, os.getuid(), os.getgid())
+            probe = c.module.CredentialServiceProbe(
+                process=c.outer, record_root=c.runtime_config.state_root, unshare="/fake/unshare",
+            )
+            assert isinstance(await probe.check(), Err), damaged
+            assert len(c.outer_unshare) == 1 and sockets.is_dir(), damaged
+            assert obligation.read_bytes() == obligation_bytes, damaged
+            assert receipt_path.read_bytes() == receipt_bytes and intent_path.read_bytes() == intent_bytes
+            assert socket_path in c.facts.entries, damaged
+            c.facts.supervisor_present = False
+            c.facts.boot = original_boot
+            c.facts.entries[socket_path] = entry
+            c.facts.peer = original_peer
+        # Inspection stops after recovery so no replacement witness can hide
+        # which exact tree was removed or which receipt bytes survived.
+        class NoLaunch:
+            async def run(self, spec, timeout):
+                assert not sockets.parent.exists(), "strict absence recovery did not remove the old tree"
+                assert not obligation.exists()
+                assert receipt_path.read_bytes() == receipt_bytes
+                assert intent_path.read_bytes() == intent_bytes
+                return Err(error=composition.diagnostic(ErrorCode.dependency_missing))
+        probe = c.module.CredentialServiceProbe(
+            process=NoLaunch(), record_root=c.runtime_config.state_root, unshare="/fake/unshare",
+        )
+        assert isinstance(await probe.check(), Err)
+        assert not sockets.parent.exists()
+        assert not c.facts.entries
+        assert not c.inner.terminated, "failed-receipt recovery must never create signal authority"
+        assert len(c.outer_unshare) == 1
+    finally:
+        await runtime.shutdown()
+
+
+async def test_confirmed_teardown_removes_short_runtime_and_resolves_obligation(recording_probe_processes):
+    """A-2 companion: confirmed cleanup must still reclaim a failed witness's sockets."""
+    c = recording_probe_processes
+    c.inner.confirmation_fails = True
+    runtime = await c.build_complete_production_and_probe()
+    try:
+        assert len(c.inner_launches) == 2
+        assert all(c.inner.identity(item.identity.pid) is None for item in c.inner_launches)
+        assert c.inner.strict_terminations and c.inner.strict_terminations[0].stage == "bound"
+        assert not c.probe_runtime_root.parent.exists(), "confirmed runtime cleanup was retained"
+        assert not (c.config.record_root / "runtime-cleanup.json").exists()
+        verdict = decode_probe_verdict((c.config.record_root / "verdict.json").read_bytes())
+        assert verdict.backend_positive_leg == "failed"
+        assert len(list((c.config.record_root / "receipts").glob("*.json"))) == 2
+        assert not runtime.deps.transport._features.keyring
     finally:
         await runtime.shutdown()
 
@@ -802,7 +943,8 @@ async def test_runtime_root_change_refuses_before_archiving_original_evidence(re
         assert c.config.record_root.is_dir()
         assert len(list((c.config.record_root / "receipts").glob("*.json"))) == 2
         assert (c.config.record_root / "verdict.json").is_file()
-        assert not c.probe_runtime_root.parent.exists()
+        assert (c.config.record_root / "runtime-cleanup.json").is_file()
+        assert c.probe_runtime_root.parent.is_dir()
     finally:
         await runtime.shutdown()
 
@@ -834,7 +976,8 @@ async def test_short_runtime_cleanup_preserves_durable_evidence_on_dispatch_fail
             await probe.check()
     else:
         assert isinstance(await probe.check(), Err)
-    assert not observed["sockets"].parent.exists()
+    assert observed["sockets"].is_dir()
+    assert (observed["records"] / "runtime-cleanup.json").is_file()
     assert (observed["records"] / "receipts/retained.json").read_bytes() == b"retained child evidence"
 
 
@@ -861,7 +1004,7 @@ async def test_caller_cancellation_leaves_witness_running_until_cleanup(tmp_path
     finally:
         finish.set()
         assert isinstance(await probe.check(), Err)
-    assert not observed[0].parent.exists()
+    assert observed[0].is_dir()
     assert len(observed) == 1
 
 
@@ -870,37 +1013,38 @@ def test_short_runtime_parent_must_be_owned_private_and_not_symlinked(monkeypatc
     p = probe_module()
     parents = []
     original_fstat = os.fstat
+    original_mkdtemp = p.mkdtemp
 
-    @contextmanager
     def damaged_parent(**kwargs):
         assert kwargs == {"prefix": "ap-", "dir": "/tmp"}
-        with TemporaryDirectory(**kwargs) as directory:
-            parent = Path(directory)
-            parents.append(parent)
-            if damage == "mode":
-                parent.chmod(0o755)
-            elif damage == "owner":
-                identity = parent.stat().st_ino
-                def wrong_owner(descriptor):
-                    info = original_fstat(descriptor)
-                    if info.st_ino == identity:
-                        return SimpleNamespace(st_uid=os.getuid() + 1, st_mode=info.st_mode)
-                    return info
-                monkeypatch.setattr(os, "fstat", wrong_owner)
-            else:
-                (parent / "real").mkdir(mode=0o700)
-                (parent / "link").symlink_to(parent / "real", target_is_directory=True)
-                directory = str(parent / "link")
-            try:
-                yield directory
-            finally:
-                monkeypatch.setattr(os, "fstat", original_fstat)
+        parent = Path(original_mkdtemp(**kwargs))
+        parents.append(parent)
+        directory = str(parent)
+        if damage == "mode":
+            parent.chmod(0o755)
+        elif damage == "owner":
+            identity = parent.stat().st_ino
+            def wrong_owner(descriptor):
+                info = original_fstat(descriptor)
+                if info.st_ino == identity:
+                    return SimpleNamespace(st_uid=os.getuid() + 1, st_mode=info.st_mode,
+                                           st_dev=info.st_dev, st_ino=info.st_ino)
+                return info
+            monkeypatch.setattr(os, "fstat", wrong_owner)
+        else:
+            (parent / "real").mkdir(mode=0o700)
+            (parent / "link").symlink_to(parent / "real", target_is_directory=True)
+            directory = str(parent / "link")
+        return directory
 
-    monkeypatch.setattr(p, "TemporaryDirectory", damaged_parent)
-    with pytest.raises((p._Refused, OSError)):
-        with p._short_runtime_root(uuid4()):
-            pytest.fail("unsafe runtime parent was accepted")
-    assert len(parents) == 1 and not parents[0].exists()
+    monkeypatch.setattr(p, "mkdtemp", damaged_parent)
+    try:
+        with pytest.raises((p._Refused, OSError)):
+            with p._short_runtime_root(uuid4()):
+                pytest.fail("unsafe runtime parent was accepted")
+        assert len(parents) == 1
+    finally:
+        monkeypatch.setattr(os, "fstat", original_fstat)
 
 
 def test_credential_probe_file_passes_with_deep_basetemp(tmp_path):

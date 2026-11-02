@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -20,7 +22,7 @@ from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import mkdtemp
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -43,7 +45,9 @@ from airplay_linux.storage.codecs import (
     RecordError, decode_launch_receipt, decode_probe_verdict, encode_daemon_reservation,
     encode_probe_verdict,
 )
-from airplay_linux.storage.repositories import JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore
+from airplay_linux.storage.repositories import (
+    JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore, LAUNCH_RECEIPT_DIRECTORY, _lifecycle_all,
+)
 
 SOCKET_IDLE_TIMEOUT = 3.0
 IDLE_CONFIRMATION = 2.0
@@ -52,6 +56,7 @@ POLL_INTERVAL = 0.05
 UNREACHABLE_BUS = "unix:path=/nonexistent/airplay-credential-probe-bus"
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+_RUNTIME_OBLIGATION = "runtime-cleanup.json"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -141,24 +146,169 @@ def _same_root(root: Path, probe_uuid: UUID, descriptor: int) -> None:
 def _short_runtime_root(probe_uuid: UUID) -> Iterator[tuple[Path, int]]:
     """Bound socket paths independently of state home and TMPDIR.
 
-    Receipts, verdicts and HOME/XDG files remain in the durable record root.
-    TemporaryDirectory uses symlink-resistant cleanup on every exit path.
+    Exiting closes descriptors only. The caller must durably record this path
+    before dispatch and explicitly remove it after confirmed exact cleanup.
     """
-    with TemporaryDirectory(prefix="ap-", dir="/tmp") as directory:
-        parent = Path(directory)
-        descriptor = _open_directory(parent)
+    parent = Path(mkdtemp(prefix="ap-", dir="/tmp"))
+    descriptor = _open_directory(parent)
+    root_descriptor = None
+    retained = False
+    try:
+        _private(os.fstat(descriptor))
+        os.mkdir(str(probe_uuid), 0o700, dir_fd=descriptor)
+        os.fsync(descriptor)
+        root = parent / str(probe_uuid)
+        root_descriptor = open_probe_root(root, probe_uuid)
+        retained = True
+        yield root, root_descriptor
+    finally:
+        if root_descriptor is not None:
+            os.close(root_descriptor)
+        os.close(descriptor)
+        if not retained:
+            # No caller could dispatch a child before yield.
+            shutil.rmtree(parent)
+
+
+def _runtime_binding(root: Path, descriptor: int) -> dict:
+    parent = _open_directory(root.parent)
+    try:
+        _private(os.fstat(parent))
+        info, outer = os.fstat(descriptor), os.fstat(parent)
+        os.fsync(parent)
+        return dict(schema="airplay-linux/probe-runtime-cleanup/v1", runtime_root=str(root),
+                    runtime_device=info.st_dev, runtime_inode=info.st_ino,
+                    parent_device=outer.st_dev, parent_inode=outer.st_ino)
+    finally:
+        os.close(parent)
+
+
+def _binding_bytes(binding: dict) -> bytes:
+    return json.dumps(binding, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _read_runtime_binding(descriptor: int, probe_uuid: UUID) -> dict:
+    payload = _read_file(descriptor, _RUNTIME_OBLIGATION, 4096)
+    binding = json.loads(payload)
+    _require(type(binding) is dict and set(binding) == {
+        "schema", "runtime_root", "runtime_device", "runtime_inode", "parent_device", "parent_inode",
+    })
+    _require(binding["schema"] == "airplay-linux/probe-runtime-cleanup/v1"
+             and type(binding["runtime_root"]) is str and _binding_bytes(binding) == payload)
+    for key in ("runtime_device", "runtime_inode", "parent_device", "parent_inode"):
+        _require(type(binding[key]) is int and binding[key] >= (0 if key.endswith("device") else 1))
+    root = Path(binding["runtime_root"])
+    _require(root.name == str(probe_uuid) and root.parent.parent == Path("/tmp")
+             and re.fullmatch(r"ap-[a-z0-9_]+", root.parent.name) is not None)
+    _require(len(os.fsencode(root / "positive/daemon.sock")) < 108)
+    return binding
+
+
+def _same_runtime(binding: dict, descriptor: int) -> None:
+    root = Path(binding["runtime_root"])
+    _same_root(root, UUID(root.name), descriptor)
+    _require(_runtime_binding(root, descriptor) == binding)
+
+
+def _remove_runtime(binding: dict, descriptor: int) -> None:
+    """Remove only empty, still-pinned directories after strict cleanup proof."""
+    _same_runtime(binding, descriptor)
+    root = Path(binding["runtime_root"])
+    _require(set(os.listdir(descriptor)) <= {"positive", "negative"})
+    for leg in os.listdir(descriptor):
+        entered = os.open(leg, _DIR_FLAGS, dir_fd=descriptor)
         try:
-            _private(os.fstat(descriptor))
-            os.mkdir(str(probe_uuid), 0o700, dir_fd=descriptor)
-            os.fsync(descriptor)
-            root = parent / str(probe_uuid)
-            root_descriptor = open_probe_root(root, probe_uuid)
-            try:
-                yield root, root_descriptor
-            finally:
-                os.close(root_descriptor)
+            _private(os.fstat(entered))
+            _require(not os.listdir(entered))
+            current = os.stat(leg, dir_fd=descriptor, follow_symlinks=False)
+            pinned = os.fstat(entered)
+            _require((current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino))
+            os.rmdir(leg, dir_fd=descriptor)
         finally:
-            os.close(descriptor)
+            os.close(entered)
+    _same_runtime(binding, descriptor)
+    parent = _open_directory(root.parent)
+    temporary = _open_directory(root.parent.parent)
+    try:
+        pinned = os.fstat(parent)
+        current = os.stat(root.name, dir_fd=parent, follow_symlinks=False)
+        _require((pinned.st_dev, pinned.st_ino) == (binding["parent_device"], binding["parent_inode"])
+                 and (current.st_dev, current.st_ino) == (binding["runtime_device"], binding["runtime_inode"]))
+        os.rmdir(root.name, dir_fd=parent)
+        os.fsync(parent)
+        current = os.stat(root.parent.name, dir_fd=temporary, follow_symlinks=False)
+        _require((current.st_dev, current.st_ino) == (pinned.st_dev, pinned.st_ino))
+        os.rmdir(root.parent.name, dir_fd=temporary)
+        os.fsync(temporary)
+    finally:
+        os.close(temporary)
+        os.close(parent)
+
+
+def _recover_runtime(record_root: Path, binding: dict) -> None:
+    """Prove exact absence before unlinking; failed receipts grant no signals.
+
+    Recovery runs outside the old user/network namespace. Directory ownership
+    is therefore checked against this parent's UID; receipt identity and entry
+    pins remain unchanged. Unreadable/live children or supervisors retain all
+    evidence and block another witness, including an uncertain spawn gap.
+    """
+    root = Path(binding["runtime_root"])
+    descriptor = open_probe_root(root, UUID(root.name))
+    try:
+        _same_runtime(binding, descriptor)
+        receipts = _lifecycle_all(_ProbeFiles(record_root), LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt)
+        _require(bool(receipts) and len(receipts) <= 2)
+        legs = [Path(receipt.runtime_directory).name for receipt in receipts]
+        _require(len(set(legs)) == len(legs) and "positive" in legs and set(legs) <= {"positive", "negative"})
+        io = EndpointObservations()
+
+        def absent():
+            for receipt in receipts:
+                _require(receipt.boot_id == io.boot_id() and receipt.daemon is not None
+                         and receipt.supervisor is not None and receipt.app == receipt.supervisor
+                         and receipt.owner_uid in {0, os.getuid()})
+                for identity in (receipt.supervisor, receipt.daemon):
+                    found = io.identity(identity.pid)
+                    _require(found.state is IdentityState.absent or (
+                        found.state is IdentityState.terminated and found.identity == identity
+                        and found.uid == os.getuid()))
+
+        absent()
+        for receipt, leg in zip(receipts, legs, strict=True):
+            _require(receipt.runtime_directory == str(root / leg) and receipt.socket_name == "daemon.sock")
+            entered = os.open(leg, _DIR_FLAGS, dir_fd=descriptor)
+            try:
+                info = os.fstat(entered)
+                _private(info)
+                _require((info.st_dev, info.st_ino) == (receipt.runtime_device, receipt.runtime_inode))
+                path = receipt.runtime_directory + "/" + receipt.socket_name
+                _require(io.unix_inodes(path) == ())
+                try:
+                    entry = io.stat(receipt.socket_name, dir_fd=entered, follow_symlinks=False)
+                except FileNotFoundError:
+                    continue
+                _require(stat.S_ISSOCK(entry.st_mode) and entry.st_uid == os.getuid()
+                         and (entry.st_dev, entry.st_ino) == (receipt.entry_device, receipt.entry_inode))
+                try:
+                    io.peer(entered, receipt.socket_name)
+                except OSError as error:
+                    _require(error.errno in {errno.ECONNREFUSED, errno.ENOENT})
+                else:
+                    raise _Refused()
+                absent()
+                current = io.stat(receipt.socket_name, dir_fd=entered, follow_symlinks=False)
+                _require((current.st_dev, current.st_ino) == (entry.st_dev, entry.st_ino))
+                _same_runtime(binding, descriptor)
+                io.unlink(receipt.socket_name, dir_fd=entered)
+                io.fsync(entered)
+            finally:
+                os.close(entered)
+        absent()
+        _remove_runtime(binding, descriptor)
+        AtomicFiles(record_root).delete(_RUNTIME_OBLIGATION)
+    finally:
+        os.close(descriptor)
 
 
 def _read_file(directory: int, name: str, limit: int) -> bytes:
@@ -345,7 +495,6 @@ class _Leg:
         # Synchronous post-pidfd-open revalidation reopens/decodes ALL local
         # receipts. It must never return a cached pre-signal snapshot.
         try:
-            from airplay_linux.storage.repositories import _lifecycle_all, LAUNCH_RECEIPT_DIRECTORY
             return Ok(value=_lifecycle_all(self.files, LAUNCH_RECEIPT_DIRECTORY, decode_launch_receipt))
         except (RecordError, StorageError):
             return _err(ErrorCode.persistence_failed)
@@ -684,16 +833,36 @@ class CredentialServiceProbe:
         finally:
             os.close(parent)
 
+    def _recover_pending(self) -> None:
+        files = AtomicFiles(self._record_root)
+        for name in files.names("daemon/probe"):
+            probe_uuid = UUID(name)
+            root = self._record_root / "daemon/probe" / name
+            descriptor = open_probe_root(root, probe_uuid)
+            try:
+                try:
+                    binding = _read_runtime_binding(descriptor, probe_uuid)
+                except FileNotFoundError:
+                    continue
+                _recover_runtime(root, binding)
+                _same_root(root, probe_uuid, descriptor)
+            finally:
+                os.close(descriptor)
+
     async def _check(self) -> Result[CredentialProofVerdict]:
         descriptor = None
         try:
             _require(type(self._unshare) is str and bool(self._unshare), ErrorCode.dependency_incompatible)
+            self._recover_pending()
             probe_uuid = uuid4()
             root = self._create_root(probe_uuid)
             descriptor = open_probe_root(root, probe_uuid)
             with _short_runtime_root(probe_uuid) as (runtime_root, runtime_descriptor):
                 socket_path = str(runtime_root / "positive" / "daemon.sock")
                 _require(len(os.fsencode(socket_path)) < 108, ErrorCode.dependency_incompatible)
+                binding = _runtime_binding(runtime_root, runtime_descriptor)
+                _same_root(root, probe_uuid, descriptor)
+                AtomicFiles(root).write(_RUNTIME_OBLIGATION, _binding_bytes(binding))
                 result = await self._process.run(CommandSpec(argv=(
                     self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
                     "--socket", socket_path, "--record-root", str(root),
@@ -705,6 +874,8 @@ class CredentialServiceProbe:
                 if isinstance(decoded, Err):
                     return decoded
                 verdict = decoded.value
+                _remove_runtime(binding, runtime_descriptor)
+                AtomicFiles(root).delete(_RUNTIME_OBLIGATION)
                 proof = CredentialProofVerdict(
                     service_leg=verdict.service_leg, backend_positive_leg=verdict.backend_positive_leg,
                     backend_negative_leg=verdict.backend_negative_leg, failure=verdict.failure,
