@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
+from types import SimpleNamespace
+
 from airplay_linux.backend.contract import BackendSource
-from airplay_linux.capture.source import verify_reported_source
-from airplay_linux.display.inventory import MonitoredOutput
+from airplay_linux.capture.source import (
+    SourceRefusal,
+    SourceVerificationRefusal,
+    verify_reported_source,
+)
+from airplay_linux.display.inventory import (
+    KScreenInventory,
+    KScreenReportedSourceVerifier,
+    MonitoredOutput,
+)
+from airplay_linux.domain.ports import CommandOutput, CommandSpec
 from airplay_linux.domain.resources import Err, Ok, Size
 
 
@@ -12,20 +25,34 @@ def _output(
     name: str = "DP-1", *, enabled: bool = True, connected: bool = True,
     output_type: int | str | None = 14, size: Size | None = Size(width=1920, height=1080),
     position: tuple[int, int] | None = (0, 0), virtual: bool | None = False,
+    scale: float | None = 1.0, output_id: str | None = "1",
 ) -> MonitoredOutput:
     return MonitoredOutput(
         name=name, enabled=enabled, connected=connected, output_type=output_type,
-        size=size, position=position, virtual=virtual,
+        size=size, position=position, virtual=virtual, scale=scale, output_id=output_id,
     )
 
 
-def _reported(x: int = 0, y: int = 0) -> BackendSource:
-    return BackendSource(type=1, width=1920, height=1080, x=x, y=y)
+def _reported(
+    x: int = 0, y: int = 0, *, width: int = 1920, height: int = 1080,
+    source_type: int = 1, has_position: bool = True,
+) -> BackendSource:
+    return BackendSource(
+        type=source_type, width=width, height=height, x=x, y=y,
+        has_position=has_position,
+    )
+
+
+def _reason(result: object) -> SourceRefusal:
+    assert isinstance(result, SourceVerificationRefusal)
+    assert result.observation.reason is not None
+    return result.observation.reason
 
 
 def test_same_size_other_position_is_not_requested_source():
     result = verify_reported_source("DP-1", _reported(), (_output(position=(100, 0)),))
     assert isinstance(result, Err)
+    assert _reason(result) is SourceRefusal.NO_POSITION_MATCH
 
 
 def test_enabled_foreign_or_virtual_geometry_collision_refuses():
@@ -35,10 +62,9 @@ def test_enabled_foreign_or_virtual_geometry_collision_refuses():
         _output("DP-2", virtual=True),
         _output("DP-3", virtual=None),
     ):
-        assert isinstance(
-            verify_reported_source("DP-1", requested, (_output(), duplicate)),
-            Err,
-        )
+        result = verify_reported_source("DP-1", requested, (_output(), duplicate))
+        assert isinstance(result, Err)
+        assert _reason(result) is SourceRefusal.AMBIGUOUS_POSITION
 
 
 def test_disabled_geometry_match_does_not_create_ambiguity():
@@ -47,6 +73,7 @@ def test_disabled_geometry_match_does_not_create_ambiguity():
         (_output(), _output("HDMI-1", enabled=False, connected=True)),
     )
     assert isinstance(result, Ok)
+    assert result.value.matched_connector == "DP-1"
 
 
 def test_enabled_disconnected_or_unknown_geometry_collision_refuses():
@@ -55,10 +82,9 @@ def test_enabled_disconnected_or_unknown_geometry_collision_refuses():
         _output("DP-2", connected=False),
         _output("DP-3", output_type="Unknown", virtual=None),
     ):
-        assert isinstance(
-            verify_reported_source("DP-1", requested, (_output(), duplicate)),
-            Err,
-        )
+        result = verify_reported_source("DP-1", requested, (_output(), duplicate))
+        assert isinstance(result, Err)
+        assert _reason(result) is SourceRefusal.AMBIGUOUS_POSITION
 
 
 def test_negative_coordinate_physical_layout_is_accepted():
@@ -75,4 +101,136 @@ def test_stale_unreadable_or_unknown_origin_layout_refuses():
         _output(position=None),
         _output("Unknown-1", output_type=None, virtual=None),
     ):
-        assert isinstance(verify_reported_source("DP-1", _reported(), (output,)), Err)
+        result = verify_reported_source("DP-1", _reported(), (output,))
+        assert isinstance(result, Err)
+
+
+def test_scaled_portal_size_corroborates_current_mode_size():
+    result = verify_reported_source(
+        "DP-1", _reported(width=2880, height=1620),
+        (_output(scale=1.5),),
+    )
+    assert isinstance(result, Ok)
+    assert result.value.reported.width == 2880
+    assert result.value.matched_connector == "DP-1"
+
+
+def test_shared_position_is_ambiguous_even_when_one_candidate_is_requested():
+    result = verify_reported_source(
+        "DP-1", _reported(),
+        (_output(), _output("HDMI-1", output_id="2")),
+    )
+    assert isinstance(result, Err)
+    assert _reason(result) is SourceRefusal.AMBIGUOUS_POSITION
+
+
+def test_source_refusals_have_distinct_reasons():
+    cases = (
+        (_reported(source_type=2), (_output(),), SourceRefusal.NON_MONITOR_SOURCE),
+        (_reported(has_position=False), (_output(),), SourceRefusal.MISSING_POSITION),
+        (_reported(), (_output(virtual=True),), SourceRefusal.VIRTUAL_OUTPUT),
+        (_reported(), (_output("HDMI-1"),), SourceRefusal.DIFFERENT_CONNECTOR),
+    )
+    for reported, layout, expected in cases:
+        assert _reason(verify_reported_source("DP-1", reported, layout)) is expected
+
+
+def test_helper_owned_output_is_refused():
+    owned = SimpleNamespace(desired_state="active", connector="DP-1", output_id="1")
+    result = verify_reported_source(
+        "DP-1", _reported(), (_output(),), owned_outputs=(owned,),
+    )
+    assert isinstance(result, Err)
+    assert _reason(result) is SourceRefusal.OWNED_OUTPUT
+
+
+class _InventoryProcess:
+    def __init__(self, document):
+        self.document = document
+        self.calls = []
+        self.spawn_calls = 0
+
+    async def run(self, spec: CommandSpec, timeout: float, stdin=None):
+        self.calls.append((spec, timeout))
+        return Ok(value=CommandOutput(
+            exit_code=0, stdout=json.dumps(self.document).encode(), stderr=b"",
+        ))
+
+    async def spawn(self, spec):
+        self.spawn_calls += 1
+        raise AssertionError("source observation must never spawn a stream")
+
+
+class _Ownerships:
+    def __init__(self, records=()):
+        self.records = tuple(records)
+
+    async def all(self):
+        return Ok(value=self.records)
+
+
+def _inventory_document(*entries):
+    return {"outputs": [
+        {
+            "id": index + 1, "name": name, "enabled": enabled,
+            "connected": connected, "type": output_type,
+            "pos": {"x": position[0], "y": position[1]},
+            "size": {"width": size[0], "height": size[1]}, "scale": scale,
+        }
+        for index, (name, enabled, connected, output_type, position, size, scale)
+        in enumerate(entries)
+    ]}
+
+
+def test_two_stream_observations_are_independent_and_typed():
+    process = _InventoryProcess(_inventory_document(
+        ("DP-1", True, True, 14, (0, 0), (1920, 1080), 1),
+        ("HDMI-1", True, True, 6, (1920, 0), (1920, 1080), 1),
+    ))
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(process), physical_inventory_available=True,
+    )
+    wrong = asyncio.run(verifier.verify("DP-1", _reported(x=1920)))
+    right = asyncio.run(verifier.verify("DP-1", _reported()))
+    assert _reason(wrong) is SourceRefusal.DIFFERENT_CONNECTOR
+    assert isinstance(right, Ok)
+    assert right.value.reported == _reported()
+    assert right.value.matched_connector == "DP-1"
+
+
+def test_owned_output_is_refused_by_async_verifier_without_spawning():
+    process = _InventoryProcess(_inventory_document(
+        ("DP-1", True, True, 14, (0, 0), (1920, 1080), 1),
+    ))
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(process), physical_inventory_available=True,
+        ownerships=_Ownerships((SimpleNamespace(
+            desired_state="active", connector="DP-1", output_id="1",
+        ),)),
+    )
+    result = asyncio.run(verifier.verify("DP-1", _reported()))
+    assert _reason(result) is SourceRefusal.OWNED_OUTPUT
+    assert process.spawn_calls == 0
+
+
+def test_observation_never_blocks_a_stream_or_spawns():
+    process = _InventoryProcess(_inventory_document(
+        ("DP-1", True, True, 14, (0, 0), (1920, 1080), 1),
+    ))
+    verifier = KScreenReportedSourceVerifier(
+        KScreenInventory(process), physical_inventory_available=True,
+    )
+    result = asyncio.run(asyncio.wait_for(
+        verifier.verify("DP-1", _reported()), timeout=0.5,
+    ))
+    assert isinstance(result, Ok)
+    assert result.value.matched_connector == "DP-1"
+    assert process.spawn_calls == 0
+
+
+def test_capture_physical_reexports_shared_output_whitelists():
+    from airplay_linux.capture import physical
+    from airplay_linux.display import inventory
+
+    assert physical.PHYSICAL_OUTPUT_TYPES is inventory.PHYSICAL_OUTPUT_TYPES
+    assert physical.PHYSICAL_OUTPUT_TYPE_NAMES is inventory.PHYSICAL_OUTPUT_TYPE_NAMES

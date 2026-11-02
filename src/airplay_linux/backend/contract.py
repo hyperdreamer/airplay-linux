@@ -170,18 +170,21 @@ class CredentialProofVerdict:
 
 @dataclass(frozen=True, kw_only=True)
 class BackendSource:
-    """Complete portal geometry; the wire decoder requires has_position=True."""
+    """Complete portal geometry, including explicit position availability."""
 
     type: int
     width: int
     height: int
     x: int
     y: int
+    has_position: bool = True
 
     def __post_init__(self) -> None:
         for name in ("type", "width", "height", "x", "y"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"source {name} must be an integer")
+        if type(self.has_position) is not bool:
+            raise TypeError("source has_position must be a boolean")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -393,7 +396,7 @@ def _decode_source(value: object) -> BackendSource | Err:
     try:
         return BackendSource(
             type=data["type"], width=data["width"], height=data["height"],
-            x=data["x"], y=data["y"],
+            x=data["x"], y=data["y"], has_position=data["has_position"],
         )
     except (TypeError, ValueError):
         return _incompatible()

@@ -19,6 +19,7 @@ def _monitor(name: str = "DP-1", *, connected: bool = True, enabled: bool = True
         name=name, enabled=enabled, connected=connected,
         output_type=output_type, size=size, position=position,
         virtual=(not _physical_name(name) if name else None),
+        scale=1.0,
     )
 
 

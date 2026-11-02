@@ -16,6 +16,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING
 
 from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
+from airplay_linux.capture.source import SourceVerificationRefusal
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
     Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
@@ -139,6 +140,19 @@ async def _safe(operation: Awaitable, code: ErrorCode = ErrorCode.transport_fail
     if isinstance(result, Err) and type(result.error.code) is ErrorCode:
         return _failure(result.error.code)
     return _failure(code)
+
+
+async def _safe_source_verification(operation: Awaitable):
+    """Retain the typed refusal produced by the source verifier."""
+    try:
+        result = await operation
+    except Exception:
+        return _failure(ErrorCode.unsupported_source)
+    if isinstance(result, Ok):
+        return result
+    if isinstance(result, SourceVerificationRefusal):
+        return result
+    return _failure(ErrorCode.unsupported_source)
 
 
 def _ack(result, operation: BackendOperation, target: ReceiverTarget) -> bool:
@@ -747,9 +761,8 @@ class DoubleTakeTransport:
                 ):
                     return _failure(ErrorCode.dependency_incompatible)
                 if len(matches) == 1 and matches[0].source is not None:
-                    verified = await _safe(
+                    verified = await _safe_source_verification(
                         self._source_verifier.verify(stream.source.connector, matches[0].source),
-                        ErrorCode.unsupported_source,
                     )
                     return verified if self._clock.now() < deadline else _failure(ErrorCode.unsupported_source)
             # Every read shares the same absolute deadline; incomplete or foreign

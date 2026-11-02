@@ -138,7 +138,9 @@ def _install_owned_daemon_epoch(
         features=PublishedDoubletakeProfile(socket_path="").features,
     )
     return _OwnedDaemonInstallation(
-        source_verifier=KScreenReportedSourceVerifier(inventory, physical_inventory_available=True),
+        source_verifier=KScreenReportedSourceVerifier(
+            inventory, physical_inventory_available=True,
+        ),
         credential_proof=probe.check, receipts=JsonLaunchReceiptStore(files),
         endpoint_verifier=verify_owned_endpoint, strict_teardown=process.terminate,
         shared_authority=SharedRootAuthority(files), ownership=ownership,
@@ -480,6 +482,8 @@ async def _compose_production(
     probed = backend.value if isinstance(backend, Ok) else _unavailable_features()
     launcher = ProductionLaunchCapability(probed, config.runtime_root, production_graph=True)
     installation = _install_owned_daemon_epoch(config, process=process, launcher=launcher)
+    if isinstance(installation.source_verifier, KScreenReportedSourceVerifier):
+        installation.source_verifier.ownerships = ownerships
     credential_proof = CredentialProofVerdict(
         service_leg="not_run", backend_positive_leg="not_run",
         backend_negative_leg="not_run", failure=None,
