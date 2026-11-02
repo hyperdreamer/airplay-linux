@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import os
 import shlex
+import shutil
 import socket
 import subprocess
 from contextlib import contextmanager
-from tempfile import TemporaryDirectory
+from tempfile import TemporaryDirectory, mkdtemp
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -26,13 +27,38 @@ def offline_live_attempt_root():
 
 
 @pytest.fixture(autouse=True)
+def private_legacy_supervisor_ctl(
+    offline_boundary_tripwires, monkeypatch, request, tmp_path_factory,
+):
+    # These legacy real-process tests inject socket-daemon/fake-daemon children,
+    # but their supervisor subprocess uses its default control factory. Give
+    # that subprocess the existing private crashing ctl fixture, so teardown
+    # exercises its fallback without looking up an installed control client.
+    if request.path != Path(__file__).parent / "process/test_supervisor.py":
+        return
+    import sys
+
+    directory = tmp_path_factory.mktemp("supervisor-ctl")
+    script = Path(__file__).parent / "fixtures/processes/fake_doubletake.py"
+    shim = directory / "doubletake-ctl"
+    shim.write_text(
+        "#!/bin/sh\n# private test-only shim: doubletake-ctl\n"
+        "export AIRPLAY_FAKE_CTL_MODE=crash\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(script))} "
+        '--shim-name doubletake-ctl "$@"\n',
+    )
+    shim.chmod(0o700)
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+@pytest.fixture(autouse=True)
 def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_live_attempt_root):
     """Refuse operational host I/O; explicitly injected fakes remain usable.
 
-    The delivered installed-surface test uses bounded, read-only help/version/
-    capability probes. Only those exact argv shapes are observations. Private
-    executable shims must be inside pytest's root and identify the fake script;
-    arbitrary PATH entries, including missing commands, confer no permission.
+    Direct execution is checked before lookup. Shells resolve bare backend names
+    through private refusal shims; their bodies are never parsed here. A -c
+    shell also starts with readonly PATH so builtins cannot retarget an allowed
+    fake. This is a lookup tripwire, not a sandbox for arbitrary child programs.
     """
     from dbus_next.aio import MessageBus
     from airplay_linux.capture import portal
@@ -114,210 +140,66 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         attempted.append(boundary)
         raise OfflineBoundaryRefusal(f"unmarked live boundary attempted: {boundary}")
 
-    def shell_tokens(program):
-        # Keep quote information: reserved words and operators only have syntax
-        # when unquoted. A '#' starts a comment only at the start of a word.
-        tokens = []
-        word = []
-        started = quoted = assignment = brace = False
+    # The shell itself chooses executable positions. Each shim records before
+    # doing anything else and never starts a backend or another executable.
+    # Use a separate short directory/log for every test, including nested pytest
+    # runs. Session cleanup happens after all monkeypatches have been undone.
+    shim_root = Path(mkdtemp(prefix="tripwire-", dir=offline_live_attempt_root))
+    shell_log = shim_root / "attempts"
+    shell_log.touch(mode=0o600)
+    for name, boundary in (("doubletake", "backend"), ("doubletake-ctl", "ctl")):
+        shim = shim_root / name
+        shim.write_text(
+            "#!/bin/sh\n"
+            f"printf '%s\\n' {boundary} >> {shlex.quote(str(shell_log))}\n"
+            "exit 125\n",
+        )
+        shim.chmod(0o700)
+    # Keep the observation handle open: tests deliberately replace os.open/stat.
+    log_reader = shell_log.open()
+    accepted_shell_attempts = []
 
-        def finish_word():
-            nonlocal started, quoted, assignment, brace
-            if started:
-                value = "".join(word)
-                if brace and value not in {"{", "}"}:
-                    refuse("backend")
-                kind = "assignment" if assignment else "quoted" if quoted else "word"
-                tokens.append((value, kind))
-                word.clear()
-            started = quoted = assignment = brace = False
+    def shell_attempts():
+        log_reader.seek(0)
+        return log_reader.read().splitlines()
 
-        index = 0
-        while index < len(program):
-            char = program[index]
-            if char in " \t\n":
-                finish_word()
-                if char == "\n":
-                    tokens.append((";", "operator"))
-                index += 1
-            elif char == "#" and not started:
-                end = program.find("\n", index)
-                index = len(program) if end < 0 else end
-            elif char in {"'", '"'}:
-                quote = char
-                started = quoted = True
-                index += 1
-                while index < len(program) and program[index] != quote:
-                    char = program[index]
-                    if quote == '"' and char in "$`":
-                        refuse("backend")
-                    if (quote == '"' and char == "\\" and index + 1 < len(program)
-                            and program[index + 1] in '$`"\\\n'):
-                        index += 1
-                        if program[index] != "\n":
-                            word.append(program[index])
-                    else:
-                        word.append(char)
-                    index += 1
-                if index == len(program):
-                    refuse("backend")
-                index += 1
-            elif char == "\\":
-                index += 1
-                if index == len(program):
-                    refuse("backend")
-                if program[index] != "\n":
-                    started = quoted = True
-                    word.append(program[index])
-                index += 1
-            elif char in ";&|()<>":
-                # Adjacent unquoted digits are an IO number, not an executable.
-                if char in "<>" and not quoted and "".join(word).isdigit():
-                    word.clear()
-                    started = False
-                finish_word()
-                operator = next((op for op in (
-                    "&>>", "<<-", "<<<", ";;&", "&&", "||", ">>", "<<",
-                    "<&", ">&", "<>", ">|", "&>", "|&", ";;", ";&",
-                ) if program.startswith(op, index)), char)
-                tokens.append((operator, "operator"))
-                index += len(operator)
-            else:
-                # Active expansion/evaluation remains unsupported. Quoted or
-                # escaped literal data reaches this lexer without these checks.
-                if char in "$`*?[]":
-                    refuse("backend")
-                if char == "=" and not quoted and "".join(word).isidentifier():
-                    assignment = True
-                brace |= char in "{}"
-                word.append(char)
-                started = True
-                index += 1
-        finish_word()
-        return tokens
+    def accept_shell_attempts(expected):
+        assert shell_attempts() == expected
+        accepted_shell_attempts[:] = expected
 
-    def check_shell(program, *, env=None):
+    def private_shim(candidate, name):
+        if not private_path(candidate):
+            return False
+        try:
+            with candidate.open("rb") as stream:
+                header = stream.read(8192)
+            return (f"# private test-only shim: {name}\n".encode() in header
+                    and b"fake_doubletake.py" in header)
+        except OSError:
+            return False
+
+    def execution_environment(env):
+        environment = dict(os.environ if env is None else env)
         if opted_in:
-            return
+            return environment
+        path = environment.get("PATH", os.defpath).split(os.pathsep)
+        path = [entry for entry in path if entry != str(shim_root)]
+        # Only an explicitly marked, test-owned directory can precede the
+        # tripwires. Validate both names so a marked backend cannot authorise
+        # an unmarked ctl (or vice versa) in the same directory.
+        first = Path(path[0]) if path and path[0] else Path(".")
+        candidates = [first / name for name in ("doubletake", "doubletake-ctl")]
+        allowed = [private_shim(candidate, candidate.name) for candidate in candidates]
+        private_first = any(allowed) and all(
+            marked or not candidate.exists() for candidate, marked in zip(candidates, allowed)
+        )
+        index = 1 if private_first else 0
+        path.insert(index, str(shim_root))
+        environment["PATH"] = os.pathsep.join(path)
+        return environment
 
-        def command(argv):
-            if not argv:
-                return
-            name = "." if argv[0] == "." else Path(argv[0]).name
-            # These can evaluate code or change lookup for a later command.
-            if name in {"eval", "source", ".", "cd", "pushd", "popd", "unset", "alias"}:
-                refuse("backend")
-            if name == "read" and "PATH" in argv[1:]:
-                refuse("backend")
-            if name in {"export", "declare", "typeset", "local", "readonly"} and any(
-                value.split("=", 1)[0] == "PATH" for value in argv[1:]
-            ):
-                refuse("backend")
-            if name == "hash" and any(value.startswith("-p") for value in argv[1:]):
-                refuse("backend")
-            if name in {"env", "command", "exec", "builtin", "time"}:
-                tail = argv[1:]
-                if name == "exec":
-                    while tail:
-                        if tail[0] == "--":
-                            tail = tail[1:]
-                            break
-                        if tail[0] == "-a" and len(tail) > 1:
-                            tail = tail[2:]
-                        elif tail[0] in {"-c", "-l", "-cl", "-lc"}:
-                            tail = tail[1:]
-                        else:
-                            break
-                elif name == "time" and tail[:1] == ["-p"]:
-                    tail = tail[1:]
-                if tail and tail[0] == "--":
-                    tail = tail[1:]
-                elif tail and (tail[0].startswith("-")
-                               or ("=" in tail[0] and tail[0].split("=", 1)[0].isidentifier())):
-                    refuse("backend")
-                command(tail)
-            else:
-                # Arguments, including a private socket called 'sh', never
-                # become separate executable candidates.
-                check_process(argv, env=env, observation=False)
-
-        argv = []
-        redirect = False
-        for_header = None
-        cases = []
-        for value, kind in shell_tokens(os.fsdecode(program)):
-            # Loop variables/values and case subjects/patterns are shell data.
-            # Their bodies resume command parsing at 'do' or the pattern's ')'.
-            if for_header is not None:
-                if kind == "operator" and value == ";" and for_header != "variable":
-                    for_header = None
-                elif kind == "operator":
-                    refuse("backend")
-                elif for_header == "variable":
-                    if not value.isidentifier() or value == "PATH":
-                        refuse("backend")
-                    for_header = "in"
-                elif for_header == "in" and kind == "word" and value == "in":
-                    for_header = "values"
-                elif for_header == "in" and kind == "word" and value == "do":
-                    for_header = None
-                elif for_header != "values":
-                    refuse("backend")
-                continue
-            if cases and cases[-1] in {"subject", "in", "pattern"}:
-                state = cases[-1]
-                if state == "subject" and kind != "operator":
-                    cases[-1] = "in"
-                elif state == "in" and kind == "word" and value == "in":
-                    cases[-1] = "pattern"
-                elif state == "in" and kind == "operator" and value == ";":
-                    continue
-                elif state == "pattern":
-                    if kind == "operator" and value == ")":
-                        cases[-1] = "body"
-                    elif kind == "word" and value == "esac":
-                        cases.pop()
-                    elif kind == "operator" and value not in {"(", "|", ";"}:
-                        refuse("backend")
-                else:
-                    refuse("backend")
-                continue
-            if cases and kind == "operator" and value in {";;", ";&", ";;&"}:
-                if redirect:
-                    refuse("backend")
-                command(argv)
-                argv = []
-                cases[-1] = "pattern"
-            elif kind == "operator":
-                if redirect:
-                    refuse("backend")
-                if value in {"<", ">", ">>", "<&", ">&", "<>", ">|", "&>", "&>>"}:
-                    redirect = True
-                elif value in {";", "&", "&&", "||", "|", "|&", "(", ")"}:
-                    command(argv)
-                    argv = []
-                else:
-                    refuse("backend")
-            elif redirect:
-                redirect = False
-            elif not argv and kind == "word" and value in {"for", "select"}:
-                for_header = "variable"
-            elif not argv and kind == "word" and value == "case":
-                cases.append("subject")
-            elif not argv and kind == "word" and value == "esac" and cases:
-                cases.pop()
-            elif not argv and kind == "word" and value in {
-                "if", "then", "elif", "else", "while", "until", "do", "!", "{",
-                "fi", "done", "}",
-            }:
-                continue
-            elif not argv and kind == "assignment":
-                refuse("backend")
-            else:
-                argv.append(value)
-        if redirect or for_header is not None or cases:
-            refuse("backend")
-        command(argv)
+    if not opted_in:
+        monkeypatch.setenv("PATH", execution_environment(None)["PATH"])
 
     def check_process(argv, *, env=None, observation=True):
         if isinstance(argv, (str, bytes)):
@@ -329,9 +211,7 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         executable = os.fsdecode(argv[0])
         name = Path(executable).name
         if name in {"sh", "bash", "dash"}:
-            if len(argv) > 2 and argv[1] == "-c":
-                check_shell(argv[2], env=env)
-            else:
+            if len(argv) <= 2 or argv[1] != "-c":
                 # Script files, stdin and other shell option forms are opaque.
                 refuse("backend")
             return
@@ -369,15 +249,8 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         # executable to decide whether an attempted operational call is allowed.
         search_path = (os.environ if env is None else env).get("PATH", os.defpath)
         candidate = Path(executable) if "/" in executable else Path(search_path.split(os.pathsep)[0]) / name
-        if private_path(candidate):
-            try:
-                with candidate.open("rb") as stream:
-                    header = stream.read(8192)
-                if (f"# private test-only shim: {name}\n".encode() in header
-                        and b"fake_doubletake.py" in header):
-                    return
-            except OSError:
-                pass
+        if private_shim(candidate, name):
+            return
         refuse("backend" if name == "doubletake" else "ctl")
 
     run = LinuxProcessRunner.run
@@ -394,16 +267,44 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
 
     def guarded_popen(self, args, *positional, **kwargs):
         shell = kwargs.get("shell", positional[7] if len(positional) > 7 else False)
-        env = kwargs.get("env")
-        if shell:
-            program = args[0] if isinstance(args, (tuple, list)) and args else args
-            check_shell(program, env=env)
-        else:
-            check_process(args, env=env)
+        env = kwargs.get("env", positional[9] if len(positional) > 9 else None)
         executable = kwargs.get("executable", positional[1] if len(positional) > 1 else None)
+        if not shell:
+            check_process(args, env=env)
         if executable is not None:
-            tail = ("-c", program) if shell else args[1:] if isinstance(args, (tuple, list)) else ()
+            tail = ("-c", "") if shell else args[1:] if isinstance(args, (tuple, list)) else ()
             check_process((executable, *tail), env=env, observation=not shell)
+        if opted_in:
+            return popen_init(self, args, *positional, **kwargs)
+
+        environment = execution_environment(env)
+        argv = list(args) if isinstance(args, (tuple, list)) else None
+        if shell:
+            program = argv[0] if argv else args
+            program = os.fsdecode(program)
+            guarded = "readonly PATH\n" + program
+            args = [guarded, *argv[1:]] if argv else guarded
+        elif argv and Path(os.fsdecode(executable or argv[0])).name in {"sh", "bash", "dash"}:
+            argv[2] = "readonly PATH\n" + os.fsdecode(argv[2])
+            args = argv
+        elif argv and len(argv) == 2 and argv[1] in {"--help", "--version", "-capabilities"}:
+            name = Path(os.fsdecode(executable or argv[0])).name
+            if name in {"doubletake", "doubletake-ctl"}:
+                # Exact read-only observations retain the original installed
+                # lookup, independently of operational shell interception.
+                path = environment["PATH"].split(os.pathsep)
+                environment["PATH"] = os.pathsep.join(entry for entry in path if entry != str(shim_root))
+                if "/" not in os.fsdecode(argv[0]) or Path(argv[0]).parent == shim_root:
+                    candidate = shutil.which(name, path=environment["PATH"])
+                    if candidate is not None:
+                        argv[0] = candidate
+                        args = argv
+
+        positional = list(positional)
+        if len(positional) > 9:
+            positional[9] = environment
+        else:
+            kwargs["env"] = environment
         return popen_init(self, args, *positional, **kwargs)
 
     construct_bus = MessageBus.__init__
@@ -474,8 +375,20 @@ def offline_boundary_tripwires(monkeypatch, request, tmp_path_factory, offline_l
         )
         ownership.verify_owned_endpoint(receipt, current_generation=1)
 
-    yield SimpleNamespace(
-        refusal_type=OfflineBoundaryRefusal, attempted=attempted, root=root,
-        attempts={"backend": backend, "ctl": ctl, "session_bus": session_bus,
-                  "socket_lease": socket_lease},
-    )
+    class Tripwires(SimpleNamespace):
+        @property
+        def attempted(self):
+            return attempted + shell_attempts()
+
+    try:
+        yield Tripwires(
+            refusal_type=OfflineBoundaryRefusal, root=root, shim_root=shim_root,
+            accept_shell_attempts=accept_shell_attempts,
+            attempts={"backend": backend, "ctl": ctl, "session_bus": session_bus,
+                      "socket_lease": socket_lease},
+        )
+    finally:
+        unaccepted = shell_attempts() != accepted_shell_attempts
+        log_reader.close()
+        if unaccepted:
+            raise OfflineBoundaryRefusal("unmarked live boundary attempted through shell")
