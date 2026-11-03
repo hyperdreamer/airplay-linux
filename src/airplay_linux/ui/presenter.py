@@ -296,6 +296,8 @@ class Presenter:
         ownerships: OwnershipStore,
         dialogs: DialogFactory,
         request_shutdown: Callable[[], Awaitable[Result[None]]],
+        *,
+        refresh_capabilities: Callable[[], Awaitable[Any]] | None = None,
     ) -> None:
         if not isinstance(window, MainWindow):
             raise TypeError("window must be a MainWindow")
@@ -320,6 +322,7 @@ class Presenter:
         self._ownerships = ownerships
         self._dialogs = dialogs
         self._request_shutdown = request_shutdown
+        self._refresh_capabilities_report = refresh_capabilities
 
         # -- authoritative caches (GUI-thread owned) -----------------------
         self._views: dict[ReceiverId, Any] = {}
@@ -933,6 +936,12 @@ class Presenter:
             # A disabled control (or a signal that raced a newer snapshot) never
             # becomes a command.
             return
+        if action is Action.retry and pane.capability_blocked:
+            # Retry here means "I fixed the missing capability": a frozen startup
+            # report would keep Start disabled until the whole application was
+            # restarted, which is exactly what the pane's notice denies.
+            self._schedule(self._refresh_capabilities(receiver_id))
+            return
         if action is Action.start:
             request = self._start_request(receiver_id, pane.visible_mode)
             if request is None:
@@ -985,6 +994,22 @@ class Presenter:
             return
         if action is Action.confirm_orphan:
             self._schedule(self._orphan_prompt(receiver_id), receiver_id=receiver_id)
+
+    async def _refresh_capabilities(self, receiver_id: Any) -> None:
+        """Re-probe capability evidence, then re-render the same selection."""
+        refresh = self._refresh_capabilities_report
+        if refresh is None:
+            return
+        fence = self._fence(receiver_id)
+        try:
+            await refresh()
+        except Exception:  # noqa: BLE001 - a failed re-probe changes nothing
+            pass
+        if self._shutting_down or self._disposed:
+            return
+        if fence is not None and fence != self._fence(receiver_id):
+            return
+        self._request_render()
 
     def _on_mode_requested(self, value: str) -> None:
         if self._shutting_down or self._disposed:

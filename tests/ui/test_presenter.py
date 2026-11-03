@@ -315,6 +315,9 @@ class PresenterRig:
         self.activity = ActivityLog()
         self.dialogs = FakeDialogs()
         self.capabilities = capability_report()
+        #: The report a capability re-probe publishes, if the test staged one.
+        self.refreshed_capabilities: CapabilityReport | None = None
+        self.refresh_calls = 0
         self.shutdown_result: Result[None] = Ok(value=None)
         self.shutdown_calls = 0
         self.shutdown_gate: asyncio.Future[Any] | None = None
@@ -329,8 +332,14 @@ class PresenterRig:
             ownerships=self.ownerships,
             dialogs=self.dialogs,
             request_shutdown=self._request_shutdown,
+            refresh_capabilities=self._refresh_capabilities,
         )
         self._started = False
+
+    async def _refresh_capabilities(self) -> None:
+        self.refresh_calls += 1
+        if self.refreshed_capabilities is not None:
+            self.capabilities = self.refreshed_capabilities
 
     async def _request_shutdown(self) -> Result[None]:
         self.shutdown_calls += 1
@@ -771,6 +780,37 @@ async def test_a_disabled_action_genuinely_refuses(rig: PresenterRig) -> None:
 
     assert prepared.manager.commands == []
     assert prepared.receivers.journal.calls("receiver_store.remove_metadata") == []
+
+
+async def test_a_capability_retry_reprobes_instead_of_replaying_the_frozen_report(
+    rig: PresenterRig,
+) -> None:
+    """The pane promises "retry after fixing it"; Retry must re-read the evidence."""
+    rig.capabilities = capability_report(
+        mirror=False,
+        diagnostics=(
+            replace(
+                diagnostic(ErrorCode.dependency_incompatible), detail="physical_source"
+            ),
+        ),
+    )
+    rig.capture.add_physical(physical("DP-1"))
+    rig.discover("a")
+    prepared = await started(rig)
+    prepared.snapshot("a")
+    await prepared.settle()
+    assert Action.start not in prepared.offered()
+    assert Action.retry in prepared.offered()
+
+    prepared.refreshed_capabilities = capability_report()
+    prepared.click(Action.retry)
+    await prepared.settle()
+
+    assert prepared.refresh_calls == 1
+    # The gate is gone, so the same selection can start, and no session command
+    # was invented for a capability question.
+    assert Action.start in prepared.offered()
+    assert prepared.commands_of(Retry) == []
 
 
 async def test_a_rejected_command_renders_a_catalog_diagnostic(

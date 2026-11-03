@@ -26,9 +26,10 @@ import asyncio
 import os
 import socket
 import stat
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from typing import Final, Literal, Protocol
+from xml.parsers import expat
 
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.ports import AudioProbe
@@ -61,6 +62,9 @@ PIPEWIRE_PROBE_TIMEOUT: Final[float] = 0.25
 SECRET_SERVICE: Final[str] = "org.freedesktop.secrets"
 SECRET_SERVICE_PATH: Final[str] = "/org/freedesktop/secrets"
 SECRET_SERVICE_INTERFACE: Final[str] = "org.freedesktop.Secret.Service"
+
+#: The D-Bus object operation that returns an object's interfaces as XML.
+INTROSPECTABLE_INTERFACE: Final[str] = "org.freedesktop.DBus.Introspectable"
 
 #: D-Bus introspection is a control call; it uses the design's 5 second bound.
 INTROSPECTION_TIMEOUT: Final[float] = 5.0
@@ -139,43 +143,107 @@ def _socket_reachable(path: str) -> bool:
     return True
 
 
+async def _connect_session_bus() -> object:
+    """Open the session bus through ``dbus-next``, imported only when needed."""
+    from dbus_next import BusType
+    from dbus_next.aio import MessageBus
+
+    return await MessageBus(bus_type=BusType.SESSION).connect()
+
+
+def _interface_names(document: object) -> frozenset[str] | None:
+    """Interface names from an introspection document, tolerantly.
+
+    ``dbus-next`` parses introspection into typed objects and validates every
+    member name against the D-Bus grammar. A real service may still publish a
+    member the library rejects: xdg-desktop-portal exports
+    ``org.freedesktop.portal.PowerProfileMonitor`` with a
+    ``power-saver-enabled`` property, and introspection then raises instead of
+    describing the object. Treating that parse failure as "the portal is
+    unreachable" denied audio on every host, so this reads the document itself:
+    only element names and ``name`` attributes are evidence here, and a member
+    the server chose to publish cannot hide an interface we need.
+
+    Parameter entities are not parsed, so a hostile DTD cannot be expanded, and
+    only the object's own interfaces count - a child node describes another
+    object.
+    """
+    if type(document) is not str:
+        return None
+    names: list[str] = []
+    depth = 0
+    parser = expat.ParserCreate()
+    parser.SetParamEntityParsing(expat.XML_PARAM_ENTITY_PARSING_NEVER)
+
+    def start(tag: str, attributes: Mapping[str, str]) -> None:
+        nonlocal depth
+        if depth <= 1 and tag == "interface":
+            name = attributes.get("name")
+            if type(name) is str and name:
+                names.append(name)
+        depth += 1
+
+    def end(_tag: str) -> None:
+        nonlocal depth
+        depth -= 1
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    try:
+        parser.Parse(document, True)
+    except expat.ExpatError:
+        return None
+    return frozenset(names) or None
+
+
 class DBusCapabilityClient:
     """Session-bus introspection through ``dbus-next``.
 
     The bus connection is opened only for this call and closed again. Every
     failure is reported as ``None`` so the audio probe can name the missing
-    capability without copying a backend exception into a diagnostic.
+    capability without copying a backend exception into a diagnostic. The
+    document is requested as raw text instead of through the library's typed
+    object model, because that model rejects member names the real portal
+    publishes (see :func:`_interface_names`).
     """
 
-    def __init__(self, timeout: float = INTROSPECTION_TIMEOUT) -> None:
+    def __init__(
+        self,
+        timeout: float = INTROSPECTION_TIMEOUT,
+        *,
+        connect: Callable[[], Awaitable[object]] | None = None,
+    ) -> None:
         self._timeout = float(timeout)
+        self._connect = _connect_session_bus if connect is None else connect
 
     async def interfaces(self, service: str, path: str) -> frozenset[str] | None:
         try:
-            from dbus_next import BusType
-            from dbus_next.aio import MessageBus
+            from dbus_next import Message
         except Exception:  # noqa: BLE001 - an absent client library proves nothing
             return None
         bus = None
         try:
-            bus = await asyncio.wait_for(
-                MessageBus(bus_type=BusType.SESSION).connect(), self._timeout,
+            bus = await asyncio.wait_for(self._connect(), self._timeout)
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination=service, path=path,
+                        interface=INTROSPECTABLE_INTERFACE, member="Introspect",
+                    )
+                ),
+                self._timeout,
             )
-            node = await asyncio.wait_for(
-                bus.introspect(service, path), self._timeout,
-            )
-            names = frozenset(
-                interface.name
-                for interface in node.interfaces
-                if type(interface.name) is str and interface.name
-            )
-            return names or None
+            body = getattr(reply, "body", None)
+            if not body or type(body[0]) is not str:
+                return None
+            return _interface_names(body[0])
         except Exception:  # noqa: BLE001 - an unreachable portal proves nothing
             return None
         finally:
-            if bus is not None:
+            disconnect = getattr(bus, "disconnect", None)
+            if callable(disconnect):
                 try:
-                    bus.disconnect()
+                    disconnect()
                 except Exception:  # noqa: BLE001 - the result is already decided
                     pass
 
@@ -317,6 +385,7 @@ async def probe_audio(policy: AudioPolicy, probe: AudioProbe) -> Result[None] | 
 __all__ = [
     "AudioStartDecision",
     "DBusCapabilityClient",
+    "INTROSPECTABLE_INTERFACE",
     "INTROSPECTION_TIMEOUT",
     "InterfaceCapabilityClient",
     "PIPEWIRE_PROBE_TIMEOUT",

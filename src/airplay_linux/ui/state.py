@@ -154,6 +154,9 @@ class PaneState:
     # part of the projection so the prompt cannot reconstruct ownership from a
     # second, potentially different snapshot.
     retained_output: str | None = None
+    # A mode gate, not a session state: the only useful control is a re-probe of
+    # the capability evidence, never a session command.
+    capability_blocked: bool = False
 
 
 @dataclass(frozen=True)
@@ -323,6 +326,28 @@ _MODE_KEYWORDS: Final[Mapping[Mode, tuple[str, ...]]] = MappingProxyType(
     }
 )
 
+#: Codes that belong to another lane's evidence.  Audio is a pre-start decision
+#: (and a mute failure only happens inside a live session), so neither can ever
+#: explain why a mode is unavailable; their details merely share vocabulary with
+#: the capture lane's portal.
+_FOREIGN_LANE_CODES: Final[frozenset[ErrorCode]] = frozenset(
+    {
+        ErrorCode.audio_unavailable,
+        ErrorCode.audio_denied,
+        ErrorCode.audio_mute_failed,
+    }
+)
+
+#: Codes that state an exact cause rather than a withheld backend operation.
+_CONCRETE_CAUSE_CODES: Final[frozenset[ErrorCode]] = frozenset(
+    {
+        ErrorCode.unsupported_source,
+        ErrorCode.portal_cancelled,
+        ErrorCode.portal_denied,
+        ErrorCode.keyring_unavailable,
+    }
+)
+
 
 # --------------------------------------------------------------------------- public
 
@@ -349,6 +374,7 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         notice=decision.notice,
         diagnostic=_diagnostic(snapshot, inputs, decision, orphans),
         retained_output=_retained_output(snapshot, ownership),
+        capability_blocked=decision.kind == "capability",
     )
 
 
@@ -1134,30 +1160,41 @@ def _orphan_diagnostic(
     return _catalog(ErrorCode.ownership_mismatch, state.receiver_id)
 
 
+def _names_mode(item: Diagnostic, keywords: tuple[str, ...]) -> bool:
+    """Whether a diagnostic's own fixed-vocabulary detail names this mode."""
+    detail = (item.detail or "").lower()
+    return any(word in detail for word in keywords)
+
+
 def _capability_diagnostic(
     state: SessionSnapshot, inputs: ViewInputs
 ) -> Diagnostic:
-    """The report's most specific frozen failure for the selected mode.
+    """The most specific frozen failure that actually explains this mode.
 
-    The catalog message names an exact missing command whenever the probe could.
-    Ranking keeps the pane from blaming an unrelated dependency: a failure whose
-    detail names this mode's own provider comes first, then any named missing
-    command, then a broader incompatibility.
+    Ranking keeps the pane from blaming an unrelated lane or an unrelated mode:
+    a diagnostic from another lane (audio never refuses a start; mute only fails
+    inside one) is excluded outright, the mode's own provider is preferred, then
+    an exact cause (a denied portal, an unavailable keyring, an unverifiable
+    source), then the backend's own withheld operation.  A missing command for
+    the other mode - ``krfb-virtualmonitor`` while Mirror is selected - is never
+    offered as this mode's cause just because it was reported first.
     """
     report = inputs.capabilities
     keywords = _MODE_KEYWORDS[inputs.selected_mode]
-    for item in report.diagnostics:
-        detail = (item.detail or "").lower()
-        if any(word in detail for word in keywords):
+    candidates = tuple(
+        item for item in report.diagnostics if item.code not in _FOREIGN_LANE_CODES
+    )
+    for item in candidates:
+        if _names_mode(item, keywords):
             return item
-    for item in report.diagnostics:
-        if item.code is ErrorCode.dependency_missing:
+    for item in candidates:
+        if item.code in _CONCRETE_CAUSE_CODES:
             return item
-    for item in report.diagnostics:
+    for item in candidates:
         if item.code is ErrorCode.dependency_incompatible:
             return item
-    if report.diagnostics:
-        return report.diagnostics[0]
+    if candidates:
+        return candidates[0]
     return _catalog(ErrorCode.unsupported_operation, state.receiver_id)
 
 

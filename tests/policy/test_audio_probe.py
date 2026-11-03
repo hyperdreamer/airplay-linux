@@ -17,6 +17,7 @@ import os
 import socket
 import stat
 from collections import deque
+from types import SimpleNamespace
 
 import pytest
 
@@ -33,6 +34,7 @@ from airplay_linux.policy.audio import (
     PORTAL_SERVICE,
     REQUIRED_PORTAL_INTERFACES,
     SCREENCAST_INTERFACE,
+    DBusCapabilityClient,
     PipeWirePortalAudioProbe,
     PipeWireSocket,
     audio_start_policy,
@@ -380,3 +382,112 @@ async def test_probe_never_requests_permission_or_opens_a_stream():
     # FakePortal exposes exactly one operation; receiving the introspection call
     # is the whole observable interaction. No session/stream verb exists here.
     assert portal.calls == [(PORTAL_SERVICE, PORTAL_OBJECT_PATH)]
+
+# ------------------------------------------------- session-bus introspection
+
+#: A faithful excerpt of what xdg-desktop-portal 1.22 exports.  The
+#: ``power-saver-enabled`` property is a real member name that ``dbus-next``
+#: refuses to parse, so the document (not the library's object model) is the
+#: evidence this client must be able to read.
+_PORTAL_DOCUMENT = """<!DOCTYPE node PUBLIC "-//freedesktop//DTD D-BUS Object
+ Introspection 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd">
+<!-- GDBus 2.90.1 -->
+<node>
+  <interface name="org.freedesktop.DBus.Properties">
+    <method name="Get">
+      <arg type="s" name="interface_name" direction="in"/>
+      <arg type="s" name="property_name" direction="in"/>
+      <arg type="v" name="value" direction="out"/>
+    </method>
+  </interface>
+  <interface name="org.freedesktop.portal.ScreenCast">
+    <method name="CreateSession">
+      <arg type="a{sv}" name="options" direction="in"/>
+      <arg type="o" name="handle" direction="out"/>
+    </method>
+    <property type="u" name="version" access="read"/>
+  </interface>
+  <interface name="org.freedesktop.portal.PowerProfileMonitor">
+    <property type="b" name="power-saver-enabled" access="read"/>
+    <property type="u" name="version" access="read"/>
+  </interface>
+  <node name="request"/>
+</node>
+"""
+
+
+class FakeBus:
+    """A message bus double: one raw introspection reply, optionally failing."""
+
+    def __init__(self, body: object, *, failure: Exception | None = None) -> None:
+        self._body = body
+        self._failure = failure
+        self.messages: list[object] = []
+        self.disconnected = False
+
+    async def call(self, message: object) -> object:
+        self.messages.append(message)
+        if self._failure is not None:
+            raise self._failure
+        return SimpleNamespace(body=self._body)
+
+    def disconnect(self) -> None:
+        self.disconnected = True
+
+
+def _connected(bus: object) -> object:
+    async def connect() -> object:
+        return bus
+
+    return connect
+
+
+async def test_the_session_bus_client_reads_a_real_introspection_document():
+    """The portal publishes hyphenated members; they must not hide interfaces."""
+    bus = FakeBus([_PORTAL_DOCUMENT])
+    client = DBusCapabilityClient(timeout=0.1, connect=_connected(bus))
+
+    names = await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH)
+
+    assert names is not None
+    assert SCREENCAST_INTERFACE in names
+    assert "org.freedesktop.portal.PowerProfileMonitor" in names
+    # Only the object's own interfaces: a child node's are a different object.
+    assert bus.messages and bus.messages[0].destination == PORTAL_SERVICE
+    assert bus.messages[0].path == PORTAL_OBJECT_PATH
+    assert bus.messages[0].interface == "org.freedesktop.DBus.Introspectable"
+    assert bus.messages[0].member == "Introspect"
+    assert bus.disconnected is True
+
+
+async def test_the_session_bus_client_requires_a_text_document():
+    bus = FakeBus([{"not": "xml"}])
+    client = DBusCapabilityClient(timeout=0.1, connect=_connected(bus))
+
+    assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is None
+    assert bus.disconnected is True
+
+
+async def test_the_session_bus_client_reports_a_malformed_document_as_unproven():
+    bus = FakeBus(["<node><interface name='unterminated'></node>"])
+    client = DBusCapabilityClient(timeout=0.1, connect=_connected(bus))
+
+    assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is None
+
+
+async def test_the_session_bus_client_disconnects_after_a_failed_call():
+    bus = FakeBus([], failure=RuntimeError("bus closed"))
+    client = DBusCapabilityClient(timeout=0.1, connect=_connected(bus))
+
+    assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is None
+    assert bus.disconnected is True
+
+
+async def test_the_session_bus_client_refuses_when_the_bus_is_unreachable():
+    async def connect() -> object:
+        raise RuntimeError("no session bus")
+
+    client = DBusCapabilityClient(timeout=0.1, connect=connect)
+
+    assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is None

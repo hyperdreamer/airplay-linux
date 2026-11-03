@@ -1006,6 +1006,123 @@ def test_mirror_capability_failure_names_the_physical_provider() -> None:
     assert pane.diagnostic.detail == "physical_source"
 
 
+def test_a_portal_audio_failure_never_explains_a_blocked_mirror() -> None:
+    """Audio is a pre-start decision, not a start refusal.
+
+    The live fault this pins: the portal audio probe names the same
+    ``org.freedesktop.portal.*`` service that physical capture uses, so a naive
+    keyword match blamed the audio path for a Mirror gate and told the user to
+    connect an audio output.  No audio diagnostic may become the mode's cause.
+    """
+    report = capabilities(
+        mirror=False,
+        diagnostics=(
+            replace(
+                diagnostic(ErrorCode.audio_unavailable),
+                detail="org.freedesktop.portal.Desktop",
+            ),
+            replace(
+                diagnostic(ErrorCode.dependency_incompatible), detail="foreground_control"
+            ),
+        ),
+    )
+    pane = project(idle(), inputs(capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.code is not ErrorCode.audio_unavailable
+    assert "audio output" not in pane.diagnostic.message
+    assert pane.actions == frozenset({Action.retry})
+    assert Action.start not in pane.actions
+
+
+def test_a_mode_gate_never_reports_an_audio_diagnostic_alone() -> None:
+    """Even the only available diagnostic may not cross lanes."""
+    report = capabilities(
+        mirror=False,
+        diagnostics=(
+            replace(
+                diagnostic(ErrorCode.audio_unavailable),
+                detail="org.freedesktop.portal.Desktop",
+            ),
+        ),
+    )
+    pane = project(idle(), inputs(capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.code is ErrorCode.unsupported_operation
+    assert "audio" not in pane.diagnostic.message.lower()
+
+
+def test_a_blocked_mode_names_the_keyring_cause_not_a_generic_incompatibility() -> None:
+    """Admission evidence is the real blocker when the backend affirms the rest."""
+    report = capabilities(
+        mirror=False,
+        diagnostics=(
+            replace(diagnostic(ErrorCode.dependency_incompatible), detail="keyring"),
+            replace(
+                diagnostic(ErrorCode.dependency_missing), detail="krfb-virtualmonitor"
+            ),
+            replace(
+                diagnostic(ErrorCode.audio_unavailable),
+                detail="org.freedesktop.portal.Desktop",
+            ),
+            replace(
+                diagnostic(ErrorCode.keyring_unavailable), detail="Secret Service"
+            ),
+        ),
+    )
+    pane = project(idle(), inputs(capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.code is ErrorCode.keyring_unavailable
+    assert "keyring" in pane.diagnostic.message.lower()
+
+
+def test_only_a_capability_gate_marks_the_pane_as_a_reprobe_target() -> None:
+    """The presenter must not treat an ordinary session Retry as a re-probe."""
+    blocked = project(
+        idle(),
+        inputs(
+            capabilities=capabilities(
+                mirror=False,
+                diagnostics=(
+                    replace(
+                        diagnostic(ErrorCode.dependency_incompatible),
+                        detail="physical_source",
+                    ),
+                ),
+            )
+        ),
+    )
+    available = project(idle(), inputs())
+    failed = project(idle(phase=SessionPhase.Failed), inputs())
+
+    assert blocked.capability_blocked is True
+    assert available.capability_blocked is False
+    assert failed.capability_blocked is False
+    assert Action.retry in failed.actions
+
+
+def test_an_unrelated_missing_command_is_not_preferred_over_the_backend_cause() -> None:
+    """Virtual mode's helper must never be named as Mirror's cause."""
+    report = capabilities(
+        mirror=False,
+        diagnostics=(
+            replace(
+                diagnostic(ErrorCode.dependency_incompatible),
+                detail="owned_daemon_control",
+            ),
+            replace(
+                diagnostic(ErrorCode.dependency_missing), detail="krfb-virtualmonitor"
+            ),
+        ),
+    )
+    pane = project(idle(), inputs(capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.detail == "owned_daemon_control"
+
+
 def test_capability_failure_only_affects_that_receivers_selected_mode() -> None:
     report = capabilities(
         mirror=False,

@@ -346,6 +346,7 @@ class _ProductionGraph:
     persistence: SessionPersistence
     report: Any
     gated: Mapping[str, str]
+    refresh: Callable[[], Awaitable[Any]]
 
 
 def _unavailable_features() -> BackendFeatures:
@@ -657,6 +658,18 @@ async def _compose_production(
     report = await probe.check()
     report_holder: dict[str, Any] = {"report": report}
     capabilities = lambda: report_holder["report"]
+
+    async def refresh_capabilities() -> Any:
+        """Re-probe capability evidence and publish the new report in place.
+
+        The dashboard's capability gate is a startup snapshot; without this the
+        pane's own Retry would replay the frozen report and Start would stay
+        disabled even after the missing dependency was fixed.
+        """
+        fresh = await probe.refresh()
+        report_holder["report"] = fresh
+        return fresh
+
     activity = ActivityLog(max_entries=1000, capabilities=report)
     deps = ManagerDeps(
         transport=transport,
@@ -686,7 +699,10 @@ async def _compose_production(
         report, features=features, installation=installation,
         credential_proof=credential_proof, probe_gate=probe_gate,
     )
-    return _ProductionGraph(deps, manager, registry, startup, persistence, report, gated)
+    return _ProductionGraph(
+        deps, manager, registry, startup, persistence, report, gated,
+        refresh_capabilities,
+    )
 
 
 @dataclass
@@ -705,6 +721,7 @@ class Runtime:
     window: Any = None
     qt_app: Any = None
     gated: Mapping[str, str] = field(default_factory=dict)
+    _refresh_capabilities: Callable[[], Awaitable[Any]] | None = None
     _diagnostics: Any = None
     _shutdown_hook: Callable[[], Awaitable[Result[None]]] | None = None
     _start_task: asyncio.Task[Result[None]] | None = field(default=None, init=False, repr=False)
@@ -812,6 +829,7 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
         runtime.deps.ownerships,
         dialogs,
         runtime.shutdown,
+        refresh_capabilities=runtime._refresh_capabilities,
     )
     runtime.qt_app = qt_app
     runtime.window = window
@@ -842,6 +860,7 @@ async def build_runtime(
         persistence = graph.persistence
         diagnostics_provider = deps.capabilities
         gated = graph.gated
+        refresh = graph.refresh
     else:
         if not isinstance(deps_override, ManagerDeps):
             raise TypeError("deps override must be a ManagerDeps")
@@ -851,6 +870,7 @@ async def build_runtime(
         persistence = SessionPersistence(manager_for_persistence, deps.sessions)
         startup = StartupRecovery(manager_for_persistence, deps, registry)
         diagnostics_provider = deps.capabilities
+        refresh = None
         gated = {
             "virtual_display": (
                 "helper/output association verifier not supplied by this composition; "
@@ -874,6 +894,7 @@ async def build_runtime(
         shutdown_coordinator=coordinator,
         presenter=presenter,
         gated=gated,
+        _refresh_capabilities=refresh,
         _diagnostics=diagnostics_provider,
         _shutdown_hook=provided.get("shutdown_hook"),
     )

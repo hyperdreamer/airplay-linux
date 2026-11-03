@@ -54,6 +54,10 @@ pairing transaction prerequisite group, while the visible catalog message may no
    `virtual_source` — or your chosen subset, if you accept that only the corresponding modes become available.
 2. `kscreen-doctor` for display observation (present on this host).
 3. PipeWire and xdg-desktop-portal for capture and audio; a Secret Service provider for remembered trust.
+   The portal must actually expose `org.freedesktop.portal.ScreenCast`, which requires a backend that implements
+   it for your desktop (`xdg-desktop-portal-kde` for Plasma). Verify with
+   `gdbus introspect --session --dest org.freedesktop.portal.Desktop --object-path /org/freedesktop/portal/desktop`
+   before blaming the application: a portal without ScreenCast reports audio as unavailable by design.
 4. `krfb-virtualmonitor` for Virtual mode. **It is absent on this host**, so Virtual is unavailable here regardless of
    the backend.
 

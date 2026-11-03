@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QLineEdit, QPushButton
 from airplay_linux.diagnostics import ACTIVITY_CODES, ENTRIES, diagnostic, safe_activity
 from airplay_linux.diagnostics.activity import ALLOWED_FIELDS
 from airplay_linux.domain.identity import ReceiverId
-from airplay_linux.domain.messages import CommandReceipt, Retry
+from airplay_linux.domain.messages import CommandReceipt, Start
 from airplay_linux.domain.operations import LeaseId, PairingResult
 from airplay_linux.domain.resources import (
     Diagnostic,
@@ -363,18 +363,16 @@ async def test_a_receipt_carrying_backend_text_is_rendered_from_the_catalog_only
     which is exactly the seam that carries adapter text in production.  The
     production presenter body under test is untouched.
     """
-    report = capability_report(virtual_display=False)
+    report = capability_report()
     app = await build(capabilities=report)
     app.discover("a")
     await app.settle()
-    app.widget("modeVirtual", QPushButton).click()
-    await app.settle()
-    assert Action.retry in app.offered()
+    assert Action.start in app.offered()
 
     real = app.manager.dispatch
 
     async def poisoned(command: Any) -> CommandReceipt:
-        if isinstance(command, Retry):
+        if isinstance(command, Start):
             return CommandReceipt(
                 operation_id=app.manager.context(
                     ReceiverId(RECEIVER_A)
@@ -392,7 +390,7 @@ async def test_a_receipt_carrying_backend_text_is_rendered_from_the_catalog_only
 
     app.manager.dispatch = poisoned
     try:
-        app.click(Action.retry)
+        app.click(Action.start)
         await app.settle()
     finally:
         app.manager.dispatch = real
