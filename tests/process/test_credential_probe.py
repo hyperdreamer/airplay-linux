@@ -255,7 +255,7 @@ def namespace_probe_witness(private_socket_root, monkeypatch):
         return True
 
     monkeypatch.setattr(ownership, "_observations", facts)
-    monkeypatch.setattr(p, "_witness_environment", lambda: p.WitnessEnvironment(
+    monkeypatch.setattr(p, "_witness_environment", lambda parent_uid=None: p.WitnessEnvironment(
         observations=facts, service=service, now=clock.now, sleep=clock.sleep,
     ))
     # The child appends a UUID and leg name; pytest roots can exceed sun_path.
@@ -727,7 +727,7 @@ async def test_failed_witness_retains_evidence_and_names_owning_leg(recording_pr
         async def unavailable():
             return False
         monkeypatch.setattr(c.module, "_witness_environment",
-                            lambda: replace(original(), service=unavailable))
+                            lambda parent_uid=None: replace(original(), service=unavailable))
     elif leg == "positive":
         c.inner.confirmation_fails = True
     elif leg == "negative":

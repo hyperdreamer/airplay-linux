@@ -80,8 +80,11 @@ class WitnessEnvironment:
     sleep: Callable[[float], Awaitable[None]] = field(repr=False)
 
 
-def _witness_environment() -> WitnessEnvironment:
-    client = DBusCapabilityClient()
+def _witness_environment(parent_uid: int | None = None) -> WitnessEnvironment:
+    # The witness runs below a user namespace, where ``os.getuid()`` is the
+    # namespace's mapped root. The session bus still observes the spawner's real
+    # kernel uid, so the handshake must name that uid explicitly.
+    client = DBusCapabilityClient(uid=parent_uid)
     return WitnessEnvironment(
         observations=EndpointObservations(), service=lambda: secret_service_available(client),
         now=time.monotonic, sleep=asyncio.sleep,
@@ -915,13 +918,42 @@ def _verdict(service="not_run", positive="not_run", negative="not_run", failure=
                         backend_negative_leg=negative, failure=failure)
 
 
-async def _witness(config, process, namespace) -> tuple[ProbeVerdict, bool]:
+def _child_import_environment() -> dict[str, str]:
+    """The exact import root of the package this process is running.
+
+    The witness child inherits a deliberately small environment allowlist, so a
+    source checkout or editable install would not be importable from its bare
+    interpreter. Deriving the path from the loaded module keeps the child on the
+    same code as its parent without inheriting a caller-controlled
+    ``PYTHONPATH``.
+    """
+    try:
+        root = Path(__file__).resolve().parents[2]
+    except (IndexError, OSError):
+        return {}
+    if not (root / "airplay_linux" / "__init__.py").is_file():
+        return {}
+    return {"PYTHONPATH": str(root)}
+
+
+def _parent_uid(raw: str | None) -> int | None:
+    """Decode the spawner's uid, or ``None`` when it is absent or malformed."""
+    if raw is None:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if 0 <= value < 2**32 else None
+
+
+async def _witness(config, process, namespace, parent_uid: int | None = None) -> tuple[ProbeVerdict, bool]:
     try:
         isolated = namespace(("unshare", "-rn"))
         _require(isinstance(isolated, Ok) and type(isolated.value) is ProcessIdentity,
                  ErrorCode.dependency_incompatible)
         _validate_config(config, isolated.value)
-        environment = _witness_environment()
+        environment = _witness_environment(parent_uid)
         service = await environment.service()
         if service is not True:
             return _verdict(service="failed", failure=ErrorCode.keyring_unavailable), True
@@ -941,14 +973,17 @@ async def _witness(config, process, namespace) -> tuple[ProbeVerdict, bool]:
 def run(
     config: ProbeConfig, *, process: ProcessPort,
     namespace: Callable[[tuple[str, ...]], Result[ProcessIdentity]],
+    parent_uid: int | None = None,
 ) -> ProbeVerdict:
     """Run inside one isolated child (or its test thread), then publish files.
 
     ``namespace`` checks the current user/network isolation and supplies the
     exact direct-child supervisor identity; it receives the required namespace
-    invocation prefix. Both backend legs use ``process`` without a nested runner.
+    invocation prefix. ``parent_uid`` is the spawning process's real uid, which
+    the session-bus handshake must state while inside the user namespace. Both
+    backend legs use ``process`` without a nested runner.
     """
-    verdict, complete = asyncio.run(_witness(config, process, namespace))
+    verdict, complete = asyncio.run(_witness(config, process, namespace, parent_uid))
     if complete:
         try:
             descriptor = open_probe_root(config.record_root, config.probe_uuid)
@@ -1110,7 +1145,8 @@ class CredentialServiceProbe:
                     self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
                     "--socket", socket_path, "--record-root", str(root),
                     "--parent-namespaces", json.dumps(_self_namespace_pins()),
-                ), env={}), timeout=30.0)
+                    "--parent-uid", str(os.getuid()),
+                ), env=_child_import_environment()), timeout=30.0)
                 _same_runtime(binding, runtime_descriptor)
                 completed = isinstance(result, Ok) and type(result.value.exit_code) is int
                 not_started = isinstance(result, Err) and result.error.code is ErrorCode.dependency_missing
@@ -1262,12 +1298,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--socket", required=True)
     parser.add_argument("--record-root", required=True)
     parser.add_argument("--parent-namespaces", default=None)
+    parser.add_argument("--parent-uid", default=None)
     arguments = parser.parse_args(argv)
     try:
         root = Path(arguments.record_root)
         runtime_root = Path(arguments.socket).parent.parent
         _require(arguments.socket == str(runtime_root / "positive" / "daemon.sock"))
         parent_namespaces = _parent_namespaces(arguments.parent_namespaces)
+        parent_uid = _parent_uid(arguments.parent_uid)
         identity = _namespace_identity(_NAMESPACE_ARGV, expected=parent_namespaces)
         _require(isinstance(identity, Ok))
         backend = shutil.which("doubletake")
@@ -1277,7 +1315,8 @@ def main(argv: list[str] | None = None) -> int:
                                 boot_id=boot, runtime_root=runtime_root)
         from airplay_linux.process.linux import LinuxProcessRunner
         run(config, process=LinuxProcessRunner(),
-            namespace=lambda required: _namespace_identity(required, expected=parent_namespaces))
+            namespace=lambda required: _namespace_identity(required, expected=parent_namespaces),
+            parent_uid=parent_uid)
         descriptor = open_probe_root(root, config.probe_uuid)
         try:
             # A completed failed leg exits zero too, but a partial publication or

@@ -143,12 +143,35 @@ def _socket_reachable(path: str) -> bool:
     return True
 
 
-async def _connect_session_bus() -> object:
+def _external_uid_auth(uid: int | None) -> object | None:
+    """An EXTERNAL authenticator naming ``uid``, or ``None`` for the default.
+
+    ``dbus-next`` states ``os.getuid()`` in its EXTERNAL handshake. That value is
+    the namespace-local identity, so inside ``unshare -r`` it reads as ``0``
+    while the bus still sees the spawning user's kernel uid and rejects the
+    mismatch. A credential witness therefore names the uid it inherited from its
+    spawner; an ordinary caller keeps the library default.
+    """
+    if uid is None:
+        return None
+    from dbus_next.auth import AuthExternal
+
+    class _ExternalUid(AuthExternal):
+        def _authentication_start(self, negotiate_unix_fd: bool = False) -> str:
+            self.negotiate_unix_fd = negotiate_unix_fd
+            return f"AUTH EXTERNAL {str(uid).encode().hex()}"
+
+    return _ExternalUid()
+
+
+async def _connect_session_bus(uid: int | None = None) -> object:
     """Open the session bus through ``dbus-next``, imported only when needed."""
     from dbus_next import BusType
     from dbus_next.aio import MessageBus
 
-    return await MessageBus(bus_type=BusType.SESSION).connect()
+    return await MessageBus(
+        bus_type=BusType.SESSION, auth=_external_uid_auth(uid),
+    ).connect()
 
 
 def _interface_names(document: object) -> frozenset[str] | None:
@@ -211,10 +234,16 @@ class DBusCapabilityClient:
         self,
         timeout: float = INTROSPECTION_TIMEOUT,
         *,
+        uid: int | None = None,
         connect: Callable[[], Awaitable[object]] | None = None,
     ) -> None:
+        if uid is not None and (type(uid) is not int or uid < 0):
+            raise ValueError("session bus uid must be a non-negative integer")
         self._timeout = float(timeout)
-        self._connect = _connect_session_bus if connect is None else connect
+        self._uid = uid
+        self._connect = (
+            (lambda: _connect_session_bus(uid)) if connect is None else connect
+        )
 
     async def interfaces(self, service: str, path: str) -> frozenset[str] | None:
         try:

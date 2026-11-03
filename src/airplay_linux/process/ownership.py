@@ -76,6 +76,14 @@ class EndpointObservations:
 
     @staticmethod
     def unix_inodes(path: str) -> tuple[int, ...] | None:
+        """Inodes of listening sockets bound to exactly ``path``.
+
+        A connected client -- including the verifier's own ``peer`` probe -- is
+        listed under the server's path with state 02/03 and either a zero or a
+        transient positive inode. Only an unconnected (state 01) row with a
+        positive inode is a listening endpoint; a client row must not turn one
+        listener into "duplicate rows". Malformed inode evidence still refuses.
+        """
         try:
             data = _read(Path("/proc/net/unix"))
             if data is None:
@@ -83,10 +91,15 @@ class EndpointObservations:
             rows = []
             for line in data.splitlines()[1:]:
                 fields = line.split(None, 7)
-                if len(fields) == 8 and fields[7] == os.fsencode(path):
-                    if not fields[6].isdigit() or int(fields[6]) <= 0:
-                        return None
-                    rows.append(int(fields[6]))
+                if len(fields) != 8 or fields[7] != os.fsencode(path):
+                    continue
+                if fields[6] == b"0":
+                    continue
+                if not fields[6].isdigit() or int(fields[6]) <= 0:
+                    return None
+                if fields[5] != b"01":
+                    continue
+                rows.append(int(fields[6]))
             return tuple(rows)
         except OSError:
             return None

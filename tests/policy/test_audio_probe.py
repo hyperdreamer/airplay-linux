@@ -491,3 +491,33 @@ async def test_the_session_bus_client_refuses_when_the_bus_is_unreachable():
     client = DBusCapabilityClient(timeout=0.1, connect=connect)
 
     assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is None
+
+
+def test_external_authenticator_names_the_requested_uid():
+    pytest.importorskip("dbus_next")
+    from airplay_linux.policy.audio import _external_uid_auth
+
+    assert _external_uid_auth(None) is None
+    authenticator = _external_uid_auth(1000)
+    assert authenticator._authentication_start() == "AUTH EXTERNAL 31303030"
+
+
+async def test_the_session_bus_client_passes_its_uid_to_the_connector(monkeypatch):
+    seen: list[int | None] = []
+
+    async def connect(uid: int | None = None) -> object:
+        seen.append(uid)
+        return FakeBus([_PORTAL_DOCUMENT])
+
+    monkeypatch.setattr("airplay_linux.policy.audio._connect_session_bus", connect)
+    client = DBusCapabilityClient(timeout=0.1, uid=1000)
+
+    assert await client.interfaces(PORTAL_SERVICE, PORTAL_OBJECT_PATH) is not None
+    assert seen == [1000]
+
+
+def test_the_session_bus_client_refuses_an_invalid_uid():
+    with pytest.raises(ValueError):
+        DBusCapabilityClient(uid=-1)
+    with pytest.raises(ValueError):
+        DBusCapabilityClient(uid=True)

@@ -965,3 +965,60 @@ async def test_production_activation_remains_closed(tmp_path, monkeypatch):
     assert not any(Path(argv[0]).name == "doubletake" and "-daemonize" in argv[1:] for _, argv in recorder.calls)
     observed = {argv[-1] for _, argv in recorder.calls}
     assert {"--help", "--version", "-capabilities", "-j"} <= observed
+
+
+# ------------------------------------------------------- /proc/net/unix endpoint rows
+
+
+def _unix_rows(*rows: str) -> bytes:
+    return (
+        "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        + "\n".join(rows)
+        + "\n"
+    ).encode()
+
+
+def _row(index: str, state: str, inode: str, path: str) -> str:
+    return (
+        f"00000000{index}: 00000002 00000000 00010000 0001 {state} "
+        f"{inode:>5} {path}"
+    )
+
+
+def test_unix_inodes_counts_only_the_listening_endpoint(monkeypatch):
+    """A connected client row names the server path but is not a second listener."""
+    from airplay_linux.process import ownership
+
+    path = "/run/user/1000/airplay/owned/daemon.sock"
+    monkeypatch.setattr(ownership, "_read", lambda _: _unix_rows(
+        _row("aaaaaaaa", "01", "900", path),
+        _row("bbbbbbbb", "02", "0", path),
+        _row("cccccccc", "03", "901", path),
+        _row("dddddddd", "01", "902", "/elsewhere.sock"),
+    ))
+
+    assert ownership.EndpointObservations.unix_inodes(path) == (900,)
+
+
+def test_unix_inodes_still_counts_a_second_listener(monkeypatch):
+    """Two unconnected endpoints remain ambiguous evidence."""
+    from airplay_linux.process import ownership
+
+    path = "/run/user/1000/airplay/owned/daemon.sock"
+    monkeypatch.setattr(ownership, "_read", lambda _: _unix_rows(
+        _row("aaaaaaaa", "01", "900", path),
+        _row("bbbbbbbb", "01", "901", path),
+    ))
+
+    assert ownership.EndpointObservations.unix_inodes(path) == (900, 901)
+
+
+def test_unix_inodes_refuses_malformed_inode_evidence(monkeypatch):
+    from airplay_linux.process import ownership
+
+    path = "/run/user/1000/airplay/owned/daemon.sock"
+    monkeypatch.setattr(ownership, "_read", lambda _: _unix_rows(
+        _row("aaaaaaaa", "01", "x", path),
+    ))
+
+    assert ownership.EndpointObservations.unix_inodes(path) is None

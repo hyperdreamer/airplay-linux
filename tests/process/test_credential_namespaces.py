@@ -182,3 +182,26 @@ async def test_dispatch_records_the_spawner_namespace_pins(tmp_path, monkeypatch
     assert isinstance(result, Err)
     argv = recorded["argv"]
     assert argv[argv.index("--parent-namespaces") + 1] == "[[4, 11], [4, 12]]"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None),
+    ("0", 0),
+    ("1000", 1000),
+    ("4294967295", 4294967295),
+    ("-1", None),
+    ("4294967296", None),
+    ("", None),
+    ("text", None),
+])
+def test_spawner_uid_decodes_conservatively(raw, expected) -> None:
+    assert probe._parent_uid(raw) == expected
+
+
+def test_child_import_environment_names_the_running_package_root() -> None:
+    """The bounded witness child must import the code its parent is running."""
+    environment = probe._child_import_environment()
+    assert set(environment) == {"PYTHONPATH"}
+    assert os.path.isfile(os.path.join(
+        environment["PYTHONPATH"], "airplay_linux", "__init__.py",
+    ))
