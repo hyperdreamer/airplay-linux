@@ -632,11 +632,27 @@ async def _compose_production(
     transport_ref["transport"] = transport
 
     audio_probe = PipeWirePortalAudioProbe()
+
+    async def composed_backend() -> Result[BackendFeatures]:
+        """Report the composition's own evidence, already proved above.
+
+        The public help probe cannot affirm the capabilities this graph owns
+        (``owned_daemon_control``, ``keyring``, ``physical_source``), so feeding
+        its raw result to the report would deny every start the transport admits.
+        A probe that produced no features keeps its own typed refusal: a missing
+        or foreign backend must still be named as such, not reduced to a missing
+        derived capability.
+        """
+        if isinstance(backend, Ok) and isinstance(backend.value, BackendFeatures):
+            return Ok(value=features)
+        return backend
+
     probe = EnvironmentProbe.from_environment(
         process=process,
         helper=helper,
         capture=capture,
         audio_probe=audio_probe,
+        backend_probe=composed_backend,
     )
     report = await probe.check()
     report_holder: dict[str, Any] = {"report": report}

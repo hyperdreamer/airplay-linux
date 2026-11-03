@@ -135,18 +135,44 @@ is in `tests/backend/test_carried_source_patch.py`.
 
 ## Installed locally (this machine)
 
-The installed `/home/bin` binaries predate the third token. Their hashes were rechecked during
-this reconciliation and remain:
+### 2026-11-03 complete build installed
+
+The stale two-token binaries were replaced with a rebuild of this exact chain. Identity of the
+installed artifacts:
+
+```text
+base v0.5.0 commit   c896e3689ab85c3ed520e502308dedfbb5a4c221
+0001 sha256         622ecded534be335557b61332cd66d57cecfdea869abc00f5e58f6f75a84d687
+0002 sha256         0927e2d24abf63f413441a3a291c545288eb09e7b3dca102d3f328bb4b764dc7
+0003 sha256         482e7ec85940b35381686730ae248b491065bfc66d28ec449b62717e0d803567
+doubletake sha256   44d85c94d2eb1ea317fa71d7085b7b92d63e06fd2add20afbea7e0cb047adba2
+doubletake-ctl      3a1018bbd9c339568453332f2c9e3ae6e5eee2f3c9dfb438cc1cfd36c08c7ac2
+```
+
+Built with Go 1.27.3 linux/amd64, `CGO_ENABLED=1`, `GOFLAGS=-mod=mod`, cached modules in a private
+`GOMODCACHE`, and GStreamer 1.28.8. `go vet ./...` was clean and `go test -count=1 ./...` passed
+(four tested packages, two without tests). The sender exits 0 with all three capability lines:
+
+```text
+capabilities-v1
+status-source
+status-source-complete
+```
+
+Hashes are build-specific, as above. The previous two-token build is retained as
+`/home/bin/doubletake.prev` and `/home/bin/doubletake-ctl.prev`; restoring those files reverts the
+installation to a state where Mirror is gated by incomplete source reporting.
+
+The prior installed pair, recorded during the 2026-11-02 reconciliation, was:
 
 ```text
 /home/bin/doubletake       sha256 22187a1802f36a2d6eae56e2fc891722d3ef10de9bd237d7da77c40c263324e6
 /home/bin/doubletake-ctl   sha256 6da625901b5e0629437378ec404d5869791fc1e5e19ed87b26ee31b14872d4fe
 ```
 
-They print only `capabilities-v1` and `status-source`, so they are **not** a valid full-chain
-installation. Installing the reconciled artifacts remains a separate operator action; require
-all three capability lines before considering Mirror. Reporting metadata alone proves no
-physical-output guarantee.
+They printed only `capabilities-v1` and `status-source` and were not a valid full-chain
+installation. Reporting metadata alone proves no physical-output guarantee, so installing the
+tokens is necessary evidence, never sufficient on its own.
 
 `/home/bin` precedes `/usr/bin` on this account's `PATH`; the packaged files are untouched.
 To revert shadowing, remove `/home/bin/doubletake` and `/home/bin/doubletake-ctl`, or restore the

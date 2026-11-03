@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Literal
+from typing import Final, Literal
 from uuid import UUID, uuid4
 
 from airplay_linux.backend.contract import CredentialProofVerdict, decode_status
@@ -1109,6 +1109,7 @@ class CredentialServiceProbe:
                 result = await self._process.run(CommandSpec(argv=(
                     self._unshare, "-rn", sys.executable, "-m", "airplay_linux.process.credential_probe",
                     "--socket", socket_path, "--record-root", str(root),
+                    "--parent-namespaces", json.dumps(_self_namespace_pins()),
                 ), env={}), timeout=30.0)
                 _same_runtime(binding, runtime_descriptor)
                 completed = isinstance(result, Ok) and type(result.value.exit_code) is int
@@ -1158,12 +1159,97 @@ class CredentialServiceProbe:
                     os.close(lock_descriptor)
 
 
-def _namespace_identity(argv: tuple[str, ...]) -> Result[ProcessIdentity]:
+_NAMESPACE_ARGV: Final[tuple[str, str]] = ("unshare", "-rn")
+_NAMESPACE_KINDS: Final[tuple[str, str]] = ("user", "net")
+
+
+def _namespace_pin(name: str) -> tuple[int, int]:
+    """The ``(device, inode)`` pair that names one namespace of this process."""
+    info = os.stat(f"/proc/self/ns/{name}")
+    _require(info.st_ino > 0)
+    return (info.st_dev, info.st_ino)
+
+
+def _self_namespace_pins() -> list[list[int]]:
+    """The spawning process's own namespace pins, in :data:`_NAMESPACE_KINDS` order.
+
+    Read before dispatch: the child can never read these for itself, because
+    entering a user namespace moves the caller below the target's namespace for
+    ptrace purposes and the kernel then refuses ``/proc/<parent>/ns/*``.
+    """
+    return [
+        [device, inode]
+        for device, inode in (_namespace_pin(name) for name in _NAMESPACE_KINDS)
+    ]
+
+
+def _parent_namespaces(raw: str | None) -> tuple[tuple[int, int], ...] | None:
+    """Decode the pins the spawning process recorded, or ``None`` if unusable."""
+    if type(raw) is not str:
+        return None
     try:
-        _require(argv == ("unshare", "-rn") and os.getuid() == 0)
-        for namespace in ("user", "net"):
-            _require(os.readlink(f"/proc/self/ns/{namespace}")
-                     != os.readlink(f"/proc/{os.getppid()}/ns/{namespace}"))
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if type(decoded) is not list or len(decoded) != len(_NAMESPACE_KINDS):
+        return None
+    pins: list[tuple[int, int]] = []
+    for entry in decoded:
+        if type(entry) is not list or len(entry) != 2:
+            return None
+        if any(type(part) is not int or part < 0 for part in entry):
+            return None
+        pins.append((entry[0], entry[1]))
+    return tuple(pins)
+
+
+def _isolation_proven(
+    argv: tuple[str, ...], uid: int,
+    expected: tuple[tuple[int, int], ...] | None,
+    observed: tuple[tuple[int, int], ...] | None,
+) -> bool:
+    """Whether the witness's own namespace pins differ from its spawner's.
+
+    Every input is evidence, so nothing truthy is accepted in a wrong shape and
+    missing evidence can never read as isolation. Both user and network
+    namespaces must differ: a private user namespace alone would leave the
+    witness on the real network, which is exactly what this gate forbids.
+    """
+    if type(argv) is not tuple or argv != _NAMESPACE_ARGV:
+        return False
+    if type(uid) is not int or uid != 0:
+        return False
+    if expected is None or observed is None:
+        return False
+    if len(expected) != len(_NAMESPACE_KINDS) or len(observed) != len(_NAMESPACE_KINDS):
+        return False
+    for pin in (*expected, *observed):
+        if type(pin) is not tuple or len(pin) != 2:
+            return False
+        if any(type(part) is not int or part < 0 for part in pin):
+            return False
+    return all(observed[index] != expected[index] for index in range(len(_NAMESPACE_KINDS)))
+
+
+def _namespace_identity(
+    argv: tuple[str, ...], *, expected: tuple[tuple[int, int], ...] | None = None,
+) -> Result[ProcessIdentity]:
+    """Prove this witness runs in namespaces the spawning process does not.
+
+    The child cannot read its parent's ``/proc/<pid>/ns/*`` links: entering a
+    user namespace puts the caller below the target's namespace for ptrace
+    purposes, so the kernel answers ``EACCES`` for exactly the comparison this
+    evidence needs. The spawning process therefore records its own pins and
+    passes them; this process reads its own pins and requires both to differ.
+    That is the same fact, stated with evidence each side can legally obtain.
+    Absent or malformed spawner evidence refuses rather than assuming isolation.
+    """
+    try:
+        observed = (
+            tuple(_namespace_pin(name) for name in _NAMESPACE_KINDS)
+            if argv == _NAMESPACE_ARGV else None
+        )
+        _require(_isolation_proven(argv, os.getuid(), expected, observed))
         identity = read_identity_evidence(os.getpid())
         _require(identity.state is IdentityState.present and identity.identity is not None)
         return Ok(value=identity.identity)
@@ -1175,12 +1261,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one isolated credential service witness")
     parser.add_argument("--socket", required=True)
     parser.add_argument("--record-root", required=True)
+    parser.add_argument("--parent-namespaces", default=None)
     arguments = parser.parse_args(argv)
     try:
         root = Path(arguments.record_root)
         runtime_root = Path(arguments.socket).parent.parent
         _require(arguments.socket == str(runtime_root / "positive" / "daemon.sock"))
-        identity = _namespace_identity(("unshare", "-rn"))
+        parent_namespaces = _parent_namespaces(arguments.parent_namespaces)
+        identity = _namespace_identity(_NAMESPACE_ARGV, expected=parent_namespaces)
         _require(isinstance(identity, Ok))
         backend = shutil.which("doubletake")
         boot = EndpointObservations.boot_id()
@@ -1188,7 +1276,8 @@ def main(argv: list[str] | None = None) -> int:
         config = prepare_config(root, backend_executable=backend, supervisor=identity.value,
                                 boot_id=boot, runtime_root=runtime_root)
         from airplay_linux.process.linux import LinuxProcessRunner
-        run(config, process=LinuxProcessRunner(), namespace=_namespace_identity)
+        run(config, process=LinuxProcessRunner(),
+            namespace=lambda required: _namespace_identity(required, expected=parent_namespaces))
         descriptor = open_probe_root(root, config.probe_uuid)
         try:
             # A completed failed leg exits zero too, but a partial publication or

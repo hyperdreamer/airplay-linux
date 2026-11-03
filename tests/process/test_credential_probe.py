@@ -265,7 +265,7 @@ def namespace_probe_witness(private_socket_root, monkeypatch):
                               supervisor=facts.supervisor, boot_id=facts.boot)
     return SimpleNamespace(module=p, config=config, facts=facts, inner=inner, clock=clock,
                            service_calls=service_calls, socket_root=private_socket_root,
-                           namespace=lambda argv: Ok(value=facts.supervisor))
+                           namespace=lambda argv, *, expected=None: Ok(value=facts.supervisor))
 
 
 @pytest.fixture
@@ -917,7 +917,8 @@ def test_production_main_uses_same_child_seam_and_requires_complete_files(
     monkeypatch.setattr(c.module.shutil, "which", lambda _: "/fake/doubletake")
     monkeypatch.setattr(ownership.EndpointObservations, "boot_id", staticmethod(lambda: c.facts.boot))
     monkeypatch.setattr(linux, "LinuxProcessRunner", lambda: c.inner)
-    argv = ["--socket", str(runtime_root / "positive/daemon.sock"), "--record-root", str(root)]
+    argv = ["--socket", str(runtime_root / "positive/daemon.sock"), "--record-root", str(root),
+            "--parent-namespaces", json.dumps([[4, 11], [4, 12]])]
     assert c.module.main(argv) == 0
     assert len(c.inner.launches) == 2
     assert decode_probe_verdict((root / "verdict.json").read_bytes()).failure is None

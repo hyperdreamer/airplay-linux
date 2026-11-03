@@ -57,10 +57,28 @@ verification, strict teardown, shared authority, a credential-service witness an
 verifier. Missing prerequisites produce a named `dependency_incompatible` refusal with no backend
 launch. The credential witness uses private user/network namespaces and two isolated backend
 legs before registry construction; its file-backed evidence must prove the service, positive and
-negative legs. Public admission requires `owned_daemon_control`, `keyring` and `multi_target`.
+negative legs. Isolation is proved from inside the child: the spawner records its own user and
+network namespace pins in the child's argv and the child requires both to differ, because a
+process inside a user namespace may not read its parent's `/proc/<pid>/ns` entries. Public
+admission requires `owned_daemon_control`, `keyring` and `multi_target`.
 
 A full-chain source-reporting build must advertise `capabilities-v1`, `status-source` and
-`status-source-complete`. Before publishing a stream, the application matches that target's reported
+`status-source-complete`. That build is installed in `/home/bin`; the rebuild identity and artifact
+hashes are recorded in [docs/backend-fork.md](docs/backend-fork.md). The previous two-token build is
+retained as `/home/bin/doubletake.prev` for rollback. Recognition still requires the matching
+sender/ctl help surface as well as the tokens, so a later or foreign build cannot inherit this
+profile.
+
+Startup capability evidence is derived from the composition's own admission result, not from the public
+help probe: the report sees exactly the `owned_daemon_control`, `keyring`, `physical_source` and
+`multi_target` values the transport is built with, so it can never refuse a mode the transport would
+admit. A backend probe that produced no features keeps its own typed refusal (a missing `doubletake` is
+reported as a missing command, not as a withheld derived flag). Mirror therefore requires the installed
+complete build *and* a passing runtime chain: private runtime root, private user/network namespace for
+the credential witness, a Secret Service provider, one physical KScreen inventory and a fresh source
+verification. A host without a Secret Service keeps Mirror gated with the credential leg named.
+
+Before publishing a stream, the application matches that target's reported
 monitor type, complete size and signed position against one fresh KScreen inventory of the requested
 physical output. Window/virtual sources, missing position, a different monitor or ambiguous geometry
 produce `unsupported_source`. Source acquisition and credential-challenge polling share one 5.0 s
@@ -74,12 +92,9 @@ diagnostics name the selected authority, failed credential leg, missing complete
 evidence and withheld flags. The fixture-only application-contract profile retains its original
 handshake and pairing prerequisites.
 
-The binaries currently installed in `/home/bin` advertise only the older two-token source contract,
-so **Mirror remains gated on this host until a complete build is installed and all runtime evidence
-passes**. The activation rebuild and its actual artifact hashes are recorded in
-[docs/backend-fork.md](docs/backend-fork.md). Verification used deterministic external boundaries;
-no live receiver streaming session was attempted. Virtual display has its own helper, source and
-output-association prerequisites and is not enabled by this activation.
+Verification used deterministic external boundaries; no live receiver streaming session was attempted.
+Virtual display has its own helper, source and output-association prerequisites and is not enabled by
+this activation.
 
 `--check-environment` reports capability evidence; [docs/operations.md](docs/operations.md) has the
 operator checks and [docs/backend-compatibility.md](docs/backend-compatibility.md) records the backend

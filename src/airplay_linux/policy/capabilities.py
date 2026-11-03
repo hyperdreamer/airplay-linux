@@ -281,6 +281,7 @@ class EnvironmentProbe:
         dbus: InterfaceCapabilityClient | None = None,
         audio_probe: AudioProbe | None = None,
         keyring_probe: Callable[[], Awaitable[bool]] | None = None,
+        backend_probe: Callable[[], Awaitable[Result[BackendFeatures]]] | None = None,
     ) -> EnvironmentProbe:
         """Compose the frozen Task 7/8/13 probes without touching a desktop.
 
@@ -289,12 +290,22 @@ class EnvironmentProbe:
         ``VirtualHelper.probe``. The caller decides which capture provider and
         D-Bus client exist, so composition remains the only place that chooses a
         real desktop adapter.
+
+        ``backend_probe`` overrides that public probe with the capability view a
+        composition root already proved. Capabilities no help text can affirm
+        (``owned_daemon_control``, ``keyring``, ``physical_source``) exist only in
+        that derived view, so passing it is what makes this report able to
+        describe a start the real transport would admit.
         """
         from airplay_linux.backend.contract import probe_backend
 
         return cls(
             environment=environment,
-            backend_probe=lambda: probe_backend(process),
+            backend_probe=(
+                (lambda: probe_backend(process))
+                if backend_probe is None
+                else backend_probe
+            ),
             helper_probe=helper.probe,  # type: ignore[attr-defined]
             capture=capture,
             dbus=dbus,
