@@ -144,6 +144,8 @@ class InnerProcess(ProbeProcessRecorder):
         self.termination_deadlines = []
         self.before_signal = []
         self.record_root = None
+        self.socket_lock = False
+        self.lock_paths = []
 
     async def spawn(self, spec):
         result = await super().spawn(spec)
@@ -162,6 +164,10 @@ class InnerProcess(ProbeProcessRecorder):
             )
             self.facts.rows[path] = (5678,)
             self.facts.peers[path] = identity
+            if self.socket_lock:
+                lock = Path(path).parent / "daemon.sock.lock"
+                lock.write_bytes(b"")
+                self.lock_paths.append(lock)
         if leg == "negative" and not self.negative_hangs:
             if self.negative_file:
                 (Path(spec.env["HOME"]) / "credentials.json").write_text("temporary fake data")
@@ -1069,3 +1075,31 @@ def test_credential_probe_file_passes_with_deep_basetemp(tmp_path):
         capture_output=True, text=True, timeout=60, check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_positive_leg_tolerates_and_removes_the_backend_socket_guard(namespace_probe_witness):
+    """doubletake keeps a zero-byte lock beside its socket; it is not a credential."""
+    c = namespace_probe_witness
+    c.inner.socket_lock = True
+
+    verdict = c.module.run(c.config, process=c.inner, namespace=c.namespace)
+
+    assert verdict.failure is None
+    assert (verdict.service_leg, verdict.backend_positive_leg,
+            verdict.backend_negative_leg) == ("passed", "passed", "passed")
+    assert c.inner.lock_paths and not c.inner.lock_paths[0].exists()
+
+
+def test_socket_guard_must_be_an_empty_owned_regular_file(tmp_path):
+    p = probe_module()
+    guard = tmp_path / "daemon.sock.lock"
+    guard.write_bytes(b"")
+    descriptor = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        assert p._empty_owned_lock(descriptor, guard.name, os.getuid()) is True
+        guard.write_bytes(b"secret")
+        assert p._empty_owned_lock(descriptor, guard.name, os.getuid()) is False
+        guard.write_bytes(b"")
+        assert p._empty_owned_lock(descriptor, guard.name, os.getuid() + 1) is False
+    finally:
+        os.close(descriptor)

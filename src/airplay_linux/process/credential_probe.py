@@ -60,6 +60,8 @@ _FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
 _RUNTIME_OBLIGATION = "runtime-cleanup.json"
 _RUNTIME_LIFECYCLE = "runtime-lifecycle.json"
 _BACKEND_DISPATCH = "backend-dispatch.json"
+#: The backend guards its control socket with a zero-byte sibling lock file.
+_SOCKET_LOCK_SUFFIX = ".lock"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -108,6 +110,19 @@ def _err(code: ErrorCode = ErrorCode.ownership_mismatch) -> Err:
 def _private(info) -> None:
     _require(stat.S_ISDIR(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o700
              and info.st_uid == os.getuid())
+
+
+def _empty_owned_lock(directory: int, name: str, owner_uid: int) -> bool:
+    """Whether ``name`` is the backend's empty socket guard, not credential data."""
+    try:
+        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == owner_uid
+        and info.st_size == 0
+    )
 
 
 def _open_directory(path: Path) -> int:
@@ -726,17 +741,46 @@ class _Leg:
     def _no_credentials_file(self) -> bool:
         # Refuse every unexpected entry in both locations. HOME/XDG files live
         # under the state root so failures retain them after socket-root cleanup.
+        # The backend also creates a zero-byte ``<socket>.lock`` guard beside its
+        # socket. That guard is not credential storage, but any content written
+        # into it would be, so only an empty regular file owned by this user is
+        # accepted.
         runtime = Path(self.receipt.runtime_directory)
+        lock_name = self.receipt.socket_name + _SOCKET_LOCK_SUFFIX
         for directory in {runtime, self.config.record_root / self.leg}:
             entered = _open_directory(directory)
             try:
                 _private(os.fstat(entered))
-                allowed = {self.receipt.socket_name} if directory == runtime else set()
-                if not set(os.listdir(entered)) <= allowed:
-                    return False
+                allowed = {self.receipt.socket_name, lock_name} if directory == runtime else set()
+                for name in os.listdir(entered):
+                    if name not in allowed:
+                        return False
+                    if name == lock_name and not _empty_owned_lock(
+                        entered, lock_name, self.receipt.owner_uid,
+                    ):
+                        return False
             finally:
                 os.close(entered)
         return True
+
+    def _remove_socket_lock(self) -> None:
+        """Remove the backend's empty socket guard once its daemon is gone."""
+        name = self.receipt.socket_name + _SOCKET_LOCK_SUFFIX
+        entered = _open_directory(Path(self.receipt.runtime_directory))
+        try:
+            _private(os.fstat(entered))
+            try:
+                os.stat(name, dir_fd=entered, follow_symlinks=False)
+            except FileNotFoundError:
+                return
+            _require(_empty_owned_lock(entered, name, self.receipt.owner_uid))
+            try:
+                os.unlink(name, dir_fd=entered)
+            except FileNotFoundError:
+                return
+            os.fsync(entered)
+        finally:
+            os.close(entered)
 
     async def _bind(self) -> bool:
         history = self._receipt_source()
@@ -832,6 +876,7 @@ class _Leg:
                 released = await self.authority.release(self.record)
                 if isinstance(released, Err):
                     raise _Refused(released.error.code)
+                self._remove_socket_lock()
             except (_Refused, OSError, StorageError) as error:
                 cleanup_failure = error.code if isinstance(error, _Refused) else ErrorCode.cleanup_timeout
         terminal_failure = cleanup_failure or failure

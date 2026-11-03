@@ -107,11 +107,22 @@ class EndpointObservations:
     @staticmethod
     def holds_socket(pid: int, inode: int) -> bool | None:
         try:
-            # Failure to inspect even one fd leaves the holder set uncertain.
-            holders = tuple(os.readlink(entry) for entry in (Path("/proc") / str(pid) / "fd").iterdir())
-            return f"socket:[{inode}]" in holders
+            entries = (Path("/proc") / str(pid) / "fd").iterdir()
         except OSError:
             return None
+        holders = []
+        for entry in entries:
+            try:
+                holders.append(os.readlink(entry))
+            except FileNotFoundError:
+                # The daemon accepts or closes connections while we scan; a
+                # descriptor that vanished is not a holder and cannot hide the
+                # stable listener descriptor this proof is looking for.
+                continue
+            except OSError:
+                # Any other unreadable descriptor leaves the set uncertain.
+                return None
+        return f"socket:[{inode}]" in holders
 
     @staticmethod
     def cmdline(pid: int) -> bytes | None:

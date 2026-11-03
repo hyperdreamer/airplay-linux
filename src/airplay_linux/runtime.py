@@ -118,7 +118,14 @@ def _install_owned_daemon_epoch(
     # still owns the sole production activation switch.
     files = AtomicFiles(config.state_root)
     inventory = KScreenInventory(process)
-    probe = CredentialServiceProbe(process=process, record_root=config.state_root, unshare="unshare")
+    # The probe walks its record root component by component with O_NOFOLLOW.
+    # A home directory reached through a symlink (a common /home/<user> ->
+    # /home/<user>-arch layout) would otherwise refuse every probe before it
+    # started. Resolving once here keeps the strict walk meaningful for every
+    # component created below the canonical root.
+    probe = CredentialServiceProbe(
+        process=process, record_root=config.state_root.resolve(), unshare="unshare",
+    )
 
     def receipt_snapshot():
         try:
