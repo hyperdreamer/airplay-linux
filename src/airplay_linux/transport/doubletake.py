@@ -665,7 +665,9 @@ class DoubleTakeTransport:
             return checked
         if self._trust_blocked(target):
             return _failure(ErrorCode.trust_cleanup_required)
-        if isinstance(source, PhysicalMonitorSource):
+        if source is None or isinstance(source, PhysicalMonitorSource):
+            # ``None`` is desktop capture: the backend opens the session and the
+            # portal decides which screen it gets.
             supported = self._features.physical_source
         elif isinstance(source, VirtualOutputSource):
             supported = self._features.virtual_source and bool(source.connector and source.kscreen_output_id)
@@ -799,9 +801,9 @@ class DoubleTakeTransport:
     async def _claim_streaming_readiness(self, stream: _Stream) -> Err | None:
         """Publish the ready event from local evidence, or return the refusal."""
         source_checked = (
-            await self._verify_reported_source(stream)
-            if isinstance(stream.source, PhysicalMonitorSource)
-            else Ok(value=None)
+            Ok(value=None)
+            if isinstance(stream.source, VirtualOutputSource)
+            else await self._verify_reported_source(stream)
         )
         checked = self._current(stream.target, stream.context)
         if isinstance(source_checked, Err):
@@ -863,8 +865,13 @@ class DoubleTakeTransport:
                 ):
                     return _failure(ErrorCode.dependency_incompatible)
                 if len(matches) == 1:
+                    requested = (
+                        stream.source.connector
+                        if isinstance(stream.source, PhysicalMonitorSource)
+                        else None
+                    )
                     verified = await _safe_source_verification(
-                        self._source_verifier.verify(stream.source.connector, matches[0].source),
+                        self._source_verifier.verify(requested, matches[0].source),
                     )
                     if self._clock.now() >= deadline:
                         return _failure(ErrorCode.unsupported_source)

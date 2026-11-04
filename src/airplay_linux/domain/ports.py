@@ -115,7 +115,7 @@ class TransportPort(Protocol):
     ) -> Result[ReceiverCapabilities | None]: ...
 
     async def start_stream(
-        self, target: ReceiverTarget, source: CaptureSource,
+        self, target: ReceiverTarget, source: CaptureSource | None,
         audio_policy: AudioPolicy, context: OperationContext,
     ) -> Result[StreamHandle]: ...
 

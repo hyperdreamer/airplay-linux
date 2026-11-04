@@ -157,6 +157,9 @@ class PaneState:
     # A mode gate, not a session state: the only useful control is a re-probe of
     # the capability evidence, never a session command.
     capability_blocked: bool = False
+    # The monitor the backend actually captured, once a Mirror stream is up.
+    # Mirror has no requested source, so this is the only honest label.
+    captured_connector: str | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +378,11 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         diagnostic=_diagnostic(snapshot, inputs, decision, orphans),
         retained_output=_retained_output(snapshot, ownership),
         capability_blocked=decision.kind == "capability",
+        captured_connector=(
+            snapshot.physical_source.connector
+            if snapshot.mode is Mode.MIRROR and snapshot.physical_source is not None
+            else None
+        ),
     )
 
 

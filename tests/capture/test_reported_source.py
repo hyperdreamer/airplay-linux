@@ -297,3 +297,50 @@ def test_capture_physical_reexports_shared_output_whitelists():
 
     assert physical.PHYSICAL_OUTPUT_TYPES is inventory.PHYSICAL_OUTPUT_TYPES
     assert physical.PHYSICAL_OUTPUT_TYPE_NAMES is inventory.PHYSICAL_OUTPUT_TYPE_NAMES
+
+
+def test_adopt_mode_accepts_a_unique_physical_output_without_a_request():
+    """With no requested connector, the captured monitor is the answer."""
+    result = verify_reported_source(None, _reported(), (_output("HDMI-1"),))
+
+    assert isinstance(result, Ok)
+    assert result.value.matched_connector == "HDMI-1"
+    assert result.value.reported is not None
+
+
+def test_adopt_mode_still_refuses_an_ambiguous_position():
+    result = verify_reported_source(
+        None, _reported(), (_output("DP-1"), _output("HDMI-1", output_id="2")),
+    )
+
+    assert isinstance(result, Err)
+    assert _reason(result) is SourceRefusal.AMBIGUOUS_POSITION
+
+
+def test_adopt_mode_still_refuses_virtual_and_owned_outputs():
+    assert _reason(verify_reported_source(None, _reported(), (_output(virtual=True),))) is (
+        SourceRefusal.VIRTUAL_OUTPUT
+    )
+    owned = SimpleNamespace(desired_state="active", connector="DP-1", output_id="1")
+    result = verify_reported_source(None, _reported(), (_output(),), owned_outputs=(owned,))
+    assert _reason(result) is SourceRefusal.OWNED_OUTPUT
+
+
+def test_adopt_mode_still_refuses_disconnected_and_unknown_origin():
+    disconnected = verify_reported_source(None, _reported(), (_output(connected=False),))
+    assert _reason(disconnected) is SourceRefusal.DISCONNECTED_OUTPUT
+    unknown = verify_reported_source(
+        None, _reported(), (_output("Unknown-1", output_type=None, virtual=None),),
+    )
+    assert _reason(unknown) is SourceRefusal.UNKNOWN_ORIGIN
+
+
+def test_adopt_mode_still_corroborates_the_current_mode_size():
+    result = verify_reported_source(
+        None, _reported(width=1280, height=720), (_output(scale=1.5),),
+    )
+    assert isinstance(result, Ok)
+    mismatch = verify_reported_source(
+        None, _reported(width=2880, height=1620), (_output(scale=1.5),),
+    )
+    assert _reason(mismatch) is SourceRefusal.SIZE_MISMATCH

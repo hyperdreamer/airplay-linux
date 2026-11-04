@@ -158,6 +158,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
     challenge: ChallengeView | None = None,
     notice: str | None = None,
     diagnostic: object | None = None,
+    captured_connector: str | None = None,
 ) -> PaneState:
     return PaneState(
         title=title,
@@ -183,6 +184,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
         challenge=challenge,
         notice=notice,
         diagnostic=diagnostic,  # type: ignore[arg-type]
+        captured_connector=captured_connector,
     )
 
 
@@ -554,9 +556,18 @@ def test_only_the_visible_modes_editor_is_shown(qtbot) -> None:
     source = window.findChild(QComboBox, "sourceCombo")
     resolution = window.findChild(QComboBox, "resolutionCombo")
 
+    captured = window.findChild(QLabel, "capturedLabel")
     window.render_selected(pane(visible_mode=Mode.MIRROR, source_enabled=True))
-    assert source.isVisibleTo(window)
+    # Mirror has no source selector: the desktop is asked when capture starts.
+    assert not source.isVisibleTo(window)
+    assert captured.isVisibleTo(window)
+    assert captured.text() == "Screen: chosen when capture starts"
     assert not resolution.isVisibleTo(window)
+
+    window.render_selected(
+        pane(visible_mode=Mode.MIRROR, source_enabled=True, captured_connector="DP-1")
+    )
+    assert captured.text() == "Captured: DP-1"
 
     window.render_selected(pane(visible_mode=Mode.VIRTUAL, resolution_enabled=True))
     assert resolution.isVisibleTo(window)

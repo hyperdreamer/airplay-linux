@@ -520,3 +520,48 @@ async def test_late_trusted_pairing_with_failed_compensation_blocks_trust() -> N
     state = rig.manager.snapshot(destination.receiver_id)
     assert state.trust is TrustState.CleanupRequired
     assert state.phase is SessionPhase.TrustCleanupRequired
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_needs_no_local_source_and_records_the_captured_one() -> None:
+    """Mirror delegates capture to the backend and reports what it captured."""
+    rig, destination = await _online_rig()
+    completion: Deferred[object] = Deferred()
+    rig.transport.queue_result("start_stream", completion)
+    await rig.manager.dispatch(
+        Start(
+            receiver_id=destination.receiver_id,
+            request=StartRequest(
+                mode=Mode.MIRROR, source=None, audio=AudioPolicy(enabled=False),
+            ),
+        )
+    )
+    await rig.settle()
+
+    # No local acquisition and no local verification: the backend owns the session.
+    assert "capture.select" not in rig.capture.journal.names()
+    assert "capture.verify" not in rig.capture.journal.names()
+    started = rig.transport.journal.calls("transport.start_stream")[-1]
+    assert started["source"] is None
+
+    state = rig.manager.snapshot(destination.receiver_id)
+    completion.resolve(
+        Ok(
+            value=StreamHandle(
+                receiver_id=destination.receiver_id,
+                endpoint_generation=destination.endpoint_generation,
+                endpoint_fingerprint=destination.endpoint_fingerprint,
+                backend_stream_id="stream-desktop",
+                daemon_instance_uuid=InstanceId(UUID(int=9)),
+                lease_id=state.transport_lease_id,
+                start_operation_id=state.operation_id,
+                source_connector="DP-1",
+            )
+        )
+    )
+    await rig.settle()
+
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.stream is not None
+    assert after.physical_source is not None
+    assert after.physical_source.connector == "DP-1"

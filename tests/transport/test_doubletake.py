@@ -2369,3 +2369,45 @@ def test_fence_compatibility_matches_actual_keyword_callability():
                 )
                 checked += 1
     assert checked >= 12, checked
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_adopts_the_reported_connector(tmp_path):
+    """Mirror carries no requested source: the captured monitor is the answer."""
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+
+    result = await h.transport.start_stream(
+        h.a, None, AudioPolicy(enabled=False), context(),
+    )
+
+    assert isinstance(result, Ok), result
+    assert result.value.source_connector == "DP-1"
+    # No local acquisition: there is no lease to verify for a desktop capture.
+    assert h.capture.journal.calls("capture.verify") == []
+    ready = next(event for event in h.events if event.kind is TransportEventKind.ready)
+    assert isinstance(ready.payload, SourceVerificationPayload)
+    assert ready.payload.connector == "DP-1"
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_still_refuses_a_non_physical_output(tmp_path):
+    h = Harness(
+        tmp_path, source_verifier=_production_source_verifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    window = BackendSource(type=2, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.status].append(_source_status(h.a, window))
+
+    result = await h.transport.start_stream(
+        h.a, None, AudioPolicy(enabled=False), context(),
+    )
+
+    assert_error(result, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)

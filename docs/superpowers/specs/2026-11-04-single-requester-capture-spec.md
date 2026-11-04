@@ -67,6 +67,8 @@ Rejected, with reasons:
 - `_begin_stream` calls `transport.start_stream(target, None, policy, context)`.
 - `_start_after_trust` no longer requires `ctx.state.physical_source`; the pairing continuation starts the
   stream directly.
+- A Mirror session has no capture source to wait for, so `ReconnectLifecycle._has_source` no longer
+  requires one: a desktop capture is startable and reconnectable without a local lease.
 - `physical_source` is applied from the admitted handle after `transport_start` succeeds:
   `PhysicalMonitorSource(connector=handle.source_connector, portal_restore_token=None,
   capture_lease_id=None)`, only when `handle.source_connector is not None`.

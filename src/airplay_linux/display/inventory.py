@@ -243,16 +243,22 @@ def _owned_output(output: object, owned_outputs: tuple[object, ...]) -> bool:
 
 
 def verify_reported_source(
-    requested: str, reported: object, layout: tuple[object, ...], *,
+    requested: str | None, reported: object, layout: tuple[object, ...], *,
     owned_outputs: tuple[object, ...] = (),
 ) -> Result[SourceObservation]:
     """Verify one reported source against one fresh, typed KScreen layout.
 
-    Position is the primary key.  Portal dimensions are only corroboration after
-    a unique enabled position match, converted from device-independent pixels to
-    the output's current-mode dimensions using its observed scale.
+    ``requested=None`` is adopt mode: the caller has no source of its own and the
+    only question is whether what the backend captured is a physical monitor this
+    application may send. Every other rule is unchanged; the matched connector is
+    reported in the observation. Position is the primary key.  Portal dimensions
+    are only corroboration after a unique enabled position match, converted from
+    device-independent pixels to the output's current-mode dimensions using its
+    observed scale.
     """
-    if type(requested) is not str or not requested or not _is_physical_connector(requested):
+    if requested is not None and (
+        type(requested) is not str or not requested or not _is_physical_connector(requested)
+    ):
         return _refusal(SourceRefusal.INVALID_REQUESTED_CONNECTOR)
     if reported is None:
         return _refusal(SourceRefusal.MISSING_SOURCE)
@@ -297,7 +303,7 @@ def verify_reported_source(
     if native_size != (current_size.width, current_size.height):
         return _refusal(SourceRefusal.SIZE_MISMATCH, reported)
     connector = getattr(output, "connector", getattr(output, "name", None))
-    if connector != requested:
+    if requested is not None and connector != requested:
         return _refusal(SourceRefusal.DIFFERENT_CONNECTOR, reported)
     if getattr(output, "virtual", None) is True:
         return _refusal(SourceRefusal.VIRTUAL_OUTPUT, reported)
@@ -333,7 +339,7 @@ class KScreenReportedSourceVerifier:
         self.last_observation: SourceObservation | None = None
 
     async def observe_reported_source(
-        self, requested: str, reported: object,
+        self, requested: str | None, reported: object,
     ) -> SourceObservation:
         if not self.physical_inventory_available:
             return SourceObservation(
@@ -381,7 +387,7 @@ class KScreenReportedSourceVerifier:
         )
 
     async def verify_reported_source(
-        self, requested: str, reported: object,
+        self, requested: str | None, reported: object,
     ) -> Result[SourceObservation]:
         observation = await self.observe_reported_source(requested, reported)
         self.last_observation = observation
@@ -389,7 +395,9 @@ class KScreenReportedSourceVerifier:
             return _refusal(observation.reason, observation.reported)
         return Ok(value=observation)
 
-    async def verify(self, requested: str, reported: object) -> Result[SourceObservation]:
+    async def verify(
+        self, requested: str | None, reported: object,
+    ) -> Result[SourceObservation]:
         return await self.verify_reported_source(requested, reported)
 
 

@@ -380,7 +380,8 @@ class MainWindow(QMainWindow):
         self._source_page = QWidget(self._editor_stack)
         source_row = QHBoxLayout(self._source_page)
         source_row.setContentsMargins(0, 0, 0, 0)
-        source_row.addWidget(QLabel("Physical monitor:", self._source_page))
+        self._source_label = QLabel("Physical monitor:", self._source_page)
+        source_row.addWidget(self._source_label)
         self._source = QComboBox(self._source_page)
         self._source.setObjectName("sourceCombo")
         self._source.setAccessibleName("Physical monitor source")
@@ -389,6 +390,13 @@ class MainWindow(QMainWindow):
             "windows and virtual outputs are never captured"
         )
         source_row.addWidget(self._source, 1)
+        # Mirror has no source control: the desktop asks when capture starts, and
+        # the only honest thing to show is what was actually captured.
+        self._source_note = QLabel("Screen: chosen when capture starts", self._source_page)
+        self._source_note.setObjectName("capturedLabel")
+        self._source_note.setAccessibleName("Captured screen")
+        source_row.addWidget(self._source_note, 1)
+        self._source_note.setVisible(False)
         self._resolution_page = QWidget(self._editor_stack)
         resolution_row = QHBoxLayout(self._resolution_page)
         resolution_row.setContentsMargins(0, 0, 0, 0)
@@ -738,6 +746,15 @@ class MainWindow(QMainWindow):
             self._source_page if mirror else self._resolution_page
         )
         self._source.setEnabled(pane.source_enabled)
+        mirror_mode = pane.visible_mode is Mode.MIRROR
+        self._source_label.setVisible(not mirror_mode)
+        self._source.setVisible(not mirror_mode)
+        self._source_note.setVisible(mirror_mode)
+        if mirror_mode:
+            captured = pane.captured_connector
+            self._source_note.setText(
+                f"Captured: {captured}" if captured else "Screen: chosen when capture starts"
+            )
         self._resolution.setEnabled(pane.resolution_enabled)
 
     def _render_mute(self, pane: PaneState) -> None:

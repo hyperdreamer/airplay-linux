@@ -127,7 +127,7 @@ class MirrorLifecycle:
             self._begin_stream(ctx)
             return True
         if isinstance(message, Retry):
-            if ctx.state.physical_source is None or not ctx.state.intent_active:
+            if not ctx.state.intent_active:
                 return False
             if ctx.state.transport in (
                 TransportState.Failed,
@@ -146,7 +146,6 @@ class MirrorLifecycle:
             if (
                 ctx.state.intent_stage is IntentStage.audio_decision
                 and ctx.state.intent_active
-                and ctx.state.physical_source is not None
                 and ctx.state.stream is None
             ):
                 self._retry_pre_ready_audio(ctx)
@@ -180,10 +179,12 @@ class MirrorLifecycle:
         state = ctx.state
         if request.mode is not Mode.MIRROR:
             return
-        if not isinstance(request.source, PhysicalMonitorSource):
+        if request.source is not None and not isinstance(request.source, PhysicalMonitorSource):
             ctx.apply(last_error=diagnostic(ErrorCode.unsupported_source, state.receiver_id))
             return
-        if not request.source.connector or type(request.source.connector) is not str:
+        if isinstance(request.source, PhysicalMonitorSource) and (
+            not request.source.connector or type(request.source.connector) is not str
+        ):
             ctx.apply(last_error=diagnostic(ErrorCode.unsupported_source, state.receiver_id))
             return
         if state.target is None or not state.online:
@@ -225,6 +226,11 @@ class MirrorLifecycle:
             observed_resolution=None,
         )
         source = request.source
+        if source is None:
+            # Desktop capture: the backend opens the ScreenCast session, so there
+            # is no local acquisition to make or verify before connecting.
+            self._after_capture(ctx)
+            return
         setattr(ctx, "_task2_requested_source", source)
         ctx.launch(
             Route.mirror,
@@ -234,20 +240,31 @@ class MirrorLifecycle:
             acquisition=True,
         )
 
+    def _after_capture(self, ctx: SessionContext) -> None:
+        """Continue once the capture source is acquired or delegated."""
+        if not ctx.state.audio_policy.enabled:
+            ctx.apply(audio=AudioState.Disabled, last_error=None)
+            self._begin_stream(ctx)
+            return
+        ctx.launch(
+            Route.mirror,
+            "audio_probe",
+            _current_context(ctx),
+            self.deps.audio_probe.check,
+        )
+
     def _start_after_trust(self, ctx: SessionContext) -> bool:
-        if (
-            not ctx.state.intent_active
-            or ctx.state.physical_source is None
-            or ctx.state.stream is not None
-        ):
+        if not ctx.state.intent_active or ctx.state.stream is not None:
             return False
         self._begin_stream(ctx)
         return True
 
     def _begin_stream(self, ctx: SessionContext) -> None:
         target = ctx.state.target
+        # ``None`` is a desktop capture: the transport asks the backend, which
+        # owns the ScreenCast session, for whatever the portal grants.
         source = ctx.state.physical_source
-        if target is None or source is None:
+        if target is None:
             return
         if ctx.state.cleanup_pending:
             return
@@ -312,17 +329,7 @@ class MirrorLifecycle:
             if isinstance(message.result, Err):
                 self._failed_start(ctx, message.result.error)
                 return True
-            if not ctx.state.audio_policy.enabled:
-                ctx.apply(audio=AudioState.Disabled, last_error=None)
-                self._begin_stream(ctx)
-                return True
-            context = _current_context(ctx)
-            ctx.launch(
-                Route.mirror,
-                "audio_probe",
-                context,
-                self.deps.audio_probe.check,
-            )
+            self._after_capture(ctx)
             return True
 
         if kind == "audio_probe":
@@ -356,6 +363,12 @@ class MirrorLifecycle:
                 intent_stage=IntentStage.active,
                 accepted_resolution=None,
             )
+            if ctx.state.physical_source is None and stream.source_connector is not None:
+                # Desktop capture has no local lease: record the connector the
+                # backend actually captured so the pane can report it.
+                ctx.apply(physical_source=PhysicalMonitorSource(
+                    connector=stream.source_connector, portal_restore_token=None,
+                ))
             if not ctx.state.audio_policy.enabled:
                 ctx.apply(audio=AudioState.Disabled)
                 return True

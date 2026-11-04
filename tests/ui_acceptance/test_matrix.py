@@ -772,7 +772,8 @@ async def test_matrix_row(row: str, build: Callable[..., Any]) -> None:
         start = app.dispatched[0]
         assert start.receiver_id == ReceiverId(RECEIVER_A)
         assert start.request.mode is Mode.MIRROR
-        assert start.request.source == physical()
+        # Mirror asks the desktop; it never names a source itself.
+        assert start.request.source is None
         assert start.request.audio == AudioPolicy(enabled=True)
         targets = [
             field_of(call["target"], "receiver_id")

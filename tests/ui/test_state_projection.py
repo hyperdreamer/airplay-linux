@@ -48,6 +48,7 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     IntentStage,
     Mode,
+    PhysicalMonitorSource,
     ResolutionDecision,
     ResolutionEvidence,
     SessionPhase,
@@ -1781,3 +1782,29 @@ def test_ui_package_reexports_the_projection() -> None:
 
     assert PackageAction is Action
     assert package_project is project
+
+
+def test_mirror_pane_reports_the_captured_connector() -> None:
+    """Mirror has no requested source: the pane reports what was captured."""
+    state = replace(
+        _mirroring_state(),
+        physical_source=PhysicalMonitorSource(
+            connector="DP-3", portal_restore_token=None,
+        ),
+    )
+    pane = project(state, inputs())
+
+    assert pane.captured_connector == "DP-3"
+
+
+def test_captured_connector_is_not_reported_for_a_virtual_session() -> None:
+    state = replace(
+        _mirroring_state(),
+        mode=Mode.VIRTUAL,
+        physical_source=PhysicalMonitorSource(
+            connector="DP-3", portal_restore_token=None,
+        ),
+    )
+    pane = project(state, inputs())
+
+    assert pane.captured_connector is None

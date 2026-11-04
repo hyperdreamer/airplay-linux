@@ -619,10 +619,9 @@ class Presenter:
         snapshot = self._snapshot(receiver_id)
         audio = snapshot.audio_policy if snapshot.intent_active else AudioPolicy()
         if mode is Mode.MIRROR:
-            source = self._source_for(receiver_id)
-            if source is None:
-                return None
-            return StartRequest(mode=Mode.MIRROR, source=source, audio=audio)
+            # Mirror carries no requested source: the backend opens the capture
+            # session and the desktop decides which screen it gets.
+            return StartRequest(mode=Mode.MIRROR, source=None, audio=audio)
         size = self._selected_size(receiver_id)
         decision = self._decision_for(receiver_id, size) if size is not None else None
         return StartRequest(mode=Mode.VIRTUAL, resolution=decision, audio=audio)

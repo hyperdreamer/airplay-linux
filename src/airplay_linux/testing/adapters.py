@@ -441,7 +441,9 @@ class FakeTransport(_Scripted, _EventSource):
         )
         if not self._fresh(target):
             return _failure(ErrorCode.stale_target, "Receiver endpoint is no longer current")
-        if not isinstance(source, (PhysicalMonitorSource, VirtualOutputSource)):
+        if source is not None and not isinstance(
+            source, (PhysicalMonitorSource, VirtualOutputSource)
+        ):
             return _failure(ErrorCode.unsupported_source, "Capture source is not a monitor")
         scripted = await self._take("start_stream", adopt=self._adopt_stream)
         if scripted is _UNSET:

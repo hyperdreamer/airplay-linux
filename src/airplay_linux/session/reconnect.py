@@ -247,7 +247,9 @@ class ReconnectLifecycle(VirtualLifecycle):
     def _has_source(self, ctx):
         if ctx.state.mode is Mode.VIRTUAL:
             return ctx.state.display is DisplayState.Owned and ctx.state.display_handle is not None
-        return ctx.state.physical_source is not None
+        # Mirror may carry no local source at all: the backend owns the ScreenCast
+        # session, so there is nothing to acquire before it can start or reconnect.
+        return ctx.state.mode is Mode.MIRROR
 
     def _allowed(self, ctx):
         return (ctx.state.intent_active and not ctx.state.cleanup_pending

@@ -667,7 +667,8 @@ async def test_start_dispatches_a_typed_request_for_the_selected_mode(
     (start,) = prepared.commands_of(Start)
     assert start.receiver_id == RECEIVER_A
     assert start.request.mode is Mode.MIRROR
-    assert start.request.source == source
+    # The desktop chooses the screen; the request never names one.
+    assert start.request.source is None
     assert start.request.resolution is None
     assert start.request.audio.enabled is True
 
@@ -718,7 +719,8 @@ async def test_sources_and_resolutions_are_receiver_local(rig: PresenterRig) -> 
     await prepared.settle()
     (start_a,) = prepared.commands_of(Start)
     assert start_a.receiver_id == RECEIVER_A
-    assert start_a.request.source.connector == "DP-1"
+    # Mirror asks the desktop for a screen; it never names one itself.
+    assert start_a.request.source is None
 
     prepared.manager.commands.clear()
     prepared.request_mode(Mode.VIRTUAL)
