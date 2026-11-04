@@ -20,8 +20,8 @@ from airplay_linux.domain.messages import (
 from airplay_linux.domain.operations import InstanceId, StreamHandle
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import (
-    AudioState, Diagnostic, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, Result,
-    TransportState, TrustState,
+    AudioState, Diagnostic, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
+    PhysicalMonitorSource, Result, TransportState, TrustState,
 )
 
 from .cleanup import runtime_for
@@ -442,6 +442,12 @@ class ReconnectLifecycle(VirtualLifecycle):
             handle = ctx.state.stream
             if handle is None:
                 return
+            if ctx.state.physical_source is None and handle.source_connector is not None:
+                # A desktop capture has no local lease, so record the connector
+                # the backend actually captured for the pane to report.
+                ctx.apply(physical_source=PhysicalMonitorSource(
+                    connector=handle.source_connector, portal_restore_token=None,
+                ))
             runtime = _virtual_runtime(ctx)
             ctx.apply(transport=TransportState.Streaming, intent_stage=IntentStage.active)
             if runtime.ready_stream != handle:

@@ -96,12 +96,16 @@ Replaces `_await_connecting_stream`'s single budget. Poll `status` every `SOURCE
 
 | Phase | Entry condition | Bound | Outcome |
 | --- | --- | --- | --- |
-| A — permission/prepare | no stream matching the target, or a matching stream without `source` | none; cancelled by abandonment, target replacement, daemon loss, shutdown | credential prompt → `dependency_incompatible`; ready stream → phase B |
-| B — handshake | a matching stream carries `source` while not `streaming` | `CONNECT_STREAMING_TIMEOUT` (20 s) | `streaming` → verification; expiry → `unsupported_source` |
+| A — permission | a matching stream exists without `source` | `PERMISSION_WAIT_TIMEOUT` (300 s); cancelled by abandonment, target replacement, daemon loss, shutdown | credential prompt → `dependency_incompatible`; `source` appears → phase B |
+| B — handshake | a matching stream carries `source` while not `streaming` | `CONNECT_STREAMING_TIMEOUT` (20 s) from the moment `source` appears | `streaming` → verification; expiry → `unsupported_source` |
+| C — never accepted | no stream for the target has ever appeared | `CONNECT_STREAMING_TIMEOUT` (20 s) | expiry → `unsupported_source` |
 
-- Phase A is unbounded because the prompt is modal and human; the pane must say so (`Waiting for the
-  screen prompt…`) and Stop/Cancel must end it within one poll interval.
-- No new `ErrorCode` is introduced: phase A has no expiry, and phase B reuses the existing refusal.
+- Phase A is the desktop's prompt. The daemon publishes the connecting stream before it has a capture
+  source, which is exactly the observable that distinguishes a pending prompt from a failed start.
+- A stream that disappeared after being seen fails at once: the backend dropped the capture.
+- One unanswered `status` read is normal while the backend is blocked on the prompt;
+  `STATUS_FAILURE_BUDGET` (3 consecutive) bounds a control that cannot answer at all.
+- No new `ErrorCode` is introduced: every phase reuses `unsupported_source`.
 
 ### 3.5 Presentation
 

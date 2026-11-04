@@ -30,7 +30,8 @@ from airplay_linux.testing.adapters import Deferred, FakeCapture, Journal, Seque
 from airplay_linux.testing.builders import context, physical, target, virtual_handle
 from airplay_linux.testing.time import FakeClock, FakeScheduler
 from airplay_linux.transport.doubletake import (
-    CONNECT_STREAMING_TIMEOUT, SOURCE_POLL_INTERVAL, DoubleTakeTransport,
+    CONNECT_STREAMING_TIMEOUT, PERMISSION_WAIT_TIMEOUT, SOURCE_POLL_INTERVAL,
+    DoubleTakeTransport,
 )
 from airplay_linux.transport.targets import TargetRegistry
 from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
@@ -1535,7 +1536,7 @@ async def test_connecting_ack_waits_for_streaming_evidence(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_connecting_ack_without_streaming_evidence_expires_the_wait(tmp_path):
+async def test_connecting_ack_without_streaming_evidence_expires_the_permission_wait(tmp_path):
     verifier = _production_source_verifier()
     h = Harness(
         tmp_path, source_verifier=verifier,
@@ -1550,7 +1551,12 @@ async def test_connecting_ack_without_streaming_evidence_expires_the_wait(tmp_pa
     pending = asyncio.create_task(h.start())
     await _drain_transport()
     assert not pending.done()
+    # A connecting stream without a source is the permission prompt: it is
+    # allowed far past the connect budget, and only the permission ceiling ends it.
     h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+    await _drain_transport()
+    assert not pending.done()
+    h.scheduler.advance(PERMISSION_WAIT_TIMEOUT)
     await _drain_transport()
     result = await pending
 
@@ -2411,3 +2417,131 @@ async def test_desktop_capture_still_refuses_a_non_physical_output(tmp_path):
     assert_error(result, ErrorCode.unsupported_source)
     assert len(h.control.calls(BackendOperation.disconnect)) == 1
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_waits_through_the_permission_prompt(tmp_path):
+    """A connecting stream without a source is the portal prompt, not a failure."""
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    # The prompt: a matching stream that has not been given a source yet.
+    for _ in range(4):
+        h.control.results[BackendOperation.status].append(_source_status(h.a, None, "connecting"))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+
+    pending = asyncio.create_task(
+        h.transport.start_stream(h.a, None, AudioPolicy(enabled=False), context())
+    )
+    await _drain_transport()
+    # Far past the connect budget: a human is still answering the prompt.
+    h.scheduler.advance(120.0)
+    await _drain_transport()
+    assert not pending.done()
+
+    for _ in range(40):
+        if pending.done():
+            break
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await _drain_transport()
+    assert pending.done(), "the waiting start never resolved"
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    assert result.value.source_connector == "DP-1"
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_handshake_expires_after_the_source_appears(tmp_path):
+    """Once capture is prepared, only the handshake is left to wait for."""
+    h = Harness(
+        tmp_path, source_verifier=_production_source_verifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    for _ in range(8):
+        h.control.results[BackendOperation.status].append(
+            _source_status(h.a, reported, "connecting")
+        )
+
+    pending = asyncio.create_task(
+        h.transport.start_stream(h.a, None, AudioPolicy(enabled=False), context())
+    )
+    await _drain_transport()
+    h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+    await _drain_transport()
+    result = await pending
+
+    assert_error(result, ErrorCode.unsupported_source)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+
+
+@pytest.mark.asyncio
+async def test_desktop_capture_without_a_stream_expires_the_connect_budget(tmp_path):
+    """No stream for the target means no prompt is pending: refuse, do not hang."""
+    h = Harness(
+        tmp_path, source_verifier=_production_source_verifier(),
+        physical_source=True, source_reporting_complete=True,
+    )
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+
+    pending = asyncio.create_task(
+        h.transport.start_stream(h.a, None, AudioPolicy(enabled=False), context())
+    )
+    await _drain_transport()
+    assert not pending.done()
+    h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+    await _drain_transport()
+    result = await pending
+
+    assert_error(result, ErrorCode.unsupported_source)
+
+
+@pytest.mark.asyncio
+async def test_a_transient_status_timeout_does_not_abort_the_permission_wait(tmp_path):
+    """The backend can miss a status read while it waits on the portal prompt."""
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(
+        Err(error=diagnostic(ErrorCode.cleanup_timeout))
+    )
+    h.control.results[BackendOperation.status].append(_source_status(h.a, None, "connecting"))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+
+    pending = asyncio.create_task(
+        h.transport.start_stream(h.a, None, AudioPolicy(enabled=False), context())
+    )
+    for _ in range(20):
+        if pending.done():
+            break
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await _drain_transport()
+    assert pending.done(), "a single unanswered status read must not end the wait"
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    assert result.value.source_connector == "DP-1"

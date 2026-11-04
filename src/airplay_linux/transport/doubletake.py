@@ -60,6 +60,13 @@ SHUTDOWN_TIMEOUT = 15.0
 #: backend answers the command before its RTSP handshake and capture
 #: preparation finish, so the acknowledgement is progress, not readiness.
 CONNECT_STREAMING_TIMEOUT = 20.0
+#: A desktop capture waits for the screen prompt the portal shows. That is a
+#: human answer, so the permission phase is generously bounded and remains
+#: cancellable; only an unanswered prompt reaches this ceiling.
+PERMISSION_WAIT_TIMEOUT = 300.0
+#: Consecutive status reads that may fail before the control is treated as
+#: unusable. A single timeout is normal while the backend waits on the portal.
+STATUS_FAILURE_BUDGET = 3
 
 
 def _failure(code: ErrorCode) -> Err:
@@ -741,16 +748,21 @@ class DoubleTakeTransport:
         """Wait for an accepted ``connect`` to reach streaming evidence.
 
         A ``connecting`` acknowledgement is progress: the backend is still
-        performing its RTSP handshake and capture preparation. Readiness is
-        never inferred from it. The same status channel that supplies source
-        evidence must report exactly this target streaming; credential prompts
-        end the wait as their own refusal, and target or daemon loss outranks
-        any later observation. The whole wait shares one budget, so an
-        unanswered interaction cannot hang the acquisition.
+        preparing capture, which for a desktop capture means waiting for the
+        portal's screen prompt. That phase is a human answer, so it is generously
+        bounded and stays cancellable; once the stream carries a source only the
+        RTSP handshake is left and the connect budget applies. Readiness is never
+        inferred from the acknowledgement, credential prompts end the wait as
+        their own refusal, and target or daemon loss outranks any later
+        observation.
         """
-        deadline = self._clock.now() + CONNECT_STREAMING_TIMEOUT
+        accepted = self._clock.now() + CONNECT_STREAMING_TIMEOUT
+        permission = self._clock.now() + PERMISSION_WAIT_TIMEOUT
+        handshake: float | None = None
+        seen = False
+        failures = 0
         loop = asyncio.get_running_loop()
-        while self._clock.now() < deadline:
+        while True:
             daemon = stream.daemon
             if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
                 return _failure(ErrorCode.stale_event)
@@ -761,15 +773,25 @@ class DoubleTakeTransport:
                 daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
                 ErrorCode.unsupported_source,
             )
-            if self._clock.now() >= deadline:
-                break
             if isinstance(status, Err):
-                return status
-            if isinstance(status.value, StatusReply):
+                # A status read can time out while the backend is blocked on the
+                # portal prompt. One unanswered read is not a failed capture, but
+                # a control that cannot answer three times in a row is.
+                failures += 1
+                if failures >= STATUS_FAILURE_BUDGET:
+                    return status
+                matches: tuple = ()
+                examined = False
+            else:
+                failures = 0
+                matches = ()
+                examined = isinstance(status.value, StatusReply)
+            if examined:
                 matches = tuple(
                     item for item in status.value.streams
                     if item.target == stream.target.canonical_host
                 )
+                seen = seen or bool(matches)
                 prompting = (
                     status.value.state == "pin_required"
                     or status.value.needs_credential
@@ -783,6 +805,27 @@ class DoubleTakeTransport:
                     return _failure(ErrorCode.dependency_incompatible)
                 if len(matches) == 1 and matches[0].state == "streaming":
                     return Ok(value=None)
+            # The backend publishes a connecting stream before it has a capture
+            # source: that is the desktop's permission prompt, and a human may
+            # take minutes to answer it. Once the stream carries a source, only
+            # the handshake is left, which is bounded.
+            prepared = examined and len(matches) == 1 and matches[0].source is not None
+            if prepared:
+                if handshake is None:
+                    handshake = self._clock.now() + CONNECT_STREAMING_TIMEOUT
+                if self._clock.now() >= handshake:
+                    return _failure(ErrorCode.unsupported_source)
+            else:
+                handshake = None
+                if examined and seen and not matches:
+                    # The stream this target had is gone: the backend dropped it.
+                    return _failure(ErrorCode.unsupported_source)
+                if not seen and self._clock.now() >= accepted:
+                    # No stream for this target ever appeared: the backend never
+                    # accepted the capture, so no prompt is pending.
+                    return _failure(ErrorCode.unsupported_source)
+            if self._clock.now() >= permission:
+                return _failure(ErrorCode.unsupported_source)
             wake = loop.create_future()
 
             def tick():
@@ -790,13 +833,12 @@ class DoubleTakeTransport:
                     wake.set_result(None)
 
             scheduled = self._scheduler.call_at(
-                min(self._clock.now() + SOURCE_POLL_INTERVAL, deadline), tick,
+                self._clock.now() + SOURCE_POLL_INTERVAL, tick,
             )
             try:
                 await wake
             finally:
                 scheduled.cancel()
-        return _failure(ErrorCode.unsupported_source)
 
     async def _claim_streaming_readiness(self, stream: _Stream) -> Err | None:
         """Publish the ready event from local evidence, or return the refusal."""
@@ -955,8 +997,8 @@ class DoubleTakeTransport:
                     return Ok(value=stream.handle)
                 if self._features.owned_daemon_control and result.value.state == "pin_required":
                     failure = _failure(ErrorCode.dependency_incompatible)
-                elif result.value.state == "connecting" and isinstance(
-                    stream.source, PhysicalMonitorSource
+                elif result.value.state == "connecting" and not isinstance(
+                    stream.source, VirtualOutputSource
                 ):
                     # The backend accepts ``connect`` before its handshake and
                     # capture preparation finish, so this ack is progress. Any
