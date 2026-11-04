@@ -141,13 +141,23 @@ def test_stale_unreadable_or_unknown_origin_layout_refuses():
 
 
 def test_scaled_portal_size_corroborates_current_mode_size():
+    """The portal reports device-independent pixels; KScreen reports the mode."""
+    result = verify_reported_source(
+        "DP-1", _reported(width=1280, height=720),
+        (_output(scale=1.5),),
+    )
+    assert isinstance(result, Ok)
+    assert result.value.reported.width == 1280
+    assert result.value.matched_connector == "DP-1"
+
+
+def test_inverted_scaled_portal_size_is_refused():
     result = verify_reported_source(
         "DP-1", _reported(width=2880, height=1620),
         (_output(scale=1.5),),
     )
-    assert isinstance(result, Ok)
-    assert result.value.reported.width == 2880
-    assert result.value.matched_connector == "DP-1"
+    assert isinstance(result, Err)
+    assert _reason(result) is SourceRefusal.SIZE_MISMATCH
 
 
 def test_shared_position_is_ambiguous_even_when_one_candidate_is_requested():

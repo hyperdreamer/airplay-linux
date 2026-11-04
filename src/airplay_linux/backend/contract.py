@@ -208,9 +208,15 @@ class BackendStream:
     credential_kind: str | None = None
 
     def __post_init__(self) -> None:
-        for name in ("device", "target", "state"):
+        for name in ("target", "state"):
             if type(getattr(self, name)) is not str or not getattr(self, name):
                 raise TypeError(f"{name} must be non-empty text")
+        # The published daemon reports an empty display name while a stream is
+        # still connecting and the receiver has not been resolved yet. Only the
+        # target identifies the stream then; a live or waiting stream must name
+        # its receiver.
+        if type(self.device) is not str or (not self.device and self.state != "connecting"):
+            raise TypeError("device must be non-empty text unless the stream is connecting")
         if self.state not in _KNOWN_STATES:
             raise ValueError("unknown backend stream state")
         for name in ("has_audio", "audio_muted"):
@@ -426,6 +432,10 @@ def _decode_stream(value: object) -> BackendStream | None:
     if target is None:
         target = _required_text(data, "target")
     state = _required_text(data, "state")
+    if device is None and state == "connecting" and data.get("device") == "":
+        # An unresolved receiver name is published as an empty string, not
+        # omitted; the stream is still identified by its target.
+        device = ""
     has_audio = _required_bool(data, "has_audio")
     audio_muted = _required_bool(data, "audio_muted")
     credential = _credential(data)

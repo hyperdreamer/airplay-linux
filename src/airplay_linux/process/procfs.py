@@ -53,6 +53,9 @@ RUNTIME_DIRECTORY_ENV: Final[str] = "AIRPLAY_LINUX_RUNTIME_DIRECTORY"
 #: megabytes; a file beyond that is not a process environment this application
 #: wrote, and reading it whole would be unbounded work driven by another process.
 MAX_ENVIRONMENT_BYTES: Final[int] = 1 << 20
+#: A command line is only used to decide whether an unreadable environment could
+#: hide ownership at all, so the bound only has to cover our own argv.
+MAX_COMMAND_LINE_BYTES: Final[int] = 1 << 16
 
 #: State characters that mean the entry cannot run any more.
 #:
@@ -343,6 +346,46 @@ def read_environment(pid: int, proc_root: Path = Path("/proc")) -> dict[str, str
     return evidence.environment
 
 
+def read_command_line_evidence(
+    pid: int, proc_root: Path = Path("/proc"),
+) -> tuple[IdentityState, bytes | None]:
+    """Read enough of ``ARGV`` to tell whether this process names a runtime.
+
+    The command line is world-readable, so it survives the protected environment
+    of a non-dumpable daemon. It is still not ownership evidence: nothing here may
+    establish "ours" from argv. Callers use it only to decide whether an
+    unreadable environment *could* hide ownership for this process.
+    """
+    if not _valid_pid(pid):
+        return IdentityState.absent, None
+    path = _entry(pid, proc_root) / "cmdline"
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_COMMAND_LINE_BYTES + 1)
+    except FileNotFoundError:
+        return IdentityState.absent, None
+    except OSError:
+        return IdentityState.unreadable, None
+    if len(data) > MAX_COMMAND_LINE_BYTES:
+        return IdentityState.unreadable, None
+    return IdentityState.present, data
+
+
+def _names_runtime_directory(pid: int, runtime_directory: str, proc_root: Path) -> bool:
+    """Whether ``pid``'s argv names this runtime, or cannot be read at all.
+
+    Every process this application spawns carries the private runtime directory
+    in its argv (the supervisor ``--runtime-directory``, the backend
+    ``-socket``). A process whose readable argv does not mention it cannot have
+    been started into this runtime, so its unreadable environment is not a
+    missing ownership fact. An unreadable argv keeps the conservative answer.
+    """
+    state, data = read_command_line_evidence(pid, proc_root)
+    if state is IdentityState.present:
+        return os.fsencode(runtime_directory) in (data or b"")
+    return state is not IdentityState.absent
+
+
 def _valid_owner(owner_uuid: object) -> bool:
     return type(owner_uuid) is UUID
 
@@ -462,7 +505,13 @@ def owned_processes(
         )
         if ownership is OwnershipState.owned:
             found.append(evidence.identity)
-        elif ownership is OwnershipState.unreadable:
+        elif ownership is OwnershipState.unreadable and _names_runtime_directory(
+            evidence.identity.pid, runtime_directory, proc_root,
+        ):
+            # An unreadable environment can only hide ownership for a process
+            # that names this runtime. Long-lived same-uid daemons with a
+            # protected environment (a user systemd manager, the compositor, a
+            # session helper) do not, so they never make the scan incomplete.
             complete = False
     return OwnedProcessScan(
         matches=tuple(sorted(found, key=lambda item: (item.pid, item.start_ticks))),

@@ -1119,3 +1119,35 @@ def test_production_launcher_refuses_unproven_surface_root_or_origin(tmp_path):
     child = root / "child"
     child.mkdir(mode=0o700)
     assert ProductionLaunchCapability(raw, link / "child", production_graph=True).available() is False
+
+
+def test_connecting_status_decodes_the_published_unresolved_device_name():
+    """The daemon emits an empty display name until the receiver resolves."""
+    result = decode_status({
+        "ok": True, "state": "connecting", "has_audio": False, "audio_muted": False,
+        "streams": [{
+            "device": "", "device_ip": "192.0.2.10", "state": "connecting",
+            "has_audio": False, "audio_muted": False,
+        }],
+    })
+
+    assert isinstance(result, StatusReply), result
+    assert result.state == "connecting"
+    assert result.device is None
+    assert result.target is None
+    assert result.streams[0].device == ""
+    assert result.streams[0].target == "192.0.2.10"
+
+
+def test_empty_device_name_is_still_refused_for_a_live_stream():
+    result = decode_status({
+        "ok": True, "state": "streaming", "has_audio": False, "audio_muted": False,
+        "device": "", "device_ip": "192.0.2.10",
+        "streams": [{
+            "device": "", "device_ip": "192.0.2.10", "state": "streaming",
+            "has_audio": False, "audio_muted": False,
+        }],
+    })
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.dependency_incompatible

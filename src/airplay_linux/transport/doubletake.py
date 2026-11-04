@@ -56,6 +56,10 @@ CONTROL_TIMEOUT = 5.0
 SOURCE_TIMEOUT = 5.0
 SOURCE_POLL_INTERVAL = 0.1
 SHUTDOWN_TIMEOUT = 15.0
+#: Budget for an accepted ``connect`` to reach streaming.  The published
+#: backend answers the command before its RTSP handshake and capture
+#: preparation finish, so the acknowledgement is progress, not readiness.
+CONNECT_STREAMING_TIMEOUT = 20.0
 
 
 def _failure(code: ErrorCode) -> Err:
@@ -731,6 +735,100 @@ class DoubleTakeTransport:
             if not polling.done():
                 polling.cancel()
 
+    async def _await_connecting_stream(self, stream: _Stream) -> Result[None]:
+        """Wait for an accepted ``connect`` to reach streaming evidence.
+
+        A ``connecting`` acknowledgement is progress: the backend is still
+        performing its RTSP handshake and capture preparation. Readiness is
+        never inferred from it. The same status channel that supplies source
+        evidence must report exactly this target streaming; credential prompts
+        end the wait as their own refusal, and target or daemon loss outranks
+        any later observation. The whole wait shares one budget, so an
+        unanswered interaction cannot hang the acquisition.
+        """
+        deadline = self._clock.now() + CONNECT_STREAMING_TIMEOUT
+        loop = asyncio.get_running_loop()
+        while self._clock.now() < deadline:
+            daemon = stream.daemon
+            if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
+                return _failure(ErrorCode.stale_event)
+            checked = self._current(stream.target, stream.context)
+            if isinstance(checked, Err):
+                return checked
+            status = await _safe(
+                daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
+                ErrorCode.unsupported_source,
+            )
+            if self._clock.now() >= deadline:
+                break
+            if isinstance(status, Err):
+                return status
+            if isinstance(status.value, StatusReply):
+                matches = tuple(
+                    item for item in status.value.streams
+                    if item.target == stream.target.canonical_host
+                )
+                prompting = (
+                    status.value.state == "pin_required"
+                    or status.value.needs_credential
+                    or status.value.credential_kind is not None
+                    or any(
+                        item.state == "pin_required" or item.credential_kind is not None
+                        for item in matches
+                    )
+                )
+                if prompting:
+                    return _failure(ErrorCode.dependency_incompatible)
+                if len(matches) == 1 and matches[0].state == "streaming":
+                    return Ok(value=None)
+            wake = loop.create_future()
+
+            def tick():
+                if not wake.done():
+                    wake.set_result(None)
+
+            scheduled = self._scheduler.call_at(
+                min(self._clock.now() + SOURCE_POLL_INTERVAL, deadline), tick,
+            )
+            try:
+                await wake
+            finally:
+                scheduled.cancel()
+        return _failure(ErrorCode.unsupported_source)
+
+    async def _claim_streaming_readiness(self, stream: _Stream) -> Err | None:
+        """Publish the ready event from local evidence, or return the refusal."""
+        source_checked = (
+            await self._verify_reported_source(stream)
+            if isinstance(stream.source, PhysicalMonitorSource)
+            else Ok(value=None)
+        )
+        checked = self._current(stream.target, stream.context)
+        if isinstance(source_checked, Err):
+            return source_checked
+        if isinstance(checked, Err):
+            return checked
+        if stream.abandoned or not stream.daemon.alive:
+            return _failure(ErrorCode.stale_event)
+        stream.ready = True
+        observation = stream.source_observation
+        payload = EventEmpty()
+        if (
+            observation is not None
+            and observation.matched_connector is not None
+            and observation.reported is not None
+        ):
+            payload = SourceVerificationPayload(
+                connector=observation.matched_connector,
+                source_type=observation.reported.type,
+                width=observation.reported.width,
+                height=observation.reported.height,
+                x=observation.reported.x,
+                y=observation.reported.y,
+            )
+        self._emit(stream, TransportEventKind.ready, payload)
+        return None
+
     async def _poll_reported_source(self, stream: _Stream, deadline: float) -> Result[None]:
         loop = asyncio.get_running_loop()
         last_missing_source: SourceVerificationRefusal | None = None
@@ -850,40 +948,28 @@ class DoubleTakeTransport:
                     return Ok(value=stream.handle)
                 if self._features.owned_daemon_control and result.value.state == "pin_required":
                     failure = _failure(ErrorCode.dependency_incompatible)
+                elif result.value.state == "connecting" and isinstance(
+                    stream.source, PhysicalMonitorSource
+                ):
+                    # The backend accepts ``connect`` before its handshake and
+                    # capture preparation finish, so this ack is progress. Any
+                    # readiness claim still needs the daemon's own status to
+                    # report exactly this target streaming, within one budget.
+                    waited = await self._await_connecting_stream(stream)
+                    claimed = (
+                        waited if isinstance(waited, Err)
+                        else await self._claim_streaming_readiness(stream)
+                    )
+                    if not isinstance(claimed, Err):
+                        return Ok(value=stream.handle)
+                    failure = claimed
                 elif result.value.state != "streaming":
                     failure = _failure(ErrorCode.unsupported_source)
                 else:
-                    source_checked = (
-                        await self._verify_reported_source(stream)
-                        if isinstance(stream.source, PhysicalMonitorSource)
-                        else Ok(value=None)
-                    )
-                    checked = self._current(stream.target, stream.context)
-                    if isinstance(source_checked, Err):
-                        failure = source_checked
-                    elif isinstance(checked, Err):
-                        failure = checked
-                    elif stream.abandoned or not stream.daemon.alive:
-                        failure = _failure(ErrorCode.stale_event)
-                    else:
-                        stream.ready = True
-                        observation = stream.source_observation
-                        payload = EventEmpty()
-                        if (
-                            observation is not None
-                            and observation.matched_connector is not None
-                            and observation.reported is not None
-                        ):
-                            payload = SourceVerificationPayload(
-                                connector=observation.matched_connector,
-                                source_type=observation.reported.type,
-                                width=observation.reported.width,
-                                height=observation.reported.height,
-                                x=observation.reported.x,
-                                y=observation.reported.y,
-                            )
-                        self._emit(stream, TransportEventKind.ready, payload)
+                    claimed = await self._claim_streaming_readiness(stream)
+                    if not isinstance(claimed, Err):
                         return Ok(value=stream.handle)
+                    failure = claimed
             else:
                 failure = result if isinstance(result, Err) else (
                     checked if isinstance(checked, Err) else _failure(

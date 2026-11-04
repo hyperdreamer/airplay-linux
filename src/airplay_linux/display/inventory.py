@@ -290,8 +290,11 @@ def verify_reported_source(
         return _refusal(SourceRefusal.AMBIGUOUS_POSITION, reported)
 
     output, current_size, scale = matches[0]
-    logical_size = (round(reported.width / scale), round(reported.height / scale))
-    if logical_size != (current_size.width, current_size.height):
+    # The portal reports device-independent pixels; the observed layout reports
+    # the output's current-mode dimensions. Converting forward (logical * scale)
+    # is the only direction that compares like with like on a scaled output.
+    native_size = (round(reported.width * scale), round(reported.height * scale))
+    if native_size != (current_size.width, current_size.height):
         return _refusal(SourceRefusal.SIZE_MISMATCH, reported)
     connector = getattr(output, "connector", getattr(output, "name", None))
     if connector != requested:

@@ -22,12 +22,16 @@ from airplay_linux.domain.messages import MutePayload, SourceVerificationPayload
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.records import DaemonRecord
-from airplay_linux.domain.resources import AudioPolicy, AudioState, Err, ErrorCode, Ok
+from airplay_linux.domain.resources import (
+    AudioPolicy, AudioState, Err, ErrorCode, Ok, PhysicalMonitorSource,
+)
 from airplay_linux.storage import AtomicFiles, JsonReceiverStore
 from airplay_linux.testing.adapters import Deferred, FakeCapture, Journal, SequenceIds
 from airplay_linux.testing.builders import context, physical, target, virtual_handle
 from airplay_linux.testing.time import FakeClock, FakeScheduler
-from airplay_linux.transport.doubletake import DoubleTakeTransport
+from airplay_linux.transport.doubletake import (
+    CONNECT_STREAMING_TIMEOUT, SOURCE_POLL_INTERVAL, DoubleTakeTransport,
+)
 from airplay_linux.transport.targets import TargetRegistry
 from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 from airplay_linux.trust.keyring import BackendKeyringStore
@@ -256,11 +260,13 @@ class Harness:
         return result.value
 
 
-def _source_status(receiver, source):
+def _source_status(receiver, source, state="streaming", *, needs_credential=False):
     stream = {
         "device": "Receiver", "device_ip": receiver.canonical_host,
-        "state": "streaming", "has_audio": False, "audio_muted": False,
+        "state": state, "has_audio": False, "audio_muted": False,
     }
+    if needs_credential:
+        stream["credential_kind"] = "pin"
     if source is not None:
         stream["source"] = {
             "type": source.type, "width": source.width, "height": source.height,
@@ -269,9 +275,10 @@ def _source_status(receiver, source):
         if source.x is not None and source.y is not None:
             stream["source"].update(x=source.x, y=source.y)
     decoded = decode_status({
-        "ok": True, "state": "streaming", "has_audio": False,
-        "audio_muted": False, "device": "Receiver",
-        "device_ip": receiver.canonical_host, "streams": [stream],
+        "ok": True, "state": state, "has_audio": False,
+        "audio_muted": False, "device": None if state == "connecting" else "Receiver",
+        "device_ip": None if state == "connecting" else receiver.canonical_host,
+        "streams": [stream],
     })
     assert isinstance(decoded, StatusReply), decoded
     return Ok(value=decoded)
@@ -285,6 +292,21 @@ class _KScreenProcess:
         return Ok(value=CommandOutput(
             exit_code=0, stdout=json.dumps(self.document).encode(), stderr=b"",
         ))
+
+
+def _pin_required_status(receiver):
+    decoded = decode_status({
+        "ok": True, "state": "pin_required", "has_audio": False, "audio_muted": False,
+        "device": "Receiver", "device_ip": receiver.canonical_host,
+        "needs_credential": True, "needs_pin": True, "credential_kind": "pin",
+        "streams": [{
+            "device": "Receiver", "device_ip": receiver.canonical_host,
+            "state": "pin_required", "has_audio": False, "audio_muted": False,
+            "credential_kind": "pin",
+        }],
+    })
+    assert isinstance(decoded, StatusReply), decoded
+    return Ok(value=decoded)
 
 
 def _production_source_verifier(*, unknown_enabled_output=False):
@@ -1439,10 +1461,22 @@ async def test_connect_acceptance_without_streaming_does_not_claim_video_readine
 
     pending = asyncio.create_task(h.start(source=source))
     if cleanup == "timeout":
+        if state == "connecting" and isinstance(source, PhysicalMonitorSource):
+            # The streaming budget must expire before refusal and cleanup.
+            await _drain_transport()
+            h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+            await _drain_transport()
         await asyncio.wait_for(gate.entered.wait(), timeout=1.0)
         h.scheduler.advance(5.0)
         await _drain_transport()
         assert pending.done()
+    elif state == "connecting" and isinstance(source, PhysicalMonitorSource):
+        # ``connecting`` is progress, not acceptance: the bounded wait must
+        # expire without streaming evidence instead of claiming readiness.
+        await _drain_transport()
+        assert not pending.done()
+        h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+        await _drain_transport()
     result = await pending
 
     assert_error(result, ErrorCode.unsupported_source if cleanup == "confirmed" else ErrorCode.cleanup_timeout)
@@ -1463,6 +1497,84 @@ async def test_connect_acceptance_without_streaming_does_not_claim_video_readine
         await _drain_transport()
         assert h.control.connected == {h.b.receiver_id}
         assert context().transport_lease_id not in h.transport._streams
+
+
+@pytest.mark.asyncio
+async def test_connecting_ack_waits_for_streaming_evidence(tmp_path):
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    reported = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    # The daemon's first snapshot still shows the handshake in flight.
+    h.control.results[BackendOperation.status].append(_source_status(h.a, None, "connecting"))
+    # The streaming snapshot, then the fresh snapshot the source verifier reads.
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, reported))
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+
+    assert not pending.done()
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.control.calls(BackendOperation.disconnect) == []
+
+    h.scheduler.advance(SOURCE_POLL_INTERVAL)
+    await _drain_transport()
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    assert result.value.source_connector == "DP-1"
+    assert any(event.kind is TransportEventKind.ready for event in h.events)
+    assert h.control.calls(BackendOperation.disconnect) == []
+
+
+@pytest.mark.asyncio
+async def test_connecting_ack_without_streaming_evidence_expires_the_wait(tmp_path):
+    verifier = _production_source_verifier()
+    h = Harness(
+        tmp_path, source_verifier=verifier,
+        physical_source=True, source_reporting_complete=True,
+    )
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_source_status(h.a, None, "connecting"))
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    assert not pending.done()
+    h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+    await _drain_transport()
+    result = await pending
+
+    assert_error(result, ErrorCode.unsupported_source)
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
+
+
+@pytest.mark.asyncio
+async def test_connecting_ack_surfaces_a_credential_prompt_immediately(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+
+    pending = asyncio.create_task(h.start())
+    await _drain_transport()
+    result = await pending
+
+    assert_error(result, ErrorCode.dependency_incompatible)
+    assert not any(event.kind is TransportEventKind.ready for event in h.events)
+    assert len(h.control.calls(BackendOperation.disconnect)) == 1
 
 
 @pytest.mark.asyncio

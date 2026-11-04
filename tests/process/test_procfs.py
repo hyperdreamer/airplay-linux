@@ -60,6 +60,7 @@ def entry(
     start_ticks: int = 22_000,
     environment: dict[str, str] | None = None,
     stat_text: str | None = None,
+    cmdline: str | None = None,
 ) -> Path:
     """Write one synthetic ``/proc/<pid>`` entry and return its directory."""
     directory = root / str(pid)
@@ -71,6 +72,10 @@ def entry(
     if environment is not None:
         (directory / "environ").write_bytes(
             b"".join(f"{name}={value}".encode() + b"\0" for name, value in environment.items())
+        )
+    if cmdline is not None:
+        (directory / "cmdline").write_bytes(
+            b"".join(part.encode() + b"\0" for part in cmdline.split(" "))
         )
     return directory
 
@@ -293,12 +298,60 @@ def test_owned_processes_reports_incomplete_when_candidate_evidence_is_unreadabl
 def test_owned_processes_reports_incomplete_when_environment_evidence_is_unreadable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    entry(tmp_path, 200, environment=owned_environment())
+    entry(
+        tmp_path, 200, environment=owned_environment(),
+        cmdline=f"python -m airplay_linux.process.supervisor --runtime-directory {RUNTIME}",
+    )
 
     def unreadable(pid: int, proc_root: Path = Path("/proc")) -> EnvironmentEvidence:
         return EnvironmentEvidence(state=IdentityState.unreadable)
 
     monkeypatch.setattr(procfs, "read_environment_evidence", unreadable)
+    scan = owned_processes(OWNER, RUNTIME, tmp_path)
+
+    assert scan.matches == ()
+    assert scan.complete is False
+
+
+def test_owned_processes_ignores_an_unreadable_environment_that_cannot_name_this_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """A protected same-uid daemon is not a candidate for this runtime."""
+    entry(
+        tmp_path, 200, environment=owned_environment(),
+        cmdline="/usr/bin/kwin_wayland --wayland-fd 7 --socket wayland-1",
+    )
+    entry(tmp_path, 100, environment=owned_environment(), cmdline="python -m other.tool")
+
+    reading = procfs.read_environment_evidence
+
+    def unreadable(pid: int, proc_root: Path = Path("/proc")) -> EnvironmentEvidence:
+        if pid == 200:
+            return EnvironmentEvidence(state=IdentityState.unreadable)
+        return reading(pid, proc_root)
+
+    monkeypatch.setattr(procfs, "read_environment_evidence", unreadable)
+    scan = owned_processes(OWNER, RUNTIME, tmp_path)
+
+    # The readable process is still matched by its exact environment; the
+    # unreadable one is excluded because its argv cannot belong to this runtime.
+    assert scan.matches == (ProcessIdentity(pid=100, start_ticks=22_000),)
+    assert scan.complete is True
+
+
+def test_owned_processes_keeps_an_unreadable_command_line_conservative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    entry(tmp_path, 200, environment=owned_environment())
+
+    def unreadable_env(pid: int, proc_root: Path = Path("/proc")) -> EnvironmentEvidence:
+        return EnvironmentEvidence(state=IdentityState.unreadable)
+
+    def unreadable_cmdline(pid: int, proc_root: Path = Path("/proc")):
+        return IdentityState.unreadable, None
+
+    monkeypatch.setattr(procfs, "read_environment_evidence", unreadable_env)
+    monkeypatch.setattr(procfs, "read_command_line_evidence", unreadable_cmdline)
     scan = owned_processes(OWNER, RUNTIME, tmp_path)
 
     assert scan.matches == ()
