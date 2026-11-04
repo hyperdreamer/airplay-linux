@@ -1808,3 +1808,25 @@ def test_captured_connector_is_not_reported_for_a_virtual_session() -> None:
     pane = project(state, inputs())
 
     assert pane.captured_connector is None
+
+
+def test_mirror_pane_reports_the_pending_screen_prompt() -> None:
+    """A connecting Mirror start with no source is the desktop's prompt."""
+    state = replace(
+        _mirroring_state(), transport=TransportState.Connecting, physical_source=None,
+    )
+    pane = project(state, inputs())
+
+    assert pane.awaiting_capture is True
+    assert pane.captured_connector is None
+
+
+def test_a_captured_source_ends_the_pending_prompt() -> None:
+    state = replace(
+        _mirroring_state(),
+        physical_source=PhysicalMonitorSource(connector="DP-3", portal_restore_token=None),
+    )
+    pane = project(state, inputs())
+
+    assert pane.awaiting_capture is False
+    assert pane.captured_connector == "DP-3"

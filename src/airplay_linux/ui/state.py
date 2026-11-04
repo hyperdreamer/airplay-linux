@@ -160,6 +160,9 @@ class PaneState:
     # The monitor the backend actually captured, once a Mirror stream is up.
     # Mirror has no requested source, so this is the only honest label.
     captured_connector: str | None = None
+    # A Mirror start is connecting but no capture source exists yet: the desktop
+    # is showing its own screen prompt, which this application cannot render.
+    awaiting_capture: bool = False
 
 
 @dataclass(frozen=True)
@@ -382,6 +385,11 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
             snapshot.physical_source.connector
             if snapshot.mode is Mode.MIRROR and snapshot.physical_source is not None
             else None
+        ),
+        awaiting_capture=(
+            snapshot.mode is Mode.MIRROR
+            and snapshot.transport is TransportState.Connecting
+            and snapshot.physical_source is None
         ),
     )
 

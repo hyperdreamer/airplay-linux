@@ -113,6 +113,8 @@ Replaces `_await_connecting_stream`'s single budget. Poll `status` every `SOURCE
   Virtual's resolution inputs and for `list_physical`).
 - `source_enabled` is false in Mirror; `Action.start` is offered whenever the session is startable.
 - After the stream is admitted the pane shows `Captured: <connector>` from `snapshot.physical_source`.
+- While a Mirror start is connecting with no source yet, the pane says `Waiting for the screen prompt…`:
+  the dialog belongs to the portal, so naming the phase is all this application can do.
 - A guard failure keeps its fixed catalog text plus the typed `detail` already carried
   (`ambiguous_position`, `size_mismatch`, `owned_output`, …) so the reason is diagnosable.
 
@@ -142,8 +144,11 @@ stay valid for the life of the session so a reconnect does not silently lose its
 
 ## 6. Invariants
 
-1. **No capture request before Start.** A fresh composition — including capability probing — must perform
-   zero ScreenCast calls. Today a fresh launch pops a dialog within ~25 s with no session and no Start.
+1. **No capture request before Start.** A fresh composition — including capability probing — performs zero
+   ScreenCast calls. Instrumented (`PortalClient.select_monitor`/`_open_peer`, fresh state root): no request
+   at launch. The owned daemon does start with the application, because it is the control plane; it only
+   asks the portal when a `connect` arrives. A launch-time dialog seen during triage came from a client
+   that had left a request pending, not from composition.
 2. **One requester.** No code path may open a ScreenCast session for Mirror other than the backend.
 3. **One prompt per Start**, and only one: the user answers the portal dialog once.
 4. **No remembered state is consumed**: whatever the store holds is voided before the next Start.

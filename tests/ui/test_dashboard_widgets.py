@@ -159,6 +159,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
     notice: str | None = None,
     diagnostic: object | None = None,
     captured_connector: str | None = None,
+    awaiting_capture: bool = False,
 ) -> PaneState:
     return PaneState(
         title=title,
@@ -185,6 +186,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
         notice=notice,
         diagnostic=diagnostic,  # type: ignore[arg-type]
         captured_connector=captured_connector,
+        awaiting_capture=awaiting_capture,
     )
 
 
@@ -568,6 +570,11 @@ def test_only_the_visible_modes_editor_is_shown(qtbot) -> None:
         pane(visible_mode=Mode.MIRROR, source_enabled=True, captured_connector="DP-1")
     )
     assert captured.text() == "Captured: DP-1"
+
+    # While the desktop's own prompt is open the pane says so, because the
+    # dialog belongs to the portal and cannot be rendered here.
+    window.render_selected(pane(visible_mode=Mode.MIRROR, awaiting_capture=True))
+    assert captured.text() == "Waiting for the screen prompt\u2026"
 
     window.render_selected(pane(visible_mode=Mode.VIRTUAL, resolution_enabled=True))
     assert resolution.isVisibleTo(window)

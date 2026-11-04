@@ -751,10 +751,12 @@ class MainWindow(QMainWindow):
         self._source.setVisible(not mirror_mode)
         self._source_note.setVisible(mirror_mode)
         if mirror_mode:
-            captured = pane.captured_connector
-            self._source_note.setText(
-                f"Captured: {captured}" if captured else "Screen: chosen when capture starts"
-            )
+            if pane.captured_connector:
+                self._source_note.setText(f"Captured: {pane.captured_connector}")
+            elif pane.awaiting_capture:
+                self._source_note.setText("Waiting for the screen prompt\u2026")
+            else:
+                self._source_note.setText("Screen: chosen when capture starts")
         self._resolution.setEnabled(pane.resolution_enabled)
 
     def _render_mute(self, pane: PaneState) -> None:
