@@ -36,6 +36,7 @@ from airplay_linux.display.association import KScreenOutputVerifier
 from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.display.creation import DisplayCreator
 from airplay_linux.display.helper import VirtualHelper
+from airplay_linux.display.permissions import FlatpakScreenCastPermissions
 from airplay_linux.display.kde import KdeVirtualDisplayProvider
 from airplay_linux.display.kscreen import KScreenObserver
 from airplay_linux.display.locking import CreationLock
@@ -227,6 +228,7 @@ OVERRIDABLE = frozenset(
         "activity",
         "restart_daemon",
         "presenter",
+        "screencast",
         "shutdown_hook",
     }
 )
@@ -354,6 +356,7 @@ class _ProductionGraph:
     report: Any
     gated: Mapping[str, str]
     refresh: Callable[[], Awaitable[Any]]
+    screencast: Any
 
 
 def _unavailable_features() -> BackendFeatures:
@@ -708,7 +711,7 @@ async def _compose_production(
     )
     return _ProductionGraph(
         deps, manager, registry, startup, persistence, report, gated,
-        refresh_capabilities,
+        refresh_capabilities, FlatpakScreenCastPermissions(process),
     )
 
 
@@ -726,6 +729,9 @@ class Runtime:
     presenter: Any = None
     dialogs: Any = None
     window: Any = None
+    #: Desktop ScreenCast approvals; None refuses a Mirror start rather than
+    #: replaying whatever the portal remembered.
+    screencast: Any = None
     qt_app: Any = None
     gated: Mapping[str, str] = field(default_factory=dict)
     _refresh_capabilities: Callable[[], Awaitable[Any]] | None = None
@@ -813,8 +819,6 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication
 
-    from airplay_linux.display.permissions import FlatpakScreenCastPermissions
-    from airplay_linux.process.linux import LinuxProcessRunner
     from airplay_linux.ui.presenter import Presenter, QtDialogFactory
     from airplay_linux.ui.window import MainWindow
 
@@ -839,7 +843,7 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
         dialogs,
         runtime.shutdown,
         refresh_capabilities=runtime._refresh_capabilities,
-        screencast=FlatpakScreenCastPermissions(LinuxProcessRunner()),
+        screencast=runtime.screencast,
     )
     runtime.qt_app = qt_app
     runtime.window = window
@@ -894,9 +898,13 @@ async def build_runtime(
     manager = graph.manager if deps_override is None else manager_for_persistence
     coordinator = ShutdownCoordinator(manager, deps, registry, persistence, deadline_seconds=15)
     presenter = provided["presenter"] if "presenter" in provided else None
+    screencast = provided.get("screencast")
+    if screencast is None and deps_override is None:
+        screencast = graph.screencast
     runtime = Runtime(
         config=config,
         deps=deps,
+        screencast=screencast,
         manager=manager,
         registry=registry,
         persistence=persistence,

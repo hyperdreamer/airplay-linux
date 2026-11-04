@@ -154,6 +154,17 @@ MATRIX_ROWS: tuple[str, ...] = (
 # --------------------------------------------------------------------------- ports
 
 
+class AcceptanceScreenCast:
+    """The desktop permission store, replaced so tests never touch the real one."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def forget_all(self) -> Result[int]:
+        self.calls += 1
+        return Ok(value=0)
+
+
 class AcceptanceTransport(FakeTransport):
     """Echo the caller's lease and publish the backend's explicit ready event."""
 
@@ -652,7 +663,7 @@ async def build(qtbot: Any, qapp: QApplication, tmp_path: Path):
                 runtime_root=tmp_path / f"app{index}" / "runtime",
                 live=True,
             ),
-            {"deps": rig.deps},
+            {"deps": rig.deps, "screencast": AcceptanceScreenCast()},
         )
         assert isinstance(built, Ok), built
         runtime = built.value

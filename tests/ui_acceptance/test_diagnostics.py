@@ -111,6 +111,8 @@ ACTIVITY_COPY: dict[str, str] = {
     "display.cleanup_required": "The virtual output removal could not be confirmed.",
     "capture.selected": "A physical monitor was selected as the capture source.",
     "capture.released": "The capture source was released.",
+    "screen.forget": "Remembered screen-sharing choices were cleared.",
+    "screen.forget_failed": "Remembered screen-sharing choices could not be cleared.",
     "resolution.required": "A resolution must be chosen before this start continues.",
     "resolution.remembered": "The chosen resolution was remembered for this receiver.",
     "audio.decision_required": "An explicit audio decision is required before start.",

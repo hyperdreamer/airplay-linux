@@ -24,6 +24,11 @@ specific screen" — and implements neither.
 | D4 | Two-phase admission wait: the permission phase is unbounded but cancellable; the handshake phase stays bounded. |
 | D5 | The pane reports the captured screen. Mirror has no source selector. |
 
+The manual revocation control added in `32cc6ab` is **removed**: with D2 it duplicates what Start already
+does, and a toolbar action that only repeats an automatic step is the same kind of false affordance as the
+source selector. Revocation *without* starting is not offered; if it is ever wanted it belongs in Settings,
+not in the operating surface.
+
 Rejected, with reasons:
 
 - **Token pass-through (A).** Needs a backend flag, a control-protocol field, a new capability token and a

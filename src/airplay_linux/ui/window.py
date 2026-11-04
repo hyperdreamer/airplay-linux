@@ -97,11 +97,6 @@ _COMMAND_LABELS: Final[Mapping[Action, tuple[str, str]]] = MappingProxyType(
         ),
         Action.pair: ("Pair", "Pair with this receiver using a PIN or password"),
         Action.scan: ("Scan", "Search the local network for AirPlay receivers"),
-        Action.forget_screen: (
-            "Forget screen memory",
-            "Clear the desktop's remembered screen-sharing choice so the next "
-            "Start asks which screen to capture",
-        ),
         Action.submit_pairing: (
             "Submit PIN",
             "Submit the PIN or password the receiver is showing",
@@ -158,7 +153,7 @@ _COMMAND_LABELS: Final[Mapping[Action, tuple[str, str]]] = MappingProxyType(
 
 #: Persistent commands stay visible and simply disable themselves.
 _PERSISTENT: Final[frozenset[Action]] = frozenset(
-    {Action.start, Action.stop, Action.pair, Action.scan, Action.mute, Action.forget_screen}
+    {Action.start, Action.stop, Action.pair, Action.scan, Action.mute}
 )
 
 #: Context-only prompts, grouped in reading order so related choices sit together
@@ -248,10 +243,6 @@ class MainWindow(QMainWindow):
         self._buttons[Action.scan] = self._button(Action.scan, toolbar)
         self._scan = self._buttons[Action.scan]
         toolbar.addWidget(self._scan)
-
-        self._buttons[Action.forget_screen] = self._button(Action.forget_screen, toolbar)
-        self._forget_screen = self._buttons[Action.forget_screen]
-        toolbar.addWidget(self._forget_screen)
 
         self._summary = QLabel("0 TVs available  0 sessions", toolbar)
         self._summary.setObjectName("summaryLabel")
@@ -484,7 +475,7 @@ class MainWindow(QMainWindow):
         self._table.selectionModel().currentRowChanged.connect(self._row_changed)
 
     def _apply_tab_order(self) -> None:
-        order = [self._scan, self._forget_screen, self._settings, self._table]
+        order = [self._scan, self._settings, self._table]
         order += [self._mirror, self._virtual]
         order += [self._source, self._resolution]
         order += [self._mute]
@@ -690,7 +681,7 @@ class MainWindow(QMainWindow):
             self._mute.setChecked(False)
         self._set_mute_affordance(muted=False)
         for action, button in self._buttons.items():
-            button.setEnabled(action in {Action.scan, Action.forget_screen})
+            button.setEnabled(action is Action.scan)
             button.setVisible(action is not Action.mute and action in _PERSISTENT)
 
     def _render_badges(self, badges: tuple[Badge, ...]) -> None:
@@ -763,7 +754,7 @@ class MainWindow(QMainWindow):
         )
         self._buttons[Action.start].setText(start_label)
         for action, button in self._buttons.items():
-            offered = action in pane.actions or action is Action.forget_screen
+            offered = action in pane.actions
             button.setEnabled(offered)
             # Persistent commands stay visible so their disabled state is legible;
             # context-only prompts appear only when the projection offers them.
@@ -869,7 +860,6 @@ _BUTTON_NAMES: Final[Mapping[Action, str]] = MappingProxyType(
         Action.stop: "stopButton",
         Action.pair: "pairButton",
         Action.scan: "scanButton",
-        Action.forget_screen: "forgetScreenButton",
         Action.submit_pairing: "submitPairingButton",
         Action.cancel: "cancelButton",
         Action.remove_metadata: "removeMetadataButton",

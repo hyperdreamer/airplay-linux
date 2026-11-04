@@ -842,29 +842,37 @@ class Presenter:
         self._sources_loaded_for = receiver_id
         self._request_render()
 
-    async def _forget_remembered_screen(self) -> None:
-        """Clear the desktop's remembered ScreenCast approvals.
+    async def _start_session(self, receiver_id: Any, request: StartRequest) -> None:
+        """Clear the desktop's remembered screen, then dispatch the start.
 
-        The portal replays the last approved screen without a dialog, so a stale
-        approval is indistinguishable from a fresh one until capture starts. This
-        removes the approvals themselves: the next capture has to ask.
+        Mirror carries no requested source: the backend opens the capture session
+        and the portal decides which screen it gets. Clearing the remembered
+        approval first is what makes Start ask instead of silently replaying an
+        old choice, and a failure to clear refuses the start rather than letting
+        it run with state the operator asked to be forgotten.
         """
+        if request.mode is Mode.MIRROR:
+            cleared = await self._clear_remembered_screen()
+            if isinstance(cleared, Err):
+                self._reject(receiver_id, cleared.error)
+                return
+        await self._dispatch(Start(receiver_id=receiver_id, request=request))
+
+    async def _clear_remembered_screen(self) -> Result[None]:
+        """Remove every remembered ScreenCast approval; log the outcome."""
         store = self._screencast
         if store is None:
             self._record_screen_memory(None, ErrorCode.dependency_missing)
-            self._reject(None, diagnostic(ErrorCode.dependency_missing))
-            self._request_render()
-            return
+            return Err(error=diagnostic(ErrorCode.dependency_missing))
         try:
             result = await store.forget_all()
         except Exception:  # noqa: BLE001 - an adapter failure is a typed diagnostic
             result = Err(error=diagnostic(ErrorCode.persistence_failed))
         if isinstance(result, Err):
             self._record_screen_memory(None, result.error.code)
-            self._reject(None, result.error)
-        else:
-            self._record_screen_memory(result.value, None)
-        self._request_render()
+            return result
+        self._record_screen_memory(result.value, None)
+        return Ok(value=None)
 
     def _record_screen_memory(self, forgotten: int | None, failure: ErrorCode | None) -> None:
         """Log one screen-memory outcome without letting a sink break the action."""
@@ -974,11 +982,6 @@ class Presenter:
             # appeared or gone while the dashboard was idle.
             self._reload_ownerships()
             return
-        if action is Action.forget_screen:
-            # Global, like Scan: the remembered screen belongs to the desktop,
-            # not to the selected receiver, and clearing it asks again next time.
-            self._schedule(self._forget_remembered_screen())
-            return
         receiver_id = self._selected
         if receiver_id is None:
             return
@@ -1002,8 +1005,7 @@ class Presenter:
                 )
                 return
             self._schedule(
-                self._dispatch(Start(receiver_id=receiver_id, request=request)),
-                receiver_id=receiver_id,
+                self._start_session(receiver_id, request), receiver_id=receiver_id,
             )
             return
         if action is Action.pair:

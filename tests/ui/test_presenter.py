@@ -303,14 +303,22 @@ class FakeDialogs:
 
 
 class FakeScreenCast:
-    """A permission store double: one call, one canned outcome."""
+    """A permission store double: one call, one canned outcome.
 
-    def __init__(self, result: Result[Any] | None = None) -> None:
+    ``commands`` is the manager's journal, sampled when the clear runs, so a test
+    can prove the clear happened before anything was dispatched.
+    """
+
+    def __init__(self, result: Result[Any] | None = None, commands: list[Any] | None = None) -> None:
         self.result: Result[Any] = Ok(value=2) if result is None else result
         self.calls = 0
+        self.commands = commands
+        self.command_counts: list[int] = []
 
     async def forget_all(self) -> Result[Any]:
         self.calls += 1
+        if self.commands is not None:
+            self.command_counts.append(len(self.commands))
         return self.result
 
 
@@ -326,7 +334,11 @@ class PresenterRig:
         self.ownerships = MemoryOwnershipStore()
         self.activity = ActivityLog()
         self.dialogs = FakeDialogs()
-        self.screencast = screencast
+        self.screencast = screencast if screencast is not None else FakeScreenCast()
+        if isinstance(self.screencast, FakeScreenCast) and self.screencast.commands is None:
+            # Sample the manager's journal from inside the clear, so a test can
+            # prove the clear ran before any command was dispatched.
+            self.screencast.commands = self.manager.commands
         self.capabilities = capability_report()
         #: The report a capability re-probe publishes, if the test staged one.
         self.refreshed_capabilities: CapabilityReport | None = None
@@ -2148,32 +2160,65 @@ async def screen_rig(qtbot: Any) -> Any:
         await prepared.settle(10)
 
 
-async def test_forget_screen_memory_clears_the_remembered_approval(screen_rig: Any) -> None:
-    """The action clears desktop state without needing a selected receiver."""
+async def test_mirror_start_clears_the_remembered_screen_first(screen_rig: Any) -> None:
+    """Start asks the desktop every time; nothing remembered may be replayed."""
+    screen_rig.capture.add_physical(physical("DP-1"))
+    screen_rig.discover("a")
     prepared = await started(screen_rig)
+    prepared.snapshot("a")
+    await prepared.settle()
 
-    prepared.click(Action.forget_screen)
+    prepared.click(Action.start)
     await prepared.settle()
 
     assert prepared.screencast.calls == 1
-    events = prepared.activity.entries()
+    # The clear ran before anything reached the manager.
+    assert prepared.screencast.command_counts == [0]
+    assert [type(command) for command in prepared.manager.commands] == [Start]
+    events = [event for event in prepared.activity.entries() if event.code.startswith("screen.")]
     assert events[-1].code == "screen.forget"
     assert events[-1].fields["remembered"] == 2
-    assert prepared.manager.commands == []
 
 
-async def test_forget_screen_memory_reports_a_typed_refusal() -> None:
+async def test_mirror_start_refuses_when_the_screen_memory_cannot_be_cleared() -> None:
+    """A start that cannot clear must not run with a remembered approval."""
     store = FakeScreenCast(Err(error=diagnostic(ErrorCode.dependency_missing)))
     prepared = PresenterRig(store)
+    prepared.capture.add_physical(physical("DP-1"))
+    prepared.discover("a")
     try:
         await prepared.start()
-        prepared.click(Action.forget_screen)
+        prepared.snapshot("a")
+        await prepared.settle()
+
+        prepared.click(Action.start)
         await prepared.settle()
 
         assert store.calls == 1
-        events = prepared.activity.entries()
+        assert prepared.manager.commands == []
+        events = [event for event in prepared.activity.entries() if event.code.startswith("screen.")]
         assert events[-1].code == "screen.forget_failed"
         assert events[-1].fields["error_code"] == ErrorCode.dependency_missing
     finally:
         await prepared.presenter.close()
         await prepared.settle(10)
+
+
+async def test_retry_does_not_clear_the_remembered_screen(screen_rig: Any) -> None:
+    """Retry repeats a decision already made; it must not re-prompt for a screen."""
+    screen_rig.capture.add_physical(physical("DP-1"))
+    screen_rig.discover("a")
+    prepared = await started(screen_rig)
+    prepared.snapshot(
+        "a",
+        phase=SessionPhase.Failed,
+        transport=TransportState.Failed,
+        last_error=diagnostic(ErrorCode.transport_failed),
+    )
+    await prepared.settle()
+
+    assert Action.retry in prepared.offered()
+    prepared.click(Action.retry)
+    await prepared.settle()
+
+    assert prepared.screencast.calls == 0
