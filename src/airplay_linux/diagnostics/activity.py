@@ -88,6 +88,7 @@ ALLOWED_FIELDS: Final[frozenset[str]] = frozenset(
         "endpoint_generation",
         "error_code",
         "explicit_video_only",
+        "remembered",
     }
 )
 
@@ -147,6 +148,7 @@ _INTEGER_BOUNDS: Final[Mapping[str, tuple[int, int]]] = MappingProxyType(
     {
         "retry_seconds": (0, 86400),
         "endpoint_generation": (0, 2**31 - 1),
+        "remembered": (0, 10_000),
     }
 )
 
@@ -245,6 +247,8 @@ _MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
         "display.cleanup_required": "The virtual output removal could not be confirmed.",
         "capture.selected": "A physical monitor was selected as the capture source.",
         "capture.released": "The capture source was released.",
+        "screen.forget": "Remembered screen-sharing choices were cleared.",
+        "screen.forget_failed": "Remembered screen-sharing choices could not be cleared.",
         "resolution.required": "A resolution must be chosen before this start continues.",
         "resolution.remembered": "The chosen resolution was remembered for this receiver.",
         "audio.decision_required": "An explicit audio decision is required before start.",

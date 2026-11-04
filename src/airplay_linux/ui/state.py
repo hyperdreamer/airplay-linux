@@ -72,6 +72,7 @@ class Action(StrEnum):
     submit_pairing = "submit_pairing"
     cancel = "cancel"
     scan = "scan"
+    forget_screen = "forget_screen"
     remove_metadata = "remove_metadata"
     retry = "retry"
     choose_resolution = "choose_resolution"

@@ -813,6 +813,8 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import QApplication
 
+    from airplay_linux.display.permissions import FlatpakScreenCastPermissions
+    from airplay_linux.process.linux import LinuxProcessRunner
     from airplay_linux.ui.presenter import Presenter, QtDialogFactory
     from airplay_linux.ui.window import MainWindow
 
@@ -837,6 +839,7 @@ def _build_live_presenter(runtime: Runtime, report_provider: Callable[[], Any]) 
         dialogs,
         runtime.shutdown,
         refresh_capabilities=runtime._refresh_capabilities,
+        screencast=FlatpakScreenCastPermissions(LinuxProcessRunner()),
     )
     runtime.qt_app = qt_app
     runtime.window = window

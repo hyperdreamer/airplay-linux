@@ -2070,3 +2070,26 @@ def test_every_dialog_button_is_text_and_every_icon_control_has_a_tooltip(qtbot)
                 assert button.text().strip(), button.objectName()
         for field in dialogue.findChildren(QLineEdit):
             assert field.accessibleName()
+
+def test_forget_screen_memory_is_global_and_never_disabled_by_the_pane(qtbot) -> None:
+    """The remembered screen belongs to the desktop, not to one receiver."""
+    from PySide6.QtWidgets import QPushButton
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    forget = window.findChild(QPushButton, "forgetScreenButton")
+    requested: list[str] = []
+    window.action_requested.connect(requested.append)
+
+    assert forget.isVisible() is True or forget.isHidden() is False
+    assert forget.isEnabled()  # nothing rendered yet: the desktop action still applies
+    forget.click()
+    assert requested == ["forget_screen"]
+
+    window.render_selected(pane(actions=frozenset({Action.stop})))
+    assert forget.isEnabled()
+
+    window.render_selected(pane(actions=frozenset()))
+    assert forget.isEnabled()

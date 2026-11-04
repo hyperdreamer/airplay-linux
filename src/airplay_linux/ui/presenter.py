@@ -61,12 +61,14 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from PySide6.QtCore import QObject, Qt, Signal, Slot
 from PySide6.QtWidgets import QWidget
 
 from airplay_linux.diagnostics import diagnostic
+from airplay_linux.diagnostics.activity import safe_activity
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.messages import (
     Cancel,
@@ -298,6 +300,7 @@ class Presenter:
         request_shutdown: Callable[[], Awaitable[Result[None]]],
         *,
         refresh_capabilities: Callable[[], Awaitable[Any]] | None = None,
+        screencast: Any | None = None,
     ) -> None:
         if not isinstance(window, MainWindow):
             raise TypeError("window must be a MainWindow")
@@ -323,6 +326,10 @@ class Presenter:
         self._dialogs = dialogs
         self._request_shutdown = request_shutdown
         self._refresh_capabilities_report = refresh_capabilities
+        # Desktop state, not a session command: this only reads and clears the
+        # portal's remembered screen approvals.  A composition that supplies no
+        # permission store fails the action instead of pretending it is absent.
+        self._screencast = screencast
 
         # -- authoritative caches (GUI-thread owned) -----------------------
         self._views: dict[ReceiverId, Any] = {}
@@ -835,6 +842,45 @@ class Presenter:
         self._sources_loaded_for = receiver_id
         self._request_render()
 
+    async def _forget_remembered_screen(self) -> None:
+        """Clear the desktop's remembered ScreenCast approvals.
+
+        The portal replays the last approved screen without a dialog, so a stale
+        approval is indistinguishable from a fresh one until capture starts. This
+        removes the approvals themselves: the next capture has to ask.
+        """
+        store = self._screencast
+        if store is None:
+            self._record_screen_memory(None, ErrorCode.dependency_missing)
+            self._reject(None, diagnostic(ErrorCode.dependency_missing))
+            self._request_render()
+            return
+        try:
+            result = await store.forget_all()
+        except Exception:  # noqa: BLE001 - an adapter failure is a typed diagnostic
+            result = Err(error=diagnostic(ErrorCode.persistence_failed))
+        if isinstance(result, Err):
+            self._record_screen_memory(None, result.error.code)
+            self._reject(None, result.error)
+        else:
+            self._record_screen_memory(result.value, None)
+        self._request_render()
+
+    def _record_screen_memory(self, forgotten: int | None, failure: ErrorCode | None) -> None:
+        """Log one screen-memory outcome without letting a sink break the action."""
+        fields: dict[str, Any] = (
+            {"remembered": forgotten} if forgotten is not None
+            else {"error_code": failure if failure is not None else ErrorCode.persistence_failed}
+        )
+        try:
+            self._activity.emit(safe_activity(
+                "screen.forget" if failure is None else "screen.forget_failed",
+                None, fields,
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            ))
+        except Exception:  # noqa: BLE001 - the activity sink is never authoritative
+            pass
+
     async def _refresh_discovery(self) -> None:
         try:
             result = await self._discovery.refresh()
@@ -927,6 +973,11 @@ class Presenter:
             # A scan also re-reads durable ownership evidence: an output may have
             # appeared or gone while the dashboard was idle.
             self._reload_ownerships()
+            return
+        if action is Action.forget_screen:
+            # Global, like Scan: the remembered screen belongs to the desktop,
+            # not to the selected receiver, and clearing it asks again next time.
+            self._schedule(self._forget_remembered_screen())
             return
         receiver_id = self._selected
         if receiver_id is None:

@@ -84,6 +84,7 @@ FIELD_SAMPLES: dict[str, str | int | bool] = {
     "endpoint_generation": 3,
     "error_code": "cleanup_timeout",
     "explicit_video_only": True,
+    "remembered": 2,
 }
 
 #: Every value the frozen domain enumerates for one vocabulary-shaped field.

@@ -302,10 +302,22 @@ class FakeDialogs:
 # ------------------------------------------------------------------------------ rig
 
 
+class FakeScreenCast:
+    """A permission store double: one call, one canned outcome."""
+
+    def __init__(self, result: Result[Any] | None = None) -> None:
+        self.result: Result[Any] = Ok(value=2) if result is None else result
+        self.calls = 0
+
+    async def forget_all(self) -> Result[Any]:
+        self.calls += 1
+        return self.result
+
+
 class PresenterRig:
     """A real dashboard wired to deterministic ports and preprogrammed dialogs."""
 
-    def __init__(self) -> None:
+    def __init__(self, screencast: Any | None = None) -> None:
         self.window = MainWindow()
         self.manager = FakeManager()
         self.discovery = FakeDiscovery()
@@ -314,6 +326,7 @@ class PresenterRig:
         self.ownerships = MemoryOwnershipStore()
         self.activity = ActivityLog()
         self.dialogs = FakeDialogs()
+        self.screencast = screencast
         self.capabilities = capability_report()
         #: The report a capability re-probe publishes, if the test staged one.
         self.refreshed_capabilities: CapabilityReport | None = None
@@ -333,6 +346,7 @@ class PresenterRig:
             dialogs=self.dialogs,
             request_shutdown=self._request_shutdown,
             refresh_capabilities=self._refresh_capabilities,
+            screencast=self.screencast,
         )
         self._started = False
 
@@ -2119,3 +2133,47 @@ def test_the_presenter_consumes_ports_not_the_session_implementation() -> None:
     source = inspect.getsource(module)
     assert "airplay_linux.session" not in source
     assert "SessionManager" not in source
+
+
+@pytest.fixture
+async def screen_rig(qtbot: Any) -> Any:
+    """A started rig with a scripted ScreenCast permission store."""
+    prepared = PresenterRig(FakeScreenCast())
+    qtbot.addWidget(prepared.window)
+    try:
+        yield prepared
+    finally:
+        await prepared.settle(10)
+        await prepared.presenter.close()
+        await prepared.settle(10)
+
+
+async def test_forget_screen_memory_clears_the_remembered_approval(screen_rig: Any) -> None:
+    """The action clears desktop state without needing a selected receiver."""
+    prepared = await started(screen_rig)
+
+    prepared.click(Action.forget_screen)
+    await prepared.settle()
+
+    assert prepared.screencast.calls == 1
+    events = prepared.activity.entries()
+    assert events[-1].code == "screen.forget"
+    assert events[-1].fields["remembered"] == 2
+    assert prepared.manager.commands == []
+
+
+async def test_forget_screen_memory_reports_a_typed_refusal() -> None:
+    store = FakeScreenCast(Err(error=diagnostic(ErrorCode.dependency_missing)))
+    prepared = PresenterRig(store)
+    try:
+        await prepared.start()
+        prepared.click(Action.forget_screen)
+        await prepared.settle()
+
+        assert store.calls == 1
+        events = prepared.activity.entries()
+        assert events[-1].code == "screen.forget_failed"
+        assert events[-1].fields["error_code"] == ErrorCode.dependency_missing
+    finally:
+        await prepared.presenter.close()
+        await prepared.settle(10)
