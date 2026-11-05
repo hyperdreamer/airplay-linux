@@ -11,7 +11,7 @@ from airplay_linux.domain.messages import EffectEvent
 from airplay_linux.domain.operations import OperationId
 from airplay_linux.domain.ports import ManagerPort, SessionStore
 from airplay_linux.domain.records import SessionSnapshot
-from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result, TrustState
+from airplay_linux.domain.resources import AudioState, Err, ErrorCode, Ok, Result, TrustState
 from airplay_linux.storage.codecs import decode_session, encode_session, is_ambiguous_identity
 
 from .engine import SessionManager
@@ -23,7 +23,9 @@ def _safe_snapshot(state: SessionSnapshot) -> SessionSnapshot:
     # pending challenge becomes the durable receiver-scoped revocation barrier.
     clean = replace(
         state, challenge=None, stream=None, transport_lease_id=None,
-        audio_operation_id=None, muted=False, next_retry_at=None,
+        audio_operation_id=None, audio=AudioState.Disabled, muted=False, next_retry_at=None,
+        remembered_volume=None, effective_volume=None, last_audible_volume=None,
+        volume_state=None, audio_close_pending=False, volume_save_failed=False,
         trust=TrustState.CleanupRequired if state.trust is TrustState.Pairing else state.trust,
     )
     # Reuse storage's explicit allowlist for nested sources, errors and requests;

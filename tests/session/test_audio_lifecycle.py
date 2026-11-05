@@ -16,6 +16,7 @@ import pytest
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     Cancel,
+    ChooseResolution,
     EmptyPayload,
     FailurePayload,
     MutePayload,
@@ -44,9 +45,11 @@ from airplay_linux.domain.resources import (
     Mode,
     Ok,
     RecoveryAction,
+    ReceiverCapabilities,
     SessionPhase,
     StartRequest,
     TransportState,
+    VolumeLevel,
 )
 from airplay_linux.session.audio import (
     audio_runtime,
@@ -104,20 +107,24 @@ def reconnecting_audio_handlers(deps):
     )
 
 
-def mirror_rig(*, transport=None, compose=audio_handlers):
+def mirror_rig(*, transport=None, compose=audio_handlers, volume=False):
     rig = SessionRig()
     for subscription in rig.manager._subscriptions:
         subscription.close()
     rig.transport = transport if transport is not None else AudioTransport()
-    rig.deps = replace(rig.deps, transport=rig.transport)
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, transport=rig.transport,
+                       capabilities=lambda: replace(report, volume=volume))
     for adapter in (rig.capture, rig.transport, rig.audio, rig.receivers, rig.activity):
         adapter.journal = rig.journal
     rig.manager = SessionManager(rig.deps, compose(rig.deps))
     return rig
 
 
-def virtual_rig(*, ready: bool):
+def virtual_rig(*, ready: bool, volume=False):
     rig = make_rig(transport=ContextTransport(ready=ready))
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, capabilities=lambda: replace(report, volume=volume))
     for subscription in rig.manager._subscriptions:
         subscription.close()
     rig.manager = SessionManager(rig.deps, virtual_audio_handlers(rig.deps))
@@ -133,26 +140,26 @@ async def online_mirror_rig(*, transport=None):
     return rig, destination
 
 
-async def start_mirror(rig, destination, *, audio=None):
+async def start_mirror(rig, destination, *, audio=None, volume: VolumeLevel | None = None):
     await rig.manager.dispatch(Start(
         receiver_id=destination.receiver_id,
         request=StartRequest(
             mode=Mode.MIRROR, source=physical(),
-            audio=audio if audio is not None else AudioPolicy(),
+            audio=audio if audio is not None else AudioPolicy(), volume=volume,
         ),
     ))
     await settle(rig)
     return rig.manager.snapshot(destination.receiver_id)
 
 
-async def start_virtual(rig, destination, *, audio=True):
+async def start_virtual(rig, destination, *, audio=True, volume: VolumeLevel | None = None):
     rig.discovery.add_target(destination)
     rig.capture.add_physical(physical())
     await rig.manager.dispatch(Start(
         receiver_id=destination.receiver_id,
         request=StartRequest(
             mode=Mode.VIRTUAL, resolution=decision(destination),
-            audio=AudioPolicy(enabled=audio),
+            audio=AudioPolicy(enabled=audio), volume=volume,
         ),
     ))
     await settle(rig)
@@ -235,6 +242,70 @@ def _streaming_snapshot():
 @pytest.fixture
 def streaming_snapshot():
     return _streaming_snapshot()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+@pytest.mark.parametrize("capable,enabled,value,want", [
+    (True, True, 30, {"value": 30}), (True, True, 0, {"value": 0}),
+    (True, True, None, None), (True, False, 30, None), (False, True, 30, None),
+])
+async def test_volume_startup_input_reaches_actual_transport(mode, capable, enabled, value, want):
+    rig = mirror_rig(volume=capable) if mode is Mode.MIRROR else virtual_rig(ready=True, volume=capable)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    volume = None if value is None else VolumeLevel(value=value)
+    if mode is Mode.MIRROR:
+        state = await start_mirror(rig, destination, audio=AudioPolicy(enabled=enabled), volume=volume)
+    else:
+        state = await start_virtual(rig, destination, audio=enabled, volume=volume)
+    calls = rig.journal.calls("transport.start_stream")
+    assert len(calls) == 1
+    assert calls[0]["initial_volume"] == want
+    assert calls[0]["audio_policy"] == {"enabled": enabled}
+    assert state.effective_volume is None and state.last_audible_volume is None
+    assert state.remembered_volume == (value if value and capable else None)
+
+
+async def test_volume_initial_value_survives_resolution_choice():
+    rig = virtual_rig(ready=True, volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.receivers.queue_result("query_modes", Ok(value=ReceiverCapabilities(
+        modes=(decision(destination).size,), reliable=True, evidence="receiver query",
+    )))
+    rig.capture.add_physical(physical())
+    await rig.manager.dispatch(Start(
+        receiver_id=destination.receiver_id,
+        request=StartRequest(mode=Mode.VIRTUAL, volume=VolumeLevel(value=0)),
+    ))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).phase is SessionPhase.ResolutionRequired
+    await rig.manager.dispatch(ChooseResolution(
+        receiver_id=destination.receiver_id, decision=decision(destination),
+    ))
+    await settle(rig)
+    calls = rig.journal.calls("transport.start_stream")
+    assert len(calls) == 1
+    assert calls[0]["initial_volume"] == {"value": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_volume_initial_value_survives_audio_decision_continuation(mode):
+    rig = mirror_rig(volume=True) if mode is Mode.MIRROR else virtual_rig(ready=True, volume=True)
+    rig.audio.queue_result("check", Err(error=diagnostic(ErrorCode.audio_unavailable)))
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    if mode is Mode.MIRROR:
+        await start_mirror(rig, destination, volume=VolumeLevel(value=0))
+    else:
+        await start_virtual(rig, destination, volume=VolumeLevel(value=0))
+    assert not rig.journal.calls("transport.start_stream")
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    assert rig.journal.calls("transport.start_stream")[0]["initial_volume"] == {"value": 0}
 
 
 def test_audio_unavailable_projection_retains_stream(streaming_snapshot):

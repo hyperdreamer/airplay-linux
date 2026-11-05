@@ -212,7 +212,8 @@ class SessionContext:
         self._require_dispatch()
         lease = LeaseId(self.deps.ids.new())
         updated = replace(context, transport_lease_id=lease)
-        self.apply(transport_lease_id=lease)
+        self.apply(transport_lease_id=lease, effective_volume=None, last_audible_volume=None,
+                   muted=False, volume_state=None, audio_close_pending=False, volume_save_failed=False)
         return updated
 
     def invalidate_trust(self) -> None:

@@ -65,6 +65,7 @@ from airplay_linux.domain.resources import (
     Ok,
     SessionPhase,
     TransportState,
+    VolumeLevel,
 )
 from airplay_linux.policy.audio import audio_start_policy
 
@@ -112,6 +113,7 @@ class AudioRuntime:
 
     pending_mute: tuple[OperationId, bool] | None = None
     muted_lease: LeaseId | None = None
+    start_volume: VolumeLevel | None = None
 
 
 def audio_runtime(ctx: SessionContext) -> AudioRuntime:

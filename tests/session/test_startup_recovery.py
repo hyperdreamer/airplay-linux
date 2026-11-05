@@ -16,7 +16,7 @@ from airplay_linux.domain.operations import (
 from airplay_linux.domain.records import RecoveryItem, SessionSnapshot
 from airplay_linux.domain.resources import (
     AudioPolicy, AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
-    SessionPhase, StartRequest, TransportState, TrustState,
+    SessionPhase, StartRequest, TransportState, TrustState, VolumeLevel,
 )
 from airplay_linux.session.engine import Route, SessionManager
 from airplay_linux.session.reconnect import build_reconnect_handlers, compose_reconnect_handlers
@@ -25,6 +25,84 @@ from airplay_linux.testing.builders import context, target
 from virtual_scenarios import (
     decision, make_rig, production_display, settle, stream_event, virtual_handlers,
 )
+
+
+def test_volume_transient_authority_is_stripped_before_custom_store():
+    from airplay_linux.session.persistence import _safe_snapshot
+    from airplay_linux.storage.codecs import encode_session, decode_session
+    state = replace(SessionSnapshot.idle(target().receiver_id), audio=AudioState.Muted, muted=True,
+                    remembered_volume=70, effective_volume=0, last_audible_volume=30,
+                    volume_state="applied", audio_close_pending=True, volume_save_failed=True,
+                    queued_start=StartRequest(mode=Mode.MIRROR, volume=VolumeLevel(value=30)))
+    clean = _safe_snapshot(state)
+    payload = encode_session(clean)
+    decoded = decode_session(payload)
+    assert clean.audio is AudioState.Disabled and not clean.muted
+    assert clean.effective_volume is None and clean.last_audible_volume is None
+    assert clean.remembered_volume is None and clean.volume_state is None
+    assert not clean.audio_close_pending and not clean.volume_save_failed
+    for field in (b"volume", b"audio_close_pending", b"last_audible_volume", b"volume_save_failed"):
+        assert field not in payload
+    assert decoded.queued_start.volume is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("version,continuous,invalid", [(1, True, False), (2, True, False),
+                                                       (2, False, False), (2, True, True)])
+async def test_volume_recovery_reloads_only_continuity_approved_receiver(tmp_path, version, continuous, invalid):
+    import json
+    from airplay_linux.storage import AtomicFiles, JsonReceiverStore, JsonSessionStore
+    from airplay_linux.domain.records import SavedReceiver
+    from airplay_linux.storage.codecs import encode_receiver
+    from airplay_linux.session.recovery import StartupRecovery
+    rig, _, _, _ = await prepared(tmp_path, online=True)
+    receiver = target()
+    saved = SavedReceiver(receiver_id=receiver.receiver_id, service_metadata=receiver.service_records,
+                          display_name="TV", last_endpoint=receiver, continuity_fingerprint=receiver.endpoint_fingerprint,
+                          credential_ref=None, remembered_resolution=None, remembered_volume=30)
+    document = json.loads(encode_receiver(saved))
+    document["version"] = version
+    if version == 1:
+        document.pop("remembered_volume")
+    elif invalid:
+        document["remembered_volume"] = 0
+    files, warnings = AtomicFiles(tmp_path / "volume-records"), []
+    receivers = JsonReceiverStore(files, on_diagnostic=warnings.append)
+    await receivers.put(saved)
+    name = files.names("receivers")[0]
+    payload = json.dumps(document).encode()
+    files.write("receivers/" + name, payload)
+    old = rig.sessions.saved[rig.receiver_id]
+    dirty_session = replace(old, remembered_volume=99, effective_volume=0,
+                            last_audible_volume=80, volume_state="applied",
+                            audio_close_pending=True, volume_save_failed=True,
+                            queued_start=StartRequest(mode=Mode.MIRROR, volume=VolumeLevel(value=30)))
+    session_files = AtomicFiles(tmp_path / "volume-sessions")
+    sessions = JsonSessionStore(session_files)
+    assert isinstance(await sessions.save(dirty_session), Ok)
+    session_name = session_files.names("sessions")[0]
+    session_payload = session_files.read("sessions/" + session_name)
+    assert session_payload is not None
+    assert b"audio_close_pending" not in session_payload and b"last_audible_volume" not in session_payload
+    assert b"volume_save_failed" not in session_payload and b'"volume"' not in session_payload
+    rig.sessions = sessions
+    rig.deps = replace(rig.deps, sessions=sessions, receivers=receivers)
+    if not continuous:
+        view = rig.discovery.views[rig.receiver_id]
+        rig.discovery.views[rig.receiver_id] = replace(view, record_set=replace(view.record_set, replacement_of=receiver.receiver_id))
+    install_handlers(rig)
+    result = await StartupRecovery(rig.manager, rig.deps, Registry([])).run()
+    await settle(rig)
+    assert isinstance(result, Ok)
+    state = rig.manager.snapshot(rig.receiver_id)
+    assert state.remembered_volume == (30 if version == 2 and continuous and not invalid else None)
+    assert state.effective_volume is None and state.last_audible_volume is None and state.volume_state is None
+    assert not state.audio_close_pending and not state.volume_save_failed and not state.muted
+    assert state.audio_policy.enabled is False
+    assert state.queued_start is None
+    assert bool(warnings) is invalid
+    assert session_files.read("sessions/" + session_name) == session_payload
+    assert files.read("receivers/" + name) == payload
 
 
 class Registry:

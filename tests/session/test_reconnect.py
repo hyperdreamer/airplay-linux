@@ -11,9 +11,10 @@ from airplay_linux.domain.messages import (
     Start, Stop, SubmitPairing, TimerEvent, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import SensitiveText
+from airplay_linux.domain.records import SessionSnapshot
 from airplay_linux.domain.resources import (
-    AudioPolicy, AudioState, DisplayState, Err, ErrorCode, Mode, Ok, SessionPhase,
-    StartRequest, TransportState, TrustState,
+    AudioPolicy, AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, SessionPhase,
+    StartRequest, TransportState, TrustState, VolumeLevel,
 )
 from airplay_linux.session.engine import SessionManager
 from airplay_linux.session.reconnect import (
@@ -26,8 +27,10 @@ from virtual_scenarios import (
 )
 
 
-def recovery_rig(*, transport=None, restart=None):
+def recovery_rig(*, transport=None, restart=None, volume=False):
     rig = make_rig(transport=transport)
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, capabilities=lambda: replace(report, volume=volume))
     for subscription in rig.manager._subscriptions:
         subscription.close()
     if restart is not None:
@@ -39,14 +42,14 @@ def recovery_rig(*, transport=None, restart=None):
     return rig
 
 
-async def start_session(rig, destination=None, *, mode=Mode.VIRTUAL, audio=False):
+async def start_session(rig, destination=None, *, mode=Mode.VIRTUAL, audio=False, volume=None):
     destination = destination or target()
     rig.discovery.add_target(destination)
     rig.capture.add_physical(physical())
     request = StartRequest(
         mode=mode, source=physical() if mode is Mode.MIRROR else None,
         resolution=decision(destination) if mode is Mode.VIRTUAL else None,
-        audio=AudioPolicy(enabled=audio),
+        audio=AudioPolicy(enabled=audio), volume=volume,
     )
     await rig.manager.dispatch(Start(receiver_id=destination.receiver_id, request=request))
     await settle(rig)
@@ -64,6 +67,66 @@ async def advance_retry(rig):
     assert state.next_retry_at is not None
     rig.scheduler.advance(state.next_retry_at - rig.clock.now())
     await settle(rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capable,enabled,expected", [
+    (True, True, {"value": 50}), (True, False, None), (False, True, None),
+])
+async def test_reconnect_uses_only_current_policy_and_validated_remembered_volume(capable, enabled, expected):
+    rig = recovery_rig(volume=capable)
+    destination = target()
+    rig.discovery.add_target(destination)
+    restored = replace(
+        SessionSnapshot.idle(destination.receiver_id, online=True), target=destination,
+        mode=Mode.MIRROR, intent_active=True, intent_stage=IntentStage.active,
+        transport=TransportState.Reconnecting, physical_source=physical(),
+        audio_policy=AudioPolicy(enabled=enabled), remembered_volume=50,
+        effective_volume=0, last_audible_volume=40, volume_state="applied",
+    )
+    rig.manager.install(restored)
+    await rig.manager.dispatch(Retry(receiver_id=destination.receiver_id))
+    await settle(rig)
+    call = starts(rig)[0]
+    assert call["initial_volume"] == expected
+    assert call["audio_policy"] == {"enabled": enabled}
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.effective_volume is None and after.last_audible_volume is None
+    assert after.volume_state is None and not after.muted
+    assert not after.audio_close_pending and not after.volume_save_failed
+    assert after.remembered_volume == 50
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_reconnect_uses_current_policy_and_remembered_volume_on_fresh_lease(mode):
+    rig = recovery_rig(volume=True)
+    before = await start_session(rig, mode=mode, audio=True, volume=VolumeLevel(value=30))
+    first = starts(rig)[0]
+    assert first["initial_volume"] == {"value": 30}
+    assert first["audio_policy"] == {"enabled": True}
+    rig.transport.emit(stream_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    waiting = rig.manager.snapshot(target().receiver_id)
+    assert waiting.effective_volume is None and waiting.last_audible_volume is None
+    assert waiting.remembered_volume == 30
+    await advance_retry(rig)
+    second = starts(rig)[1]
+    assert second["initial_volume"] == {"value": 30}
+    assert second["audio_policy"] == {"enabled": True}
+    after = rig.manager.snapshot(target().receiver_id)
+    assert after.transport_lease_id != before.transport_lease_id
+
+
+@pytest.mark.asyncio
+async def test_reconnect_does_not_reuse_explicit_zero_as_remembered_preference():
+    rig = recovery_rig(volume=True)
+    await start_session(rig, mode=Mode.MIRROR, audio=True, volume=VolumeLevel(value=0))
+    assert starts(rig)[0]["initial_volume"] == {"value": 0}
+    rig.transport.emit(stream_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    await advance_retry(rig)
+    assert starts(rig)[1]["initial_volume"] is None
 
 
 def test_network_backoff_is_capped_without_becoming_terminal():
@@ -390,14 +453,18 @@ async def test_stale_reconnect_result_never_revives_or_tears_down_a_new_target(m
     gate = Deferred()
 
     class HeldReconnect(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
             if len(self.journal.calls("transport.start_stream")) == 1 and not getattr(self, "held", False):
                 self.held = True
-                result = (await super().start_stream(destination, source, audio, operation)
+                result = (await super().start_stream(
+                    destination, source, audio, operation, initial_volume=initial_volume,
+                )
                           if outcome == "success" else Err(error=diagnostic(ErrorCode.transport_failed)))
                 await gate.wait()
                 return result
-            return await super().start_stream(destination, source, audio, operation)
+            return await super().start_stream(
+                destination, source, audio, operation, initial_volume=initial_volume,
+            )
 
     rig = recovery_rig(transport=HeldReconnect())
     before = await start_session(rig, mode=mode)
@@ -472,8 +539,10 @@ async def test_pairing_completion_waits_for_original_connection_before_reconnect
     gate = Deferred()
 
     class ConnectingPair(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(
+                destination, source, audio, operation, initial_volume=initial_volume,
+            )
             if not getattr(self, "asked", False):
                 self.asked = True
                 self.emit(TransportEvent(
@@ -553,8 +622,8 @@ async def test_receiver_rejection_notice_is_terminal_after_exact_stream_stop():
 
 @pytest.mark.asyncio
 async def test_fallback_continuity_loss_at_the_same_endpoint_still_invalidates_trust():
-    rig = recovery_rig()
-    before = await start_session(rig)
+    rig = recovery_rig(volume=True)
+    before = await start_session(rig, audio=True, volume=VolumeLevel(value=40))
     view = rig.discovery.current(before.receiver_id)
     view = replace(view, record_set=replace(
         view.record_set, identity_kind="fingerprint", continuity_verified=False,
@@ -565,6 +634,7 @@ async def test_fallback_continuity_loss_at_the_same_endpoint_still_invalidates_t
     after = rig.manager.snapshot(before.receiver_id)
     assert after.trust is TrustState.Untrusted
     assert after.resolution is None
+    assert after.remembered_volume is None
     assert after.stream is None
     assert rig.pairing.journal.calls("pairing.mark_invalid")
     assert after.display_handle == before.display_handle
@@ -594,14 +664,18 @@ async def test_reconnect_completion_rechecks_discovery_even_before_its_notice(ou
     gate = Deferred()
 
     class Held(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
             if not getattr(self, "held", False) and len(self.journal.calls("transport.start_stream")) == 1:
                 self.held = True
-                result = (await super().start_stream(destination, source, audio, operation)
+                result = (await super().start_stream(
+                    destination, source, audio, operation, initial_volume=initial_volume,
+                )
                           if outcome == "success" else Err(error=diagnostic(ErrorCode.transport_failed)))
                 await gate.wait()
                 return result
-            return await super().start_stream(destination, source, audio, operation)
+            return await super().start_stream(
+                destination, source, audio, operation, initial_volume=initial_volume,
+            )
 
     rig = recovery_rig(transport=Held())
     before = await start_session(rig)

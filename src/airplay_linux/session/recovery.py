@@ -286,6 +286,7 @@ class StartupRecovery:
                 intent_active=old.intent_active,
                 intent_stage=IntentStage.recovering if old.intent_active else IntentStage.idle,
                 audio_policy=old.audio_policy,
+                remembered_volume=preference.remembered_volume if continuous and preference else None,
                 session_generation=old.session_generation, trust_generation=old.trust_generation + 1,
                 trust=TrustState.CleanupRequired if tombstone else TrustState.Unknown,
                 last_error=trust_error,

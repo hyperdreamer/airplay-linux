@@ -25,7 +25,7 @@ from airplay_linux.domain.records import SavedReceiver
 from airplay_linux.domain.resources import (
     AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
     ReceiverCapabilities, ResolutionDecision, ResolutionEvidence, Size,
-    StartRequest, TransportState, TrustState, VirtualOutputSource,
+    StartRequest, TransportState, TrustState, VirtualOutputSource, VolumeLevel,
 )
 from airplay_linux.storage import PreferenceAccess, is_ambiguous_identity
 
@@ -360,7 +360,9 @@ class VirtualLifecycle(MirrorLifecycle):
                 return True
             runtime = _virtual_runtime(ctx)
             runtime.recreating = True
-            request = StartRequest(mode=Mode.VIRTUAL, resolution=choice, audio=ctx.state.audio_policy)
+            request = StartRequest(mode=Mode.VIRTUAL, resolution=choice, audio=ctx.state.audio_policy,
+                                   volume=VolumeLevel(value=ctx.state.remembered_volume)
+                                   if ctx.state.remembered_volume is not None else None)
             self.cleanup._stop(ctx, request)
             setattr(ctx, "_task2_cleanup_continue", self.cleanup._continue)
             ctx.apply(intent_stage=IntentStage.reconfiguring, cleanup_pending=False)
@@ -409,8 +411,13 @@ class VirtualLifecycle(MirrorLifecycle):
             ctx.apply(last_error=diagnostic(ErrorCode.unsupported_operation, state.receiver_id))
             return
         operation = ctx.supersede("start") if supersede else ctx.operation()
+        from .audio import audio_runtime
+        audio_runtime(ctx).start_volume = message.request.volume
+        remembered = message.request.volume.value if (self.deps.capabilities().volume
+                      and message.request.volume is not None and message.request.volume.value > 0) else None
         setattr(ctx, "_virtual_runtime", _VirtualRuntime(request=message.request))
         ctx.apply(
+            remembered_volume=remembered,
             operation_id=operation.operation_id, mode=Mode.VIRTUAL, intent_active=True,
             intent_stage=IntentStage.starting, display=DisplayState.Resolving,
             transport=TransportState.Idle, resolution=None, observed_resolution=None,
@@ -647,11 +654,21 @@ class VirtualLifecycle(MirrorLifecycle):
         runtime = _virtual_runtime(ctx)
         runtime.pending_ready = None
         runtime.ready_stream = None
+        from .audio import audio_runtime
+        policy = ctx.state.audio_policy
+        startup_request = runtime.request is not None
+        initial = (audio_runtime(ctx).start_volume
+                   if startup_request else
+                   VolumeLevel(value=ctx.state.remembered_volume)
+                   if ctx.state.remembered_volume is not None else None)
+        if not self.deps.capabilities().volume or not policy.enabled:
+            initial = None
+        runtime.request = None
         operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
         ctx.launch(
             Route.virtual, "transport_start", operation,
-            lambda: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, ctx.state.audio_policy, operation), acquisition=True),
+            lambda policy=policy, initial=initial: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, policy, operation, initial_volume=initial), acquisition=True),
             acquisition=True,
         )
 
