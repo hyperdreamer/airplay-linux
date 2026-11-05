@@ -49,6 +49,50 @@ def display_event(owned, kind="helper_exit", destination=None, **changes):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stop_before_save", [False, True])
+async def test_resolution_uses_shared_preferences_and_publishes_success(monkeypatch, stop_before_save):
+    rig = make_rig()
+    destination = target()
+    original = SavedReceiver(
+        receiver_id=destination.receiver_id, service_metadata=destination.service_records,
+        display_name="Saved name", last_endpoint=destination,
+        continuity_fingerprint=destination.endpoint_fingerprint, credential_ref=None,
+        remembered_resolution=None, remembered_volume=30,
+    )
+    rig.receivers.receivers[destination.receiver_id] = original
+    writer = rig.deps.preferences
+    update = writer.update
+    gate, entered = Deferred(), []
+    async def held(record_set, **kwargs):
+        entered.append((record_set, kwargs))
+        await gate.wait()
+        return await update(record_set, **kwargs)
+    monkeypatch.setattr(writer, "update", held)
+    publications = []
+    subscription = rig.manager.subscribe(publications.append)
+    state = await start_virtual(rig, size=SMALL)
+    assert len(entered) == 1
+    assert entered[0][1]["remembered_resolution"].size == SMALL
+    assert entered[0][1]["still_current"]()
+    if stop_before_save:
+        await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+        await settle(rig)
+    publications.clear()
+    gate.resolve(None)
+    await settle(rig)
+    subscription.close()
+    stored = rig.receivers.receivers[destination.receiver_id]
+    if stop_before_save:
+        assert stored == original
+    else:
+        assert stored.remembered_volume == 30
+        assert stored.remembered_resolution.size == SMALL
+        assert stored.display_name == original.display_name
+        assert publications, "successful preference effects must refresh snapshot subscribers"
+        assert rig.manager.snapshot(destination.receiver_id) == state
+
+
+@pytest.mark.asyncio
 async def test_unknown_mode_precedes_any_output():
     rig = SessionRig(virtual_handlers)
     rig.discovery.add_target(target())

@@ -39,6 +39,7 @@ from airplay_linux.testing.adapters import (
 )
 from airplay_linux.testing.builders import target
 from airplay_linux.testing.time import FakeClock, FakeScheduler
+from airplay_linux.storage.repositories import ReceiverPreferenceWriter
 from airplay_linux.trust.fences import TrustFenceRegistry
 
 from .engine import Handler, ManagerDeps, Route, SessionManager
@@ -92,6 +93,7 @@ class SessionRig:
             audio_probe=self.audio,
             sessions=self.sessions,
             receivers=self.receivers,
+            preferences=ReceiverPreferenceWriter(self.receivers, self.discovery),
             ownerships=self.ownerships,
             fences=self.fences,
             clock=self.clock,

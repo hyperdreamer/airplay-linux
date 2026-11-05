@@ -17,6 +17,7 @@ import shutil
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -29,7 +30,7 @@ from airplay_linux.backend.control import (
 )
 from airplay_linux.capture.physical import KscreenConnectorInventory, PhysicalCaptureProvider
 from airplay_linux.diagnostics.activity import ActivityLog
-from airplay_linux.diagnostics import diagnostic
+from airplay_linux.diagnostics import diagnostic, safe_activity
 from airplay_linux.discovery.identity import IdentityResolver
 from airplay_linux.discovery.zeroconf_adapter import AzcMdnsClient, ZeroconfDiscovery
 from airplay_linux.display.association import KScreenOutputVerifier
@@ -44,7 +45,8 @@ from airplay_linux.display.recovery import DisplayRecovery
 from airplay_linux.display.removal import DisplayRemover
 from airplay_linux.domain.operations import InstanceId, OperationContext
 from airplay_linux.domain.ports import ProcessPort
-from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
+from airplay_linux.domain.identity import ReceiverId
+from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
 from airplay_linux.policy.audio import PipeWirePortalAudioProbe
 from airplay_linux.policy.capabilities import EnvironmentProbe
 from airplay_linux.process.authority import SharedRootAuthority
@@ -78,7 +80,9 @@ from airplay_linux.storage import (
     StorageError,
     decode_launch_receipt,
 )
-from airplay_linux.storage.repositories import LAUNCH_RECEIPT_DIRECTORY, _lifecycle_all
+from airplay_linux.storage.repositories import (
+    LAUNCH_RECEIPT_DIRECTORY, ReceiverPreferenceWriter, _lifecycle_all,
+)
 from airplay_linux.transport.doubletake import DoubleTakeTransport
 from airplay_linux.trust.fences import TrustFenceRegistry
 from airplay_linux.trust.keyring import BackendKeyringStore
@@ -485,7 +489,20 @@ async def _compose_production(
 
     files = AtomicFiles(config.state_root)
     sessions = JsonSessionStore(files)
-    receivers = JsonReceiverStore(files)
+    activity: ActivityLog | None = None
+    pending_preferences: dict[ReceiverId, Diagnostic] = {}
+
+    def preference_diagnostic(warning: Diagnostic) -> None:
+        if activity is None:
+            pending_preferences[warning.receiver_id] = warning
+            return
+        activity.emit(safe_activity(
+            "audio.volume_unavailable", warning.receiver_id,
+            {"reason": "invalid_preference", "error_code": ErrorCode.volume_preference_invalid.value},
+            datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        ))
+
+    receivers = JsonReceiverStore(files, on_diagnostic=preference_diagnostic)
     ownerships = JsonOwnershipStore(files)
     daemons = JsonDaemonStore(files)
 
@@ -538,6 +555,7 @@ async def _compose_production(
 
     resolver = IdentityResolver()
     discovery = ZeroconfDiscovery(resolver, clock, AzcMdnsClient(clock))
+    preferences = ReceiverPreferenceWriter(receivers, discovery)
     portal = PortalClient()
     connectors = KscreenConnectorInventory(source_inventory)
     capture = PhysicalCaptureProvider(portal, connectors, features, ids=ids)
@@ -681,6 +699,12 @@ async def _compose_production(
         return fresh
 
     activity = ActivityLog(max_entries=1000, capabilities=report)
+    for warning in pending_preferences.values():
+        try:
+            preference_diagnostic(warning)
+        except Exception:
+            pass
+    pending_preferences.clear()
     deps = ManagerDeps(
         transport=transport,
         pairing=transport,
@@ -690,6 +714,7 @@ async def _compose_production(
         audio_probe=audio_probe,
         sessions=sessions,
         receivers=receivers,
+        preferences=preferences,
         ownerships=ownerships,
         fences=fences,
         clock=clock,

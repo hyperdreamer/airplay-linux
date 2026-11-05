@@ -785,7 +785,10 @@ class VirtualLifecycle(MirrorLifecycle):
             return True
         if kind == "remember_resolution":
             if isinstance(message.result, Err):
-                ctx.apply(last_error=message.result.error)
+                if message.result.error.code is not ErrorCode.stale_target:
+                    ctx.apply(last_error=message.result.error)
+            else:
+                ctx.apply()  # Preference caches subscribe to fresh publications.
             return True
         return super()._effect(ctx, message)
 
@@ -813,7 +816,7 @@ class VirtualLifecycle(MirrorLifecycle):
             ctx.apply(audio=AudioState.Disabled)
         self._remember(ctx)
 
-    def _remember(self, ctx):
+    def _remember(self, ctx: SessionContext) -> None:
         record_set = self._record_set(ctx)
         choice, observed = ctx.state.resolution, ctx.state.observed_resolution
         if record_set is None or choice is None or observed is None:
@@ -821,29 +824,30 @@ class VirtualLifecycle(MirrorLifecycle):
         remembered = _rememberable(record_set, choice, observed)
         if remembered is None:
             return
-        target = ctx.state.target
-        receiver_id = ctx.state.receiver_id
-        view = self.deps.discovery.current(receiver_id)
+        admitted = ctx.state
+        operation = _current_context(ctx)
+
+        def still_current():
+            state = ctx.state
+            return (
+                state.receiver_id == admitted.receiver_id and state.target == admitted.target
+                and state.session_generation == admitted.session_generation
+                and state.operation_id == admitted.operation_id
+                and state.transport_lease_id == admitted.transport_lease_id
+                and state.stream == admitted.stream
+                and state.trust_generation == admitted.trust_generation
+                and state.online and state.intent_active and not state.cleanup_pending
+                and state.trust not in (TrustState.Pairing, TrustState.CleanupRequired, TrustState.RevocationPending)
+                and state.resolution == choice and state.observed_resolution == observed
+                and state.display_handle == admitted.display_handle
+                and state.accepted_resolution is None
+            )
 
         async def save():
-            latest = await self.deps.receivers.get(receiver_id)
-            if isinstance(latest, Err):
-                return latest
-            current_view = self.deps.discovery.current(receiver_id)
-            if current_view is None or current_view.record_set != record_set:
-                return Ok(value=None)
-            saved = latest.value
-            if saved is None:
-                saved = SavedReceiver(
-                    receiver_id=receiver_id, service_metadata=record_set.records,
-                    display_name=view.display_name, last_endpoint=target,
-                    continuity_fingerprint=record_set.endpoint_fingerprint,
-                    credential_ref=None, remembered_resolution=remembered,
-                )
-            else:
-                saved = replace(saved, remembered_resolution=remembered)
-            return await self.deps.receivers.put(saved)
-        ctx.launch(Route.virtual, "remember_resolution", _current_context(ctx), save)
+            return await self.deps.preferences.update(
+                record_set, remembered_resolution=remembered, still_current=still_current,
+            )
+        ctx.launch(Route.virtual, "remember_resolution", operation, save)
 
     def _transport_event(self, ctx, event):
         if ctx.state.mode is not Mode.VIRTUAL:

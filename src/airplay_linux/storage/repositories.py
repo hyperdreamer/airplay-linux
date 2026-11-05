@@ -22,15 +22,17 @@ an erasure: the bytes stay on disk as evidence for the user's cleanup decision.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import Final, TypeVar
 from uuid import UUID
 from urllib.parse import quote
 
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.identity import ReceiverId, ReceiverRecordSet
+from airplay_linux.domain.identity import ReceiverId, ReceiverRecordSet, ReceiverTarget
+from airplay_linux.domain.ports import DiscoveryPort, ReceiverStore
 from airplay_linux.domain.operations import InstanceId, OwnerId
 from airplay_linux.domain.records import (
     DaemonCleanupIntent,
@@ -41,7 +43,9 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
-from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
+from airplay_linux.domain.resources import (
+    Diagnostic, Err, ErrorCode, Ok, ResolutionDecision, Result, VolumeLevel,
+)
 
 from .atomic import AtomicFiles, StorageError
 from .codecs import (
@@ -566,6 +570,79 @@ class JsonSupervisorReleaseIntentStore:
 # --------------------------------------------------------------------------- preferences
 
 
+class ReceiverPreferenceWriter:
+    """Merge durable preferences under one continuity-checked lock per receiver."""
+
+    def __init__(self, store: ReceiverStore, discovery: DiscoveryPort) -> None:
+        self._store = store
+        self._discovery = discovery
+        self._locks: dict[ReceiverId, asyncio.Lock] = {}
+
+    async def update(
+        self, record_set: ReceiverRecordSet, *,
+        remembered_resolution: ResolutionDecision | None = None,
+        remembered_volume: VolumeLevel | None = None,
+        still_current: Callable[[], bool],
+    ) -> Result[SavedReceiver]:
+        receiver_id = record_set.receiver_id
+        if (
+            (remembered_resolution is None) == (remembered_volume is None)
+            or (remembered_resolution is not None and type(remembered_resolution) is not ResolutionDecision)
+            or (remembered_volume is not None and (
+                type(remembered_volume) is not VolumeLevel or remembered_volume.value == 0
+            ))
+        ):
+            return Err(error=diagnostic(ErrorCode.invalid_input, receiver_id))
+
+        def current(saved: SavedReceiver | None) -> bool:
+            view = self._discovery.current(receiver_id)
+            return (
+                view is not None and view.online and view.record_set == record_set
+                and still_current()
+                and record_set.persistable and not record_set.ambiguous
+                and record_set.identity_kind != "ambiguous"
+                and not is_ambiguous_identity(receiver_id)
+                and record_set.replacement_of is None
+                and (record_set.identity_kind == "device" or record_set.continuity_verified)
+                and (saved is None or PreferenceAccess.for_record_set(record_set, saved) is not None)
+            )
+
+        async with self._locks.setdefault(receiver_id, asyncio.Lock()):
+            latest = await self._store.get(receiver_id)
+            if isinstance(latest, Err):
+                return latest
+            saved = latest.value
+            if not current(saved):
+                return Err(error=diagnostic(ErrorCode.stale_target, receiver_id))
+            if saved is None:
+                view = self._discovery.current(receiver_id)
+                endpoint = ReceiverTarget(
+                    receiver_id=receiver_id, service_records=record_set.records,
+                    canonical_host=record_set.canonical_address,
+                    service_port=record_set.records[0].port if record_set.records else 7000,
+                    protocol="airplay", endpoint_fingerprint=record_set.endpoint_fingerprint,
+                    endpoint_generation=record_set.endpoint_generation,
+                )
+                saved = SavedReceiver(
+                    receiver_id=receiver_id, service_metadata=record_set.records,
+                    display_name=view.display_name, last_endpoint=endpoint,
+                    continuity_fingerprint=record_set.endpoint_fingerprint,
+                    credential_ref=None, remembered_resolution=None, remembered_volume=None,
+                )
+            updated = (
+                replace(saved, remembered_resolution=remembered_resolution)
+                if remembered_resolution is not None
+                else replace(saved, remembered_volume=remembered_volume.value)
+            )
+            result = await self._store.put(updated)
+            if isinstance(result, Err):
+                return result
+            if not current(updated):
+                # An admitted commit is never rolled back over a newer record.
+                return Err(error=diagnostic(ErrorCode.stale_target, receiver_id))
+            return Ok(value=updated)
+
+
 @dataclass(frozen=True, kw_only=True)
 class PreferenceAccess:
     """Decide whether saved preferences still describe *this* identity.
@@ -619,6 +696,7 @@ __all__ = [
     "JsonSessionStore",
     "OWNERSHIP_DIRECTORY",
     "PreferenceAccess",
+    "ReceiverPreferenceWriter",
     "RECEIVER_DIRECTORY",
     "SESSION_DIRECTORY",
 ]

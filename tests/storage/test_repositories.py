@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 from dataclasses import replace
@@ -8,7 +9,9 @@ from uuid import UUID
 import pytest
 
 from airplay_linux.domain import ports
-from airplay_linux.domain.resources import Err, ErrorCode, Ok
+from airplay_linux.domain.resources import Err, ErrorCode, Ok, VolumeLevel
+from airplay_linux.testing.adapters import Deferred, FakeDiscovery, MemoryReceiverStore
+from airplay_linux.testing.builders import target
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.storage import AtomicFiles
 from airplay_linux.storage import codecs, repositories
@@ -110,6 +113,189 @@ async def test_receiver_volume_warnings_are_content_sensitive_and_never_rewrite(
     files.write(key, json.dumps(raw | {"receiver_id": "secret-invalid-identity", "remembered_volume": 0}).encode())
     assert isinstance(await store.all(), Err)
     assert len(warnings) == 3
+
+
+@pytest.fixture
+def interleaved_preferences():
+    class BarrierStore(MemoryReceiverStore):
+        def __init__(self):
+            super().__init__()
+            self.get_entered, self.get_release = Deferred(), Deferred()
+            self.put_entered, self.put_release = Deferred(), Deferred()
+            self.gets = []
+            self.hold_get = self.hold_put = True
+
+        async def get(self, receiver_id):
+            self.gets.append(receiver_id)
+            if receiver_id == target().receiver_id and self.hold_get:
+                self.hold_get = False
+                self.get_entered.resolve(None)
+                await self.get_release.wait()
+            return await super().get(receiver_id)
+
+        async def put(self, record):
+            if record.receiver_id == target().receiver_id and self.hold_put:
+                self.hold_put = False
+                self.put_entered.resolve(None)
+                await self.put_release.wait()
+            return await super().put(record)
+
+    store, discovery = BarrierStore(), FakeDiscovery()
+    discovery.add_target(target())
+    discovery.add_target(target("b", address="192.0.2.11"))
+    return store, discovery
+
+
+def test_preferences_writer_api():
+    writer = repositories.ReceiverPreferenceWriter
+    assert inspect.iscoroutinefunction(writer.update)
+    assert tuple(inspect.signature(writer.update).parameters) == (
+        "self", "record_set", "remembered_resolution", "remembered_volume", "still_current",
+    )
+
+
+@pytest.mark.parametrize("volume_first", [False, True])
+async def test_preferences_merge_both_orderings_and_independent_receivers(interleaved_preferences, volume_first):
+    store, discovery = interleaved_preferences
+    writer = repositories.ReceiverPreferenceWriter(store, discovery)
+    record_set = discovery.current(target().receiver_id).record_set
+    original = saved(remembered_resolution=None)
+    store.receivers[original.receiver_id] = original
+    resolution = saved().remembered_resolution
+    fields = [{"remembered_resolution": resolution}, {"remembered_volume": VolumeLevel(value=30)}]
+    if volume_first:
+        fields.reverse()
+    async with asyncio.TaskGroup() as tasks:
+        first = tasks.create_task(writer.update(record_set, **fields[0], still_current=lambda: True))
+        await asyncio.wait_for(store.get_entered.wait(), 1)
+        attempted = asyncio.Event()
+        async def second_write():
+            attempted.set()
+            return await writer.update(record_set, **fields[1], still_current=lambda: True)
+        second = tasks.create_task(second_write())
+        await attempted.wait()
+        assert store.gets.count(original.receiver_id) == 1
+        other = discovery.current(target("b").receiver_id).record_set
+        independent = await asyncio.wait_for(writer.update(other, remembered_volume=VolumeLevel(value=40), still_current=lambda: True), 1)
+        assert isinstance(independent, Ok)
+        assert store.receivers[other.receiver_id].remembered_volume == 40
+        store.get_release.resolve(None)
+        await asyncio.wait_for(store.put_entered.wait(), 1)
+        assert store.gets.count(original.receiver_id) == 1
+        store.put_release.resolve(None)
+    assert isinstance(first.result(), Ok) and isinstance(second.result(), Ok)
+    assert store.receivers[original.receiver_id] == replace(original, remembered_resolution=resolution, remembered_volume=30)
+    assert second.result().value == store.receivers[original.receiver_id]
+
+
+@pytest.mark.parametrize("kwargs", [
+    {}, {"remembered_volume": VolumeLevel(value=0)}, {"remembered_volume": 30},
+    {"remembered_resolution": "bad"},
+    {"remembered_volume": VolumeLevel(value=30), "remembered_resolution": saved().remembered_resolution},
+])
+async def test_preferences_reject_invalid_arguments_without_io(kwargs):
+    store, discovery = MemoryReceiverStore(), FakeDiscovery()
+    discovery.add_target(target())
+    writer = repositories.ReceiverPreferenceWriter(store, discovery)
+    result = await writer.update(discovery.current(target().receiver_id).record_set, **kwargs, still_current=lambda: True)
+    assert isinstance(result, Err) and result.error.code is ErrorCode.invalid_input
+    assert store.journal.names() == []
+
+
+@pytest.mark.parametrize("phase", ["after_get", "before_put", "after_put"])
+@pytest.mark.parametrize("invalidate", ["intent", "replacement", "offline", "continuity"])
+async def test_preferences_recheck_after_await_and_never_roll_back_newer_bytes(phase, invalidate):
+    discovery = FakeDiscovery()
+    discovery.add_target(target())
+    view = discovery.current(target().receiver_id)
+    record_set = replace(view.record_set, identity_kind="fingerprint") if invalidate == "continuity" else view.record_set
+    discovery.views[target().receiver_id] = replace(view, record_set=record_set)
+    current = True
+    original = saved(remembered_volume=20)
+    newer = replace(original, remembered_volume=80)
+    def invalidate_now():
+        nonlocal current
+        if invalidate == "intent":
+            current = False
+        elif invalidate == "replacement":
+            discovery.add_target(target(endpoint_generation=2))
+        elif invalidate == "offline":
+            discovery.remove_target(original.receiver_id)
+        else:
+            discovery.views[original.receiver_id] = replace(view, record_set=replace(record_set, continuity_verified=False))
+
+    class Store(MemoryReceiverStore):
+        async def get(self, receiver_id):
+            result = await super().get(receiver_id)
+            if phase == "after_get":
+                invalidate_now()
+            return result
+        async def put(self, record):
+            result = await super().put(record)
+            if phase == "after_put":
+                invalidate_now()
+                self.receivers[record.receiver_id] = newer
+            return result
+    store = Store()
+    store.receivers[original.receiver_id] = original
+    if phase == "before_put":
+        invalidate_now()
+    result = await repositories.ReceiverPreferenceWriter(store, discovery).update(
+        record_set, remembered_volume=VolumeLevel(value=30), still_current=lambda: current,
+    )
+    assert isinstance(result, Err) and result.error.code is ErrorCode.stale_target
+    assert store.receivers[original.receiver_id] == (newer if phase == "after_put" else original)
+    assert len(store.journal.calls("receiver_store.put")) == (1 if phase == "after_put" else 0)
+
+
+@pytest.mark.parametrize("change", [
+    {"persistable": False}, {"ambiguous": True}, {"replacement_of": "airplay-device:b"},
+    {"identity_kind": "fingerprint", "continuity_verified": False},
+])
+@pytest.mark.parametrize("exists", [False, True])
+async def test_preferences_refuse_unjustified_identity(change, exists):
+    store, discovery = MemoryReceiverStore(), FakeDiscovery()
+    discovery.add_target(target())
+    view = discovery.current(target().receiver_id)
+    record_set = replace(view.record_set, **change)
+    discovery.views[target().receiver_id] = replace(view, record_set=record_set)
+    if exists:
+        store.receivers[target().receiver_id] = saved()
+    result = await repositories.ReceiverPreferenceWriter(store, discovery).update(
+        record_set, remembered_volume=VolumeLevel(value=30), still_current=lambda: True,
+    )
+    assert isinstance(result, Err) and result.error.code is ErrorCode.stale_target
+    assert not store.journal.calls("receiver_store.put")
+
+
+async def test_preferences_refuse_existing_fallback_record_without_continuity():
+    store, discovery = MemoryReceiverStore(), FakeDiscovery()
+    discovery.add_target(target())
+    view = discovery.current(target().receiver_id)
+    record_set = replace(view.record_set, identity_kind="fingerprint", continuity_verified=True)
+    discovery.views[target().receiver_id] = replace(view, record_set=record_set)
+    original = saved(continuity_fingerprint="older-endpoint", remembered_volume=20)
+    store.receivers[original.receiver_id] = original
+    result = await repositories.ReceiverPreferenceWriter(store, discovery).update(
+        record_set, remembered_volume=VolumeLevel(value=30), still_current=lambda: True,
+    )
+    assert isinstance(result, Err) and result.error.code is ErrorCode.stale_target
+    assert store.receivers[original.receiver_id] == original
+    assert not store.journal.calls("receiver_store.put")
+
+
+async def test_preferences_create_current_metadata_and_preserve_typed_store_failures():
+    store, discovery = MemoryReceiverStore(), FakeDiscovery()
+    discovery.add_target(target())
+    view = discovery.current(target().receiver_id)
+    writer = repositories.ReceiverPreferenceWriter(store, discovery)
+    created = await writer.update(view.record_set, remembered_volume=VolumeLevel(value=30), still_current=lambda: True)
+    assert created == Ok(value=saved(display_name=view.display_name, remembered_resolution=None, remembered_volume=30))
+    failure = Err(error=diagnostic(ErrorCode.persistence_failed, target().receiver_id))
+    for method in ("get", "put"):
+        store.queue_result(method, failure)
+        assert await writer.update(view.record_set, remembered_volume=VolumeLevel(value=40), still_current=lambda: True) == failure
+        assert store.receivers[target().receiver_id] == created.value
 
 
 def test_public_exports_and_receipt_free_process_signature():

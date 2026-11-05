@@ -83,6 +83,7 @@ from airplay_linux.domain.resources import (
     TransportState,
     TrustState,
 )
+from airplay_linux.storage.repositories import ReceiverPreferenceWriter
 from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 
 from .fencing import accept_challenge, accept_cleanup, accept_display, accept_transport
@@ -113,6 +114,7 @@ class ManagerDeps:
     audio_probe: AudioProbe
     sessions: SessionStore
     receivers: ReceiverStore
+    preferences: ReceiverPreferenceWriter
     ownerships: OwnershipStore
     fences: TrustFenceRegistry
     clock: Clock
