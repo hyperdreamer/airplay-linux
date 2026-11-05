@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
 from typing import Final, TypeVar
 from uuid import UUID
 from urllib.parse import quote
@@ -175,8 +176,28 @@ class JsonSessionStore:
 class JsonReceiverStore:
     """``ReceiverStore`` for non-secret saved receivers; never an ambiguous one."""
 
-    def __init__(self, files: AtomicFiles) -> None:
+    def __init__(
+        self, files: AtomicFiles, *, on_diagnostic: Callable[[Diagnostic], None] | None = None,
+    ) -> None:
         self._files = files
+        self._on_diagnostic = on_diagnostic
+        self._invalid_digests: dict[ReceiverId, bytes] = {}
+
+    def _decode(self, payload: bytes) -> SavedReceiver:
+        warnings: list[Diagnostic] = []
+        saved = decode_receiver(payload, on_diagnostic=warnings.append)
+        if warnings:
+            digest = sha256(payload).digest()
+            if self._invalid_digests.get(saved.receiver_id) != digest:
+                self._invalid_digests[saved.receiver_id] = digest
+                if self._on_diagnostic is not None:
+                    try:
+                        self._on_diagnostic(warnings[0])
+                    except Exception:
+                        pass
+        else:
+            self._invalid_digests.pop(saved.receiver_id, None)
+        return saved
 
     async def get(self, receiver_id: ReceiverId) -> Result[SavedReceiver | None]:
         if is_ambiguous_identity(receiver_id):
@@ -189,7 +210,7 @@ class JsonReceiverStore:
         if payload is None:
             return Ok(value=None)
         try:
-            return Ok(value=decode_receiver(payload))
+            return Ok(value=self._decode(payload))
         except RecordError as error:
             return _err(error.reason)
 
@@ -206,7 +227,7 @@ class JsonReceiverStore:
                 payload = self._files.read(f"{RECEIVER_DIRECTORY}/{name}")
                 if payload is None:
                     continue
-                stored.append(decode_receiver(payload))
+                stored.append(self._decode(payload))
             except StorageError as error:
                 return _err(error.step)
             except RecordError as error:

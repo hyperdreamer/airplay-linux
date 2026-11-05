@@ -85,13 +85,19 @@ from airplay_linux.domain.resources import (
     VirtualOutputSource,
 )
 
-#: The one document version this module writes and the only one it reads.
+#: Default document version; receiver preferences have their own v2 writer.
 VERSION: Final[int] = 1
 
 SESSION_SCHEMA: Final[str] = "airplay-linux/session"
 OWNERSHIP_SCHEMA: Final[str] = "airplay-linux/ownership"
 DAEMON_SCHEMA: Final[str] = "airplay-linux/daemon"
 RECEIVER_SCHEMA: Final[str] = "airplay-linux/receiver"
+
+_ACCEPTED_VERSIONS = {
+    SESSION_SCHEMA: frozenset({1}), OWNERSHIP_SCHEMA: frozenset({1}),
+    DAEMON_SCHEMA: frozenset({1}), RECEIVER_SCHEMA: frozenset({1, 2}),
+}
+_WRITE_VERSIONS = {RECEIVER_SCHEMA: 2}
 
 #: The design's reservation stages, exactly.
 OWNERSHIP_STAGES: Final[frozenset[str]] = frozenset(
@@ -739,7 +745,7 @@ ErrorCodec = _Codec(dump=_dump_error, load=_load_error)
 
 
 def _dump_document(schema: str, values: dict[str, object]) -> bytes:
-    document = {"schema": schema, "version": VERSION, **values}
+    document = {"schema": schema, "version": _WRITE_VERSIONS.get(schema, VERSION), **values}
     try:
         text = json.dumps(
             document,
@@ -771,8 +777,10 @@ def _load_document(payload: object, schema: str, fields: tuple[tuple[str, _Codec
     if document.get("schema") != schema:
         raise RecordError("unknown_schema")
     version = document.get("version")
-    if type(version) is not int or version != VERSION:
+    if type(version) is not int or version not in _ACCEPTED_VERSIONS[schema]:
         raise RecordError("unknown_version")
+    if schema == RECEIVER_SCHEMA and version == 2:
+        fields = _RECEIVER_V2_FIELDS
     expected = {name for name, _ in fields} | {"schema", "version"}
     present = set(document)
     if present - expected:
@@ -921,8 +929,16 @@ _RECEIVER_FIELDS: Final[tuple[tuple[str, _Codec], ...]] = (
 )
 
 
+_RECEIVER_V2_FIELDS = _RECEIVER_FIELDS + (
+    ("remembered_volume", _Codec(
+        dump=lambda value: None if value is None else _integer(value, low=1, high=100),
+        load=lambda value: value,
+    )),
+)
+
+
 def encode_receiver(saved: SavedReceiver) -> bytes:
-    """Non-secret receiver preferences, including the remembered resolution.
+    """Non-secret receiver preferences, including resolution and positive volume.
 
     ``credential_ref`` is deliberately *not* representable in version 1 of this
     record, and a saved receiver that still holds one is refused rather than
@@ -943,16 +959,26 @@ def encode_receiver(saved: SavedReceiver) -> bytes:
         _invalid()
     if saved.credential_ref is not None:
         raise RecordError(CREDENTIAL_REFERENCE_CONFLICT.reason)
-    return _dump_document(RECEIVER_SCHEMA, _fields_of(saved, _RECEIVER_FIELDS))
+    return _dump_document(RECEIVER_SCHEMA, _fields_of(saved, _RECEIVER_V2_FIELDS))
 
 
-def decode_receiver(payload: bytes) -> SavedReceiver:
+def decode_receiver(
+    payload: bytes, *, on_diagnostic: Callable[[Diagnostic], None] | None = None,
+) -> SavedReceiver:
     values = _load_document(payload, RECEIVER_SCHEMA, _RECEIVER_FIELDS)
-    # Version 1 has no field for a committed reference, and a decoder may not
-    # invent one. A loaded record therefore never claims a reference; the caller
-    # re-derives it from the credential adapter by receiver id.
+    # Only this leaf is droppable, after all structural and old-member checks.
+    volume = values.get("remembered_volume")
+    invalid_volume = volume is not None and (type(volume) is not int or not 1 <= volume <= 100)
+    values["remembered_volume"] = None if invalid_volume else volume
+    # Credentials are always re-derived from the keyring, never metadata.
     values["credential_ref"] = None
-    return _construct(SavedReceiver, values)  # type: ignore[return-value]
+    saved = _construct(SavedReceiver, values)
+    if invalid_volume and on_diagnostic is not None:
+        try:
+            on_diagnostic(diagnostic(ErrorCode.volume_preference_invalid, saved.receiver_id))
+        except Exception:
+            pass
+    return saved  # type: ignore[return-value]
 
 
 # -------------------------------------------------------------- recorded resolutions

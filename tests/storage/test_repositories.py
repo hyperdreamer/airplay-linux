@@ -8,7 +8,8 @@ from uuid import UUID
 import pytest
 
 from airplay_linux.domain import ports
-from airplay_linux.domain.resources import Ok
+from airplay_linux.domain.resources import Err, ErrorCode, Ok
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.storage import AtomicFiles
 from airplay_linux.storage import codecs, repositories
 import airplay_linux.storage as storage
@@ -31,6 +32,14 @@ async def test_legacy_store_roundtrip_is_byte_identical_while_new_types_are_stri
     for item, encode, decode, directory, store, writer, reader in cases:
         raw = encode(item)
         doc = json.loads(raw)
+        if directory == "receivers":
+            assert doc["version"] == 2
+            assert "remembered_volume" in doc
+            old = {key: value for key, value in doc.items() if key != "remembered_volume"}
+            old["version"] = 1
+            assert decode(json.dumps(old).encode()) == item
+        else:
+            assert doc["version"] == 1
         # Pin delivered duplicate-member and trailing-whitespace tolerance in every family.
         duplicated = b'{"schema":' + json.dumps(doc["schema"]).encode() + b"," + raw[1:] + b" \n\t"
         assert decode(duplicated) == decode(raw)
@@ -66,6 +75,41 @@ async def test_legacy_store_roundtrip_is_byte_identical_while_new_types_are_stri
         for wrong in (None, {}, "invalid", daemon()):
             with pytest.raises(codecs.RecordError):
                 encode(wrong)
+
+
+@pytest.mark.parametrize("raises", [False, True])
+async def test_receiver_volume_warnings_are_content_sensitive_and_never_rewrite(tmp_path, raises):
+    from urllib.parse import quote
+    files = AtomicFiles(tmp_path)
+    warnings = []
+    def receive(warning):
+        warnings.append(warning)
+        if raises:
+            raise RuntimeError("secret callback text")
+    store = repositories.JsonReceiverStore(files, on_diagnostic=receive)
+    original = saved(remembered_volume=30)
+    sibling = saved(receiver_id="airplay-device:b", last_endpoint=None)
+    assert await store.put(sibling) == Ok(value=None)
+    key = "receivers/" + quote(original.receiver_id, safe="") + ".json"
+    raw = json.loads(codecs.encode_receiver(original))
+    async def check_bad(value, count):
+        payload = json.dumps(raw | {"remembered_volume": value}).encode()
+        files.write(key, payload)
+        for _ in range(2):
+            assert await store.get(original.receiver_id) == Ok(value=replace(original, remembered_volume=None))
+            listed = await store.all()
+            assert isinstance(listed, Ok)
+            assert set(item.receiver_id for item in listed.value) == {original.receiver_id, sibling.receiver_id}
+        assert files.read(key) == payload
+        assert warnings == [diagnostic(ErrorCode.volume_preference_invalid, original.receiver_id)] * count
+    await check_bad("secret-invalid-volume", 1)
+    await check_bad(0, 2)
+    files.write(key, codecs.encode_receiver(original))
+    assert await store.all() == Ok(value=(original, sibling))
+    await check_bad(0, 3)
+    files.write(key, json.dumps(raw | {"receiver_id": "secret-invalid-identity", "remembered_volume": 0}).encode())
+    assert isinstance(await store.all(), Err)
+    assert len(warnings) == 3
 
 
 def test_public_exports_and_receipt_free_process_signature():
