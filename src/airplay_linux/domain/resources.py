@@ -97,6 +97,10 @@ class ErrorCode(StrEnum):
     audio_denied = "audio_denied"
     audio_unavailable = "audio_unavailable"
     audio_mute_failed = "audio_mute_failed"
+    audio_volume_failed = "audio_volume_failed"
+    volume_unavailable = "volume_unavailable"
+    volume_preference_invalid = "volume_preference_invalid"
+    volume_preference_failed = "volume_preference_failed"
     receiver_rejected = "receiver_rejected"
     stale_target = "stale_target"
     stale_event = "stale_event"
@@ -190,6 +194,17 @@ CaptureSource: TypeAlias = PhysicalMonitorSource | VirtualOutputSource
 
 
 @dataclass(frozen=True, kw_only=True)
+class VolumeLevel:
+    value: int
+
+    def __post_init__(self) -> None:
+        if type(self.value) is not int:
+            raise TypeError("volume must be an integer")
+        if not 0 <= self.value <= 100:
+            raise ValueError("volume must be between 0 and 100")
+
+
+@dataclass(frozen=True, kw_only=True)
 class AudioPolicy:
     enabled: bool = True
 
@@ -228,6 +243,11 @@ class CapabilityReport:
     remembered_pairing: bool
     additional_virtual_outputs: bool
     diagnostics: tuple[Diagnostic, ...]
+    volume: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.volume) is not bool:
+            raise TypeError("volume capability must be a boolean")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -236,7 +256,10 @@ class StartRequest:
     source: PhysicalMonitorSource | None = None
     resolution: ResolutionDecision | None = None
     audio: AudioPolicy = AudioPolicy()
+    volume: VolumeLevel | None = None
 
     def __post_init__(self) -> None:
+        if self.volume is not None and type(self.volume) is not VolumeLevel:
+            raise TypeError("start volume must be a VolumeLevel or None")
         if self.source is not None and not isinstance(self.source, PhysicalMonitorSource):
             raise TypeError("start source must be a physical monitor")

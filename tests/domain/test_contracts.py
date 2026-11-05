@@ -53,6 +53,157 @@ from airplay_linux.domain.resources import (
 RECEIVER = ReceiverId("airplay-device:001122334455")
 
 
+@pytest.mark.parametrize("n", [0, 1, 100])
+def test_volume_level_exact_integer_boundaries(n):
+    assert resources.VolumeLevel(value=n).value == n
+
+
+@pytest.mark.parametrize("bad", [True, False, 1.0, "30", None])
+def test_volume_level_rejects_nonintegers(bad):
+    with pytest.raises(TypeError, match="^volume must be an integer$"):
+        resources.VolumeLevel(value=bad)
+
+
+@pytest.mark.parametrize("bad", [-1, 101])
+def test_volume_level_rejects_out_of_range(bad):
+    with pytest.raises(ValueError, match="^volume must be between 0 and 100$"):
+        resources.VolumeLevel(value=bad)
+
+
+def test_volume_receipt_distinguishes_missing_and_silent():
+    missing = records.AudioStartReceipt(audio=True)
+    silent = records.AudioStartReceipt(audio=True, volume_state="applied", level=0)
+    assert missing.volume_state is missing.level is None
+    assert silent.level == 0
+    with pytest.raises((TypeError, ValueError)):
+        records.AudioStartReceipt(audio=True, volume_state="applied")
+    with pytest.raises(TypeError, match="^volume command requires a VolumeLevel$"):
+        messages.SetVolume(receiver_id=RECEIVER, level=30)
+
+
+@pytest.mark.parametrize("bad", [True, False, 30, 0, "30", 1.0])
+def test_volume_start_requires_typed_level(bad):
+    with pytest.raises(TypeError, match="^start volume must be a VolumeLevel or None$"):
+        StartRequest(mode=Mode.MIRROR, volume=bad)
+
+
+@pytest.mark.parametrize("n", [0, 1, 100])
+def test_volume_typed_command_event_and_start(n):
+    level = resources.VolumeLevel(value=n)
+    command = messages.SetVolume(receiver_id=RECEIVER, level=level)
+    payload = messages.VolumePayload(level=n, ok=True)
+    assert isinstance(command, messages.Command)
+    assert isinstance(payload, messages.TransportPayload)
+    assert StartRequest(mode=Mode.MIRROR, volume=level).volume is level
+    assert messages.SetVolume in get_args(messages.Command)
+    assert messages.VolumePayload in get_args(messages.TransportPayload)
+    with pytest.raises(FrozenInstanceError):
+        command.level = resources.VolumeLevel(value=0)
+
+
+@pytest.mark.parametrize("field,valid", [
+    ("remembered_volume", (None, 1, 100)), ("last_audible_volume", (None, 1, 100)),
+    ("effective_volume", (None, 0, 1, 100)),
+    ("volume_state", (None, "unrequested", "pending", "applied", "refused")),
+    ("audio_close_pending", (True, False)), ("volume_save_failed", (True, False)),
+])
+def test_volume_snapshot_valid_members(field, valid):
+    for value in valid:
+        snapshot = replace(SessionSnapshot.idle(RECEIVER), **{field: value})
+        assert getattr(snapshot, field) == value
+
+
+@pytest.mark.parametrize("field,invalid", [
+    ("remembered_volume", (0, -1, 101, True, False, 1.0, "30")),
+    ("last_audible_volume", (0, -1, 101, True, False, 1.0, "30")),
+    ("effective_volume", (-1, 101, True, False, 1.0, "30")),
+    ("volume_state", (True, False, 0, 1.0, "", "unknown", [])),
+    ("audio_close_pending", (None, 0, 1, "false", 1.0)),
+    ("volume_save_failed", (None, 0, 1, "false", 1.0)),
+])
+def test_volume_snapshot_rejects_invalid_members(field, invalid):
+    for value in invalid:
+        with pytest.raises((TypeError, ValueError)):
+            replace(SessionSnapshot.idle(RECEIVER), **{field: value})
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("audio", None), ("audio", 0), ("audio", 1), ("audio", "true"),
+    ("volume_state", ""), ("volume_state", "unknown"), ("volume_state", 0),
+    ("volume_state", True), ("volume_state", []),
+    ("level", True), ("level", False), ("level", "30"), ("level", 1.0),
+    ("level", -1), ("level", 101),
+])
+def test_volume_receipt_rejects_invalid_members(field, bad):
+    with pytest.raises((TypeError, ValueError)):
+        records.AudioStartReceipt(**({"audio": True} | {field: bad}))
+
+
+@pytest.mark.parametrize("state", [None, "unrequested", "pending", "applied", "refused"])
+@pytest.mark.parametrize("n", [0, 1, 100])
+def test_volume_receipt_preserves_acknowledged_history(state, n):
+    receipt = records.AudioStartReceipt(audio=True, volume_state=state, level=n)
+    assert receipt.volume_state == state and receipt.level == n
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("level", True), ("level", False), ("level", None), ("level", -1),
+    ("level", 101), ("level", "30"), ("level", 1.0),
+    ("ok", 0), ("ok", 1), ("ok", None), ("ok", "false"),
+])
+def test_volume_event_validates_exact_members(field, bad):
+    with pytest.raises((TypeError, ValueError)):
+        messages.VolumePayload(**({"level": 30, "ok": True} | {field: bad}))
+
+
+@pytest.mark.parametrize("n", [None, 1, 100])
+def test_volume_saved_receiver_allows_only_positive_preferences(n):
+    saved = records.SavedReceiver(receiver_id=RECEIVER, service_metadata=(), display_name="TV",
+        last_endpoint=None, continuity_fingerprint="fp", credential_ref=None,
+        remembered_resolution=None, remembered_volume=n)
+    assert saved.remembered_volume == n
+
+
+@pytest.mark.parametrize("bad", [0, -1, 101, True, False, 1.0, "30"])
+def test_volume_saved_receiver_rejects_invalid_preferences(bad):
+    with pytest.raises((TypeError, ValueError)):
+        records.SavedReceiver(receiver_id=RECEIVER, service_metadata=(), display_name="TV",
+            last_endpoint=None, continuity_fingerprint="fp", credential_ref=None,
+            remembered_resolution=None, remembered_volume=bad)
+
+
+@pytest.mark.parametrize("bad", [None, 0, 1, "true", 1.0])
+def test_volume_capability_is_an_exact_boolean(bad):
+    with pytest.raises(TypeError):
+        resources.CapabilityReport(environment="test", discovery=False, mirror=False,
+            virtual_display=False, audio=False, remembered_pairing=False,
+            additional_virtual_outputs=False, diagnostics=(), volume=bad)
+
+
+def test_volume_contract_defaults_and_port_annotations():
+    report = resources.CapabilityReport(environment="test", discovery=False, mirror=False,
+        virtual_display=False, audio=False, remembered_pairing=False,
+        additional_virtual_outputs=False, diagnostics=())
+    assert report.volume is False
+    assert replace(report, volume=True).volume is True
+    assert StartRequest(mode=Mode.MIRROR).volume is None
+    start = inspect.signature(ports.TransportPort.start_stream)
+    assert tuple(start.parameters) == ("self", "target", "source", "audio_policy", "context", "initial_volume")
+    initial = start.parameters["initial_volume"]
+    assert initial.kind is inspect.Parameter.KEYWORD_ONLY and initial.default is None
+    assert initial.annotation == "VolumeLevel | None"
+    assert start.return_annotation == "Result[StreamHandle]"
+    assert inspect.signature(ports.TransportPort.start_audio).return_annotation == "Result[AudioStartReceipt]"
+    volume = inspect.signature(ports.TransportPort.set_volume)
+    assert tuple(volume.parameters) == ("self", "handle", "level", "context")
+    assert volume.parameters["level"].annotation == "VolumeLevel"
+    assert volume.return_annotation == "Result[int]"
+    close = inspect.signature(ports.TransportPort.close_audio)
+    assert tuple(close.parameters) == ("self", "handle", "context")
+    assert close.return_annotation == "Result[None]"
+
+
+
 @pytest.mark.parametrize(
     ("enum", "values"),
     [
@@ -63,9 +214,9 @@ RECEIVER = ReceiverId("airplay-device:001122334455")
         (TrustState, ("Unknown", "Untrusted", "Trusted", "Pairing", "RevocationPending", "CleanupRequired")),
         (SessionPhase, ("Available", "Offline", "ResolutionRequired", "AudioDecisionRequired", "CreatingDisplay", "Pairing", "Connecting", "Mirroring", "VirtualDisplay", "Reconnecting", "Reconfiguring", "Recovering", "Stopping", "CleanupRequired", "TrustCleanupRequired", "Failed")),
         (IntentStage, ("idle", "starting", "active", "resolution", "audio_decision", "reconfiguring", "recovering", "stopping", "cleanup")),
-        (ErrorCode, ("portal_cancelled", "portal_denied", "keyring_unavailable", "unsupported_source", "unsupported_mode", "unsupported_operation", "dependency_missing", "dependency_incompatible", "audio_denied", "audio_unavailable", "audio_mute_failed", "receiver_rejected", "stale_target", "stale_event", "stale_socket", "ownership_mismatch", "helper_failed", "configuration_failed", "cleanup_timeout", "trust_cleanup_required", "resolution_mismatch", "discovery_failed", "transport_failed", "daemon_failed", "persistence_failed", "invalid_input", "pairing_expired")),
+        (ErrorCode, ("portal_cancelled", "portal_denied", "keyring_unavailable", "unsupported_source", "unsupported_mode", "unsupported_operation", "dependency_missing", "dependency_incompatible", "audio_denied", "audio_unavailable", "audio_mute_failed", "audio_volume_failed", "volume_unavailable", "volume_preference_invalid", "volume_preference_failed", "receiver_rejected", "stale_target", "stale_event", "stale_socket", "ownership_mismatch", "helper_failed", "configuration_failed", "cleanup_timeout", "trust_cleanup_required", "resolution_mismatch", "discovery_failed", "transport_failed", "daemon_failed", "persistence_failed", "invalid_input", "pairing_expired")),
         (RecoveryAction, ("retry", "stop", "back", "choose_mode", "video_only", "retry_audio", "retry_cleanup", "retry_revocation", "keep_blocked", "remove_metadata", "recreate", "confirm_remove", "keep")),
-        (messages.TransportEventKind, ("ready", "stopped", "network_lost", "pairing_required", "credential_invalid", "audio_start_failed", "audio_failed", "audio_recovered", "mute_result", "accepted_mode", "failed", "daemon_exit")),
+        (messages.TransportEventKind, ("ready", "stopped", "network_lost", "pairing_required", "credential_invalid", "audio_start_failed", "audio_failed", "audio_recovered", "mute_result", "volume_result", "accepted_mode", "failed", "daemon_exit")),
     ],
 )
 def test_serialized_enums_round_trip(enum, values):
@@ -133,7 +284,8 @@ def test_idle_snapshot_has_no_acquired_resources_or_pending_intent():
     assert offline.muted is False
     assert offline.session_generation == offline.trust_generation == offline.reconnect_attempt == 0
     assert offline.cleanup_pending is False
-    for name in ("target", "mode", "physical_source", "display_handle", "ownership_uuid", "resolution", "observed_resolution", "accepted_resolution", "stream", "challenge", "last_error", "next_retry_at", "operation_id", "transport_lease_id", "audio_operation_id", "queued_start"):
+    assert offline.audio_close_pending is offline.volume_save_failed is False
+    for name in ("target", "mode", "physical_source", "display_handle", "ownership_uuid", "resolution", "observed_resolution", "accepted_resolution", "stream", "challenge", "last_error", "next_retry_at", "operation_id", "transport_lease_id", "audio_operation_id", "queued_start", "remembered_volume", "effective_volume", "last_audible_volume", "volume_state"):
         assert getattr(offline, name) is None, name
 
 
@@ -301,7 +453,7 @@ def test_protocol_boundaries_exist_without_instantiating_adapters():
         "IdFactory": ("new",), "Subscription": ("close",),
         "DiscoveryPort": ("start", "refresh", "current", "subscribe", "close"),
         "CapturePort": ("list_physical", "select", "verify", "release"),
-        "TransportPort": ("update_target", "query_modes", "start_stream", "stop_stream", "set_muted", "start_audio", "subscribe", "shutdown"),
+        "TransportPort": ("update_target", "query_modes", "start_stream", "stop_stream", "set_muted", "start_audio", "set_volume", "close_audio", "subscribe", "shutdown"),
         "PairingPort": ("begin_pairing", "submit_pairing", "cancel_pairing", "forget_trust", "mark_invalid", "retry_revocation"),
         "CredentialStore": ("load_credential_ref", "prepare_pairing", "commit_pairing", "cancel_pairing", "revoke_pairing", "mark_invalid"),
         "DisplayPort": ("create", "prepare_teardown", "mark_removing", "remove", "reconcile", "approve_orphan", "subscribe"),

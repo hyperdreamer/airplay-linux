@@ -183,6 +183,39 @@ class ProbeVerdict:
 
 
 @dataclass(frozen=True, kw_only=True)
+class AudioStartReceipt:
+    audio: bool
+    volume_state: str | None = None
+    level: int | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.audio) is not bool:
+            raise TypeError("receipt audio must be a boolean")
+        _validate_volume_state(self.volume_state)
+        _validate_optional_volume("receipt level", self.level, minimum=0)
+        if self.volume_state == "applied" and self.level is None:
+            raise ValueError("applied volume requires a level")
+
+
+def _validate_volume_state(state: str | None) -> None:
+    if state is None:
+        return
+    if type(state) is not str:
+        raise TypeError("volume state must be a string or None")
+    if state not in ("unrequested", "pending", "applied", "refused"):
+        raise ValueError("invalid volume state")
+
+
+def _validate_optional_volume(name: str, value: int | None, *, minimum: int) -> None:
+    if value is None:
+        return
+    if type(value) is not int:
+        raise TypeError(f"{name} must be an integer or None")
+    if not minimum <= value <= 100:
+        raise ValueError(f"{name} must be between {minimum} and 100")
+
+
+@dataclass(frozen=True, kw_only=True)
 class SessionSnapshot:
     receiver_id: ReceiverId
     target: ReceiverTarget | None = None
@@ -215,11 +248,24 @@ class SessionSnapshot:
     audio_operation_id: OperationId | None = None
     queued_start: StartRequest | None = None
     cleanup_pending: bool = False
+    remembered_volume: int | None = None
+    effective_volume: int | None = None
+    last_audible_volume: int | None = None
+    volume_state: str | None = None
+    audio_close_pending: bool = False
+    volume_save_failed: bool = False
 
     def __post_init__(self) -> None:
         _validate_generation("session_generation", self.session_generation)
         _validate_generation("trust_generation", self.trust_generation)
         _validate_generation("reconnect_attempt", self.reconnect_attempt)
+        _validate_optional_volume("remembered volume", self.remembered_volume, minimum=1)
+        _validate_optional_volume("effective volume", self.effective_volume, minimum=0)
+        _validate_optional_volume("last audible volume", self.last_audible_volume, minimum=1)
+        _validate_volume_state(self.volume_state)
+        for name in ("audio_close_pending", "volume_save_failed"):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a boolean")
 
     @classmethod
     def idle(cls, receiver_id: ReceiverId, online: bool = False) -> SessionSnapshot:
@@ -241,6 +287,10 @@ class SavedReceiver:
     continuity_fingerprint: str
     credential_ref: OpaqueCredentialRef | None
     remembered_resolution: ResolutionDecision | None
+    remembered_volume: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_optional_volume("remembered volume", self.remembered_volume, minimum=1)
 
 
 @dataclass(frozen=True, kw_only=True)

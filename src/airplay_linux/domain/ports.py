@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     )
     from .records import (
         ActivityEvent,
+        AudioStartReceipt,
         DaemonCleanupIntent,
         DaemonRecord,
         LaunchReceipt,
@@ -55,6 +56,7 @@ if TYPE_CHECKING:
         ReceiverCapabilities,
         Result,
         Size,
+        VolumeLevel,
     )
 
 
@@ -116,7 +118,8 @@ class TransportPort(Protocol):
 
     async def start_stream(
         self, target: ReceiverTarget, source: CaptureSource | None,
-        audio_policy: AudioPolicy, context: OperationContext,
+        audio_policy: AudioPolicy, context: OperationContext, *,
+        initial_volume: VolumeLevel | None = None,
     ) -> Result[StreamHandle]: ...
 
     async def stop_stream(self, handle: StreamHandle, context: OperationContext) -> Result[None]: ...
@@ -125,7 +128,13 @@ class TransportPort(Protocol):
         self, handle: StreamHandle, muted: bool, context: OperationContext,
     ) -> Result[None]: ...
 
-    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]: ...
+    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[AudioStartReceipt]: ...
+
+    async def set_volume(
+        self, handle: StreamHandle, level: VolumeLevel, context: OperationContext,
+    ) -> Result[int]: ...
+
+    async def close_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]: ...
 
     def subscribe(self, callback: Callable[[TransportEvent], None]) -> Subscription: ...
 

@@ -85,6 +85,8 @@ FIELD_SAMPLES: dict[str, str | int | bool] = {
     "error_code": "cleanup_timeout",
     "explicit_video_only": True,
     "remembered": 2,
+    "level": 30,
+    "reason": "backend_unsupported",
 }
 
 #: Every value the frozen domain enumerates for one vocabulary-shaped field.
@@ -102,6 +104,10 @@ ENUMERATED_VALUES: tuple[tuple[str, str], ...] = (
         for member in enum
     )
     + tuple(("command_name", command) for command in sorted(ALLOWED_COMMANDS))
+    + tuple(("reason", reason) for reason in (
+        "backend_unsupported", "startup_refused", "receipt_pending", "receipt_missing",
+        "no_audio", "invalid_preference", "audio_closed", "close_unconfirmed",
+    ))
     + tuple(
         ("reservation_stage", stage)
         for stage in ("reserved", "helper_started", "output_observed", "published", "removing")
@@ -737,6 +743,11 @@ UNPINNED_CODES: Final[frozenset[ErrorCode]] = frozenset(
         # design:365 keeps the prior known audio state on a mute failure and reports
         # the backend error; the matrix enumerates no primary action for that case.
         ErrorCode.audio_mute_failed,
+        # The audio-volume spec pins these separately below, outside the original matrix.
+        ErrorCode.audio_volume_failed,
+        ErrorCode.volume_unavailable,
+        ErrorCode.volume_preference_invalid,
+        ErrorCode.volume_preference_failed,
         # Target-local, retryable events the design describes in prose only:
         # design:439 (discovery), design:402 (a stale event changes nothing),
         # design:355 (bounded invalid-input budget and challenge expiry).
@@ -855,6 +866,92 @@ def test_trust_cleanup_offers_a_way_to_drop_the_saved_metadata():
 
 
 # ------------------------------------------------------------------ activity
+
+
+def test_volume_activity_applied_has_fixed_message_and_integer_field():
+    event = safe_activity("audio.volume_applied", RECEIVER, {"level": 30}, "2026-11-05T00:00:00Z")
+    assert event.message == "Receiver volume was applied."
+    assert dict(event.fields) == {"level": 30}
+    with pytest.raises(TypeError):
+        event.fields["level"] = 40
+
+
+@pytest.mark.parametrize("code,message,recovery", [
+    ("audio_volume_failed", "The audio control change could not be confirmed. The last confirmed audio state is kept. Try the control again, or stop the session.", ("back", "stop")),
+    ("volume_unavailable", "The starting volume could not be confirmed. Audio is withheld. Retry audio, start video only, or stop the session.", ("retry_audio", "video_only", "stop")),
+    ("volume_preference_invalid", "The saved volume is invalid and was ignored. Other receiver preferences are unchanged.", ("back",)),
+    ("volume_preference_failed", "The receiver volume was applied but could not be saved. The previous saved level is kept.", ("back", "stop")),
+])
+def test_volume_catalog_messages_and_recovery_are_fixed(code, message, recovery):
+    item = diagnostic(ErrorCode(code), RECEIVER)
+    assert item.message == message and item.receiver_id == RECEIVER
+    assert tuple(action.value for action in item.recovery) == recovery
+    assert item.detail is None
+
+
+@pytest.mark.parametrize("level", [0, 1, 30, 100])
+def test_volume_activity_bounds_and_export(level):
+    event = safe_activity("audio.volume_applied", RECEIVER, {"level": level}, UTC)
+    log = ActivityLog()
+    log.emit(event)
+    assert json.loads(log.export())["activity"][0]["fields"] == {"level": level}
+
+
+@pytest.mark.parametrize("bad", [True, False, -1, 101, 1.0, "30", None, CANARY_TEXT])
+def test_volume_activity_rejects_invalid_level_without_echo(bad):
+    with pytest.raises((TypeError, ValueError)) as caught:
+        safe_activity("audio.volume_failed", RECEIVER, {"level": bad}, UTC)
+    assert CANARY_TEXT not in str(caught.value)
+
+
+@pytest.mark.parametrize("reason", [
+    "backend_unsupported", "startup_refused", "receipt_pending", "receipt_missing",
+    "no_audio", "invalid_preference", "audio_closed", "close_unconfirmed",
+])
+def test_volume_activity_reason_vocabulary_and_failure_copy(reason):
+    unavailable = safe_activity("audio.volume_unavailable", RECEIVER, {"reason": reason}, UTC)
+    assert unavailable.message == "Receiver volume control is unavailable."
+    assert dict(unavailable.fields) == {"reason": reason}
+    failed = safe_activity("audio.volume_failed", RECEIVER,
+        {"reason": reason, "error_code": ErrorCode.audio_volume_failed}, UTC)
+    assert failed.message == "Receiver audio control change could not be confirmed."
+    assert failed.fields["error_code"] == "audio_volume_failed"
+
+
+@pytest.mark.parametrize("reason", [None, True, 0, "", "unknown", "audio_closed ", CANARY_TEXT])
+def test_volume_activity_refuses_free_form_reason(reason):
+    with pytest.raises((TypeError, ValueError)) as caught:
+        safe_activity("audio.volume_unavailable", RECEIVER, {"reason": reason}, UTC)
+    assert CANARY_TEXT not in str(caught.value)
+
+
+@pytest.mark.parametrize("field", ["level", "reason"])
+def test_volume_fields_reject_hostile_hooks(field):
+    counter = hook_counter()
+    for _, value in hostile_probes(counter):
+        with pytest.raises((TypeError, ValueError)) as caught:
+            safe_activity("audio.volume_failed", RECEIVER, {field: value}, UTC)
+        assert HOOK_CANARY not in str(caught.value)
+    assert counter.calls == []
+
+
+@pytest.mark.parametrize("bad", [0, 1, None, "true", CANARY_TEXT])
+def test_volume_capability_export_validates_forged_leaf(bad):
+    report = capability_report()
+    object.__setattr__(report, "volume", bad)
+    with pytest.raises(TypeError) as caught:
+        ActivityLog(capabilities=report).export()
+    assert str(caught.value) == "capability flags must be booleans"
+
+
+def test_volume_capability_snapshot_is_immutable_and_detached():
+    report = replace(capability_report(), volume=True)
+    log = ActivityLog(capabilities=report)
+    object.__setattr__(report, "volume", False)
+    assert json.loads(log.export())["capabilities"]["volume"] is True
+    assert ("volume", True) in log._capabilities.flags
+    with pytest.raises(AttributeError):
+        object.__setattr__(log._capabilities, "flags", ())
 
 
 def test_allowlist_matches_the_frozen_field_permit():
@@ -1964,6 +2061,7 @@ def test_capability_environment_rejects_non_string_data_cleanly():
         "audio",
         "remembered_pairing",
         "additional_virtual_outputs",
+        "volume",
     ],
 )
 @pytest.mark.parametrize(
@@ -1975,7 +2073,8 @@ def test_capability_export_rejects_unvalidated_flag_values(field, value):
         value = RaisingClassStr(CANARY_TEXT)
     elif value == "raising-object":
         value = RaisingClassObject()
-    report = replace(capability_report(), **{field: value})
+    report = capability_report()
+    object.__setattr__(report, field, value)
     log = ActivityLog(capabilities=report)
 
     with pytest.raises(TypeError) as caught:
@@ -2130,6 +2229,7 @@ def test_genuine_diagnostics_still_export_their_fixed_codes():
         "audio": True,
         "remembered_pairing": True,
         "additional_virtual_outputs": True,
+        "volume": False,
         "diagnostic_codes": ["audio_unavailable", "dependency_missing"],
     }
     vocabulary = {member.value for member in ErrorCode}
@@ -2158,6 +2258,7 @@ def test_export_includes_counts_and_capabilities_only():
         "audio": True,
         "remembered_pairing": False,
         "additional_virtual_outputs": False,
+        "volume": False,
         "diagnostic_codes": ["dependency_missing"],
     }
     assert CANARY not in log.export()
@@ -3269,7 +3370,9 @@ def matrix_report(**leaves: object) -> CapabilityReport:
         additional_virtual_outputs=False,
         diagnostics=(),
     )
-    return replace(report, **leaves)
+    for name, value in leaves.items():
+        object.__setattr__(report, name, value)
+    return report
 
 
 def matrix_activity(fields: object) -> ActivityEvent:
@@ -3403,6 +3506,7 @@ def matrix_slots() -> tuple[MatrixSlot, ...]:
         "audio",
         "remembered_pairing",
         "additional_virtual_outputs",
+        "volume",
     ):
         slots.append(
             MatrixSlot(
@@ -3562,6 +3666,7 @@ def test_the_positive_matrix_covers_every_public_parameter():
         "CapabilityReport.audio",
         "CapabilityReport.remembered_pairing",
         "CapabilityReport.additional_virtual_outputs",
+        "CapabilityReport.volume",
         "CapabilityReport.diagnostics",
         "CapabilityReport.diagnostics.item",
         "CapabilityReport.diagnostics.item.code",
@@ -4145,6 +4250,7 @@ def test_a_retyped_capability_diagnostic_alias_cannot_reach_the_export(hook):
         ("audio", False),
         ("remembered_pairing", True),
         ("additional_virtual_outputs", True),
+        ("volume", True),
         ("diagnostics", ()),
     ],
 )
