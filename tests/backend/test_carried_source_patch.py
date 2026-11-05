@@ -293,7 +293,20 @@ def test_target_volume_patch_executes_carried_contract(tmp_path) -> None:
         "ack30_reject40", "unrequested_reject_first", "queued_pending",
         "queued_applied", "closed_refused", "closed_partial",
     }
+    expected = {
+        "ack30_reject40": (30, "applied", False),
+        "unrequested_reject_first": (None, "unrequested", False),
+        "queued_pending": (30, "pending", False),
+        "queued_applied": (60, "applied", False),
+        "closed_refused": (None, "unrequested", True),
+        "closed_partial": (30, "applied", True),
+    }
     for item in traces:
+        decoded = decode_status(item["status"])
+        assert isinstance(decoded, StatusReply), decoded
+        assert len(decoded.streams) == 1
+        stream = decoded.streams[0]
+        assert (stream.volume, stream.volume_state, stream.audio_closed) == expected[item["trace"]]
         for stream in item["status"]["streams"]:
             assert stream["volume_state"] != "applied" or "volume" in stream
             if item["quiescent"]:

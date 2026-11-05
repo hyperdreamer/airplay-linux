@@ -197,6 +197,69 @@ def _messages(report) -> str:
 # ---------------------------------------------------------------------- matrix
 
 
+@pytest.mark.parametrize("capable", [False, True])
+async def test_volume_report_uses_proven_backend_only_and_preserves_other_gates(capable):
+    result = features(target_volume=capable)
+    report = await probe(backend_probe=backend(Ok(value=result))).check()
+    baseline = await probe().check()
+    assert report.volume is capable
+    for field in ("discovery", "mirror", "virtual_display", "audio", "remembered_pairing",
+                  "additional_virtual_outputs", "diagnostics"):
+        assert getattr(report, field) == getattr(baseline, field)
+
+
+async def test_volume_report_check_cache_and_refresh_follow_new_proof():
+    backend_probe = backend(
+        Ok(value=features()), Ok(value=features(target_volume=True)),
+        Err(error=diagnostic(ErrorCode.dependency_incompatible)),
+    )
+    builder = probe(backend_probe=backend_probe)
+    legacy = await builder.check()
+    assert legacy.volume is False and backend_probe.calls == 1
+    assert await builder.check() is legacy
+    capable = await builder.refresh()
+    assert capable.volume is True and backend_probe.calls == 2
+    refused = await builder.refresh()
+    assert refused.volume is False and backend_probe.calls == 3
+    assert refused.discovery is True
+
+
+async def test_volume_report_does_not_promote_audio_or_mode_or_trust_gates():
+    report = await probe(
+        backend_probe=backend(Ok(value=features(target_volume=True, physical_source=False,
+            virtual_source=False, owned_daemon_control=False, foreground_control=False, owner_handshake=False))),
+        audio_probe=audio(Err(error=diagnostic(ErrorCode.audio_unavailable))),
+    ).check()
+    assert report.volume is True
+    assert report.audio is report.mirror is report.virtual_display is report.remembered_pairing is False
+    assert isinstance(can_start(report, Mode.MIRROR, TrustState.Trusted), Err)
+    assert isinstance(can_start(report, Mode.VIRTUAL, TrustState.RevocationPending), Err)
+
+
+@pytest.mark.parametrize("mode", ["capable", "legacy", "incoherent"])
+async def test_volume_report_from_classified_surface(mode):
+    fixtures = Path(__file__).parents[1] / "fixtures" / "backend"
+    sender = (fixtures / "doubletake-0.5-source-help.txt").read_text()
+    ctl = (fixtures / "doubletake-ctl-0.5-help.txt").read_text()
+    tokens = frozenset({"capabilities-v1", "status-source", "status-source-complete"})
+    if mode != "legacy":
+        old = "  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)"
+        new = (
+            "  connect [target] [--audio on|off] [--volume <0-100>] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n"
+            "  volume <0-100> [target]             Set mirrored audio level (all streams, or only the given IP)\n"
+            "  audio off [target]                  Close mirrored audio (all streams, or only the given IP)"
+        )
+        assert ctl.count(old) == 1
+        ctl = ctl.replace(old, new)
+    if mode == "capable":
+        tokens |= {"target-volume"}
+    classified = features_from_help(sender, ctl, advertised=tokens)
+    report = await probe(backend_probe=backend(Ok(value=classified))).check()
+    assert report.volume is (mode == "capable")
+    assert report.mirror is report.virtual_display is report.remembered_pairing is False
+    assert classified.owned_daemon_control is False
+
+
 async def test_complete_kde_plasma_6_wayland_enables_every_proven_capability():
     report = await probe().check()
 

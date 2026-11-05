@@ -542,6 +542,7 @@ class EnvironmentProbe:
             remembered_pairing=remembered_pairing,
             additional_virtual_outputs=additional_outputs,
             diagnostics=tuple(diagnostics),
+            volume=backend is not None and backend.target_volume,
         )
 
 

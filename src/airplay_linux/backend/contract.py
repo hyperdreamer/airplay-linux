@@ -34,6 +34,7 @@ _KNOWN_STATES: Final[frozenset[str]] = frozenset(
     {"idle", "discovering", "connecting", "streaming", "pin_required"}
 )
 _CREDENTIAL_KINDS: Final[frozenset[str]] = frozenset({"pin", "password"})
+_VOLUME_STATES: Final[frozenset[str]] = frozenset({"unrequested", "pending", "applied", "refused"})
 
 # Exact published control surface of doubletake 0.5.0, transcribed from the
 # pinned source at e18f85d07f74a3b9d49f448762d28f3f7feb3938:
@@ -66,6 +67,13 @@ _PINNED_050_CTL_COMMANDS: Final[dict[str, str]] = {
     "mute": "[target]",
     "unmute": "[target]",
 }
+_VOLUME_CTL_COMMANDS: Final[dict[str, str]] = {
+    **_PINNED_050_CTL_COMMANDS,
+    "connect": "[target] [--audio on|off] [--volume <0-100>] [PIN-or-password]",
+    "volume": "<0-100> [target]",
+    "audio": "off [target]",
+}
+_TARGET_VOLUME_TOKEN: Final[str] = "target-volume"
 _PINNED_050_PROFILE: Final[str] = "doubletake-0.5"
 _PINNED_050_VERSION: Final[str] = "0.5.0"
 # The published ctl usage documents that a target-scoped command addresses only
@@ -122,6 +130,7 @@ class BackendFeatures:
     owned_daemon_control: bool = False
     #: Exact complete-source recognition is installed by the source lane.
     source_reporting_complete: bool = False
+    target_volume: bool = False
 
     def __post_init__(self) -> None:
         if type(self.profile) is not str or type(self.version) is not str:
@@ -206,6 +215,9 @@ class BackendStream:
     audio_muted: bool
     source: BackendSource | None = None
     credential_kind: str | None = None
+    volume: int | None = None
+    volume_state: str | None = None
+    audio_closed: bool | None = None
 
     def __post_init__(self) -> None:
         for name in ("target", "state"):
@@ -226,6 +238,20 @@ class BackendStream:
             raise ValueError("unknown credential kind")
         if self.source is not None and not isinstance(self.source, BackendSource):
             raise TypeError("source must be a BackendSource or None")
+        if self.volume is not None:
+            if type(self.volume) is not int:
+                raise TypeError("stream volume must be an integer or None")
+            if not 0 <= self.volume <= 100:
+                raise ValueError("stream volume must be between 0 and 100")
+        if self.volume_state is not None:
+            if type(self.volume_state) is not str:
+                raise TypeError("stream volume state must be a string or None")
+            if self.volume_state not in _VOLUME_STATES:
+                raise ValueError("unknown stream volume state")
+        if self.volume_state == "applied" and self.volume is None:
+            raise ValueError("applied stream volume requires a level")
+        if self.audio_closed is not None and type(self.audio_closed) is not bool:
+            raise TypeError("stream audio closed must be a boolean or None")
 
     @property
     def device_ip(self) -> str:
@@ -454,6 +480,24 @@ def _decode_stream(value: object) -> BackendStream | None:
         or credential is _INVALID
     ):
         return None
+    volume: int | None = None
+    volume_state: str | None = None
+    audio_closed: bool | None = None
+    if "volume" in data:
+        value = data["volume"]
+        if type(value) is not int or not 0 <= value <= 100:
+            return None
+        volume = value
+    if "volume_state" in data:
+        value = data["volume_state"]
+        if type(value) is not str or value not in _VOLUME_STATES:
+            return None
+        volume_state = value
+    if "audio_closed" in data:
+        value = data["audio_closed"]
+        if type(value) is not bool:
+            return None
+        audio_closed = value
     try:
         return BackendStream(
             device=device,
@@ -463,6 +507,9 @@ def _decode_stream(value: object) -> BackendStream | None:
             audio_muted=audio_muted,
             source=source,
             credential_kind=credential,
+            volume=volume,
+            volume_state=volume_state,
+            audio_closed=audio_closed,
         )
     except (TypeError, ValueError):
         return None
@@ -819,35 +866,34 @@ def features_from_help(
 
     sender_flags = _sender_surface(sender_help)
     ctl_commands = _ctl_surface(ctl_help)
-    ctl_matches = (
-        ctl_commands is not None
-        and {
-            name: command.arguments for name, command in ctl_commands.items()
-        } == _PINNED_050_CTL_COMMANDS
+    signatures = (
+        None if ctl_commands is None
+        else {name: row.arguments for name, row in ctl_commands.items()}
     )
-    patched_surface = (
-        sender_flags == _PINNED_050_SOURCE_SENDER_FLAGS and ctl_matches
+    ctl_pinned = signatures == _PINNED_050_CTL_COMMANDS
+    ctl_volume = (
+        signatures == _VOLUME_CTL_COMMANDS
+        and _target_scope_proven(ctl_commands.get("volume"))
+        and _target_scope_proven(ctl_commands.get("audio"))
+    )
+    source_surface = sender_flags == _PINNED_050_SOURCE_SENDER_FLAGS
+    source_tokens = {_CAPABILITY_SCHEMA_TOKEN, _STATUS_SOURCE_TOKEN} <= set(advertised)
+    target_volume = ctl_volume and source_tokens and _TARGET_VOLUME_TOKEN in advertised
+    inconsistent = (
+        (ctl_volume and not target_volume)
+        or (ctl_pinned and _TARGET_VOLUME_TOKEN in advertised)
     )
     verified = (
-        sender_flags is not None
-        and ctl_commands is not None
-        and (
-            sender_flags == _PINNED_050_SENDER_FLAGS or sender_flags == _PINNED_050_SOURCE_SENDER_FLAGS
-        )
-        and ctl_matches
+        sender_flags in (_PINNED_050_SENDER_FLAGS, _PINNED_050_SOURCE_SENDER_FLAGS)
+        and (ctl_pinned or ctl_volume)
+        and not inconsistent
     )
-    source_complete = patched_surface and {
-        _CAPABILITY_SCHEMA_TOKEN,
-        _STATUS_SOURCE_TOKEN,
-        _STATUS_SOURCE_COMPLETE_TOKEN,
-    } <= set(advertised)
-    if patched_surface and not {
-        _CAPABILITY_SCHEMA_TOKEN,
-        _STATUS_SOURCE_TOKEN,
-    } <= set(advertised):
-        # An extra flag is not an advertisement.  Without the machine-readable
-        # tokens this surface proves nothing, so fall through to the refusal below.
+    if source_surface and not source_tokens:
         verified = False
+    patched_surface = verified and source_surface
+    source_complete = patched_surface and {
+        _CAPABILITY_SCHEMA_TOKEN, _STATUS_SOURCE_TOKEN, _STATUS_SOURCE_COMPLETE_TOKEN,
+    } <= set(advertised)
     if not verified:
         # Unknown, partial, later, foreign, or merely-similar help text proves no
         # public capability and no private one.  Report the observed version text
@@ -898,6 +944,7 @@ def features_from_help(
         query_modes=False,
         source_reporting=patched_surface,
         source_reporting_complete=source_complete,
+        target_volume=target_volume,
     )
 
 

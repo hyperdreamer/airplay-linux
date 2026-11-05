@@ -15,6 +15,7 @@ import pytest
 from airplay_linux.backend.contract import (
     BackendFeatures,
     BackendSource,
+    BackendStream,
     DevicesReply,
     StatusReply,
     _decode_source,
@@ -28,6 +29,222 @@ from airplay_linux.domain.resources import Err, ErrorCode, Ok
 
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "backend"
+
+
+@pytest.fixture
+def volume_help():
+    sender = (FIXTURES / "doubletake-0.5-source-help.txt").read_text()
+    ctl = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    old = "  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)"
+    new = (
+        "  connect [target] [--audio on|off] [--volume <0-100>] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n"
+        "  volume <0-100> [target]             Set mirrored audio level (all streams, or only the given IP)\n"
+        "  audio off [target]                  Close mirrored audio (all streams, or only the given IP)"
+    )
+    assert ctl.count(old) == 1
+    return sender, ctl.replace(old, new), frozenset({
+        "capabilities-v1", "status-source", "status-source-complete", "target-volume",
+    })
+
+
+def test_volume_surface_retains_source_profile(volume_help):
+    sender, ctl, tokens = volume_help
+    features = features_from_help(sender, ctl, advertised=tokens)
+    assert features.profile == "doubletake-0.5+source"
+    assert features.target_volume is True
+    assert features.source_reporting_complete is True
+    assert features.owned_daemon_control is False
+    assert features.target_mute is True and features.multi_target is True
+    for name in ("foreground_control", "owner_handshake", "physical_source", "virtual_source",
+                 "target_bound_pairing", "keyring", "provisional_commit", "audio_restart"):
+        assert getattr(features, name) is False
+
+
+@pytest.mark.parametrize("sender_name,profile,source", [
+    ("doubletake-0.5-help.txt", "doubletake-0.5", False),
+    ("doubletake-0.5-source-help.txt", "doubletake-0.5+source", True),
+])
+@pytest.mark.parametrize("complete", [False, True])
+def test_volume_surface_requires_no_new_profile_or_sender_flags(volume_help, sender_name, profile, source, complete):
+    _, ctl, tokens = volume_help
+    if not complete:
+        tokens -= {"status-source-complete"}
+    features = features_from_help((FIXTURES / sender_name).read_text(), ctl, advertised=tokens)
+    assert features.profile == profile and features.target_volume is True
+    assert features.source_reporting is source
+    assert features.source_reporting_complete is (source and complete)
+
+
+@pytest.mark.parametrize("removed", [
+    {"target-volume"}, {"capabilities-v1"}, {"status-source"},
+    {"capabilities-v1", "status-source", "target-volume", "status-source-complete"},
+])
+def test_volume_partial_advertisement_refuses_whole_surface(volume_help, removed):
+    sender, ctl, tokens = volume_help
+    features = features_from_help(sender, ctl, advertised=tokens - removed)
+    assert features.profile == "doubletake-unknown"
+    assert all(getattr(features, name) is False for name in features.__dataclass_fields__
+               if name not in ("profile", "version"))
+
+
+@pytest.mark.parametrize("sender_name", ["doubletake-0.5-help.txt", "doubletake-0.5-source-help.txt"])
+def test_volume_token_on_legacy_table_refuses_incoherent_pair(volume_help, sender_name):
+    _, _, tokens = volume_help
+    features = features_from_help((FIXTURES / sender_name).read_text(),
+        (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text(), advertised=tokens)
+    assert features.profile == "doubletake-unknown" and features.target_volume is False
+
+
+@pytest.mark.parametrize("row", ["volume", "audio"])
+@pytest.mark.parametrize("replacement", [
+    "only the given host", "not only the given IP", "target ignored; only the given IP",
+    "only the given IP is unsupported", "all streams",
+])
+def test_volume_each_new_row_requires_its_own_affirmative_scope(volume_help, row, replacement):
+    sender, ctl, tokens = volume_help
+    lines = ctl.splitlines()
+    original = next(line for line in lines if line.startswith(f"  {row} "))
+    changed = original.replace("only the given IP", replacement)
+    assert changed != original
+    ctl = ctl.replace(original, changed)
+    features = features_from_help(sender, ctl, advertised=tokens)
+    assert features.profile == "doubletake-unknown"
+    assert features.target_volume is False
+
+
+@pytest.mark.parametrize("old,new", [
+    ("off [target]", "on [target]"), ("off [target]", "[target] off"),
+    ("<0-100> [target]", "[target] <0-100>"),
+    ("[--audio on|off] [--volume <0-100>]", "[--volume <0-100>] [--audio on|off]"),
+    ("[--audio on|off] ", ""),
+])
+def test_volume_wrong_operand_signature_refuses(volume_help, old, new):
+    sender, ctl, tokens = volume_help
+    assert old in ctl
+    features = features_from_help(sender, ctl.replace(old, new), advertised=tokens)
+    assert features.profile == "doubletake-unknown" and features.target_volume is False
+
+
+@pytest.mark.parametrize("row", ["audio", "volume"])
+def test_volume_missing_new_row_refuses_half_installation(volume_help, row):
+    sender, ctl, tokens = volume_help
+    ctl = "\n".join(line for line in ctl.splitlines() if not line.startswith(f"  {row} "))
+    features = features_from_help(sender, ctl, advertised=tokens)
+    assert features.profile == "doubletake-unknown" and features.target_volume is False
+
+
+def test_volume_unknown_tokens_grant_nothing_and_legacy_omission_stays_false(volume_help):
+    sender, ctl, tokens = volume_help
+    features = features_from_help(sender, ctl, advertised=tokens | {"owned-daemon", "arbitrary"})
+    assert features.target_volume and not features.owned_daemon_control
+    legacy = (FIXTURES / "doubletake-ctl-0.5-help.txt").read_text()
+    source = features_from_help(sender, legacy, advertised=tokens - {"target-volume"})
+    assert source.profile == "doubletake-0.5+source" and source.target_volume is False
+    missing = features_from_help(sender, legacy)
+    assert missing.profile == "doubletake-unknown" and missing.target_volume is False
+
+
+@pytest.mark.parametrize("bad", [0, 1, "true", None])
+def test_volume_feature_rejects_nonboolean_gate(volume_help, bad):
+    sender, ctl, tokens = volume_help
+    with pytest.raises(TypeError, match="backend capability target_volume must be a boolean"):
+        replace(features_from_help(sender, ctl, advertised=tokens), target_volume=bad)
+
+
+
+@pytest.fixture
+def volume_status():
+    payload = json.loads((FIXTURES / "status-0.5.json").read_text())
+    stream = dict(payload["streams"][1])
+    stream["audio_muted"] = False
+    return {
+        "ok": True, "state": "streaming", "has_audio": True, "audio_muted": False,
+        "device": stream["device"], "device_ip": stream["device_ip"], "streams": [stream],
+    }
+
+
+@pytest.mark.parametrize("n", [None, 0, 1, 100])
+@pytest.mark.parametrize("state", [None, "unrequested", "pending", "applied", "refused"])
+def test_volume_status_preserves_absence_zero_and_states(volume_status, n, state):
+    stream = volume_status["streams"][0]
+    if n is not None:
+        stream["volume"] = n
+    if state is not None:
+        stream["volume_state"] = state
+    decoded = decode_status(volume_status)
+    if state == "applied" and n is None:
+        assert isinstance(decoded, Err) and decoded.error.code is ErrorCode.dependency_incompatible
+        return
+    assert isinstance(decoded, StatusReply)
+    assert decoded.streams[0].volume == n
+    assert decoded.streams[0].volume_state == state
+    assert decoded.streams[0].audio_closed is None
+    assert not hasattr(decoded, "volume") and not hasattr(decoded, "audio_closed")
+
+
+@pytest.mark.parametrize("field,bad", [
+    ("volume", None), ("volume", True), ("volume", False), ("volume", "30"),
+    ("volume", 30.0), ("volume", -1), ("volume", 101), ("volume", []), ("volume", {}),
+    ("volume_state", None), ("volume_state", True), ("volume_state", 0),
+    ("volume_state", "unknown"), ("volume_state", "Applied"), ("volume_state", []),
+    ("audio_closed", None), ("audio_closed", 0), ("audio_closed", 1),
+    ("audio_closed", "false"), ("audio_closed", []),
+])
+def test_volume_status_refuses_present_invalid_members(volume_status, field, bad):
+    volume_status["streams"][0][field] = bad
+    decoded = decode_status(volume_status)
+    assert isinstance(decoded, Err) and decoded.error.code is ErrorCode.dependency_incompatible
+
+
+@pytest.mark.parametrize("closed", [False, True])
+def test_volume_status_strict_audio_latch_is_per_stream(volume_status, closed):
+    first = volume_status["streams"][0]
+    first.update(volume=0, volume_state="applied", audio_closed=closed)
+    volume_status["streams"].append({
+        "device": "Other", "device_ip": "192.0.2.20", "state": "streaming",
+        "has_audio": True, "audio_muted": False,
+    })
+    decoded = decode_status(volume_status)
+    assert isinstance(decoded, StatusReply)
+    a, b = decoded.streams
+    assert (a.volume, a.volume_state, a.audio_closed) == (0, "applied", closed)
+    assert (b.volume, b.volume_state, b.audio_closed) == (None, None, None)
+
+
+def test_volume_status_never_borrows_foreign_or_aggregate_evidence(volume_status):
+    volume_status.update(volume=30, volume_state="applied", audio_closed=True)
+    first = volume_status["streams"][0]
+    first["volume_state"] = "applied"
+    volume_status["streams"].append({
+        "device": "Other", "device_ip": "192.0.2.20", "state": "streaming",
+        "has_audio": True, "audio_muted": False, "volume": 30,
+        "volume_state": "applied", "audio_closed": True,
+    })
+    assert isinstance(decode_status(volume_status), Err)
+    del first["volume_state"]
+    decoded = decode_status(volume_status)
+    assert isinstance(decoded, StatusReply)
+    assert decoded.streams[0].volume is decoded.streams[0].volume_state is decoded.streams[0].audio_closed is None
+    assert decoded.streams[1].volume == 30 and decoded.streams[1].audio_closed is True
+
+
+@pytest.mark.parametrize("change", [
+    {"volume": True}, {"volume": 1.0}, {"volume": "30"}, {"volume": -1}, {"volume": 101},
+    {"volume_state": True}, {"volume_state": "invalid"}, {"volume_state": "applied"},
+    {"audio_closed": 1}, {"audio_closed": "true"},
+])
+def test_volume_stream_constructor_matches_decoder_validation(change):
+    with pytest.raises((TypeError, ValueError)):
+        BackendStream(device="TV", target="192.0.2.10", state="streaming",
+                      has_audio=True, audio_muted=False, **change)
+
+
+def test_volume_optional_constructor_supports_legacy_and_zero():
+    legacy = BackendStream(device="TV", target="192.0.2.10", state="streaming",
+                           has_audio=True, audio_muted=False)
+    assert legacy.volume is legacy.volume_state is legacy.audio_closed is None
+    zero = replace(legacy, volume=0, volume_state="applied", audio_closed=False)
+    assert zero.volume == 0 and zero.audio_closed is False
 
 
 def test_source_position_must_be_present_and_integral():
