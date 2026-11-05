@@ -1,7 +1,7 @@
 # Audio volume control — design
 
-- **Status:** design revision 4 after independent review rounds 1–3; awaiting review round 4.
-- **Date:** 2026-11-05 (revision 4)
+- **Status:** design revision 5 after independent review rounds 1–4; awaiting review round 5.
+- **Date:** 2026-11-05 (revision 5)
 - **Delivery target:** `/data/home/guest/Development/airplay-linux`, branch `master`, no remote.
 - **Mockup record:** `docs/superpowers/specs/assets/2026-11-05-audio-volume-control-mockup.png`
 
@@ -32,6 +32,18 @@ blockers shared two causes, and both are removed:
 | M1 pending per-stream command work | §5.4.5: one in-flight command per lease, coalesced to the latest desired level, retired on Stop/replacement/audio loss |
 | M2 inventory gaps | §6 adds `cmd/doubletake/main.go`, `runtime.py`, `session/recovery.py`, `testing/adapters.py` |
 | M3 proof gaps | §8 adds live dispatch, two-target isolation, status output and refusal/retry |
+
+**Revision 5** fixes round 4. Round 4's two blockers were both about the receipt channel and about
+one promise that overreached the RTSP layer:
+
+| Round-4 item | Resolution in revision 5 |
+| --- | --- |
+| B1 the startup receipt never reaches the authority | §5.3/§5.4.2: `start_audio` becomes the typed carrier (`AudioStartReceipt`) built from the per-stream status read the transport already performs, so no new poll owner or subscription is invented |
+| B2 "never acknowledged" cannot preserve a retryable stream | §5.1.3/§5.4.4: a complete receiver rejection is recoverable and keeps video; an incomplete or timed-out RTSP response follows the library's existing unusable-connection rule, fails setup and is cleaned up. The retry promise is narrowed to what the protocol can honestly support |
+| M1 coalescing ignores workers that outlive a timeout | §5.4.5: "complete" means the owned worker settled; the next value is drained only after settlement, one worker and one slot per lease |
+| M2 legacy omission of the new status fields | §5.3/§7: the fields stay optional in the shared decoder, and a *capable* backend's missing receipt is refused in the volume path, not in the shared decoder |
+| M3 inventory misses the upstream mapping test | §6 adds `internal/airplay/mirror_setup_test.go`, whose `TestAudioVolumeBody` calls the bool signature |
+| m refused-startup slider admission | §5.4.7: the exception is removed; Retry is the only way out of `refused` |
 
 ## 1. Background
 
@@ -110,11 +122,18 @@ Four behavioural rules:
    silence. Unset reproduces today's 0 dB setup write.
 3. **Audible media is withheld until the level is acknowledged.** When a level was requested, the
    daemon does not start audio capture for that stream until the receiver acknowledges it (the
-   current start point is `internal/daemon/daemon.go:1246`, gated on `session.HasAudio()`). If the
-   write is refused or never acknowledged, audio is **not** flowing and `status` says
-   `volume_state: refused`. A later acknowledged `volume` on the same stream opens audio. This is
+   current start point is `internal/daemon/daemon.go:1246`, gated on `session.HasAudio()`). This is
    local suppression, so it does not depend on the receiver honouring a mute, and it cannot fall
-   back to maximum.
+   back to maximum. Three outcomes are distinguished, because they have different consequences:
+   - **Complete rejection** — the receiver answered and refused. The control connection is still
+     usable, video is unaffected, audio stays withheld, and `status` says `volume_state: refused`.
+     A later acknowledged `volume` on that stream opens audio.
+   - **Incomplete or timed-out response** — the existing rule that an unfinished response leaves the
+     RTSP control connection unusable applies unchanged. Setup fails, the stream is cleaned up by
+     the current failure path, and the application sees an ordinary transport failure. The design
+     makes no stronger promise here, and the write is bounded well inside the application's
+     source-prepared handshake budget so the daemon cannot outlive it silently.
+   - **Never requested** — today's behaviour, unchanged.
 4. **Acknowledge, don't echo.** A stream's stored percent changes only when the receiver
    acknowledged the `SET_PARAMETER` (RTSP 200). `status` reports per stream the optional `volume`
    (integer 0–100, absent until something is acknowledged) and `volume_state`
@@ -172,6 +191,13 @@ twelve literal profile comparisons keep working (`transport/doubletake.py:525`,
   reuse carries the snapshot's value so a retry cannot invent a level.
 - `TransportPort.start_stream(..., initial_volume: VolumeLevel | None)` and
   `TransportPort.set_volume(handle, level, context) -> Result[int]`.
+- `AudioStartReceipt` (`domain/records.py`): `audio: bool`, `volume_state: str | None`,
+  `level: int | None`. `TransportPort.start_audio` returns `Result[AudioStartReceipt]` instead of
+  `Result[None]`. On this profile the transport already fetches exactly one status entry for the
+  stream in `_reported_stream_audio` (`transport/doubletake.py:1131-1155`), so the receipt is built
+  from a read that already happens — no new poll owner, subscription or deadline is introduced, and
+  callers that ignore the receipt keep working. The two new fields stay **optional** in the shared
+  status decoder, which also serves handshake and mute replies.
 - `BackendStream.volume: int | None` and `BackendStream.volume_state: str`, decoded strictly
   (`unrequested|pending|applied|refused`); any other value refuses the status reply.
 - `TransportEventKind.volume_result` with `VolumePayload(level, ok)`; effect kind `volume` joins
@@ -204,23 +230,29 @@ other.
 1. **Startup is capability-conditioned.** `start_stream` receives `initial_volume` only when the
    backend proves `target_volume`, the audio policy is enabled, and a `remembered` level exists.
    Otherwise no level is requested and the stream behaves exactly as today.
-2. **Startup confirmation comes from `status`.** After the exact handle is adopted, the authority
-   waits within the existing connect budget for `volume_state` to leave `pending`:
-   `applied` → `effective = volume`, `last_audible = volume` (when > 0); `refused` → §5.4.4;
-   `unrequested` → `effective` unknown, as on a legacy backend. A timeout leaves `effective`
-   unknown with one diagnostic; it never assumes the level was applied.
+2. **Startup confirmation arrives in the audio-start receipt.** The authority calls
+   `start_audio(handle, context)` as it already does, and reads `AudioStartReceipt.volume_state`:
+   `applied` → `effective = level`, `last_audible = level` (when > 0); `refused` → §5.4.4;
+   `pending` or absent on a capable backend → one diagnostic and `effective` unknown, never assumed;
+   `unrequested` or a legacy backend → `effective` unknown, exactly as today. The deadline is the
+   one that call already has; the authority never invents a second timer.
 3. **A stale result is discarded silently** by operation id, as `session/fencing.py:78` and
    `session/engine.py:532` already do — no event, no diagnostic.
-4. **A refused startup level is recoverable, not fatal.** The daemon is already withholding audio,
-   so the stream is video-only and `volume_unavailable` is reported. `RetryAudio` re-issues
-   `volume <remembered>` on that same stream; the daemon answers with `volume_state = applied` and
-   opens audio, so recovery does not need an audio restart. `Start video only` keeps the current
-   video-only behaviour, and `Stop` tears the stream down. A `has_audio` observation alone never
-   clears the refusal.
-5. **Bounded command work.** At most one `volume` command is in flight per transport lease; newer
-   desired levels coalesce into a single latest value, issued when the current one completes.
-   Queued work is retired on Stop, on lease replacement and on audio loss, so a slider drag cannot
-   accumulate commands. `effective`/`last_audible` change only on acknowledgement.
+4. **A rejected startup level is recoverable; a broken connection is not.** A complete rejection
+   leaves video running and audio withheld, reports `volume_unavailable`, and admits `RetryAudio`,
+   which re-issues `volume <remembered>` on that same stream; the daemon answers with
+   `volume_state = applied` and opens audio, so recovery needs no audio restart. An incomplete or
+   timed-out response is an ordinary transport failure: the stream is cleaned up under the existing
+   rules and the ordinary Retry/Start path applies, with no same-stream promise. `Start video only`
+   keeps the current video-only behaviour and `Stop` tears the stream down. A `has_audio`
+   observation alone never clears a refusal.
+5. **Bounded command work.** One worker and one desired-value slot per transport lease. A newer
+   desired level replaces the slot; the slot is drained only when the current worker has
+   **settled**, not when the public wait timed out — today `_wait` returns on timeout without
+   settling its child (`transport/doubletake.py:493`) while the worker still holds `stream.lock`
+   (`:1165`), so "completion" must mean settlement or a slider drag would accumulate workers
+   behind a surviving lock. The slot is retired on Stop, on lease replacement and on audio loss.
+   `effective`/`last_audible` change only on acknowledgement.
 6. **Lease scoping.** A replacement stream starts with no `effective` and no `last_audible`; it
    acquires them only through its own acknowledgement.
 7. **Transition table** — the whole contract:
@@ -229,7 +261,7 @@ other.
 | --- | --- | --- | --- |
 | Start | `remembered` present, backend proves the capability, audio enabled | `connect … --volume r` | `effective = volume`, `last_audible = volume` |
 | Start | no `remembered`, or no proven capability | `connect` (unchanged) | `effective` unknown |
-| Slider to n ≥ 1 | audio `Enabled`, `Muted`, or a refused startup on this lease | `volume n` | `effective = n`, `last_audible = n`, `remembered = n` then persist |
+| Slider to n ≥ 1 | audio `Enabled` or `Muted` | `volume n` | `effective = n`, `last_audible = n`, `remembered = n` then persist |
 | Slider to 0 | audio `Enabled` or `Muted` | `volume 0` | `effective = 0`, `last_audible` unchanged, `remembered` unchanged |
 | Speaker mute | audio `Enabled` | `volume 0` | `effective = 0`, `last_audible` unchanged |
 | Speaker unmute | `last_audible` known | `volume last_audible` | `effective = last_audible` |
@@ -307,7 +339,7 @@ availability; stale completions emit nothing. `AudioLifecycle._emit()` swallows 
 
 | Area | Files |
 | --- | --- |
-| Backend patch | `vendor/doubletake/0004-target-volume.patch`; backend files `internal/airplay/{mirror,client}.go`, `internal/daemon/*`, `cmd/doubletake-ctl/main.go`, `cmd/doubletake/main.go` |
+| Backend patch | `vendor/doubletake/0004-target-volume.patch`; backend files `internal/airplay/{mirror,client}.go`, `internal/airplay/mirror_setup_test.go` (`TestAudioVolumeBody` calls the bool signature and will not compile), `internal/daemon/*`, `cmd/doubletake-ctl/main.go`, `cmd/doubletake/main.go` |
 | Proof | `backend/contract.py` (surface tables, feature flag, status decode) |
 | Capability producer | `policy/capabilities.py`, `domain/resources.py` (`CapabilityReport.volume`) |
 | Typed control | `backend/control.py`, `process/ownership.py` |
@@ -330,7 +362,9 @@ availability; stale completions emit nothing. `AudioLifecycle._emit()` swallows 
 | Verified backend without volume | Row disabled with one reason; `mute`/`unmute` as today; one diagnostic per session |
 | Incoherent surface | Whole backend refused, exactly as today's unknown surface — never downgraded |
 | Startup level refused | Daemon withholds audio; `volume_state = refused`; `volume_unavailable`; video preserved; Retry re-issues `volume` |
-| Startup level never acknowledged within the connect budget | `effective` unknown, one diagnostic, audio still withheld by the daemon; Retry available |
+| Startup level rejected by the receiver (complete response) | Daemon withholds audio, video keeps running; `volume_unavailable`; Retry re-issues `volume` on that stream |
+| Startup level write times out or the response is incomplete | The library's unusable-connection rule applies: setup fails, the stream is cleaned up, ordinary transport failure; no same-stream promise |
+| Legacy reply omits `volume`/`volume_state` | Accepted as "unknown", never manufactured into an applied level; a **capable** backend's missing receipt is refused in the volume path |
 | Live `volume` refused, failed or timed out | `effective`/`last_audible` unchanged; one diagnostic; audio keeps playing |
 | Stale volume result | Discarded silently |
 | Receiver replaced mid-session | New stream has no `effective`/`last_audible`; a replaced identity inherits no remembered level |
@@ -347,8 +381,9 @@ All offline; no live receiver, no network.
 - **Contract:** both ctl tables recognized; volume row without token refused; token without row
   refused; a volume row whose scope statement is missing, negated or borrowed refused; a source-help
   surface without tokens refused (unchanged); status decode for `volume` absent/0/100/out-of-range/
-  non-integer and every `volume_state`, including an unknown state; profile string unchanged for
-  every surface.
+  non-integer and every `volume_state`, including an unknown state; a legacy status or mute reply that
+  omits both new fields still decodes exactly as today; a capable backend whose receipt is missing is
+  refused in the volume path, not by the shared decoder; profile string unchanged for every surface.
 - **Carried-code proof (Go, offline, GOPROXY=off).** The patch factors its decisions into
   declarations a test can compile against a fake RTSP writer, in the carried-code style of
   `tests/backend/test_carried_source_patch.py`: the mapping, the setup decision, the `volume`
@@ -356,16 +391,24 @@ All offline; no live receiver, no network.
   output. Assertions: 0/1/50/99/100 map exactly and monotonically; the setup write uses the
   requested percent, not 0 dB; unset keeps 0 dB; explicit zero silences; a refused level withholds
   audio and reports `refused`; an acknowledged `volume` afterwards reports `applied` and opens audio;
-  a rejected write leaves the previous acknowledged percent; two targets do not cross; `status`
-  distinguishes absent, 0 and `refused`; the connect parser accepts `--volume` in the documented
-  position, rejects out-of-range, and never treats a flag as a PIN.
+  a rejected write leaves the previous acknowledged percent; an incomplete or withheld response
+  leaves the control connection unusable and fails setup rather than continuing at maximum; two
+  targets do not cross; `status` distinguishes absent, 0 and `refused`; the connect parser accepts
+  `--volume` in the documented position, rejects out-of-range, and never treats a flag as a PIN.
 - **Transport:** `start_stream` passes the initial level into the connect argv only when supplied;
-  an absent target is refused before dispatch; acknowledged level returned; fence respected; timeout
-  leaves `effective` unknown.
+  an absent target is refused before dispatch; acknowledged level returned; `AudioStartReceipt`
+  carries `volume_state` and the level from the same status read; fence respected; a timeout leaves
+  `effective` unknown.
 - **Session (through `SessionManager`):** every row of §5.4.7, including a legacy backend with a
-  saved level, a refused startup followed by Retry, the coalescing queue under a slider drag, Stop
-  during a pending command, and replacement mid-flight; snapshot clearing on reload; FakeTransport
-  parity.
+  saved level, a rejected startup followed by Retry, a timed-out write ending in ordinary cleanup,
+  the coalescing queue under a slider drag with settlement counted (not public timeouts), Stop during
+  a pending command, and replacement mid-flight; snapshot clearing on reload; FakeTransport parity;
+  mute representation stays consistent through zero → audio loss → Retry/recovery → positive level
+  (`AudioRuntime.muted_lease`, `stream.muted`, `snapshot.muted`, `AudioState.Muted`), and **no**
+  backend `mute`/`unmute` command is sent on a volume-capable stream.
+- **Composed:** one `SessionManager` → real transport → scripted control/daemon-fake test that drives
+  a start with a remembered level and asserts the receipt, because handler-only tests cannot show
+  that the receipt reaches the authority.
 - **Storage:** v1 record loads with no level; v2 round-trip; 0 and out-of-range dropped while the
   rest of the record loads; identity corruption still refuses the record; concurrent preference
   writes both survive; `PreferenceAccess` refusal paths withhold the level.
