@@ -156,11 +156,11 @@ async def test_pending_connection_churn_retains_verified_output(churn, outcome):
     gate = Deferred()
 
     class HeldTransport(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
             if getattr(self, "returned", False):
-                return await super().start_stream(destination, source, audio, operation)
+                return await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
             self.returned = True
-            result = (await super().start_stream(destination, source, audio, operation)
+            result = (await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
                       if outcome == "success" else Err(error=diagnostic(ErrorCode.transport_failed)))
             await gate.wait()
             return result
@@ -212,10 +212,10 @@ async def test_retired_connection_cannot_replace_a_new_connection(outcome):
     gate = Deferred()
 
     class FirstHeld(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
             if destination.endpoint_generation != 1:
-                return await super().start_stream(destination, source, audio, operation)
-            result = (await super().start_stream(destination, source, audio, operation)
+                return await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
+            result = (await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
                       if outcome == "success" else Err(error=diagnostic(ErrorCode.transport_failed)))
             await gate.wait()
             return result
@@ -240,8 +240,8 @@ async def test_uncertain_retired_stream_keeps_output_until_exact_cleanup(finish)
     connect = Deferred()
 
     class Held(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
             self.acquired = result.value
             await connect.wait()
             return result
@@ -287,8 +287,8 @@ async def test_stop_joins_inflight_retired_stream_cleanup_before_removing_output
     connect, stop = Deferred(), Deferred()
 
     class Held(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
             await connect.wait()
             return result
 
@@ -398,8 +398,8 @@ class TransportHarness:
         harness = self
 
         class HeldTransport(DoubleTakeTransport):
-            async def start_stream(self, *args):
-                result = await super().start_stream(*args)
+            async def start_stream(self, *args, initial_volume=None):
+                result = await super().start_stream(*args, initial_volume=initial_volume)
                 harness.result = result
                 if harness.gate is not None:
                     await harness.gate.wait()
@@ -481,8 +481,8 @@ async def test_early_ready_must_match_the_eventual_acquired_handle(field):
         def __init__(self):
             super().__init__(ready=False)
 
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
             handle = result.value
             changed = "another-stream" if field == "backend_stream_id" else UUID(int=999999)
             wrong = replace(handle, **{field: changed})
@@ -512,8 +512,8 @@ async def test_ready_queued_between_transport_return_and_actor_adoption_is_not_l
         def __init__(self):
             super().__init__(ready=False)
 
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
             asyncio.get_running_loop().call_soon(self.emit, TransportEvent(
                 kind=TransportEventKind.ready, receiver_id=destination.receiver_id,
                 stream=result.value, endpoint_fingerprint=destination.endpoint_fingerprint,

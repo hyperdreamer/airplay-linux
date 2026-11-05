@@ -42,6 +42,7 @@ from airplay_linux.domain.records import (
     SessionSnapshot,
 )
 from airplay_linux.domain.resources import (
+    AudioPolicy,
     AudioState,
     CapabilityReport,
     DisplayState,
@@ -231,6 +232,93 @@ def idle_snapshot_fixture() -> SessionSnapshot:
 @pytest.fixture(name="view_inputs")
 def view_inputs_fixture() -> ViewInputs:
     return inputs()
+
+
+# --------------------------------------------------------------------------- volume
+
+_VOLUME_UNSUPPORTED = "The installed backend does not support receiver volume."
+_VOLUME_START = "Start a stream to change receiver volume."
+_VOLUME_AUDIO = "Receiver volume is unavailable while audio is off or unconfirmed."
+_VOLUME_CLEANUP = "Wait for cleanup before changing receiver volume."
+_VOLUME_TRUST = "Resolve receiver trust before changing its volume."
+_VOLUME_READY = "Set this receiver's volume; 0% mutes it."
+
+
+@pytest.mark.parametrize("changes,reason", [
+    ({}, _VOLUME_READY),
+    ({"stream": None, "audio": AudioState.Unavailable, "cleanup_pending": True,
+      "trust": TrustState.CleanupRequired}, _VOLUME_START),
+    ({"transport": TransportState.Connecting}, _VOLUME_START),
+    ({"transport": TransportState.Idle}, _VOLUME_START),
+    ({"audio_policy": AudioPolicy(enabled=False), "cleanup_pending": True,
+      "trust": TrustState.CleanupRequired}, _VOLUME_AUDIO),
+    ({"audio_close_pending": True}, _VOLUME_AUDIO),
+    ({"audio": AudioState.Disabled}, _VOLUME_AUDIO),
+    ({"audio": AudioState.Starting}, _VOLUME_AUDIO),
+    ({"audio": AudioState.Unavailable}, _VOLUME_AUDIO),
+    ({"intent_stage": IntentStage.audio_decision}, _VOLUME_AUDIO),
+    ({"cleanup_pending": True, "trust": TrustState.CleanupRequired}, _VOLUME_CLEANUP),
+    ({"display": DisplayState.CleanupRequired}, _VOLUME_CLEANUP),
+    ({"phase": SessionPhase.Stopping}, _VOLUME_CLEANUP),
+    ({"phase": SessionPhase.CleanupRequired}, _VOLUME_CLEANUP),
+    ({"trust": TrustState.Pairing}, _VOLUME_TRUST),
+    ({"trust": TrustState.RevocationPending}, _VOLUME_TRUST),
+    ({"trust": TrustState.CleanupRequired}, _VOLUME_TRUST),
+    ({"phase": SessionPhase.Reconnecting}, _VOLUME_START),
+    ({"phase": SessionPhase.Pairing}, _VOLUME_START),
+    ({"phase": SessionPhase.Available}, _VOLUME_START),
+])
+def test_volume_projection_reason_precedence(changes, reason):
+    state = replace(_mirroring_state(), effective_volume=37, **changes)
+    pane = project(state, inputs(capabilities=capabilities(volume=True)))
+    assert pane.volume_supported
+    assert pane.volume_enabled is (reason == _VOLUME_READY)
+    assert pane.volume_tooltip == reason
+    assert pane.volume_level == 37 and pane.volume_readout == "37%"
+    if reason != _VOLUME_READY:
+        assert not pane.mute_enabled and Action.mute not in pane.actions
+    unsupported = project(state, inputs(capabilities=capabilities(volume=False)))
+    assert not unsupported.volume_supported and not unsupported.volume_enabled
+    assert unsupported.volume_tooltip == _VOLUME_UNSUPPORTED
+
+
+@pytest.mark.parametrize("level,readout", [(None, "—"), (0, "Mute"), (1, "1%"), (100, "100%")])
+@pytest.mark.parametrize("audio", [AudioState.Enabled, AudioState.Muted, AudioState.Unavailable, AudioState.Disabled])
+def test_volume_readout_uses_only_acknowledged_history(level, readout, audio):
+    state = replace(_mirroring_state(), effective_volume=level, last_audible_volume=65,
+                    remembered_volume=82, audio=audio)
+    pane = project(state, inputs(capabilities=capabilities(volume=True)))
+    assert pane.volume_level == level and pane.volume_readout == readout
+    assert pane.volume_enabled is (audio in (AudioState.Enabled, AudioState.Muted))
+
+
+def test_volume_saved_offline_selection_has_start_reason_and_unknown_readout():
+    pane = project(idle(online=False, target=None, phase=SessionPhase.Offline),
+                   inputs(receiver=None, capabilities=capabilities(volume=True)))
+    assert pane.volume_tooltip == _VOLUME_START
+    assert not pane.volume_enabled and pane.volume_readout == "—"
+
+
+@pytest.mark.parametrize("level,readout", [(30, "30%"), (0, "Mute")])
+def test_volume_save_warning_keeps_applied_readout(level, readout):
+    state = replace(_mirroring_state(), effective_volume=level, volume_save_failed=True)
+    pane = project(state, inputs(capabilities=capabilities(volume=True)))
+    assert pane.volume_save_failed and pane.volume_readout == readout
+    assert pane.notice == "Applied, but could not be saved."
+
+
+@pytest.mark.parametrize("policy,pending", [(False, False), (False, True), (True, True)])
+def test_volume_close_decision_offers_fresh_close_and_stop_only(policy, pending):
+    state = replace(_mirroring_state(), intent_stage=IntentStage.audio_decision,
+                    phase=SessionPhase.AudioDecisionRequired, audio=AudioState.Unavailable,
+                    audio_policy=AudioPolicy(enabled=policy), audio_close_pending=pending,
+                    effective_volume=30)
+    pane = project(state, inputs(capabilities=capabilities(volume=True)))
+    assert pane.actions == frozenset({Action.video_only, Action.stop})
+    assert not pane.mute_enabled and not pane.volume_enabled
+    assert pane.volume_readout == "30%"
+    legacy = project(state, inputs(capabilities=capabilities(volume=False)))
+    assert legacy.actions == frozenset({Action.retry_audio, Action.video_only, Action.cancel})
 
 
 # --------------------------------------------------------------------------- matrix

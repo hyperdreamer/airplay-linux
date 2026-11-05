@@ -21,6 +21,7 @@ pumped explicitly by ``rig.settle`` (which never sleeps for wall-clock time).
 from __future__ import annotations
 
 import asyncio
+import json
 from dataclasses import replace
 from typing import Any
 from uuid import UUID
@@ -39,6 +40,7 @@ from airplay_linux.domain.messages import (
     CommandReceipt,
     ConfirmOrphanRemoval,
     ConfirmSwitch,
+    DiscoveryEvent,
     Forget,
     KeepCleanup,
     Pair,
@@ -48,6 +50,7 @@ from airplay_linux.domain.messages import (
     RetryCleanup,
     RetryRevocation,
     SetMuted,
+    SetVolume,
     Start,
     StartVideoOnly,
     Stop,
@@ -72,6 +75,7 @@ from airplay_linux.domain.records import (
     SessionSnapshot,
 )
 from airplay_linux.domain.resources import (
+    AudioPolicy,
     AudioState,
     CapabilityReport,
     Diagnostic,
@@ -89,6 +93,7 @@ from airplay_linux.domain.resources import (
     Size,
     TransportState,
     TrustState,
+    VolumeLevel,
 )
 from airplay_linux.testing.adapters import (
     Deferred,
@@ -114,7 +119,7 @@ HD_READY = Size(width=1280, height=720)
 #: Every type the frozen ``Command`` union admits; nothing else may be dispatched.
 COMMAND_TYPES: tuple[type, ...] = (
     Start, Stop, Cancel, Retry, SubmitPairing, Pair, Forget, ChooseResolution,
-    ChangeResolution, RecreateAccepted, SetMuted, RetryAudio, StartVideoOnly,
+    ChangeResolution, RecreateAccepted, SetMuted, SetVolume, RetryAudio, StartVideoOnly,
     RetryCleanup, RetryRevocation, KeepCleanup, ConfirmSwitch, ConfirmOrphanRemoval,
 )
 
@@ -1100,7 +1105,9 @@ async def test_an_idle_mode_request_is_local_and_per_receiver(rig: PresenterRig)
 # ---------------------------------------------------------------------- audio
 
 
-async def test_audio_actions_affect_only_the_selected_receiver(rig: PresenterRig) -> None:
+@pytest.mark.parametrize("capable", [False, True])
+async def test_audio_actions_affect_only_the_selected_receiver(rig: PresenterRig, capable) -> None:
+    rig.capabilities = capability_report(volume=capable)
     rig.discover("a")
     rig.discover("b")
     prepared = await started(rig)
@@ -1129,6 +1136,204 @@ async def test_audio_actions_affect_only_the_selected_receiver(rig: PresenterRig
     await prepared.settle()
     (retry,) = prepared.commands_of(RetryAudio)
     assert retry.receiver_id == RECEIVER_B
+
+
+async def test_volume_dispatch_captures_receiver_and_never_writes_preferences(rig: PresenterRig):
+    rig.capabilities = capability_report(volume=True)
+    rig.discover("a")
+    rig.discover("b")
+    await rig.start()
+    mirror_snapshot(rig, "a", effective_volume=30)
+    mirror_snapshot(rig, "b", effective_volume=60)
+    await rig.settle()
+    rig.select("a")
+    rig.window.volume_requested.emit(44)
+    rig.select("b")  # change selection before either scheduled dispatch starts
+    rig.window.volume_requested.emit(71)
+    await rig.settle()
+    assert [(c.receiver_id, c.level) for c in rig.commands_of(SetVolume)] == [
+        (RECEIVER_A, VolumeLevel(value=44)), (RECEIVER_B, VolumeLevel(value=71)),
+    ]
+    assert all(type(command) in COMMAND_TYPES for command in rig.manager.commands)
+    assert not rig.receivers.journal.calls("receiver_store.put")
+    rig.manager.commands.clear()
+    rig.select("a")
+    rig.presenter._request_render()
+    await rig.settle()
+    assert rig.manager.commands == []
+    assert rig.window._volume_readout.text() == "30%"
+
+
+@pytest.mark.parametrize("invalid", [-1, 101, True, 1.5, "30", None])
+async def test_volume_presenter_validates_exact_integer(rig: PresenterRig, invalid):
+    rig.capabilities = capability_report(volume=True)
+    rig.discover()
+    await rig.start()
+    mirror_snapshot(rig)
+    await rig.settle()
+    rig.presenter._on_volume_requested(invalid)
+    await rig.settle()
+    assert rig.manager.commands == []
+
+
+@pytest.mark.parametrize("block", ["capability", "selection", "stream", "audio", "trust", "cleanup", "close"])
+async def test_volume_disabled_malicious_signal_is_rejected(rig: PresenterRig, block):
+    rig.capabilities = capability_report(volume=block != "capability")
+    if block != "selection":
+        rig.discover()
+    await rig.start()
+    if block != "selection":
+        changes = {
+            "stream": {"stream": None}, "audio": {"audio": AudioState.Unavailable},
+            "trust": {"trust": TrustState.Pairing}, "cleanup": {"cleanup_pending": True},
+            "close": {"audio_close_pending": True, "audio_policy": AudioPolicy(enabled=False)},
+        }.get(block, {})
+        mirror_snapshot(rig, **changes)
+    await rig.settle()
+    rig.window.volume_requested.emit(42)
+    rig.window.mute_requested.emit(True) if block in {"trust", "cleanup", "close"} else None
+    await rig.settle()
+    assert rig.manager.commands == []
+
+
+@pytest.mark.parametrize("stage", ["shutting_down", "disposed"])
+async def test_volume_close_lifecycle_rejects_signals(rig: PresenterRig, stage):
+    rig.capabilities = capability_report(volume=True)
+    rig.discover()
+    await rig.start()
+    mirror_snapshot(rig)
+    await rig.settle()
+    if stage == "shutting_down":
+        gate = rig.hold_shutdown()
+        rig.window.closing_requested.emit()
+    else:
+        await rig.presenter.close()
+    rig.window.volume_requested.emit(42)
+    await rig.settle()
+    assert rig.manager.commands == []
+    if stage == "shutting_down":
+        gate.set_result(None)
+        await rig.settle()
+
+
+@pytest.mark.parametrize("capable,enabled", [(True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_volume_start_request_uses_only_approved_capable_preference(rig: PresenterRig, capable, enabled, mode):
+    rig.capabilities = capability_report(volume=capable)
+    rig.discover()
+    rig.receivers.receivers[RECEIVER_A] = saved_receiver(remembered_volume=35)
+    await rig.start()
+    rig.snapshot(intent_active=not enabled, audio_policy=AudioPolicy(enabled=enabled))
+    await rig.settle()
+    request = rig.presenter._start_request(RECEIVER_A, mode)
+    assert request.volume == (VolumeLevel(value=35) if capable and enabled else None)
+    assert request.audio.enabled is enabled
+    assert rig.manager.commands == []
+    if enabled:
+        rig.request_mode(mode)
+        rig.click(Action.start)
+        await rig.settle()
+        assert rig.commands_of(Start)[0].request.volume == request.volume
+
+
+@pytest.mark.parametrize("identity", ["absent", "replacement", "ambiguous", "nonpersistable", "unverified", "changed-fallback", "invalid-volume"])
+async def test_volume_start_drops_unjustified_or_invalid_saved_preference(rig: PresenterRig, identity):
+    from airplay_linux.storage.codecs import decode_receiver, encode_receiver
+    rig.capabilities = capability_report(volume=True)
+    rig.discover()
+    saved = saved_receiver(remembered_volume=35)
+    if identity == "invalid-volume":
+        raw = json.loads(encode_receiver(saved)) | {"remembered_volume": 0}
+        saved = decode_receiver(json.dumps(raw).encode())
+    if identity != "absent":
+        rig.receivers.receivers[RECEIVER_A] = saved
+    if identity in {"replacement", "ambiguous", "nonpersistable", "unverified", "changed-fallback"}:
+        view = rig.discovery.current(RECEIVER_A)
+        changes = {
+            "replacement": {"replacement_of": RECEIVER_B}, "ambiguous": {"ambiguous": True},
+            "nonpersistable": {"persistable": False},
+            "unverified": {"identity_kind": "service", "continuity_verified": False},
+            "changed-fallback": {"identity_kind": "service", "continuity_verified": True},
+        }[identity]
+        rig.discovery.views[RECEIVER_A] = replace(view, record_set=replace(view.record_set, **changes))
+    await rig.start()
+    rig.snapshot()
+    await rig.settle()
+    rig.click(Action.start)
+    await rig.settle()
+    assert rig.commands_of(Start)[0].request.volume is None
+
+
+async def test_volume_snapshot_reload_coalesces_and_latest_preference_wins(rig: PresenterRig):
+    rig.capabilities = capability_report(volume=True)
+    rig.discover("a")
+    rig.discover("b")
+    old = saved_receiver("a", remembered_volume=10)
+    other = saved_receiver("b", remembered_volume=85)
+    rig.receivers.receivers.update({RECEIVER_A: old, RECEIVER_B: other})
+    await rig.start()
+    snapshot = mirror_snapshot(rig)
+    rig.snapshot("b")
+    await rig.settle()
+    calls = len(rig.receivers.journal.calls("receiver_store.all"))
+    first, second = Deferred(), Deferred()
+    rig.receivers.queue_result("all", first)
+    rig.receivers.queue_result("all", second)
+    rig.receivers.receivers[RECEIVER_A] = replace(old, remembered_volume=20)
+    rig.manager.emit_snapshot(snapshot)  # equal publication still refreshes
+    await rig.settle()
+    assert len(rig.receivers.journal.calls("receiver_store.all")) == calls + 1
+    rig.select("b")
+    rig.receivers.receivers[RECEIVER_A] = replace(old, remembered_volume=60)
+    rig.manager.emit_snapshot(snapshot)
+    rig.manager.emit_snapshot(snapshot)
+    await rig.settle()
+    assert len(rig.receivers.journal.calls("receiver_store.all")) == calls + 1
+    first.resolve(Ok(value=(replace(old, remembered_volume=20), other)))
+    await rig.settle()
+    assert len(rig.receivers.journal.calls("receiver_store.all")) == calls + 2
+    assert rig.presenter._start_request(RECEIVER_A, Mode.MIRROR).volume == VolumeLevel(value=10)
+    second.resolve(Ok(value=(replace(old, remembered_volume=60), other)))
+    await rig.settle()
+    assert rig.presenter._start_request(RECEIVER_A, Mode.MIRROR).volume == VolumeLevel(value=60)
+    assert rig.presenter._start_request(RECEIVER_B, Mode.MIRROR).volume == VolumeLevel(value=85)
+    assert rig.presenter._selected == RECEIVER_B
+    assert rig.manager.commands == []
+
+
+async def test_volume_delayed_reload_rechecks_replaced_identity(rig: PresenterRig):
+    rig.capabilities = capability_report(volume=True)
+    rig.discover()
+    old = saved_receiver(remembered_volume=25)
+    rig.receivers.receivers[RECEIVER_A] = old
+    await rig.start()
+    snapshot = mirror_snapshot(rig)
+    await rig.settle()
+    gate = Deferred()
+    rig.receivers.queue_result("all", gate)
+    rig.manager.emit_snapshot(snapshot)
+    await rig.settle()
+    view = rig.discovery.current(RECEIVER_A)
+    replacement = replace(view, record_set=replace(view.record_set, replacement_of=RECEIVER_B))
+    rig.discovery.views[RECEIVER_A] = replacement
+    rig.discovery.emit(DiscoveryEvent(kind="updated", receiver=replacement, diagnostic=None))
+    await rig.settle()
+    gate.resolve(Ok(value=(replace(old, remembered_volume=60),)))
+    await rig.settle()
+    assert rig.presenter._start_request(RECEIVER_A, Mode.MIRROR).volume is None
+    assert rig.manager.commands == []
+
+
+@pytest.mark.parametrize("supported", [False, True])
+async def test_volume_empty_window_uses_current_capability_reason(rig: PresenterRig, supported):
+    rig.capabilities = capability_report(volume=supported)
+    await rig.start()
+    assert rig.window._volume_slider.toolTip() == (
+        "Select a receiver to change its volume." if supported
+        else "The installed backend does not support receiver volume."
+    )
+    assert rig.window._volume_readout.text() == "—"
+    assert rig.manager.commands == []
 
 
 async def test_audio_decision_requires_an_explicit_choice(rig: PresenterRig) -> None:

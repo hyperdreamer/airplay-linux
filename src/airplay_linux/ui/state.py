@@ -163,6 +163,12 @@ class PaneState:
     # A Mirror start is connecting but no capture source exists yet: the desktop
     # is showing its own screen prompt, which this application cannot render.
     awaiting_capture: bool = False
+    volume_supported: bool = False
+    volume_enabled: bool = False
+    volume_level: int | None = None
+    volume_readout: str = "—"
+    volume_tooltip: str = ""
+    volume_save_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -364,20 +370,28 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
     ownership = _ownership_for(snapshot, inputs)
     orphans = _orphans_for(snapshot, inputs)
     decision = _decide(snapshot, inputs, ownership, orphans)
+    volume_enabled, volume_reason = _volume_control(snapshot, inputs)
+    actions = decision.actions
+    if inputs.capabilities.volume and not volume_enabled:
+        actions = actions - {Action.mute}
+    notice = decision.notice
+    if snapshot.volume_save_failed:
+        notice = "Applied, but could not be saved."
+    level = snapshot.effective_volume
     return PaneState(
         title=_title(snapshot, inputs),
         phase_label=_phase_label(snapshot),
         badges=_badges(snapshot, ownership),
-        actions=decision.actions,
+        actions=actions,
         mode_enabled=_mode_enabled(snapshot, ownership),
         visible_mode=_visible_mode(snapshot, inputs),
         primary_label=decision.primary,
         source_enabled=_source_enabled(snapshot, inputs),
         resolution_enabled=_resolution_enabled(snapshot, inputs),
-        mute_enabled=Action.mute in decision.actions,
+        mute_enabled=Action.mute in actions,
         muted=bool(snapshot.muted),
         challenge=_actionable_challenge(snapshot),
-        notice=decision.notice,
+        notice=notice,
         diagnostic=_diagnostic(snapshot, inputs, decision, orphans),
         retained_output=_retained_output(snapshot, ownership),
         capability_blocked=decision.kind == "capability",
@@ -391,6 +405,12 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
             and snapshot.transport is TransportState.Connecting
             and snapshot.physical_source is None
         ),
+        volume_supported=inputs.capabilities.volume,
+        volume_enabled=volume_enabled,
+        volume_level=level,
+        volume_readout="—" if level is None else "Mute" if level == 0 else f"{level}%",
+        volume_tooltip=volume_reason,
+        volume_save_failed=snapshot.volume_save_failed,
     )
 
 
@@ -501,6 +521,17 @@ def _decide(
             actions=frozenset({Action.recreate, Action.stop}),
             primary="Recreate",
             notice=_mismatch_notice(state),
+        )
+
+    if (inputs.capabilities.volume
+            and (state.audio_close_pending
+                 or (not state.audio_policy.enabled
+                     and state.intent_stage is IntentStage.audio_decision))):
+        return _Decision(
+            kind="audio_closing",
+            actions=frozenset({Action.video_only, Action.stop}),
+            primary="Start video only",
+            notice=_NOTICE_AUDIO_DECISION,
         )
 
     phase = state.phase
@@ -862,6 +893,27 @@ def _can_pair(state: SessionSnapshot, inputs: ViewInputs) -> bool:
         and state.display is DisplayState.None_
         and state.trust in (TrustState.Unknown, TrustState.Untrusted)
     )
+
+
+def _volume_control(state: SessionSnapshot, inputs: ViewInputs) -> tuple[bool, str]:
+    # project() is called for a selected receiver id, including saved offline
+    # receivers. The window owns the distinct no-selection presentation.
+    if not inputs.capabilities.volume:
+        return False, "The installed backend does not support receiver volume."
+    if state.stream is None or state.transport is not TransportState.Streaming:
+        return False, "Start a stream to change receiver volume."
+    if (not state.audio_policy.enabled or state.audio_close_pending
+            or state.audio not in (AudioState.Enabled, AudioState.Muted)
+            or state.intent_stage is IntentStage.audio_decision):
+        return False, "Receiver volume is unavailable while audio is off or unconfirmed."
+    if (state.cleanup_pending or _cleanup_uncertain(state)
+            or state.phase in (SessionPhase.Stopping, SessionPhase.CleanupRequired)):
+        return False, "Wait for cleanup before changing receiver volume."
+    if _trust_uncertain(state) or state.trust is TrustState.Pairing:
+        return False, "Resolve receiver trust before changing its volume."
+    if state.phase not in (SessionPhase.Mirroring, SessionPhase.VirtualDisplay):
+        return False, "Start a stream to change receiver volume."
+    return True, "Set this receiver's volume; 0% mutes it."
 
 
 def _can_mute(state: SessionSnapshot) -> bool:

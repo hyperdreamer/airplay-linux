@@ -12,13 +12,15 @@ No test needs a visible desktop: ``QT_QPA_PLATFORM=offscreen`` is enough.
 
 from __future__ import annotations
 
+from dataclasses import replace
 import gc
 import weakref
 from uuid import UUID
 
 import pytest
 
-from PySide6.QtCore import QEvent, QModelIndex, QObject, Qt
+from PySide6.QtCore import QEvent, QModelIndex, QObject, QPoint, QPointF, Qt
+from PySide6.QtGui import QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QAbstractButton,
@@ -29,6 +31,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSplitter,
     QTableView,
     QToolButton,
@@ -863,7 +866,8 @@ def test_every_disabled_command_refuses_click_and_keyboard_activation(qtbot) -> 
     assert mute == []
 
 
-def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
+@pytest.mark.parametrize("supported", [False, True])
+def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot, supported) -> None:
     from PySide6.QtWidgets import QToolButton
 
     from airplay_linux.ui.window import MainWindow
@@ -880,7 +884,12 @@ def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
     requests: list[bool] = []
     window.mute_requested.connect(requests.append)
 
-    window.render_selected(pane(mute_enabled=True, muted=False))
+    window.render_selected(replace(pane(mute_enabled=True, muted=False), volume_supported=supported))
+    assert mute.toolTip() == (
+        "Mute this receiver's audio for this session. Unmute restores its last audible level."
+        if supported else
+        "Mute this receiver's audio for this session only; the receiver keeps its own volume setting."
+    )
     assert mute.isEnabled()
     assert not mute.isChecked()
     assert requests == []  # rendering never emits a mute request
@@ -889,7 +898,12 @@ def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
     assert requests == [True]
     assert mute.isChecked()
 
-    window.render_selected(pane(mute_enabled=True, muted=True))
+    window.render_selected(replace(pane(mute_enabled=True, muted=True), volume_supported=supported))
+    assert mute.toolTip() == (
+        "Audio is muted for this receiver. Activate to restore its last audible level."
+        if supported else
+        "Audio is muted for this receiver. Activate to unmute; muting is receiver-local and lasts for this session only."
+    )
     assert mute.isChecked()
     mute.click()
     assert requests == [True, False]
@@ -898,6 +912,129 @@ def test_mute_toggle_is_labelled_and_emits_the_requested_state(qtbot) -> None:
     assert not mute.isEnabled()
     mute.click()
     assert requests == [True, False]
+
+
+def volume_pane(**changes) -> PaneState:
+    return replace(pane(mute_enabled=True), volume_supported=True,
+                   **({"volume_enabled": True, "volume_level": 30,
+                       "volume_readout": "30%", "volume_tooltip": "Set this receiver's volume; 0% mutes it."}
+                      | changes))
+
+
+def test_volume_native_row_and_focus_order(qtbot):
+    from airplay_linux.ui.window import MainWindow
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(volume_pane())
+    window.show()
+    window.activateWindow()
+    QApplication.processEvents()
+    row = window.findChild(QWidget, "volumeRow")
+    slider = window.findChild(QSlider, "volumeSlider")
+    label = window.findChild(QLabel, "volumeLabel")
+    readout = window.findChild(QLabel, "volumeReadout")
+    assert row is not None and row.isVisibleTo(window)
+    assert label.text() == "Volume" and label.buddy() is slider
+    assert slider.orientation() is Qt.Orientation.Horizontal
+    assert (slider.minimum(), slider.maximum(), slider.singleStep(), slider.pageStep()) == (0, 100, 1, 10)
+    assert slider.focusPolicy() is Qt.FocusPolicy.StrongFocus
+    assert slider.accessibleName() == "Receiver volume"
+    assert readout.accessibleName() == "Receiver volume level"
+    assert [row.layout().itemAt(i).widget() for i in range(3)] == [label, slider, readout]
+    parent_layout = row.parentWidget().layout()
+    position = parent_layout.indexOf(row)
+    primary = parent_layout.itemAt(position - 1).layout()
+    assert [primary.itemAt(i).widget().objectName() for i in range(4)] == [
+        "startButton", "stopButton", "pairButton", "muteToggle",
+    ]
+    mute = window.findChild(QToolButton, "muteToggle")
+    mute.setFocus()
+    QTest.keyClick(mute, Qt.Key.Key_Tab)
+    assert QApplication.focusWidget() is slider
+
+
+@pytest.mark.parametrize("key,expected", [
+    (Qt.Key.Key_Right, 31), (Qt.Key.Key_Left, 29),
+    (Qt.Key.Key_Up, 31), (Qt.Key.Key_Down, 29),
+    (Qt.Key.Key_PageUp, 40), (Qt.Key.Key_PageDown, 20),
+    (Qt.Key.Key_Home, 0), (Qt.Key.Key_End, 100),
+])
+def test_volume_keys_request_without_claiming_acknowledgement(qtbot, key, expected):
+    from airplay_linux.ui.window import MainWindow
+    window = MainWindow()
+    qtbot.addWidget(window)
+    requests = []
+    window.volume_requested.connect(requests.append)
+    window.render_selected(volume_pane())
+    slider = window.findChild(QSlider, "volumeSlider")
+    assert requests == []
+    QTest.keyClick(slider, key)
+    assert requests == [expected] and slider.value() == expected
+    assert window.findChild(QLabel, "volumeReadout").text() == "30%"
+    window.render_selected(volume_pane(volume_level=expected,
+                                      volume_readout="Mute" if expected == 0 else f"{expected}%"))
+    assert requests == [expected]
+    assert window.findChild(QLabel, "volumeReadout").text() == ("Mute" if expected == 0 else f"{expected}%")
+    QTest.keyClick(slider, Qt.Key.Key_End)
+    requests.clear()
+    QTest.keyClick(slider, Qt.Key.Key_Right)
+    assert slider.value() == 100 and not requests
+    QTest.keyClick(slider, Qt.Key.Key_Home)
+    requests.clear()
+    QTest.keyClick(slider, Qt.Key.Key_Left)
+    assert slider.value() == 0 and not requests
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_volume_disabled_and_no_selection_cannot_emit(qtbot, supported):
+    from airplay_linux.ui.window import MainWindow
+    window = MainWindow()
+    qtbot.addWidget(window)
+    requests = []
+    window.volume_requested.connect(requests.append)
+    window._render_no_selection(volume_supported=supported)
+    slider = window.findChild(QSlider, "volumeSlider")
+    assert window.findChild(QWidget, "volumeRow").isVisibleTo(window)
+    assert not slider.isEnabled() and slider.value() == 0
+    assert slider.accessibleDescription() == "Level unknown"
+    assert window.findChild(QLabel, "volumeReadout").text() == "—"
+    assert slider.toolTip() == (
+        "Select a receiver to change its volume." if supported
+        else "The installed backend does not support receiver volume."
+    )
+    window.render_selected(volume_pane(volume_enabled=False, volume_level=None, volume_readout="—"))
+    QTest.keyClick(slider, Qt.Key.Key_End)
+    wheel = QWheelEvent(QPointF(2, 2), QPointF(2, 2), QPoint(), QPoint(0, 120),
+                        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier,
+                        Qt.ScrollPhase.NoScrollPhase, False)
+    QApplication.sendEvent(slider, wheel)
+    slider.setValue(80)  # a malicious programmatic change is still not a request
+    assert requests == []
+    window.render_selected(volume_pane(volume_level=None, volume_readout="—"))
+    assert slider.value() == 0 and slider.accessibleDescription() == "Level unknown"
+    window.render_selected(volume_pane())
+    assert slider.accessibleDescription() == ""
+    assert requests == []
+
+
+def test_volume_render_restores_signal_guard_on_exception(qtbot, monkeypatch):
+    from airplay_linux.ui.window import MainWindow
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.render_selected(volume_pane())
+    requests = []
+    window.volume_requested.connect(requests.append)
+    slider = window.findChild(QSlider, "volumeSlider")
+    def failing_set(value):
+        assert slider.signalsBlocked()
+        raise RuntimeError("setup failed")
+    with monkeypatch.context() as patch:
+        patch.setattr(slider, "setValue", failing_set)
+        with pytest.raises(RuntimeError, match="setup failed"):
+            window.render_selected(volume_pane(volume_level=90, volume_readout="90%"))
+    assert not slider.signalsBlocked() and not requests
+    slider.setValue(45)
+    assert requests == [45]
 
 
 def test_badges_are_replaced_in_place_on_every_render(qtbot) -> None:
@@ -1032,7 +1169,8 @@ def focus_chain(start: object) -> list[object]:
     return chain
 
 
-def test_keyboard_navigation_reaches_every_enabled_command(qtbot) -> None:
+@pytest.mark.parametrize("supported", [False, True])
+def test_keyboard_navigation_reaches_every_enabled_command(qtbot, supported) -> None:
     from PySide6.QtWidgets import QAbstractButton, QComboBox
 
     from airplay_linux.ui.window import MainWindow
@@ -1041,15 +1179,15 @@ def test_keyboard_navigation_reaches_every_enabled_command(qtbot) -> None:
     qtbot.addWidget(window)
     window.show()
     window.render_receivers((receiver_row(),))
-    window.render_selected(
+    window.render_selected(replace(
         pane(
             actions=frozenset({action for action, _ in ACTION_CONTROLS}),
             mode_enabled=True,
             source_enabled=True,
             resolution_enabled=True,
             mute_enabled=True,
-        )
-    )
+        ), volume_supported=supported, volume_enabled=supported,
+    ))
 
     chain = focus_chain(window)
     for button in window.findChildren(QAbstractButton):
@@ -1061,6 +1199,11 @@ def test_keyboard_navigation_reaches_every_enabled_command(qtbot) -> None:
             # Icon-only controls must still be describable and learnable.
             assert button.accessibleName(), button.objectName()
             assert button.toolTip(), button.objectName()
+    for slider in window.findChildren(QSlider):
+        if slider.isVisibleTo(window) and slider.isEnabled():
+            assert slider in chain
+            assert slider.focusPolicy() is Qt.FocusPolicy.StrongFocus
+            assert slider.accessibleName() == "Receiver volume"
     for combo in window.findChildren(QComboBox):
         if not combo.isVisibleTo(window) or not combo.isEnabled():
             continue
@@ -1185,13 +1328,15 @@ def test_presenter_selection_of_choices_is_silent(qtbot) -> None:
     assert emitted == []
 
 
-def test_choice_controls_explain_themselves(qtbot) -> None:
+@pytest.mark.parametrize("supported", [False, True])
+def test_choice_controls_explain_themselves(qtbot, supported) -> None:
     from PySide6.QtWidgets import QComboBox
 
     from airplay_linux.ui.window import MainWindow
 
     window = MainWindow()
     qtbot.addWidget(window)
+    window.render_selected(replace(pane(), volume_supported=supported))
     for name in ("sourceCombo", "resolutionCombo"):
         combo = window.findChild(QComboBox, name)
         assert combo is not None
