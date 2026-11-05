@@ -1,7 +1,7 @@
 # Audio volume control — design
 
-- **Status:** design revision 5 after independent review rounds 1–4; awaiting review round 5.
-- **Date:** 2026-11-05 (revision 5)
+- **Status:** design revision 6 after independent review rounds 1–5; awaiting review round 6.
+- **Date:** 2026-11-05 (revision 6)
 - **Delivery target:** `/data/home/guest/Development/airplay-linux`, branch `master`, no remote.
 - **Mockup record:** `docs/superpowers/specs/assets/2026-11-05-audio-volume-control-mockup.png`
 
@@ -44,6 +44,17 @@ one promise that overreached the RTSP layer:
 | M2 legacy omission of the new status fields | §5.3/§7: the fields stay optional in the shared decoder, and a *capable* backend's missing receipt is refused in the volume path, not in the shared decoder |
 | M3 inventory misses the upstream mapping test | §6 adds `internal/airplay/mirror_setup_test.go`, whose `TestAudioVolumeBody` calls the bool signature |
 | m refused-startup slider admission | §5.4.7: the exception is removed; Retry is the only way out of `refused` |
+
+**Revision 6** fixes round 5. Round 5 closed every prior item and found one race plus two settlement /
+transition gaps, all of which come from the daemon owning the audio decision while the app owns the
+user's intent:
+
+| Round-5 item | Resolution in revision 6 |
+| --- | --- |
+| B1 "Start video only" cannot supersede a withheld-stream retry | §5.1.5/§5.4.6: the patch adds an acknowledged per-stream audio gate (`audio on|off`). Video-only closes the gate before the app publishes `Disabled`, so a late acknowledgement cannot open audio |
+| M1 Python settlement is not daemon settlement | §5.1.6/§5.4.5: the daemon coalesces the latest level per stream behind one worker with a bounded write deadline, so application-side settlement never has to stand in for daemon-side work |
+| M2 receipt outcomes lack an actor/event contract | §5.4.8: an outcome table fixes `AudioState`, `intent_stage`, mute, and which events may be emitted for every receipt outcome |
+| m `FakeTransport.start_audio` not inventoried | §6/§8: the fake is inventoried and its legacy `Ok(None)` successes are normalized to a receipt |
 
 ## 1. Background
 
@@ -111,8 +122,8 @@ Stacks on 0001+0002+0003. Scope, by file, against the pinned tree:
 | --- | --- |
 | `internal/airplay/mirror.go` | `audioVolumeBody(percent int)`: 0 → `-144` dB, 1–100 → `20*log10(percent/100)` dB, 100 → exactly `0` dB. New `SetAudioLevel(percent int) error` beside `SetAudioMuted`. Both setup writes at `:1128` and `:1138` use the configured initial percent instead of a hardcoded 0 dB. |
 | `internal/airplay/client.go` | `StreamConfig` gains a requested initial level as `*int` (presence and value are separate); nil reproduces today's behaviour exactly. |
-| `internal/daemon/…` | Carry the requested level from the connect request into `StreamConfig`; hold per stream the last acknowledged percent and a `volume_state`; serve `volume` on a live stream; report both in `status`. |
-| `cmd/doubletake-ctl` | `connect [target] [--volume <0-100>] [PIN-or-password]` and `volume <0-100> [target]`, parsed explicitly — today's `args[2]` slot is the PIN (`cmd/doubletake-ctl/main.go:49`), so a bare positional must never be assumed to be a level. `-capabilities` gains `target-volume` in `cmd/doubletake/main.go`. |
+| `internal/daemon/…` | Carry the requested level from the connect request into `StreamConfig`; hold per stream the last acknowledged percent, a `volume_state`, the latest desired percent and an **audio gate**; coalesce level changes behind one worker per stream; serve `volume` and `audio on|off` on a live stream; report level and state in `status`. |
+| `cmd/doubletake-ctl` | `connect [target] [--volume <0-100>] [PIN-or-password]`, `volume <0-100> [target]` and `audio <on|off> [target]`, parsed explicitly — today's `args[2]` slot is the PIN (`cmd/doubletake-ctl/main.go:49`), so a bare positional must never be assumed to be a level. `-capabilities` gains `target-volume` in `cmd/doubletake/main.go`. |
 
 Four behavioural rules:
 
@@ -138,6 +149,17 @@ Four behavioural rules:
    acknowledged the `SET_PARAMETER` (RTSP 200). `status` reports per stream the optional `volume`
    (integer 0–100, absent until something is acknowledged) and `volume_state`
    (`unrequested | pending | applied | refused`). Absent is not 0, and `pending` is not `refused`.
+5. **The daemon owns an audio gate, and it can be closed from outside.** Per stream there is an
+   explicit boolean gate: audio capture opens only when the gate is open **and** (a requested level
+   is acknowledged, or none was requested). `audio off [target]` closes it and is acknowledged;
+   `audio on [target]` reopens it. Closing the gate is the barrier that makes "Start video only"
+   truthful: after it is acknowledged, a late level acknowledgement for that stream cannot open
+   audio. `Stop` retires the stream as it does today.
+6. **The daemon coalesces, so the app never has to wait for it.** Each stream keeps the latest
+   desired percent and applies it through one worker; a newer value replaces the pending one. The
+   live write carries an absolute deadline that covers the receiver connection, so a slow or
+   unresponsive receiver cannot accumulate queued writes behind the connection mutex. This is why
+   the application's settlement rule (§5.4.5) is sufficient: it never represents daemon work.
 
 The sender's help output does not change, so the pinned sender-flag set is untouched.
 
@@ -189,8 +211,9 @@ twelve literal profile comparisons keep working (`transport/doubletake.py:525`,
   input to starting a stream. The presenter fills it from the receiver preference it already holds,
   after `PreferenceAccess` validation, **and only when the backend proves `target_volume`**. Reconnect
   reuse carries the snapshot's value so a retry cannot invent a level.
-- `TransportPort.start_stream(..., initial_volume: VolumeLevel | None)` and
-  `TransportPort.set_volume(handle, level, context) -> Result[int]`.
+- `TransportPort.start_stream(..., initial_volume: VolumeLevel | None)`,
+  `TransportPort.set_volume(handle, level, context) -> Result[int]`, and
+  `TransportPort.close_audio(handle, context) -> Result[None]` (the `audio off` gate barrier).
 - `AudioStartReceipt` (`domain/records.py`): `audio: bool`, `volume_state: str | None`,
   `level: int | None`. `TransportPort.start_audio` returns `Result[AudioStartReceipt]` instead of
   `Result[None]`. On this profile the transport already fetches exactly one status entry for the
@@ -274,6 +297,28 @@ preference write is reported and leaves the previous `remembered` in place while
 `last_audible` keep the applied value; the UI shows the applied level and says it could not be
 saved.
 
+**Start video only is a barrier, not a local flag.** Choosing it issues `close_audio` (`audio off`)
+for that stream and publishes `AudioState.Disabled` / `AudioPolicy(enabled=False)` **only after the
+daemon acknowledges the closed gate**. A pending level retry can therefore not open audio behind the
+user's choice. If the barrier is refused or times out, the authority keeps the audio state and
+reports one diagnostic rather than publishing a video-only claim it cannot enforce; `Stop` remains
+available.
+
+**Receipt outcomes.** `AudioStartReceipt` decides the actor state, so every outcome is fixed here:
+
+| Receipt | `AudioState` | `intent_stage` | mute | Events |
+| --- | --- | --- | --- | --- |
+| `applied`, level > 0 | `Enabled` | `active` | false | `audio_recovered` |
+| `applied`, level = 0 | `Muted` | `active` | true | `audio_recovered` |
+| `refused` | `Unavailable` | `audio_decision` | false | `audio_start_failed` |
+| `pending` | `Starting` | unchanged | false | none — one diagnostic |
+| missing on a capable backend | `Unavailable` | `audio_decision` | false | `audio_start_failed` |
+| `unrequested` or legacy | today's behaviour | today's behaviour | today's behaviour | today's behaviour |
+
+The transport must not emit `audio_recovered` before the receipt is known: today it emits it and
+then returns success (`transport/doubletake.py:1118`), which would confirm audio for a stream whose
+level was withheld. Confirmation is emitted with the receipt, in the same actor step.
+
 8. **No audio, no level.** With audio `Disabled` (video-only), `Unavailable`, or undecided, a volume
    command is refused rather than sent, and `remembered` is preserved — except the explicit Retry
    row above, which is the only way out of `refused`.
@@ -349,7 +394,7 @@ availability; stale completions emit nothing. `AudioLifecycle._emit()` swallows 
 | Composition | `runtime.py` (preference writer, capability report wiring) |
 | Storage | `storage/codecs.py`, `storage/repositories.py` |
 | UI | `ui/state.py`, `ui/presenter.py`, `ui/window.py` |
-| Testing aids | `testing/adapters.py` (`FakeTransport.start_stream`, `set_volume`) |
+| Testing aids | `testing/adapters.py` (`FakeTransport.start_stream`, `start_audio`, `set_volume`, `close_audio`) |
 | Diagnostics | `diagnostics/activity.py`, `diagnostics/catalog.py` |
 | Docs | `docs/operations.md`, `docs/backend-fork.md`, `docs/backend-compatibility.md` |
 | Tests | §8, including the pinned inventories in `tests/domain/test_contracts.py:68` and `tests/environment/test_installed_contracts.py:57`, the backend fixtures and the fake operation set |
@@ -371,6 +416,9 @@ availability; stale completions emit nothing. `AudioLifecycle._emit()` swallows 
 | Stored volume malformed | Only the volume preference is dropped and reported |
 | Level requested with audio unavailable | Refused, except the explicit Retry row |
 | Preference write fails | Reported; `effective` stands; `remembered` unchanged; UI says it could not be saved |
+| Video-only barrier refused or timed out | Audio state kept, `Disabled` not published, one diagnostic; `Stop` available |
+| Late level acknowledgement after the gate closed | Ignored: the daemon leaves audio closed for that stream |
+| Start video only while a Retry is in flight | The acknowledged gate closes first; the late acknowledgement cannot open audio |
 | Sender patched, ctl not (or the reverse) | Incoherent surface → whole backend refused |
 | Legacy backend with a saved level | `--volume` is never sent (capability-conditioned), so downgrade cannot break streaming |
 
@@ -402,10 +450,14 @@ All offline; no live receiver, no network.
 - **Session (through `SessionManager`):** every row of §5.4.7, including a legacy backend with a
   saved level, a rejected startup followed by Retry, a timed-out write ending in ordinary cleanup,
   the coalescing queue under a slider drag with settlement counted (not public timeouts), Stop during
-  a pending command, and replacement mid-flight; snapshot clearing on reload; FakeTransport parity;
+  a pending command, and replacement mid-flight; snapshot clearing on reload; FakeTransport parity,
+  where a scripted `Ok(None)` start is normalized to a legacy receipt with no manufactured level;
   mute representation stays consistent through zero → audio loss → Retry/recovery → positive level
   (`AudioRuntime.muted_lease`, `stream.muted`, `snapshot.muted`, `AudioState.Muted`), and **no**
   backend `mute`/`unmute` command is sent on a volume-capable stream.
+- **Video-only barrier:** rejected start → Retry with the response held → Start video only → late
+  RTSP 200 must leave audio capture closed, and a refused or timed-out barrier must not publish
+  `Disabled`.
 - **Composed:** one `SessionManager` → real transport → scripted control/daemon-fake test that drives
   a start with a remembered level and asserts the receipt, because handler-only tests cannot show
   that the receipt reaches the authority.
