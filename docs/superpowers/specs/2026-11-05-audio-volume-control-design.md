@@ -1,7 +1,7 @@
 # Audio volume control — design
 
-- **Status:** design revision 7 after independent review rounds 1–6; awaiting review round 7.
-- **Date:** 2026-11-05 (revision 7)
+- **Status:** design revision 8 after independent review rounds 1–7; awaiting review round 8.
+- **Date:** 2026-11-05 (revision 8)
 - **Delivery target:** `/data/home/guest/Development/airplay-linux`, branch `master`, no remote.
 - **Mockup record:** `docs/superpowers/specs/assets/2026-11-05-audio-volume-control-mockup.png`
 
@@ -68,6 +68,13 @@ intent travel with the stream and the live gate one-way:
 | F3 a timed-out close can make Retry falsely confirm | §5.1.5/§5.4.6: the gate is a **latched one-way close** with no `audio on`, so an obsolete acknowledgement cannot reopen it; an uncertain close admits repeated close and Stop, not Retry |
 | F4 the pending receipt is a dead end | §5.4.8: `pending` collapses into `Unavailable / audio_decision`, which is retryable, and Retry re-samples the receipt instead of resting in `Starting` |
 | M1 gate quiescence and worker retirement unproven | §5.1.5/§8: a close acknowledgement means existing and in-progress audio production for that stream has quiesced, with carried-Go probes for both acknowledgement orders and late completions |
+
+**Revision 8** fixes round 7. Round 7 closed F1, F2, F4 and M1 and left one blocker: because the
+video-only *policy* was only published after the daemon acknowledged the close, an automatic
+reconnect could build its next stream from a still-enabled policy. Revision 8 publishes the policy
+at admission and defers only the confirmed `AudioState.Disabled`, so the next `connect` carries
+`--audio off` regardless of whether the old close was ever acknowledged. It also adds the audio
+row's own negative proof cases and the connect parser's `--audio` cases.
 
 ## 1. Background
 
@@ -326,16 +333,23 @@ There are two cases and they are not the same:
 - **Before or at start** — the audio policy is already `enabled=False`, so the connect request carries
   `--audio off`; the daemon never performs the setup volume writes and never starts capture. Nothing
   can start playing, and no live command is needed.
-- **While a stream exists and is undecided** — choosing it issues `close_audio` (`audio off`) and
-  publishes `AudioState.Disabled` / `AudioPolicy(enabled=False)` **only after the daemon acknowledges
-  the latch**. Because the latch is one-way, a level retry that is acknowledged afterwards cannot
-  open audio.
+- **While a stream exists and is undecided** — choosing it does two things in one actor step,
+  **in this order**: it records `AudioPolicy(enabled=False)` immediately, and it issues
+  `close_audio` (`audio off`) for the current stream. Only the *confirmed* `AudioState.Disabled`
+  waits for the daemon's acknowledgement.
 
-If the close is refused, the authority keeps the audio state and reports one diagnostic rather than
-publishing a video-only claim it cannot enforce. If the close times out, the intent is **latched in
-the application**: repeated `close_audio` attempts and `Stop` are admitted, ordinary volume Retry is
-not, and `Disabled` is not published until the latch is confirmed. There is no `audio on`, so no
-obsolete or reordered command can reopen a stream's audio.
+The split matters because the policy is what a later stream is built from. `reconnect`
+(`session/reconnect.py:319`) and the virtual path (`session/virtual.py:599`) copy the current policy
+into their next start, so recording the policy at admission is what stops a reconnect from starting
+a stream that re-enables audio: the next `connect` carries `--audio off` and performs neither setup
+volume write nor capture, even if the old stream's close was never acknowledged. A level retry
+acknowledged after the latch closed cannot reopen it, because the latch is one-way.
+
+If the close is refused, the authority keeps the audio state, reports one diagnostic, and the close
+can be retried. If the close times out, the requested policy still stands: repeated `close_audio`
+attempts and `Stop` are admitted, ordinary volume Retry is not, and `Disabled` is not published until
+the latch is confirmed. There is no `audio on`, so no obsolete or reordered command can reopen a
+stream's audio.
 
 **Receipt outcomes.** `AudioStartReceipt` decides the actor state, so every outcome is fixed here:
 
@@ -465,7 +479,8 @@ availability; stale completions emit nothing. `AudioLifecycle._emit()` swallows 
 All offline; no live receiver, no network.
 
 - **Contract:** both ctl tables recognized; volume row without token refused; token without row
-  refused; a volume row whose scope statement is missing, negated or borrowed refused; a source-help
+  refused; a volume row whose scope statement is missing, negated or borrowed refused; the same three
+  cases for the `audio off [target]` row; a missing or malformed audio row refused; a source-help
   surface without tokens refused (unchanged); status decode for `volume` absent/0/100/out-of-range/
   non-integer and every `volume_state`, including an unknown state; a legacy status or mute reply that
   omits both new fields still decodes exactly as today; a capable backend whose receipt is missing is
@@ -480,7 +495,9 @@ All offline; no live receiver, no network.
   a rejected write leaves the previous acknowledged percent; an incomplete or withheld response
   leaves the control connection unusable and fails setup rather than continuing at maximum; two
   targets do not cross; `status` distinguishes absent, 0 and `refused`; the connect parser accepts
-  `--volume` in the documented position, rejects out-of-range, and never treats a flag as a PIN.
+  `--audio on|off` and `--volume` in the documented positions, rejects out-of-range values and
+  `--audio` with an invalid argument, and never treats a flag as a PIN; a legacy `connect` with
+  neither flag produces the argv of today.
 - **Transport:** `start_stream` passes the initial level into the connect argv only when supplied;
   an absent target is refused before dispatch; acknowledged level returned; `AudioStartReceipt`
   carries `volume_state` and the level from the same status read; fence respected; a timeout leaves
