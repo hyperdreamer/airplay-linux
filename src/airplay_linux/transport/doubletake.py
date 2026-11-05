@@ -1093,21 +1093,65 @@ class DoubleTakeTransport:
             checked = self._owned(stream.handle, context)
             if isinstance(checked, Err):
                 return checked
-            result = await self._request(
-                stream.daemon, BackendOperation.start_audio, stream.target, EmptyPayload(), context,
-            ) if self._features.audio_restart else _failure(ErrorCode.audio_unavailable)
-            checked = self._owned(stream.handle, context)
-            if isinstance(checked, Err):
-                return checked
-            if not _ack(result, BackendOperation.start_audio, stream.target):
+            if self._features.audio_restart:
+                result = await self._request(
+                    stream.daemon, BackendOperation.start_audio, stream.target, EmptyPayload(), context,
+                )
+                checked = self._owned(stream.handle, context)
+                if isinstance(checked, Err):
+                    return checked
+                confirmed = _ack(result, BackendOperation.start_audio, stream.target)
+                failure = None if confirmed else (
+                    result if isinstance(result, Err) else _failure(ErrorCode.audio_unavailable)
+                )
+            else:
+                # A backend without an independent audio operation starts audio
+                # as part of the stream itself, so the daemon's own report for
+                # this exact stream is the only evidence that it is running.
+                failure = await self._reported_stream_audio(stream, context)
+            if failure is not None:
                 stream.audio = AudioState.Unavailable
-                failure = result if isinstance(result, Err) else _failure(ErrorCode.audio_unavailable)
                 self._emit(stream, TransportEventKind.audio_failed if stream.ready else TransportEventKind.audio_start_failed,
                            FailurePayload(diagnostic=failure.error), context)
                 return failure
             stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
             self._emit(stream, TransportEventKind.audio_recovered, context=context)
             return Ok(value=None)
+
+    async def _reported_stream_audio(self, stream: _Stream, context: OperationContext) -> Err | None:
+        """Whether the daemon's own status proves this exact stream has audio.
+
+        The published backend carries audio with ``connect`` and exposes no
+        separate audio operation, so the stream is the only audio evidence there
+        is. One streaming entry for exactly this target that reports audio is
+        proof; a missing, ambiguous, foreign or silent report proves nothing and
+        keeps the typed refusal.
+        """
+        daemon = stream.daemon
+        if daemon is None or not daemon.alive or not daemon.authenticated:
+            return _failure(ErrorCode.stale_event)
+        reported = await _safe(
+            daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
+            ErrorCode.audio_unavailable,
+        )
+        checked = self._owned(stream.handle, context)
+        if isinstance(checked, Err):
+            return checked
+        if isinstance(reported, Err):
+            return reported
+        status = reported.value
+        if not isinstance(status, StatusReply):
+            return _failure(ErrorCode.audio_unavailable)
+        matching = tuple(
+            item for item in status.streams if item.target == stream.target.canonical_host
+        )
+        if (
+            len(matching) != 1
+            or matching[0].state != "streaming"
+            or matching[0].has_audio is not True
+        ):
+            return _failure(ErrorCode.audio_unavailable)
+        return None
 
     async def set_muted(self, handle: StreamHandle, muted: bool, context: OperationContext) -> Result[None]:
         owned = self._owned(handle, context)

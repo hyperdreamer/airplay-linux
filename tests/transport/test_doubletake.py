@@ -1816,6 +1816,100 @@ async def test_audio_capability_failure_preserves_video_and_disables_mute(tmp_pa
     assert h.control.calls(BackendOperation.mute) == []
 
 
+def _audio_status(
+    receiver, *, stream_audio, top_audio, state="streaming", muted=False, duplicates=False,
+):
+    stream = {
+        "device": "Receiver", "device_ip": receiver.canonical_host,
+        "state": state, "has_audio": stream_audio, "audio_muted": muted,
+    }
+    streams = [stream, dict(stream)] if duplicates else [stream]
+    decoded = decode_status({
+        "ok": True, "state": state, "has_audio": top_audio, "audio_muted": muted,
+        "device": None if state == "connecting" else "Receiver",
+        "device_ip": None if state == "connecting" else receiver.canonical_host,
+        "streams": streams,
+    })
+    assert isinstance(decoded, StatusReply), decoded
+    return Ok(value=decoded)
+
+
+# The published backend starts audio with the stream and exposes no separate
+# audio operation, so the daemon's own report is the only audio evidence the
+# application can have for such a composition.
+@pytest.mark.asyncio
+async def test_stream_reporting_audio_confirms_audio_without_a_backend_operation(tmp_path):
+    h = Harness(tmp_path, audio_restart=False)
+    handle = await h.handle()
+    h.control.results[BackendOperation.status].append(
+        _audio_status(h.a, stream_audio=True, top_audio=True)
+    )
+
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    assert h.control.calls(BackendOperation.start_audio) == []
+    confirmed = next(event for event in h.events if event.kind is TransportEventKind.audio_recovered)
+    assert confirmed.stream == handle
+    assert h.transport._streams[handle.lease_id].audio is AudioState.Enabled
+    # Confirmed audio makes the receiver-local mute command usable again.
+    assert isinstance(await h.transport.set_muted(handle, True, context()), Ok)
+    assert len(h.control.calls(BackendOperation.mute)) == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_reporting_no_audio_keeps_the_typed_refusal(tmp_path):
+    h = Harness(tmp_path, audio_restart=False)
+    handle = await h.handle()
+    h.control.results[BackendOperation.status].append(
+        _audio_status(h.a, stream_audio=False, top_audio=False)
+    )
+
+    assert_error(await h.transport.start_audio(handle, context()), ErrorCode.audio_unavailable)
+    assert h.control.calls(BackendOperation.start_audio) == []
+    assert h.transport._streams[handle.lease_id].audio is AudioState.Unavailable
+    failed = h.events[-1]
+    assert failed.kind is TransportEventKind.audio_failed
+    assert failed.payload.diagnostic.code is ErrorCode.audio_unavailable
+    assert h.control.calls(BackendOperation.mute) == []
+
+
+@pytest.mark.asyncio
+async def test_a_duplicated_stream_entry_never_confirms_audio(tmp_path):
+    h = Harness(tmp_path, audio_restart=False)
+    handle = await h.handle()
+    h.control.results[BackendOperation.status].append(
+        _audio_status(h.a, stream_audio=True, top_audio=True, duplicates=True)
+    )
+
+    assert_error(await h.transport.start_audio(handle, context()), ErrorCode.audio_unavailable)
+    assert h.transport._streams[handle.lease_id].audio is AudioState.Unavailable
+
+
+@pytest.mark.asyncio
+async def test_a_still_connecting_stream_never_confirms_audio(tmp_path):
+    h = Harness(tmp_path, audio_restart=False)
+    handle = await h.handle()
+    # A connecting stream may carry an audio flag, but audio is only confirmed
+    # by a stream the backend already reports as streaming.
+    h.control.results[BackendOperation.status].append(
+        _audio_status(h.a, stream_audio=True, top_audio=False, state="connecting")
+    )
+
+    assert_error(await h.transport.start_audio(handle, context()), ErrorCode.audio_unavailable)
+    assert h.transport._streams[handle.lease_id].audio is AudioState.Unavailable
+
+
+@pytest.mark.asyncio
+async def test_another_target_s_stream_audio_never_confirms_this_stream(tmp_path):
+    h = Harness(tmp_path, audio_restart=False)
+    handle = await h.handle()
+    h.control.results[BackendOperation.status].append(
+        _audio_status(h.b, stream_audio=True, top_audio=True)
+    )
+
+    assert_error(await h.transport.start_audio(handle, context()), ErrorCode.audio_unavailable)
+    assert h.transport._streams[handle.lease_id].audio is AudioState.Unavailable
+
+
 @pytest.mark.asyncio
 async def test_failed_audio_can_retry_on_the_same_stream_and_display_tokens(tmp_path):
     h = Harness(tmp_path)
