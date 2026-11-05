@@ -29,6 +29,7 @@ tasks:
   sequence: 1
   depends_on: []
   ownership:
+  - tests/backend/test_carried_source_patch.py
   - vendor/doubletake/0004-target-volume.patch
   exclusive_resources: []
   interfaces:
@@ -48,7 +49,15 @@ tasks:
   sequence: 2
   depends_on:
   - T-001
-  ownership: []
+  ownership:
+  - src/airplay_linux/diagnostics/activity.py
+  - src/airplay_linux/diagnostics/catalog.py
+  - src/airplay_linux/domain/messages.py
+  - src/airplay_linux/domain/ports.py
+  - src/airplay_linux/domain/records.py
+  - src/airplay_linux/domain/resources.py
+  - tests/diagnostics/test_safety.py
+  - tests/domain/test_contracts.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -83,7 +92,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/diagnostics/test_safety.py
+    - tests/domain/test_contracts.py
 - id: T-003
   plan_task: 3
   title: Recognize only coherent volume surfaces and decode per-stream evidence
@@ -91,7 +101,12 @@ tasks:
   sequence: 3
   depends_on:
   - T-002
-  ownership: []
+  ownership:
+  - src/airplay_linux/backend/contract.py
+  - src/airplay_linux/policy/capabilities.py
+  - tests/backend/test_carried_source_patch.py
+  - tests/backend/test_contract.py
+  - tests/policy/test_capabilities.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -121,6 +136,7 @@ tasks:
     - pytest
     - -q
     - tests/backend/test_carried_source_patch.py
+    - tests/backend/test_contract.py
 - id: T-004
   plan_task: 4
   title: Store receiver v2 preferences without blocking recovery on a bad level
@@ -128,7 +144,11 @@ tasks:
   sequence: 4
   depends_on:
   - T-003
-  ownership: []
+  ownership:
+  - src/airplay_linux/storage/codecs.py
+  - src/airplay_linux/storage/repositories.py
+  - tests/storage/test_atomic_records.py
+  - tests/storage/test_repositories.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -148,7 +168,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/storage/test_atomic_records.py
+    - tests/storage/test_repositories.py
 - id: T-005
   plan_task: 5
   title: Share one continuity-checked preference writer at composition
@@ -156,7 +177,15 @@ tasks:
   sequence: 5
   depends_on:
   - T-004
-  ownership: []
+  ownership:
+  - src/airplay_linux/runtime.py
+  - src/airplay_linux/session/engine.py
+  - src/airplay_linux/session/testing.py
+  - src/airplay_linux/session/virtual.py
+  - src/airplay_linux/storage/repositories.py
+  - tests/app/test_composition.py
+  - tests/session/test_virtual_and_resolution.py
+  - tests/storage/test_repositories.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -176,7 +205,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/app/test_composition.py
+    - tests/session/test_virtual_and_resolution.py
 - id: T-006
   plan_task: 6
   title: Add target-fenced typed controls and full-status acknowledgements
@@ -184,7 +214,13 @@ tasks:
   sequence: 6
   depends_on:
   - T-005
-  ownership: []
+  ownership:
+  - src/airplay_linux/backend/control.py
+  - src/airplay_linux/process/ownership.py
+  - tests/backend/test_contract.py
+  - tests/backend/test_control.py
+  - tests/fixtures/backend/contract-v1.json
+  - tests/process/test_ownership.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -210,7 +246,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/backend/test_contract.py
+    - tests/backend/test_control.py
 - id: T-007
   plan_task: 7
   title: Carry receipts through transport and emit actual worker settlement
@@ -218,7 +255,16 @@ tasks:
   sequence: 7
   depends_on:
   - T-006
-  ownership: []
+  ownership:
+  - src/airplay_linux/testing/adapters.py
+  - src/airplay_linux/transport/doubletake.py
+  - src/airplay_linux/transport/targets.py
+  - tests/adapter_contracts/test_transport_contract.py
+  - tests/integration/test_lifecycle_matrix.py
+  - tests/session/virtual_scenarios.py
+  - tests/testing/test_fakes.py
+  - tests/transport/test_doubletake.py
+  - tests/ui_acceptance/test_matrix.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -250,7 +296,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/adapter_contracts/test_transport_contract.py
+    - tests/integration/test_lifecycle_matrix.py
 - id: T-008
   plan_task: 8
   title: Propagate startup volume and strip transient authority on recovery
@@ -258,7 +305,18 @@ tasks:
   sequence: 8
   depends_on:
   - T-007
-  ownership: []
+  ownership:
+  - src/airplay_linux/session/audio.py
+  - src/airplay_linux/session/engine.py
+  - src/airplay_linux/session/mirror.py
+  - src/airplay_linux/session/persistence.py
+  - src/airplay_linux/session/reconnect.py
+  - src/airplay_linux/session/recovery.py
+  - src/airplay_linux/session/virtual.py
+  - tests/session/test_audio_lifecycle.py
+  - tests/session/test_reconnect.py
+  - tests/session/test_startup_recovery.py
+  - tests/session/test_virtual_and_resolution.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -278,7 +336,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/session/test_audio_lifecycle.py
+    - tests/session/test_reconnect.py
 - id: T-009
   plan_task: 9
   title: Implement actor receipt, single-knob, settlement and close authority
@@ -286,7 +345,13 @@ tasks:
   sequence: 9
   depends_on:
   - T-008
-  ownership: []
+  ownership:
+  - src/airplay_linux/session/audio.py
+  - src/airplay_linux/session/engine.py
+  - src/airplay_linux/session/fencing.py
+  - tests/session/test_actor_fences.py
+  - tests/session/test_audio_lifecycle.py
+  - tests/session/test_fencing.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -315,7 +380,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/session/test_actor_fences.py
+    - tests/session/test_audio_lifecycle.py
 - id: T-010
   plan_task: 10
   title: Project the acknowledged volume row and dispatch typed UI requests
@@ -323,7 +389,13 @@ tasks:
   sequence: 10
   depends_on:
   - T-009
-  ownership: []
+  ownership:
+  - src/airplay_linux/ui/presenter.py
+  - src/airplay_linux/ui/state.py
+  - src/airplay_linux/ui/window.py
+  - tests/ui/test_dashboard_widgets.py
+  - tests/ui/test_presenter.py
+  - tests/ui/test_state_projection.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -349,7 +421,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/ui/test_dashboard_widgets.py
+    - tests/ui/test_presenter.py
 - id: T-011
   plan_task: 11
   title: Prove composed receipts, live-failure recovery and complete offline regression
@@ -358,10 +431,17 @@ tasks:
   depends_on:
   - T-010
   ownership:
+  - tests/backend/test_carried_source_patch.py
+  - tests/backend/test_contract.py
+  - tests/backend/test_control.py
   - tests/diagnostics/test_safety.py
+  - tests/domain/test_contracts.py
+  - tests/environment/test_installed_contracts.py
+  - tests/session/test_audio_lifecycle.py
   - tests/storage/test_atomic_records.py
   - tests/storage/test_repositories.py
   - tests/testing/test_fakes.py
+  - tests/transport/test_doubletake.py
   - tests/ui/test_presenter.py
   exclusive_resources: []
   interfaces:
@@ -391,8 +471,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/diagnostics/test_safety.py
-    - tests/storage/test_atomic_records.py
+    - tests/backend/test_carried_source_patch.py
+    - tests/backend/test_contract.py
 - id: T-012
   plan_task: 12
   title: Document operational behavior, coherent compatibility and carried provenance
@@ -400,7 +480,12 @@ tasks:
   sequence: 12
   depends_on:
   - T-011
-  ownership: []
+  ownership:
+  - docs/backend-compatibility.md
+  - docs/backend-fork.md
+  - docs/operations.md
+  - tests/backend/test_contract.py
+  - tests/environment/test_installed_contracts.py
   exclusive_resources: []
   interfaces:
     produces:
@@ -423,7 +508,8 @@ tasks:
     - -m
     - pytest
     - -q
-    - tests/backend/test_carried_source_patch.py
+    - tests/backend/test_contract.py
+    - tests/environment/test_installed_contracts.py
 - id: T-013
   plan_task: 13
   title: Prepare the rebuilt helper pair and receipt the operator installation
@@ -431,7 +517,10 @@ tasks:
   sequence: 13
   depends_on:
   - T-012
-  ownership: []
+  ownership:
+  - docs/backend-compatibility.md
+  - docs/backend-fork.md
+  - docs/operations.md
   exclusive_resources: []
   interfaces:
     produces: []
