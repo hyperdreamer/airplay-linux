@@ -31,12 +31,14 @@ from airplay_linux.domain.operations import (
 )
 from airplay_linux.domain.ports import CommandOutput, CommandSpec, Clock, Subscription
 from airplay_linux.domain.resources import (
+    AudioPolicy,
     CaptureSource,
     Diagnostic,
     Err,
     ErrorCode,
     Ok,
     Result,
+    VolumeLevel,
 )
 
 
@@ -52,6 +54,8 @@ class BackendOperation(StrEnum):
     disconnect = "disconnect"
     mute = "mute"
     unmute = "unmute"
+    volume = "volume"
+    audio_off = "audio_off"
     query_modes = "query_modes"
     start_audio = "start_audio"
     restart_audio = "restart_audio"
@@ -71,6 +75,8 @@ class BackendOperation(StrEnum):
     DISCONNECT = disconnect
     MUTE = mute
     UNMUTE = unmute
+    VOLUME = volume
+    AUDIO_OFF = audio_off
     QUERY_MODES = query_modes
     START_AUDIO = start_audio
     RESTART_AUDIO = restart_audio
@@ -95,6 +101,16 @@ class ConnectPayload:
 
     source: CaptureSource | None = None
     credential: SensitiveText | str | None = field(default=None, repr=False)
+    audio: AudioPolicy | None = None
+    initial_volume: VolumeLevel | None = None
+
+    def __post_init__(self) -> None:
+        if self.audio is not None and (
+            type(self.audio) is not AudioPolicy or type(self.audio.enabled) is not bool
+        ):
+            raise TypeError("connect audio must be an AudioPolicy or None")
+        if self.initial_volume is not None and type(self.initial_volume) is not VolumeLevel:
+            raise TypeError("connect volume must be a VolumeLevel or None")
 
     def __repr__(self) -> str:
         source = "<present>" if self.source is not None else "None"
@@ -113,6 +129,24 @@ class CredentialPayload:
 @dataclass(frozen=True, kw_only=True)
 class MutePayload:
     muted: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class VolumePayload:
+    level: VolumeLevel
+
+    def __post_init__(self) -> None:
+        if type(self.level) is not VolumeLevel:
+            raise TypeError("volume payload requires a VolumeLevel")
+
+
+@dataclass(frozen=True, kw_only=True)
+class AudioGatePayload:
+    enabled: Literal[False] = False
+
+    def __post_init__(self) -> None:
+        if self.enabled is not False:
+            raise TypeError("audio gate only accepts False")
 
 
 @dataclass(frozen=True, kw_only=True, repr=False)
@@ -141,6 +175,8 @@ BackendPayload: TypeAlias = (
     | ConnectPayload
     | CredentialPayload
     | MutePayload
+    | VolumePayload
+    | AudioGatePayload
     | SourcePayload
     | PairingPayload
     | ModesPayload
@@ -163,6 +199,8 @@ FENCE_REQUIRED_OPERATIONS: Final[frozenset[BackendOperation]] = frozenset(
         BackendOperation.disconnect,
         BackendOperation.mute,
         BackendOperation.unmute,
+        BackendOperation.volume,
+        BackendOperation.audio_off,
         BackendOperation.start_audio,
         BackendOperation.restart_audio,
     }
@@ -380,7 +418,7 @@ class PublishedDoubletakeProfile:
             return _err(ErrorCode.unsupported_operation)
         if type(self.socket_path) is not str or not self.socket_path or not self.socket_path.startswith("/") or "\x00" in self.socket_path:
             return _err(ErrorCode.stale_socket)
-        if not isinstance(payload, (EmptyPayload, ConnectPayload, CredentialPayload, MutePayload, SourcePayload, PairingPayload, ModesPayload)):
+        if not isinstance(payload, (EmptyPayload, ConnectPayload, CredentialPayload, MutePayload, VolumePayload, AudioGatePayload, SourcePayload, PairingPayload, ModesPayload)):
             return _err(ErrorCode.invalid_input)
 
         target_text: str | None = None
@@ -406,6 +444,19 @@ class PublishedDoubletakeProfile:
                 return _err(ErrorCode.invalid_input)
             return Ok(value=("doubletake-ctl", "-socket", self.socket_path, op.value, target_text))
 
+        if op in {BackendOperation.volume, BackendOperation.audio_off}:
+            if target_text is None or not self.features.target_volume:
+                return _err(ErrorCode.unsupported_operation)
+            if op is BackendOperation.volume:
+                if type(payload) is not VolumePayload or type(payload.level) is not VolumeLevel:
+                    return _err(ErrorCode.invalid_input)
+                arguments = ("volume", str(payload.level.value), target_text)
+            else:
+                if type(payload) is not AudioGatePayload or payload.enabled is not False:
+                    return _err(ErrorCode.invalid_input)
+                arguments = ("audio", "off", target_text)
+            return Ok(value=("doubletake-ctl", "-socket", self.socket_path, *arguments))
+
         if op is BackendOperation.connect:
             if target_text is None:
                 return _err(ErrorCode.unsupported_operation)
@@ -418,6 +469,21 @@ class PublishedDoubletakeProfile:
                     return _err(ErrorCode.unsupported_operation)
                 if payload.source is not None:
                     return _err(ErrorCode.unsupported_source)
+                if payload.audio is not None or payload.initial_volume is not None:
+                    if not self.features.target_volume:
+                        return _err(ErrorCode.unsupported_operation)
+                    if (
+                        (payload.audio is not None and (
+                            type(payload.audio) is not AudioPolicy or type(payload.audio.enabled) is not bool
+                        ))
+                        or (payload.initial_volume is not None and type(payload.initial_volume) is not VolumeLevel)
+                        or (payload.initial_volume is not None and payload.audio is not None and not payload.audio.enabled)
+                    ):
+                        return _err(ErrorCode.invalid_input)
+                    arguments = () if payload.audio is None else ("--audio", "on" if payload.audio.enabled else "off")
+                    if payload.initial_volume is not None:
+                        arguments += ("--volume", str(payload.initial_volume.value))
+                    return Ok(value=("doubletake-ctl", "-socket", self.socket_path, "connect", target_text, *arguments))
             return Ok(value=("doubletake-ctl", "-socket", self.socket_path, "connect", target_text))
 
         # No other operation has a published v0.5 command mapping.
@@ -480,7 +546,7 @@ class ApplicationContractProfile(PublishedDoubletakeProfile):
         if not isinstance(
             payload,
             (EmptyPayload, ConnectPayload, CredentialPayload, MutePayload,
-             SourcePayload, PairingPayload, ModesPayload),
+             VolumePayload, AudioGatePayload, SourcePayload, PairingPayload, ModesPayload),
         ):
             return _err(ErrorCode.invalid_input)
         target_text: str | None = None
@@ -497,6 +563,15 @@ class ApplicationContractProfile(PublishedDoubletakeProfile):
                 return _err(ErrorCode.invalid_input)
         elif op in target_operations and target_text is None:
             return _err(ErrorCode.unsupported_operation)
+        if op in {BackendOperation.volume, BackendOperation.audio_off}:
+            checked = super().try_argv(op, target, payload)
+            if isinstance(checked, Err):
+                return checked
+        if op is BackendOperation.connect and isinstance(payload, ConnectPayload):
+            if payload.audio is not None or payload.initial_volume is not None:
+                checked = super().try_argv(op, target, payload)
+                if isinstance(checked, Err):
+                    return checked
         # Payload values, including credentials, are consumed by the fake
         # socket/process harness and are intentionally never placed in argv.
         argv = ("application-contract-v1", "-socket", self.socket_path, op.value)
@@ -586,6 +661,11 @@ class PublishedDoubletakeControl:
             return False
         if operation in {BackendOperation.status, BackendOperation.discover, BackendOperation.devices}:
             return True
+        if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+            if not features.target_volume or not features.multi_target:
+                return False
+            if self._public_authority() and not features.owned_daemon_control:
+                return False
         if features.profile in {"doubletake-0.5", "doubletake-0.5+source"}:
             return self._public_authority() and self._authority.allows(operation)
         if self._public_authority():
@@ -596,6 +676,8 @@ class PublishedDoubletakeControl:
             return features.multi_target
         if operation in {BackendOperation.mute, BackendOperation.unmute}:
             return features.multi_target and features.target_mute
+        if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+            return features.multi_target and features.target_volume
         if operation is BackendOperation.connect:
             return all(
                 (
@@ -888,7 +970,9 @@ class PublishedDoubletakeControl:
             # The published CLI uses exit 1 for this valid rejection envelope.
             # Keep rejection fixed and operation-specific; never copy its free
             # form ``error`` field into a diagnostic.
-            if output.exit_code not in {0, 1}:
+            if output.exit_code not in {0, 1} or (
+                op in {BackendOperation.volume, BackendOperation.audio_off} and output.exit_code != 1
+            ):
                 return _err(ErrorCode.daemon_failed)
             return _err(_rejection_code(op))
         if output.exit_code != 0:
@@ -907,6 +991,29 @@ class PublishedDoubletakeControl:
             decoded = decode_devices(response)
             if isinstance(decoded, Err):
                 return decoded
+            return Ok(value=decoded)
+
+        if op in {BackendOperation.volume, BackendOperation.audio_off}:
+            decoded = decode_status(response)
+            if isinstance(decoded, Err):
+                return _err(ErrorCode.audio_volume_failed)
+            checked = self._ownership_check(decoded)
+            if isinstance(checked, Err):
+                return checked
+            matches = [stream for stream in decoded.streams if stream.target == target.canonical_host]
+            if len(matches) != 1:
+                return _err(ErrorCode.audio_volume_failed)
+            stream = matches[0]
+            if op is BackendOperation.volume:
+                if not (
+                    stream.state == "streaming" and stream.has_audio
+                    and stream.volume_state == "applied" and stream.audio_closed is False
+                    and stream.volume == payload.level.value
+                ):
+                    return _err(ErrorCode.audio_volume_failed)
+            elif stream.audio_closed is not True:
+                return _err(ErrorCode.audio_volume_failed)
+            self._emit(BackendNotice(kind=BackendNoticeKind.stream, status=decoded))
             return Ok(value=decoded)
 
         if op in {BackendOperation.mute, BackendOperation.unmute}:
@@ -1124,6 +1231,8 @@ def _secret_text(value: SensitiveText | str | None) -> str | None:
 
 
 def _rejection_code(operation: BackendOperation) -> ErrorCode:
+    if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+        return ErrorCode.audio_volume_failed
     if operation in {BackendOperation.mute, BackendOperation.unmute}:
         return ErrorCode.audio_mute_failed
     if operation in {BackendOperation.start_audio, BackendOperation.restart_audio}:
@@ -1182,6 +1291,7 @@ def _parse_mute_ack(
 __all__ = [
     "AckReply",
     "ApplicationContractProfile",
+    "AudioGatePayload",
     "BackendControl",
     "BackendDevice",
     "BackendFeatures",
@@ -1208,4 +1318,5 @@ __all__ = [
     "SourcePayload",
     "StatusReply",
     "UnsupportedControl",
+    "VolumePayload",
 ]

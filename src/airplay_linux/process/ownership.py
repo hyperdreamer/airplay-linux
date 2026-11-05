@@ -327,6 +327,8 @@ class EvidenceAuthority:
             return f.multi_target
         if operation in {BackendOperation.mute, BackendOperation.unmute}:
             return f.multi_target and f.target_mute
+        if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+            return f.multi_target and f.target_volume
         if operation is BackendOperation.connect:
             return f.multi_target and (f.physical_source or f.virtual_source)
         if operation is BackendOperation.shutdown:

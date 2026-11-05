@@ -33,6 +33,7 @@ from airplay_linux.domain.messages import (
     RetryCleanup,
     RetryRevocation,
     SetMuted,
+    SetVolume,
     Start,
     StartVideoOnly,
     Stop,
@@ -83,6 +84,7 @@ from airplay_linux.domain.resources import (
     TransportState,
     TrustState,
 )
+from airplay_linux.storage.repositories import ReceiverPreferenceWriter
 from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 
 from .fencing import accept_challenge, accept_cleanup, accept_display, accept_transport
@@ -113,6 +115,7 @@ class ManagerDeps:
     audio_probe: AudioProbe
     sessions: SessionStore
     receivers: ReceiverStore
+    preferences: ReceiverPreferenceWriter
     ownerships: OwnershipStore
     fences: TrustFenceRegistry
     clock: Clock
@@ -210,7 +213,8 @@ class SessionContext:
         self._require_dispatch()
         lease = LeaseId(self.deps.ids.new())
         updated = replace(context, transport_lease_id=lease)
-        self.apply(transport_lease_id=lease)
+        self.apply(transport_lease_id=lease, effective_volume=None, last_audible_volume=None,
+                   muted=False, volume_state=None, audio_close_pending=False, volume_save_failed=False)
         return updated
 
     def invalidate_trust(self) -> None:
@@ -786,7 +790,7 @@ class SessionManager:
             return Route.trust
         if isinstance(message, (ChooseResolution, ChangeResolution, RecreateAccepted)):
             return Route.resolution
-        if isinstance(message, (SetMuted, RetryAudio)):
+        if isinstance(message, (SetMuted, SetVolume, RetryAudio)):
             return Route.audio
         if isinstance(message, (RetryCleanup, KeepCleanup, ConfirmOrphanRemoval)):
             return Route.cleanup

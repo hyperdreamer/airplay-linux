@@ -660,7 +660,7 @@ async def test_default_evidence_authority_never_derives_composition_capabilities
         receipts=e.source, process=e, evidence_factory=TerminationEvidence,
     )
     assert a.allows(BackendOperation.status) is True
-    for operation in (BackendOperation.connect, BackendOperation.disconnect, BackendOperation.mute, BackendOperation.shutdown):
+    for operation in (BackendOperation.connect, BackendOperation.disconnect, BackendOperation.mute, BackendOperation.volume, BackendOperation.audio_off, BackendOperation.shutdown):
         assert a.allows(operation) is False
     assert_no_effects(e)
 
@@ -828,6 +828,43 @@ def test_connect_capability_predicate_is_independent_of_keyring(owned_endpoint_e
     )
     assert authority(e, features=features).allows(BackendOperation.connect) is expected
     assert e.walk == [] and e.termination_calls == []
+    assert_no_effects(e)
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("owned", [False, True])
+@pytest.mark.parametrize("multi", [False, True])
+@pytest.mark.parametrize("volume", [False, True])
+async def test_volume_authority_requires_three_independent_gates(owned_endpoint_evidence, operation, owned, multi, volume):
+    e = owned_endpoint_evidence
+    features = replace(
+        PublishedDoubletakeProfile(socket_path=e.record.socket_path).features,
+        owned_daemon_control=owned, multi_target=multi, target_volume=volume,
+    )
+    a = authority(e, features=features)
+    op = BackendOperation(operation)
+    assert a.allows(op) is (owned and multi and volume)
+    if not (owned and multi and volume):
+        assert_refused(await a.authorize(e.record, op, target(), lambda: Ok(value=None)), ErrorCode.dependency_incompatible)
+        assert e.walk == []
+    else:
+        assert isinstance(await a.authorize(e.record, op, target(), lambda: Ok(value=None)), Ok)
+    assert_no_effects(e)
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+async def test_volume_authority_requires_fence_and_current_receipt(owned_endpoint_evidence, operation):
+    e = owned_endpoint_evidence
+    features = replace(
+        PublishedDoubletakeProfile(socket_path=e.record.socket_path).features,
+        owned_daemon_control=True, target_volume=True,
+    )
+    a, op = authority(e, features=features), BackendOperation(operation)
+    assert_refused(await a.authorize(e.record, op, target(), None), ErrorCode.dependency_incompatible)
+    assert e.walk == []
+    assert_refused(await a.authorize(e.record, op, target(), lambda: Err(error=diagnostic(ErrorCode.stale_target))), ErrorCode.stale_target)
+    e.receipts = (replace(e.receipt, peer_start_ticks=999),)
+    assert_refused(await a.authorize(e.record, op, target(), lambda: Ok(value=None)), ErrorCode.ownership_mismatch)
     assert_no_effects(e)
 
 

@@ -22,12 +22,13 @@ from airplay_linux.capture.source import (
 from airplay_linux.backend.control import (
     BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
     Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
+    VolumePayload, AudioGatePayload,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.messages import (
     EmptyPayload as EventEmpty, FailurePayload, MutePayload as EventMute,
-    SourceVerificationPayload, TransportEvent, TransportEventKind,
+    SourceVerificationPayload, TransportEvent, TransportEventKind, VolumePayload as EventVolume,
 )
 from airplay_linux.domain.operations import (
     ChallengeId, InstanceId, LeaseId, OperationContext, PairingChallenge,
@@ -36,10 +37,10 @@ from airplay_linux.domain.operations import (
 from airplay_linux.domain.ports import (
     CapturePort, Clock, CredentialStore, IdFactory, ReceiverStore, Scheduler, Subscription,
 )
-from airplay_linux.domain.records import DaemonRecord
+from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
 from airplay_linux.domain.resources import (
     AudioPolicy, AudioState, CaptureSource, Err, ErrorCode, Ok,
-    PhysicalMonitorSource, ReceiverCapabilities, Result, VirtualOutputSource,
+    PhysicalMonitorSource, ReceiverCapabilities, Result, VirtualOutputSource, VolumeLevel,
 )
 from airplay_linux.process.daemon_registry import DaemonNotice, DaemonRegistry
 from airplay_linux.trust.coordinator import PairingCoordinator
@@ -196,6 +197,21 @@ class _Daemon:
 
 
 @dataclass(kw_only=True, repr=False)
+class _VolumeTask:
+    handle: StreamHandle
+    context: OperationContext
+    level: VolumeLevel
+    task: asyncio.Task | None = None
+    expired: bool = False
+
+
+@dataclass(kw_only=True, repr=False)
+class _CloseTask:
+    task: asyncio.Task
+    expired: bool = False
+
+
+@dataclass(kw_only=True, repr=False)
 class _Stream:
     target: ReceiverTarget
     context: OperationContext
@@ -208,6 +224,12 @@ class _Stream:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ready: bool = False
     muted: bool = False
+    initial_volume: VolumeLevel | None = None
+    audio_closed: bool = False
+    volume_state: str | None = None
+    has_audio: bool = False
+    volume_task: _VolumeTask | None = None
+    close_task: _CloseTask | None = None
     source_observation: SourceObservation | None = None
     abandoned: bool = False
     released: bool = False
@@ -446,6 +468,7 @@ class DoubleTakeTransport:
         for lease, stream in tuple(self._streams.items()):
             if stream.daemon is not daemon or daemon is None:
                 continue
+            self._retire_volume(stream)
             del self._streams[lease]
             if stream.handle is not None:
                 self._retired[stream.handle] = stream
@@ -612,6 +635,20 @@ class DoubleTakeTransport:
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
         fence = self._dispatch_fence(target, context, cleanup=cleanup)
+        if operation in (BackendOperation.volume, BackendOperation.audio_off):
+            original = self._streams.get(context.transport_lease_id)
+            def fence():
+                if original is None or original.handle is None:
+                    return _failure(ErrorCode.stale_event)
+                current = self._audio_owned(original.handle, context)
+                if isinstance(current, Err):
+                    return current
+                if operation is BackendOperation.volume and (original.audio_closed or not original.audio_policy.enabled):
+                    return _failure(ErrorCode.audio_volume_failed)
+                return Ok(value=None)
+            checked = fence()
+            if isinstance(checked, Err):
+                return checked
         fenced = _accepts_dispatch_fence(daemon.control)
         if requires_dispatch_fence(operation) and not fenced:
             # Fail closed. A control that cannot accept the dispatch fence would
@@ -664,9 +701,11 @@ class DoubleTakeTransport:
         )
 
     async def start_stream(
-        self, target: ReceiverTarget, source: CaptureSource,
-        audio_policy: AudioPolicy, context: OperationContext,
+        self, target: ReceiverTarget, source: CaptureSource | None,
+        audio_policy: AudioPolicy, context: OperationContext, *, initial_volume: VolumeLevel | None = None,
     ) -> Result[StreamHandle]:
+        if initial_volume is not None and type(initial_volume) is not VolumeLevel:
+            return _failure(ErrorCode.invalid_input)
         checked = self._current(target, context)
         if isinstance(checked, Err):
             return checked
@@ -695,7 +734,8 @@ class DoubleTakeTransport:
             return _failure(ErrorCode.stale_event)
         stream = _Stream(
             target=target, context=replace(context, transport_lease_id=lease), source=source,
-            audio_policy=audio_policy, lease=lease,
+            audio_policy=audio_policy, lease=lease, initial_volume=initial_volume,
+            audio_closed=self._features.target_volume and not audio_policy.enabled,
             audio=AudioState.Starting if audio_policy.enabled else AudioState.Disabled,
         )
         self._streams[lease] = stream
@@ -719,6 +759,7 @@ class DoubleTakeTransport:
         return self._failed(stream, cleaned) if isinstance(cleaned, Err) else cleaned
 
     def _drop(self, stream: _Stream) -> None:
+        self._retire_volume(stream)
         if self._streams.get(stream.lease) is stream:
             del self._streams[stream.lease]
         if stream.handle is not None:
@@ -979,7 +1020,10 @@ class DoubleTakeTransport:
             # Stop must join this acquisition barrier before its ack can prove
             # release: disconnecting ahead of a late connect is not cleanup.
             result = await self._request(
-                stream.daemon, BackendOperation.connect, stream.target, ConnectPayload(), stream.context,
+                stream.daemon, BackendOperation.connect, stream.target,
+                ConnectPayload(audio=stream.audio_policy,
+                               initial_volume=stream.initial_volume if stream.audio_policy.enabled else None)
+                if self._features.target_volume else ConnectPayload(), stream.context,
             )
             if not connected.done():
                 connected.set_result(None)
@@ -1056,6 +1100,7 @@ class DoubleTakeTransport:
         owned = self._owned(handle)
         if isinstance(owned, Err):
             return owned
+        self._retire_volume(owned.value)
         return await self._wait(self._spawn(self._stop_owned(owned.value, context)), ErrorCode.cleanup_timeout)
 
     async def _stop_owned(self, stream: _Stream, context: OperationContext) -> Result[None]:
@@ -1080,53 +1125,58 @@ class DoubleTakeTransport:
             self._emit(stream, TransportEventKind.stopped, context=context)
             return Ok(value=None)
 
-    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
+    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[AudioStartReceipt]:
         owned = self._owned(handle, context)
         if isinstance(owned, Err):
             return owned
-        if not owned.value.audio_policy.enabled:
+        if not owned.value.audio_policy.enabled or owned.value.audio_closed:
             return _failure(ErrorCode.unsupported_operation)
         return await self._wait(self._spawn(self._start_audio(owned.value, context)), ErrorCode.audio_unavailable)
 
-    async def _start_audio(self, stream: _Stream, context: OperationContext) -> Result[None]:
+    async def _start_audio(self, stream: _Stream, context: OperationContext) -> Result[AudioStartReceipt]:
         async with stream.lock:
             checked = self._owned(stream.handle, context)
             if isinstance(checked, Err):
                 return checked
-            if self._features.audio_restart:
+            if not stream.audio_policy.enabled or stream.audio_closed:
+                return _failure(ErrorCode.audio_unavailable)
+            if self._features.audio_restart and not self._features.target_volume:
                 result = await self._request(
                     stream.daemon, BackendOperation.start_audio, stream.target, EmptyPayload(), context,
                 )
                 checked = self._owned(stream.handle, context)
                 if isinstance(checked, Err):
                     return checked
-                confirmed = _ack(result, BackendOperation.start_audio, stream.target)
-                failure = None if confirmed else (
-                    result if isinstance(result, Err) else _failure(ErrorCode.audio_unavailable)
-                )
+                result = Ok(value=AudioStartReceipt(audio=True)) if _ack(
+                    result, BackendOperation.start_audio, stream.target,
+                ) else result if isinstance(result, Err) else _failure(ErrorCode.audio_unavailable)
             else:
-                # A backend without an independent audio operation starts audio
-                # as part of the stream itself, so the daemon's own report for
-                # this exact stream is the only evidence that it is running.
-                failure = await self._reported_stream_audio(stream, context)
-            if failure is not None:
+                result = await self._reported_stream_audio(stream, context)
+            if isinstance(result, Err):
                 stream.audio = AudioState.Unavailable
+                stream.muted = False
                 self._emit(stream, TransportEventKind.audio_failed if stream.ready else TransportEventKind.audio_start_failed,
-                           FailurePayload(diagnostic=failure.error), context)
-                return failure
-            stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
-            self._emit(stream, TransportEventKind.audio_recovered, context=context)
-            return Ok(value=None)
+                           FailurePayload(diagnostic=result.error), context)
+                return result
+            receipt = result.value
+            stream.has_audio = receipt.audio
+            if self._features.target_volume:
+                stream.volume_state = receipt.volume_state
+                if receipt.volume_state == "applied" and receipt.audio:
+                    stream.muted = receipt.level == 0
+                    stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
+                elif receipt.volume_state == "unrequested" and receipt.audio:
+                    stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
+                else:
+                    stream.muted = False
+                    stream.audio = AudioState.Unavailable
+            else:
+                stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
+                self._emit(stream, TransportEventKind.audio_recovered, context=context)
+            return result
 
-    async def _reported_stream_audio(self, stream: _Stream, context: OperationContext) -> Err | None:
-        """Whether the daemon's own status proves this exact stream has audio.
-
-        The published backend carries audio with ``connect`` and exposes no
-        separate audio operation, so the stream is the only audio evidence there
-        is. One streaming entry for exactly this target that reports audio is
-        proof; a missing, ambiguous, foreign or silent report proves nothing and
-        keeps the typed refusal.
-        """
+    async def _reported_stream_audio(self, stream: _Stream, context: OperationContext) -> Result[AudioStartReceipt]:
+        """Return the exact target's receipt from the existing single status read."""
         daemon = stream.daemon
         if daemon is None or not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.stale_event)
@@ -1137,21 +1187,153 @@ class DoubleTakeTransport:
         checked = self._owned(stream.handle, context)
         if isinstance(checked, Err):
             return checked
+        if not stream.audio_policy.enabled or stream.audio_closed:
+            return _failure(ErrorCode.audio_unavailable)
         if isinstance(reported, Err):
             return reported
         status = reported.value
         if not isinstance(status, StatusReply):
             return _failure(ErrorCode.audio_unavailable)
-        matching = tuple(
-            item for item in status.streams if item.target == stream.target.canonical_host
-        )
-        if (
-            len(matching) != 1
-            or matching[0].state != "streaming"
-            or matching[0].has_audio is not True
-        ):
+        matching = tuple(item for item in status.streams if item.target == stream.target.canonical_host)
+        if len(matching) != 1 or matching[0].state != "streaming" or matching[0].audio_closed is True:
             return _failure(ErrorCode.audio_unavailable)
-        return None
+        entry = matching[0]
+        if not self._features.target_volume and not entry.has_audio:
+            return _failure(ErrorCode.audio_unavailable)
+        return Ok(value=AudioStartReceipt(audio=entry.has_audio, volume_state=entry.volume_state, level=entry.volume))
+
+    @staticmethod
+    def _retire_volume(stream: _Stream) -> None:
+        if stream.volume_task is not None:
+            stream.volume_task.expired = True
+
+    def _audio_owned(self, handle: StreamHandle, context: OperationContext) -> Result[_Stream]:
+        owned = self._owned(handle, context)
+        if isinstance(owned, Err):
+            return owned
+        stream = owned.value
+        fence = self._fences.get(handle.receiver_id)
+        if self._trust_blocked(stream.target):
+            return _failure(ErrorCode.trust_cleanup_required)
+        if fence is None or (
+            fence.endpoint_fingerprint != handle.endpoint_fingerprint
+            or fence.endpoint_generation != handle.endpoint_generation
+            or fence.session_generation != context.session_generation
+            or fence.trust_generation != (context.trust_generation or 0)
+            or fence.active_challenge_id is not None
+        ):
+            return _failure(ErrorCode.stale_event)
+        return owned
+
+    async def set_volume(self, handle: StreamHandle, level: VolumeLevel, context: OperationContext) -> Result[int]:
+        if type(handle) is not StreamHandle or type(level) is not VolumeLevel or type(context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input)
+        record = _VolumeTask(handle=handle, context=context, level=level)
+        record.task = self._spawn(self._set_volume(record))
+        record.task.add_done_callback(lambda task: self._volume_settled(record))
+        return await self._wait(record.task, ErrorCode.audio_volume_failed,
+                                lambda: setattr(record, "expired", True))
+
+    def _volume_settled(self, record: _VolumeTask) -> None:
+        task = record.task
+        result = None if task.cancelled() else task.result()
+        current = self._audio_owned(record.handle, record.context)
+        ok = (not record.expired and isinstance(result, Ok) and isinstance(current, Ok)
+              and not current.value.audio_closed and current.value.audio_policy.enabled)
+        if isinstance(current, Ok) and current.value.volume_task is record:
+            current.value.volume_task = None
+        event = TransportEvent(
+            kind=TransportEventKind.volume_result, receiver_id=record.handle.receiver_id,
+            stream=record.handle, endpoint_fingerprint=record.handle.endpoint_fingerprint,
+            endpoint_generation=record.handle.endpoint_generation,
+            daemon_instance_uuid=record.handle.daemon_instance_uuid, context=record.context,
+            payload=EventVolume(level=result.value if ok else record.level.value, ok=ok),
+        )
+        for callback in tuple(self._callbacks):
+            try:
+                callback(event)
+            except Exception:
+                continue
+
+    async def _set_volume(self, record: _VolumeTask) -> Result[int]:
+        if not self._features.target_volume:
+            return _failure(ErrorCode.unsupported_operation)
+        owned = self._audio_owned(record.handle, record.context)
+        if isinstance(owned, Err):
+            return owned
+        stream = owned.value
+        if stream.volume_task is not None and not stream.volume_task.task.done():
+            return _failure(ErrorCode.audio_volume_failed)
+        stream.volume_task = record
+        async with stream.lock:
+            checked = self._audio_owned(record.handle, record.context)
+            if isinstance(checked, Err):
+                return checked
+            retry = (stream.volume_state == "refused" and stream.has_audio
+                     and stream.initial_volume == record.level)
+            if (record.expired or stream.audio_closed or not stream.audio_policy.enabled
+                    or (stream.audio not in (AudioState.Enabled, AudioState.Muted) and not retry)):
+                return _failure(ErrorCode.audio_volume_failed)
+            result = await self._request(stream.daemon, BackendOperation.volume, stream.target,
+                                         VolumePayload(level=record.level), record.context)
+            checked = self._audio_owned(record.handle, record.context)
+            if isinstance(checked, Err):
+                return checked
+            if record.expired or stream.audio_closed or not stream.audio_policy.enabled:
+                return _failure(ErrorCode.audio_volume_failed)
+            if isinstance(result, Err):
+                return result
+            if not isinstance(result.value, StatusReply):
+                return _failure(ErrorCode.audio_volume_failed)
+            entries = [s for s in result.value.streams if s.target == stream.target.canonical_host]
+            if len(entries) != 1:
+                return _failure(ErrorCode.audio_volume_failed)
+            receipt = entries[0]
+            if not (receipt.state == "streaming" and receipt.has_audio and receipt.audio_closed is False
+                    and receipt.volume_state == "applied" and receipt.volume == record.level.value):
+                return _failure(ErrorCode.audio_volume_failed)
+            stream.muted = receipt.volume == 0
+            stream.audio = AudioState.Muted if stream.muted else AudioState.Enabled
+            stream.volume_state = "applied"
+            return Ok(value=receipt.volume)
+
+    async def close_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
+        if type(handle) is not StreamHandle or type(context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input)
+        if not self._features.target_volume:
+            return _failure(ErrorCode.unsupported_operation)
+        owned = self._audio_owned(handle, context)
+        if isinstance(owned, Err):
+            return owned
+        stream = owned.value
+        stream.audio_closed = True
+        stream.audio_policy = replace(stream.audio_policy, enabled=False)
+        self._retire_volume(stream)
+        record = stream.close_task
+        if record is None or record.task.done():
+            record = _CloseTask(task=self._spawn(self._close_audio(stream, context)))
+            stream.close_task = record
+        result = await self._wait(record.task, ErrorCode.audio_volume_failed,
+                                  lambda: setattr(record, "expired", True))
+        return _failure(ErrorCode.audio_volume_failed) if record.expired else result
+
+    async def _close_audio(self, stream: _Stream, context: OperationContext) -> Result[None]:
+        # Closing audio must never wait behind the stream's volume lock.
+        checked = self._audio_owned(stream.handle, context)
+        if isinstance(checked, Err):
+            return checked
+        result = await self._request(stream.daemon, BackendOperation.audio_off, stream.target,
+                                     AudioGatePayload(), context)
+        checked = self._audio_owned(stream.handle, context)
+        if isinstance(checked, Err):
+            return checked
+        if isinstance(result, Err):
+            return result
+        entries = ([s for s in result.value.streams if s.target == stream.target.canonical_host]
+                   if isinstance(result.value, StatusReply) else [])
+        if len(entries) != 1 or entries[0].audio_closed is not True:
+            return _failure(ErrorCode.audio_volume_failed)
+        return Ok(value=None)
 
     async def set_muted(self, handle: StreamHandle, muted: bool, context: OperationContext) -> Result[None]:
         owned = self._owned(handle, context)

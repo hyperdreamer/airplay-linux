@@ -36,7 +36,7 @@ destruction never retires the prompt that superseded it.
 
 User intent leaves through the signals ``receiver_selected``, ``action_requested``,
 ``mode_requested``, ``source_selected``, ``resolution_selected``,
-``mute_requested`` and ``closing_requested``.  The presenter owns which receiver
+``mute_requested``, ``volume_requested`` and ``closing_requested``. The presenter owns which receiver
 is selected and when the window really closes; :meth:`MainWindow.allow_close` is
 the only way to let ``closeEvent`` through.
 """
@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
@@ -189,6 +190,7 @@ class MainWindow(QMainWindow):
     source_selected = Signal(str)
     resolution_selected = Signal(int, int)
     mute_requested = Signal(bool)
+    volume_requested = Signal(int)
     closing_requested = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -428,6 +430,28 @@ class MainWindow(QMainWindow):
         primary_row.addStretch(1)
         layout.addLayout(primary_row)
 
+        self._volume_row = QWidget(pane)
+        self._volume_row.setObjectName("volumeRow")
+        volume_layout = QHBoxLayout(self._volume_row)
+        volume_layout.setContentsMargins(0, 0, 0, 0)
+        self._volume_label = QLabel("Volume", self._volume_row)
+        self._volume_label.setObjectName("volumeLabel")
+        self._volume_slider = QSlider(Qt.Orientation.Horizontal, self._volume_row)
+        self._volume_slider.setObjectName("volumeSlider")
+        self._volume_slider.setRange(0, 100)
+        self._volume_slider.setSingleStep(1)
+        self._volume_slider.setPageStep(10)
+        self._volume_slider.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._volume_slider.setAccessibleName("Receiver volume")
+        self._volume_label.setBuddy(self._volume_slider)
+        self._volume_readout = QLabel("—", self._volume_row)
+        self._volume_readout.setObjectName("volumeReadout")
+        self._volume_readout.setAccessibleName("Receiver volume level")
+        volume_layout.addWidget(self._volume_label)
+        volume_layout.addWidget(self._volume_slider, 1)
+        volume_layout.addWidget(self._volume_readout)
+        layout.addWidget(self._volume_row)
+
         actions = QGridLayout()
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setHorizontalSpacing(4)
@@ -478,6 +502,7 @@ class MainWindow(QMainWindow):
         self._mirror.clicked.connect(lambda: self._request_mode(Mode.MIRROR))
         self._virtual.clicked.connect(lambda: self._request_mode(Mode.VIRTUAL))
         self._mute.toggled.connect(self._request_mute)
+        self._volume_slider.valueChanged.connect(self._request_volume)
         self._source.currentIndexChanged.connect(self._source_changed)
         self._resolution.currentIndexChanged.connect(self._resolution_changed)
         self._table.selectionModel().currentRowChanged.connect(self._row_changed)
@@ -486,7 +511,7 @@ class MainWindow(QMainWindow):
         order = [self._scan, self._settings, self._table]
         order += [self._mirror, self._virtual]
         order += [self._source, self._resolution]
-        order += [self._mute]
+        order += [self._mute, self._volume_slider]
         order += [self._buttons[action] for action in _COMMAND_LABELS if action in self._buttons]
         for first, second in zip(order, order[1:], strict=False):
             QWidget.setTabOrder(first, second)
@@ -513,6 +538,7 @@ class MainWindow(QMainWindow):
         self._render_error(pane)
         self._render_editor(pane)
         self._render_mute(pane)
+        self._render_volume(pane)
         self._render_actions(pane)
 
     def set_activity(self, events: tuple[ActivityEvent, ...]) -> None:
@@ -672,7 +698,8 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------- render
 
-    def _render_no_selection(self) -> None:
+    def _render_no_selection(self, *, volume_supported: bool = False) -> None:
+        self._pane = None
         self._mode_selectable = False
         self._mirror.setEnabled(False)
         self._virtual.setEnabled(False)
@@ -687,7 +714,18 @@ class MainWindow(QMainWindow):
         self._mute.setEnabled(False)
         with QSignalBlocker(self._mute):
             self._mute.setChecked(False)
-        self._set_mute_affordance(muted=False)
+        self._set_mute_affordance(muted=False, volume_supported=volume_supported)
+        with QSignalBlocker(self._volume_slider):
+            self._volume_slider.setValue(0)
+        self._volume_slider.setEnabled(False)
+        self._volume_slider.setAccessibleDescription("Level unknown")
+        self._volume_readout.setText("—")
+        self._volume_row.setToolTip(
+            "Select a receiver to change its volume." if volume_supported
+            else "The installed backend does not support receiver volume."
+        )
+        self._volume_slider.setToolTip(self._volume_row.toolTip())
+        self._volume_row.setVisible(True)
         for action, button in self._buttons.items():
             button.setEnabled(action is Action.scan)
             button.setVisible(action is not Action.mute and action in _PERSISTENT)
@@ -763,7 +801,20 @@ class MainWindow(QMainWindow):
         with QSignalBlocker(self._mute):
             self._mute.setChecked(pane.muted)
         self._mute.setEnabled(pane.mute_enabled)
-        self._set_mute_affordance(muted=pane.muted)
+        self._set_mute_affordance(muted=pane.muted, volume_supported=pane.volume_supported)
+
+    def _render_volume(self, pane: PaneState) -> None:
+        with QSignalBlocker(self._volume_slider):
+            self._volume_slider.setRange(0, 100)
+            self._volume_slider.setValue(pane.volume_level if pane.volume_level is not None else 0)
+            self._volume_slider.setEnabled(pane.volume_enabled)
+            self._volume_slider.setAccessibleDescription(
+                "Level unknown" if pane.volume_level is None else ""
+            )
+        self._volume_readout.setText(pane.volume_readout)
+        self._volume_slider.setToolTip(pane.volume_tooltip)
+        self._volume_row.setToolTip(pane.volume_tooltip)
+        self._volume_row.setVisible(True)
 
     def _render_actions(self, pane: PaneState) -> None:
         start_label = (
@@ -800,6 +851,13 @@ class MainWindow(QMainWindow):
         self._dismiss_tracked_prompt()
         self.mute_requested.emit(bool(muted))
 
+    def _request_volume(self, level: int) -> None:
+        if (self._pane is None or not self._pane.volume_enabled
+                or not self._volume_slider.isEnabled()):
+            return
+        self._dismiss_tracked_prompt()
+        self.volume_requested.emit(level)
+
     def _source_changed(self, index: int) -> None:
         if index < 0:
             return
@@ -828,7 +886,7 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------------- helpers
 
-    def _set_mute_affordance(self, *, muted: bool) -> None:
+    def _set_mute_affordance(self, *, muted: bool, volume_supported: bool = False) -> None:
         if muted:
             name = "Unmute receiver audio"
             tooltip = (
@@ -843,6 +901,12 @@ class MainWindow(QMainWindow):
                 "its own volume setting."
             )
             pixmap = QStyle.StandardPixmap.SP_MediaVolume
+        if volume_supported:
+            tooltip = (
+                "Audio is muted for this receiver. Activate to restore its last audible level."
+                if muted else
+                "Mute this receiver's audio for this session. Unmute restores its last audible level."
+            )
         self._mute.setAccessibleName(name)
         self._mute.setToolTip(tooltip)
         icon: QIcon = self.style().standardIcon(pixmap)

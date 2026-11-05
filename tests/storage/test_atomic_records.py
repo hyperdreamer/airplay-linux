@@ -67,6 +67,7 @@ from airplay_linux.domain.resources import (
     StartRequest,
     TransportState,
     TrustState,
+    VolumeLevel,
 )
 from airplay_linux.storage import (
     CREDENTIAL_REFERENCE_CONFLICT,
@@ -274,6 +275,120 @@ def record_set(**overrides: object) -> ReceiverRecordSet:
         "ambiguous": False,
     }
     return ReceiverRecordSet(**(defaults | overrides))
+
+
+# --------------------------------------------------------------------------- receiver volume versions
+
+
+@pytest.fixture
+def receiver_v1():
+    return b'{"continuity_fingerprint":"fp","display_name":"TV","last_endpoint":null,"receiver_id":"airplay-device:a","remembered_resolution":null,"schema":"airplay-linux/receiver","service_metadata":[],"version":1}'
+
+
+@pytest.fixture
+def receiver_v2():
+    return b'{"continuity_fingerprint":"fp","display_name":"TV","last_endpoint":null,"receiver_id":"airplay-device:a","remembered_resolution":null,"remembered_volume":30,"schema":"airplay-linux/receiver","service_metadata":[],"version":2}'
+
+
+def test_receiver_volume_v2_exact_minimal_bytes(receiver_v1, receiver_v2):
+    record = SavedReceiver(
+        receiver_id=ReceiverId("airplay-device:a"), service_metadata=(),
+        display_name="TV", last_endpoint=None, continuity_fingerprint="fp",
+        credential_ref=None, remembered_resolution=None, remembered_volume=30,
+    )
+    assert encode_receiver(record) == receiver_v2
+    assert decode_receiver(receiver_v2) == record
+    assert decode_receiver(receiver_v1) == replace(record, remembered_volume=None)
+    assert set(json.loads(receiver_v1)) == {
+        "schema", "version", "receiver_id", "service_metadata", "display_name",
+        "last_endpoint", "continuity_fingerprint", "remembered_resolution",
+    }
+
+
+@pytest.mark.parametrize("level", [None, 1, 30, 100])
+def test_receiver_volume_valid_boundaries(level):
+    record = saved(remembered_volume=level)
+    raw = encode_receiver(record)
+    assert json.loads(raw)["remembered_volume"] == level
+    assert json.loads(raw)["version"] == 2
+    assert decode_receiver(raw) == record
+
+
+@pytest.mark.parametrize("bad", [0, -1, 101, True, False, "30", 3.5, [], {}, 10**100])
+def test_bad_volume_drops_only_preference(bad, receiver_v2):
+    raw = json.loads(receiver_v2)
+    raw["remembered_volume"] = bad
+    warnings = []
+    decoded = decode_receiver(json.dumps(raw).encode(), on_diagnostic=warnings.append)
+    expected = decode_receiver(receiver_v2)
+    assert decoded == replace(expected, remembered_volume=None)
+    assert warnings == [diagnostic(ErrorCode.volume_preference_invalid, decoded.receiver_id)]
+
+
+@pytest.mark.parametrize("change", [
+    {"receiver_id": "secret-not-an-identity"}, {"schema": "other"},
+    {"version": True}, {"version": "2"}, {"version": 3},
+    {"display_name": []}, {"last_endpoint": {}}, {"service_metadata": {}},
+    {"continuity_fingerprint": ""}, {"remembered_resolution": {}},
+    {"credential_ref": None}, {"extra": "secret"},
+])
+def test_receiver_bad_volume_never_hides_structural_corruption(receiver_v2, change):
+    raw = json.loads(receiver_v2) | {"remembered_volume": "secret"} | change
+    warnings = []
+    with pytest.raises(RecordError):
+        decode_receiver(json.dumps(raw).encode(), on_diagnostic=warnings.append)
+    assert warnings == []
+
+
+@pytest.mark.parametrize("fixture", ["receiver_v1", "receiver_v2"])
+def test_receiver_version_field_sets_are_exact(request, fixture):
+    raw = json.loads(request.getfixturevalue(fixture))
+    if fixture == "receiver_v2":
+        del raw["remembered_volume"]
+    else:
+        raw["remembered_volume"] = None
+    with pytest.raises(RecordError):
+        decode_receiver(json.dumps(raw).encode())
+
+
+def test_receiver_invalid_volume_callback_failure_is_contained(receiver_v2):
+    raw = json.loads(receiver_v2) | {"remembered_volume": 0}
+    def broken(_warning):
+        raise RuntimeError("secret-sink-failure")
+    assert decode_receiver(json.dumps(raw).encode(), on_diagnostic=broken).remembered_volume is None
+
+
+@pytest.mark.parametrize("record,encode,decode", [
+    (rich_snapshot, encode_session, decode_session),
+    (ownership, encode_ownership, decode_ownership),
+    (daemon, encode_daemon, decode_daemon),
+])
+def test_receiver_v2_does_not_promote_other_schemas(record, encode, decode):
+    raw = json.loads(encode(record()))
+    assert raw["version"] == 1
+    raw["version"] = 2
+    with pytest.raises(RecordError, match="unknown_version"):
+        decode(json.dumps(raw).encode())
+
+
+def test_session_and_queued_start_exclude_volume_authority():
+    snapshot = rich_snapshot()
+    snapshot = replace(
+        snapshot, remembered_volume=30, effective_volume=0, last_audible_volume=30,
+        volume_state="applied", audio_close_pending=True, volume_save_failed=True,
+        queued_start=replace(snapshot.queued_start, volume=VolumeLevel(value=30)),
+    )
+    payload = encode_session(snapshot)
+    raw = json.loads(payload)
+    for key in ("remembered_volume", "effective_volume", "last_audible_volume",
+                "volume_state", "audio_close_pending", "volume_save_failed"):
+        assert key not in raw
+    assert set(raw["queued_start"]) == {"mode", "source", "resolution", "audio"}
+    decoded = decode_session(payload)
+    assert decoded.queued_start.volume is None
+    assert decoded.effective_volume is decoded.remembered_volume is None
+    assert decoded.last_audible_volume is decoded.volume_state is None
+    assert not decoded.audio_close_pending and not decoded.volume_save_failed
 
 
 # --------------------------------------------------------------------------- atomic files

@@ -21,7 +21,7 @@ from airplay_linux.domain.operations import InstanceId, StreamHandle
 from airplay_linux.domain.records import DaemonRecord
 from airplay_linux.domain.resources import (
     AudioState, Diagnostic, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
-    PhysicalMonitorSource, Result, TransportState, TrustState,
+    PhysicalMonitorSource, Result, TransportState, TrustState, VolumeLevel,
 )
 
 from .cleanup import runtime_for
@@ -105,6 +105,7 @@ class _ReconnectRuntime:
     local_required: bool = False
     dead_instance: InstanceId | None = None
     last_instance: InstanceId | None = None
+    initial_start_pending: bool = False
     immediate: bool = False
     release_failed: bool = False
 
@@ -188,7 +189,9 @@ class ReconnectLifecycle(VirtualLifecycle):
             if retire_identity:
                 runtime.require_pairing = True
                 _virtual_runtime(ctx).pairing_requested = True
-                ctx.apply(resolution=None, accepted_resolution=None)
+                ctx.apply(resolution=None, accepted_resolution=None, remembered_volume=None)
+                from .audio import audio_runtime
+                audio_runtime(ctx).start_volume = None
         return changed
 
     def _refresh_discovery(self, ctx):
@@ -205,7 +208,10 @@ class ReconnectLifecycle(VirtualLifecycle):
             ctx.apply(last_error=diagnostic(ErrorCode.stale_target, ctx.state.receiver_id))
             return
         self._retire_terminal_error(ctx)
+        was_active = ctx.state.intent_active
         super()._start(ctx, message, supersede=supersede)
+        if not was_active and ctx.state.intent_active:
+            _runtime(ctx).initial_start_pending = True
 
     def reconnect(self, ctx, message):
         if isinstance(message, DiscoveryEvent):
@@ -315,11 +321,23 @@ class ReconnectLifecycle(VirtualLifecycle):
         source = ctx.state.display_handle.source if ctx.state.mode is Mode.VIRTUAL else ctx.state.physical_source
         runtime = _virtual_runtime(ctx)
         runtime.pending_ready = runtime.ready_stream = None
-        operation = ctx.new_transport_lease(_current_context(ctx))
         policy = ctx.state.audio_policy
+        from .audio import audio_runtime
+        runtime = _runtime(ctx)
+        initial = (audio_runtime(ctx).start_volume
+                   if runtime.initial_start_pending
+                   else VolumeLevel(value=ctx.state.remembered_volume)
+                   if ctx.state.remembered_volume is not None else None)
+        runtime.initial_start_pending = False
+        if ctx.state.mode is Mode.VIRTUAL:
+            _virtual_runtime(ctx).request = None
+        if not self.deps.capabilities().volume or not policy.enabled:
+            initial = None
+        audio_runtime(ctx).start_volume = initial
+        operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
 
-        async def start():
+        async def start(policy=policy, initial=initial):
             # Selection/probe may have crossed an await. Check the discovery
             # authority again before handing any command to the transport.
             view = self.deps.discovery.current(ctx.state.receiver_id)
@@ -329,7 +347,7 @@ class ReconnectLifecycle(VirtualLifecycle):
             self.deps.transport.update_target(target, ctx.state.receiver_id)
             return await self._with_backend_events(
                 ctx, operation,
-                lambda: self.deps.transport.start_stream(target, source, policy, operation),
+                lambda: self.deps.transport.start_stream(target, source, policy, operation, initial_volume=initial),
                 acquisition=True,
             )
 

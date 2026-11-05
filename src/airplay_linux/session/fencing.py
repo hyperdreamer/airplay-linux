@@ -91,6 +91,7 @@ def accept_transport(state: SessionSnapshot, event: TransportEvent) -> bool:
         TransportEventKind.audio_failed,
         TransportEventKind.audio_recovered,
         TransportEventKind.mute_result,
+        TransportEventKind.volume_result,
     }
     if stopped:
         if state.transport_lease_id is not None and state.transport_lease_id != stream.lease_id:

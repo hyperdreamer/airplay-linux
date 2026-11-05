@@ -286,7 +286,10 @@ def test_challenge_requires_every_current_trust_token(changes) -> None:
     assert not accept_challenge(state, replace(challenge, **changes))
 
 
-@pytest.mark.parametrize("kind", [TransportEventKind.audio_recovered, TransportEventKind.mute_result])
+@pytest.mark.parametrize("kind", [
+    TransportEventKind.audio_recovered, TransportEventKind.mute_result,
+    TransportEventKind.volume_result,
+])
 def test_audio_results_use_their_pending_operation_without_staling_stream_notices(kind) -> None:
     destination = target()
     handle = stream()

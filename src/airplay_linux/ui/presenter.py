@@ -85,6 +85,7 @@ from airplay_linux.domain.messages import (
     RetryCleanup,
     RetryRevocation,
     SetMuted,
+    SetVolume,
     Start,
     StartVideoOnly,
     Stop,
@@ -116,7 +117,9 @@ from airplay_linux.domain.resources import (
     StartRequest,
     TransportState,
     TrustState,
+    VolumeLevel,
 )
+from airplay_linux.storage.repositories import PreferenceAccess
 from airplay_linux.ui.dialogs import (
     ConfirmStopDialog,
     OrphanDialog,
@@ -354,6 +357,8 @@ class Presenter:
         # -- request tokens ------------------------------------------------
         self._saved_loading = False
         self._saved_loaded = False
+        self._saved_publication = 0
+        self._saved_refresh_pending = False
         self._ownership_epoch = 0
         self._ownerships_loaded = False
         self._ownerships_loading = 0
@@ -411,6 +416,7 @@ class Presenter:
         self._window.source_selected.connect(self._on_source_selected)
         self._window.resolution_selected.connect(self._on_resolution_selected)
         self._window.mute_requested.connect(self._on_mute_requested)
+        self._window.volume_requested.connect(self._on_volume_requested)
         self._window.closing_requested.connect(self._on_closing_requested)
         self._subscribe(self._manager.subscribe, self._bridge.snapshot.emit)
         self._subscribe(self._discovery.subscribe, self._bridge.discovery.emit)
@@ -618,13 +624,22 @@ class Presenter:
         """Build the typed start this receiver's current state can accept."""
         snapshot = self._snapshot(receiver_id)
         audio = snapshot.audio_policy if snapshot.intent_active else AudioPolicy()
+        volume = None
+        view = self._view(receiver_id)
+        if (self._report().volume and audio.enabled and view is not None
+                and snapshot.online and snapshot.target is not None
+                and view.record_set.endpoint_fingerprint == snapshot.target.endpoint_fingerprint
+                and view.record_set.endpoint_generation == snapshot.target.endpoint_generation):
+            saved = PreferenceAccess.for_record_set(view.record_set, self._saved.get(receiver_id))
+            if saved is not None and saved.remembered_volume is not None:
+                volume = VolumeLevel(value=saved.remembered_volume)
         if mode is Mode.MIRROR:
             # Mirror carries no requested source: the backend opens the capture
             # session and the desktop decides which screen it gets.
-            return StartRequest(mode=Mode.MIRROR, source=None, audio=audio)
+            return StartRequest(mode=Mode.MIRROR, source=None, audio=audio, volume=volume)
         size = self._selected_size(receiver_id)
         decision = self._decision_for(receiver_id, size) if size is not None else None
-        return StartRequest(mode=Mode.VIRTUAL, resolution=decision, audio=audio)
+        return StartRequest(mode=Mode.VIRTUAL, resolution=decision, audio=audio, volume=volume)
 
     def _inputs(self, receiver_id: ReceiverId, report: CapabilityReport) -> ViewInputs:
         return ViewInputs(
@@ -731,7 +746,7 @@ class Presenter:
         if selected is None:
             # The window owns the empty state; reuse it rather than fabricating a
             # PaneState that would carry actions no receiver can honour.
-            self._window._render_no_selection()  # noqa: SLF001 - owned empty state
+            self._window._render_no_selection(volume_supported=report.volume)  # noqa: SLF001
             return
         pane = self._pane(selected)
         self._window.select_receiver(selected)
@@ -761,28 +776,45 @@ class Presenter:
 
     def _start_saved_load(self) -> None:
         if self._saved_loading:
+            self._saved_refresh_pending = True
             return
         self._saved_loading = True
         self._schedule(self._load_saved())
 
     async def _load_saved(self) -> None:
         try:
-            result = await self._receivers.all()
-        except Exception:  # noqa: BLE001 - a store failure is a typed diagnostic
-            result = Err(error=diagnostic(ErrorCode.persistence_failed))
+            while not self._disposed:
+                publication = self._saved_publication
+                self._saved_refresh_pending = False
+                try:
+                    result = await self._receivers.all()
+                except Exception:  # noqa: BLE001 - a store failure is a typed diagnostic
+                    result = Err(error=diagnostic(ErrorCode.persistence_failed))
+                if self._disposed:
+                    return
+                if publication != self._saved_publication or self._saved_refresh_pending:
+                    # Never publish a read crossed by a later preference commit.
+                    # Any number of publications during it share one next read.
+                    continue
+                self._saved_loaded = True
+                if isinstance(result, Ok):
+                    refreshed: dict[ReceiverId, SavedReceiver] = {}
+                    for saved in result.value:
+                        if not isinstance(saved, SavedReceiver):
+                            continue
+                        view = self._view(saved.receiver_id)
+                        # An offline record with no current advertisement remains
+                        # list metadata. Starting still requires live continuity.
+                        if (view is None
+                                or PreferenceAccess.for_record_set(view.record_set, saved) is not None):
+                            refreshed[saved.receiver_id] = saved
+                    self._saved = refreshed
+                else:
+                    self._reject(self._selected, result.error)
+                self._request_render()
+                return
         finally:
             self._saved_loading = False
-        if self._disposed:
-            return
-        self._saved_loaded = True
-        if isinstance(result, Ok):
-            self._saved = {
-                saved.receiver_id: saved for saved in result.value
-                if isinstance(saved, SavedReceiver)
-            }
-        else:
-            self._reject(self._selected, result.error)
-        self._request_render()
 
     def _reload_ownerships(self) -> None:
         self._ownership_epoch += 1
@@ -911,6 +943,8 @@ class Presenter:
             # even when it is delivered late.
             return
         self._snapshots[snapshot.receiver_id] = snapshot
+        self._saved_publication += 1
+        self._start_saved_load()
         pairing = self._pairing_pending.get(snapshot.receiver_id)
         if pairing is not None and self._pane(snapshot.receiver_id).challenge != pairing:
             # Snapshot publication is authoritative even when this receiver is
@@ -1150,6 +1184,21 @@ class Presenter:
             return
         self._schedule(
             self._dispatch(SetMuted(receiver_id=receiver_id, muted=bool(muted))),
+            receiver_id=receiver_id,
+        )
+
+    def _on_volume_requested(self, level: int) -> None:
+        if self._shutting_down or self._disposed:
+            return
+        receiver_id = self._selected
+        if receiver_id is None or not self._pane(receiver_id).volume_enabled:
+            return
+        try:
+            volume = VolumeLevel(value=level)
+        except (TypeError, ValueError):
+            return
+        self._schedule(
+            self._dispatch(SetVolume(receiver_id=receiver_id, level=volume)),
             receiver_id=receiver_id,
         )
 

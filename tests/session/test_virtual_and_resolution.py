@@ -14,9 +14,9 @@ from airplay_linux.domain.operations import SensitiveText
 from airplay_linux.domain.records import SavedReceiver
 from airplay_linux.domain.resources import (
     AudioState, DisplayState, Err, ErrorCode, Mode, Ok, ReceiverCapabilities, SessionPhase,
-    StartRequest, TransportState, TrustState,
+    StartRequest, TransportState, TrustState, VolumeLevel,
 )
-from airplay_linux.session.engine import Route
+from airplay_linux.session.engine import Route, SessionManager
 from airplay_linux.session.testing import SessionRig
 from airplay_linux.session.virtual import build_virtual_handlers, compose_virtual_handlers
 from airplay_linux.testing.adapters import Deferred, FakeDisplay
@@ -27,12 +27,12 @@ from virtual_scenarios import (
 )
 
 
-async def start_virtual(rig, destination=None, size=HD):
+async def start_virtual(rig, destination=None, size=HD, *, volume: VolumeLevel | None = None):
     destination = destination or target()
     rig.discovery.add_target(destination)
     await rig.manager.dispatch(Start(
         receiver_id=destination.receiver_id,
-        request=StartRequest(mode=Mode.VIRTUAL, resolution=decision(destination, size)),
+        request=StartRequest(mode=Mode.VIRTUAL, resolution=decision(destination, size), volume=volume),
     ))
     await settle(rig)
     return rig.manager.snapshot(destination.receiver_id)
@@ -46,6 +46,50 @@ def display_event(owned, kind="helper_exit", destination=None, **changes):
         output_id=owned.source.kscreen_output_id, helper=owned.helper,
         handle=owned, diagnostic=None,
     ), **changes)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_before_save", [False, True])
+async def test_resolution_uses_shared_preferences_and_publishes_success(monkeypatch, stop_before_save):
+    rig = make_rig()
+    destination = target()
+    original = SavedReceiver(
+        receiver_id=destination.receiver_id, service_metadata=destination.service_records,
+        display_name="Saved name", last_endpoint=destination,
+        continuity_fingerprint=destination.endpoint_fingerprint, credential_ref=None,
+        remembered_resolution=None, remembered_volume=30,
+    )
+    rig.receivers.receivers[destination.receiver_id] = original
+    writer = rig.deps.preferences
+    update = writer.update
+    gate, entered = Deferred(), []
+    async def held(record_set, **kwargs):
+        entered.append((record_set, kwargs))
+        await gate.wait()
+        return await update(record_set, **kwargs)
+    monkeypatch.setattr(writer, "update", held)
+    publications = []
+    subscription = rig.manager.subscribe(publications.append)
+    state = await start_virtual(rig, size=SMALL)
+    assert len(entered) == 1
+    assert entered[0][1]["remembered_resolution"].size == SMALL
+    assert entered[0][1]["still_current"]()
+    if stop_before_save:
+        await rig.manager.dispatch(Stop(receiver_id=destination.receiver_id))
+        await settle(rig)
+    publications.clear()
+    gate.resolve(None)
+    await settle(rig)
+    subscription.close()
+    stored = rig.receivers.receivers[destination.receiver_id]
+    if stop_before_save:
+        assert stored == original
+    else:
+        assert stored.remembered_volume == 30
+        assert stored.remembered_resolution.size == SMALL
+        assert stored.display_name == original.display_name
+        assert publications, "successful preference effects must refresh snapshot subscribers"
+        assert rig.manager.snapshot(destination.receiver_id) == state
 
 
 @pytest.mark.asyncio
@@ -581,8 +625,10 @@ async def test_cancel_releases_late_successes_before_reporting_available(stage):
             return result
 
     class HeldTransport(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(
+                destination, source, audio, operation, initial_volume=initial_volume,
+            )
             if stage == "stream":
                 await gate.wait()
             return result
@@ -608,8 +654,10 @@ async def test_pairing_while_connecting_keeps_output_and_retries_after_original_
     gate = Deferred()
 
     class ConnectingPair(ContextTransport):
-        async def start_stream(self, destination, source, audio, operation):
-            result = await super().start_stream(destination, source, audio, operation)
+        async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+            result = await super().start_stream(
+                destination, source, audio, operation, initial_volume=initial_volume,
+            )
             if not getattr(self, "asked", False):
                 self.asked = True
                 self.emit(TransportEvent(
@@ -623,7 +671,12 @@ async def test_pairing_while_connecting_keeps_output_and_retries_after_original_
             return result
 
     rig = make_rig(transport=ConnectingPair())
-    pairing = await start_virtual(rig)
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, capabilities=lambda: replace(report, volume=True))
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    rig.manager = SessionManager(rig.deps, virtual_handlers(rig.deps))
+    pairing = await start_virtual(rig, volume=VolumeLevel(value=30))
     assert pairing.phase is SessionPhase.Pairing
     assert pairing.display is DisplayState.Owned
     assert pairing.challenge is not None
@@ -633,6 +686,7 @@ async def test_pairing_while_connecting_keeps_output_and_retries_after_original_
     ))
     await settle(rig)
     assert len(rig.journal.calls("transport.start_stream")) == 1
+    assert rig.journal.calls("transport.start_stream")[0]["initial_volume"] == {"value": 30}
     gate.resolve(Ok(value=None))
     await settle(rig)
     after = rig.manager.snapshot(target().receiver_id)

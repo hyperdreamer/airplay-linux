@@ -139,6 +139,34 @@ ENTRIES: Mapping[ErrorCode, CatalogEntry] = MappingProxyType(
             ),
             recovery=(RecoveryAction.retry, RecoveryAction.stop),
         ),
+        ErrorCode.audio_volume_failed: CatalogEntry(
+            message=(
+                "The audio control change could not be confirmed. The last confirmed "
+                "audio state is kept. Try the control again, or stop the session."
+            ),
+            recovery=(RecoveryAction.back, RecoveryAction.stop),
+        ),
+        ErrorCode.volume_unavailable: CatalogEntry(
+            message=(
+                "The starting volume could not be confirmed. Audio is withheld. "
+                "Retry audio, start video only, or stop the session."
+            ),
+            recovery=(RecoveryAction.retry_audio, RecoveryAction.video_only, RecoveryAction.stop),
+        ),
+        ErrorCode.volume_preference_invalid: CatalogEntry(
+            message=(
+                "The saved volume is invalid and was ignored. "
+                "Other receiver preferences are unchanged."
+            ),
+            recovery=(RecoveryAction.back,),
+        ),
+        ErrorCode.volume_preference_failed: CatalogEntry(
+            message=(
+                "The receiver volume was applied but could not be saved. "
+                "The previous saved level is kept."
+            ),
+            recovery=(RecoveryAction.back, RecoveryAction.stop),
+        ),
         ErrorCode.receiver_rejected: CatalogEntry(
             message=(
                 "The receiver rejected this request. Confirm the request on the receiver "

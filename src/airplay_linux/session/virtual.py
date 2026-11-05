@@ -25,7 +25,7 @@ from airplay_linux.domain.records import SavedReceiver
 from airplay_linux.domain.resources import (
     AudioState, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok,
     ReceiverCapabilities, ResolutionDecision, ResolutionEvidence, Size,
-    StartRequest, TransportState, TrustState, VirtualOutputSource,
+    StartRequest, TransportState, TrustState, VirtualOutputSource, VolumeLevel,
 )
 from airplay_linux.storage import PreferenceAccess, is_ambiguous_identity
 
@@ -360,7 +360,9 @@ class VirtualLifecycle(MirrorLifecycle):
                 return True
             runtime = _virtual_runtime(ctx)
             runtime.recreating = True
-            request = StartRequest(mode=Mode.VIRTUAL, resolution=choice, audio=ctx.state.audio_policy)
+            request = StartRequest(mode=Mode.VIRTUAL, resolution=choice, audio=ctx.state.audio_policy,
+                                   volume=VolumeLevel(value=ctx.state.remembered_volume)
+                                   if ctx.state.remembered_volume is not None else None)
             self.cleanup._stop(ctx, request)
             setattr(ctx, "_task2_cleanup_continue", self.cleanup._continue)
             ctx.apply(intent_stage=IntentStage.reconfiguring, cleanup_pending=False)
@@ -409,8 +411,13 @@ class VirtualLifecycle(MirrorLifecycle):
             ctx.apply(last_error=diagnostic(ErrorCode.unsupported_operation, state.receiver_id))
             return
         operation = ctx.supersede("start") if supersede else ctx.operation()
+        from .audio import audio_runtime
+        audio_runtime(ctx).start_volume = message.request.volume
+        remembered = message.request.volume.value if (self.deps.capabilities().volume
+                      and message.request.volume is not None and message.request.volume.value > 0) else None
         setattr(ctx, "_virtual_runtime", _VirtualRuntime(request=message.request))
         ctx.apply(
+            remembered_volume=remembered,
             operation_id=operation.operation_id, mode=Mode.VIRTUAL, intent_active=True,
             intent_stage=IntentStage.starting, display=DisplayState.Resolving,
             transport=TransportState.Idle, resolution=None, observed_resolution=None,
@@ -647,11 +654,22 @@ class VirtualLifecycle(MirrorLifecycle):
         runtime = _virtual_runtime(ctx)
         runtime.pending_ready = None
         runtime.ready_stream = None
+        from .audio import audio_runtime
+        policy = ctx.state.audio_policy
+        startup_request = runtime.request is not None
+        initial = (audio_runtime(ctx).start_volume
+                   if startup_request else
+                   VolumeLevel(value=ctx.state.remembered_volume)
+                   if ctx.state.remembered_volume is not None else None)
+        if not self.deps.capabilities().volume or not policy.enabled:
+            initial = None
+        audio_runtime(ctx).start_volume = initial
+        runtime.request = None
         operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
         ctx.launch(
             Route.virtual, "transport_start", operation,
-            lambda: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, ctx.state.audio_policy, operation), acquisition=True),
+            lambda policy=policy, initial=initial: self._with_backend_events(ctx, operation, lambda: self.deps.transport.start_stream(target, handle.source, policy, operation, initial_volume=initial), acquisition=True),
             acquisition=True,
         )
 
@@ -785,7 +803,10 @@ class VirtualLifecycle(MirrorLifecycle):
             return True
         if kind == "remember_resolution":
             if isinstance(message.result, Err):
-                ctx.apply(last_error=message.result.error)
+                if message.result.error.code is not ErrorCode.stale_target:
+                    ctx.apply(last_error=message.result.error)
+            else:
+                ctx.apply()  # Preference caches subscribe to fresh publications.
             return True
         return super()._effect(ctx, message)
 
@@ -813,7 +834,7 @@ class VirtualLifecycle(MirrorLifecycle):
             ctx.apply(audio=AudioState.Disabled)
         self._remember(ctx)
 
-    def _remember(self, ctx):
+    def _remember(self, ctx: SessionContext) -> None:
         record_set = self._record_set(ctx)
         choice, observed = ctx.state.resolution, ctx.state.observed_resolution
         if record_set is None or choice is None or observed is None:
@@ -821,29 +842,30 @@ class VirtualLifecycle(MirrorLifecycle):
         remembered = _rememberable(record_set, choice, observed)
         if remembered is None:
             return
-        target = ctx.state.target
-        receiver_id = ctx.state.receiver_id
-        view = self.deps.discovery.current(receiver_id)
+        admitted = ctx.state
+        operation = _current_context(ctx)
+
+        def still_current():
+            state = ctx.state
+            return (
+                state.receiver_id == admitted.receiver_id and state.target == admitted.target
+                and state.session_generation == admitted.session_generation
+                and state.operation_id == admitted.operation_id
+                and state.transport_lease_id == admitted.transport_lease_id
+                and state.stream == admitted.stream
+                and state.trust_generation == admitted.trust_generation
+                and state.online and state.intent_active and not state.cleanup_pending
+                and state.trust not in (TrustState.Pairing, TrustState.CleanupRequired, TrustState.RevocationPending)
+                and state.resolution == choice and state.observed_resolution == observed
+                and state.display_handle == admitted.display_handle
+                and state.accepted_resolution is None
+            )
 
         async def save():
-            latest = await self.deps.receivers.get(receiver_id)
-            if isinstance(latest, Err):
-                return latest
-            current_view = self.deps.discovery.current(receiver_id)
-            if current_view is None or current_view.record_set != record_set:
-                return Ok(value=None)
-            saved = latest.value
-            if saved is None:
-                saved = SavedReceiver(
-                    receiver_id=receiver_id, service_metadata=record_set.records,
-                    display_name=view.display_name, last_endpoint=target,
-                    continuity_fingerprint=record_set.endpoint_fingerprint,
-                    credential_ref=None, remembered_resolution=remembered,
-                )
-            else:
-                saved = replace(saved, remembered_resolution=remembered)
-            return await self.deps.receivers.put(saved)
-        ctx.launch(Route.virtual, "remember_resolution", _current_context(ctx), save)
+            return await self.deps.preferences.update(
+                record_set, remembered_resolution=remembered, still_current=still_current,
+            )
+        ctx.launch(Route.virtual, "remember_resolution", operation, save)
 
     def _transport_event(self, ctx, event):
         if ctx.state.mode is not Mode.VIRTUAL:

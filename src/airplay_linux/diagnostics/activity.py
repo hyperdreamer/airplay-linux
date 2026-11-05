@@ -21,7 +21,7 @@ Accepting a value is also not the same as owning it. A :class:`CapabilityReport`
 is frozen, but the caller keeps its own alias, and ``object.__setattr__`` can
 retype that alias to a subclass, or rewrite one of its leaves, at any time after
 the log has accepted it. So the report's *evidence* -- the environment label,
-the six capability flags and the validated diagnostic codes -- is normalized
+the seven capability flags and the validated diagnostic codes -- is normalized
 once, at acceptance, into :class:`_CapabilitySnapshot` and only safe built-in
 leaves are retained. Normalizing includes sanitizing: the environment allowlist
 and its fixed ``Unknown`` fallback are applied *before* the snapshot is built, so
@@ -89,6 +89,8 @@ ALLOWED_FIELDS: Final[frozenset[str]] = frozenset(
         "error_code",
         "explicit_video_only",
         "remembered",
+        "level",
+        "reason",
     }
 )
 
@@ -119,6 +121,10 @@ _VOCABULARIES: Final[Mapping[str, Vocabulary]] = MappingProxyType(
         "audio": boundary.captured_enum(AudioState),
         "trust": boundary.captured_enum(TrustState),
         "error_code": boundary.captured_enum(ErrorCode),
+        "reason": boundary.captured_texts((
+            "backend_unsupported", "startup_refused", "receipt_pending", "receipt_missing",
+            "no_audio", "invalid_preference", "audio_closed", "close_unconfirmed",
+        )),
         "command_name": boundary.captured_texts(ALLOWED_COMMANDS),
         # The reservation stages the design's atomic ownership protocol defines.
         "reservation_stage": boundary.captured_texts(
@@ -149,6 +155,7 @@ _INTEGER_BOUNDS: Final[Mapping[str, tuple[int, int]]] = MappingProxyType(
         "retry_seconds": (0, 86400),
         "endpoint_generation": (0, 2**31 - 1),
         "remembered": (0, 10_000),
+        "level": (0, 100),
     }
 )
 
@@ -197,7 +204,7 @@ _DIAGNOSTIC_CODE_MESSAGE: Final[str] = (
     "capability diagnostics must carry a registered error code"
 )
 
-#: The six capability flags, in the order the export document lists them.
+#: The seven capability flags, in the order the export document lists them.
 _CAPABILITY_FLAGS: Final[tuple[str, ...]] = (
     "discovery",
     "mirror",
@@ -205,6 +212,7 @@ _CAPABILITY_FLAGS: Final[tuple[str, ...]] = (
     "audio",
     "remembered_pairing",
     "additional_virtual_outputs",
+    "volume",
 )
 
 #: Fixed message copy per code; a new code needs a line here, not a raw string.
@@ -238,6 +246,9 @@ _MESSAGES: Final[Mapping[str, str]] = MappingProxyType(
         "audio.muted": "The receiver was muted for this session.",
         "audio.unmuted": "The receiver was unmuted for this session.",
         "audio.recovered": "Audio recovered; the video stream was preserved.",
+        "audio.volume_applied": "Receiver volume was applied.",
+        "audio.volume_failed": "Receiver audio control change could not be confirmed.",
+        "audio.volume_unavailable": "Receiver volume control is unavailable.",
         "display.reserved": "A virtual output reservation was recorded.",
         "display.helper_started": "The virtual display helper started.",
         "display.output_observed": "The virtual output appeared.",

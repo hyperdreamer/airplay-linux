@@ -199,6 +199,76 @@ async def test_shutdown_is_idempotent(tmp_path: Path) -> None:
     assert isinstance(second, Ok)
 
 
+@pytest.mark.asyncio
+async def test_production_preferences_share_one_writer_and_bridge_early_warnings(tmp_path, monkeypatch):
+    import json
+    from urllib.parse import quote
+    from airplay_linux import runtime as composition
+    from airplay_linux.policy.capabilities import EnvironmentProbe
+    from airplay_linux.storage import AtomicFiles, JsonReceiverStore, encode_receiver
+    from airplay_linux.storage.repositories import ReceiverPreferenceWriter
+    from airplay_linux.domain.records import SavedReceiver
+    from airplay_linux.testing.adapters import FakeProcess
+    from airplay_linux.testing.builders import target
+
+    receiver_id = target().receiver_id
+    files = AtomicFiles(tmp_path / "state")
+    record = SavedReceiver(
+        receiver_id=receiver_id, service_metadata=(), display_name="TV", last_endpoint=None,
+        continuity_fingerprint="fp", credential_ref=None, remembered_resolution=None,
+    )
+    raw = json.loads(encode_receiver(record))
+    key = "receivers/" + quote(receiver_id, safe="") + ".json"
+    files.write(key, json.dumps(raw | {"remembered_volume": "secret-invalid-volume"}).encode())
+    constructed = []
+    class Writer(ReceiverPreferenceWriter):
+        def __init__(self, store, discovery):
+            super().__init__(store, discovery)
+            constructed.append(self)
+    class EarlyStore(JsonReceiverStore):
+        def __init__(self, files, **kwargs):
+            super().__init__(files, **kwargs)
+            # Exercise the real decoder/dedup before ActivityLog construction.
+            self._decode(files.read(key))
+            self._decode(files.read(key))
+    async def unavailable(_process):
+        return Err(error=diagnostic(ErrorCode.dependency_missing))
+    async def report(_probe):
+        return SessionRig().deps.capabilities()
+    monkeypatch.setattr(composition, "ReceiverPreferenceWriter", Writer)
+    monkeypatch.setattr(composition, "JsonReceiverStore", EarlyStore)
+    monkeypatch.setattr(composition, "probe_backend", unavailable)
+    monkeypatch.setattr(EnvironmentProbe, "check", report)
+    graph = await composition._compose_production(
+        RuntimeConfig(state_root=tmp_path / "state", runtime_root=tmp_path / "run"),
+        process=FakeProcess(),
+    )
+    assert constructed == [graph.deps.preferences]
+    assert graph.deps.preferences._store is graph.deps.receivers
+    assert graph.deps.preferences._discovery is graph.deps.discovery
+    log = graph.deps.activity
+    assert len(log.entries()) == 1
+    assert (await graph.deps.receivers.get(receiver_id)).value.remembered_volume is None
+    assert len(log.entries()) == 1
+    files.write(key, json.dumps(raw | {"remembered_volume": 0}).encode())
+    assert isinstance(await graph.deps.receivers.all(), Ok)
+    assert len(log.entries()) == 2
+    for event in log.entries():
+        assert event.code == "audio.volume_unavailable"
+        assert event.receiver_id == receiver_id
+        assert dict(event.fields) == {"reason": "invalid_preference", "error_code": "volume_preference_invalid"}
+    assert "secret" not in log.export()
+
+
+def test_session_rig_preferences_share_one_writer():
+    from airplay_linux.storage.repositories import ReceiverPreferenceWriter
+    rig = SessionRig()
+    assert type(rig.deps.preferences) is ReceiverPreferenceWriter
+    assert rig.deps.preferences._store is rig.receivers
+    assert rig.deps.preferences._discovery is rig.discovery
+    assert compose_manager(rig.deps).deps.preferences is rig.deps.preferences
+
+
 def tmp_path_stub() -> Path:
     from tempfile import mkdtemp
 

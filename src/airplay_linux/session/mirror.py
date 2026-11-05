@@ -213,7 +213,12 @@ class MirrorLifecycle:
             return
 
         context = ctx.supersede("start") if supersede else _current_context(ctx)
+        from .audio import audio_runtime
+        audio_runtime(ctx).start_volume = request.volume
+        remembered = request.volume.value if (self.deps.capabilities().volume and request.volume is not None
+                                              and request.volume.value > 0) else None
         ctx.apply(
+            remembered_volume=remembered,
             mode=Mode.MIRROR,
             intent_active=True,
             intent_stage=IntentStage.starting,
@@ -276,12 +281,16 @@ class MirrorLifecycle:
             intent_active=True,
         )
         policy = ctx.state.audio_policy
+        from .audio import audio_runtime
+        initial = audio_runtime(ctx).start_volume
+        if not self.deps.capabilities().volume or not policy.enabled:
+            initial = None
         ctx.launch(
             Route.mirror,
             "transport_start",
             context,
-            lambda target=target, source=source, policy=policy, context=context: self.deps.transport.start_stream(
-                target, source, policy, context,
+            lambda target=target, source=source, policy=policy, context=context, initial=initial: self.deps.transport.start_stream(
+                target, source, policy, context, initial_volume=initial,
             ),
             acquisition=True,
         )

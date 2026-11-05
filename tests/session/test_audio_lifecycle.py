@@ -8,32 +8,50 @@ evidence.
 
 from __future__ import annotations
 
+import asyncio
+import importlib.util
+import json
+from collections import defaultdict, deque
 from dataclasses import replace
+from pathlib import Path
 from uuid import UUID
 
 import pytest
 
+from airplay_linux.backend.control import (
+    BackendOperation,
+    OwnershipProof,
+    PublishedDoubletakeControl,
+    PublishedDoubletakeProfile,
+)
+from airplay_linux.capture.source import MonitoredOutput, verify_reported_source
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     Cancel,
+    ChooseResolution,
     EmptyPayload,
     FailurePayload,
     MutePayload,
+    Retry,
     RetryAudio,
     SetMuted,
+    SetVolume,
     Start,
     StartVideoOnly,
     Stop,
     TransportEvent,
     TransportEventKind,
+    VolumePayload,
 )
 from airplay_linux.domain.operations import (
     InstanceId,
     OperationContext,
     OperationId,
+    ProcessIdentity,
     StreamHandle,
 )
-from airplay_linux.domain.records import SessionSnapshot
+from airplay_linux.domain.ports import CommandOutput
+from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord, SessionSnapshot
 from airplay_linux.domain.resources import (
     AudioPolicy,
     AudioState,
@@ -44,9 +62,13 @@ from airplay_linux.domain.resources import (
     Mode,
     Ok,
     RecoveryAction,
+    ReceiverCapabilities,
     SessionPhase,
+    Size,
     StartRequest,
     TransportState,
+    TrustState,
+    VolumeLevel,
 )
 from airplay_linux.session.audio import (
     audio_runtime,
@@ -63,6 +85,8 @@ from airplay_linux.session.testing import SessionRig
 from airplay_linux.session.virtual import build_virtual_handlers, compose_virtual_handlers
 from airplay_linux.testing.adapters import Deferred, FakeTransport
 from airplay_linux.testing.builders import context, physical, target, virtual_handle
+from airplay_linux.transport.doubletake import DoubleTakeTransport
+from airplay_linux.trust.keyring import BackendKeyringStore
 from virtual_scenarios import ContextTransport, decision, make_rig, settle, stream_event
 
 
@@ -104,20 +128,24 @@ def reconnecting_audio_handlers(deps):
     )
 
 
-def mirror_rig(*, transport=None, compose=audio_handlers):
+def mirror_rig(*, transport=None, compose=audio_handlers, volume=False):
     rig = SessionRig()
     for subscription in rig.manager._subscriptions:
         subscription.close()
     rig.transport = transport if transport is not None else AudioTransport()
-    rig.deps = replace(rig.deps, transport=rig.transport)
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, transport=rig.transport,
+                       capabilities=lambda: replace(report, volume=volume))
     for adapter in (rig.capture, rig.transport, rig.audio, rig.receivers, rig.activity):
         adapter.journal = rig.journal
     rig.manager = SessionManager(rig.deps, compose(rig.deps))
     return rig
 
 
-def virtual_rig(*, ready: bool):
+def virtual_rig(*, ready: bool, volume=False):
     rig = make_rig(transport=ContextTransport(ready=ready))
+    report = rig.deps.capabilities()
+    rig.deps = replace(rig.deps, capabilities=lambda: replace(report, volume=volume))
     for subscription in rig.manager._subscriptions:
         subscription.close()
     rig.manager = SessionManager(rig.deps, virtual_audio_handlers(rig.deps))
@@ -133,26 +161,26 @@ async def online_mirror_rig(*, transport=None):
     return rig, destination
 
 
-async def start_mirror(rig, destination, *, audio=None):
+async def start_mirror(rig, destination, *, audio=None, volume: VolumeLevel | None = None):
     await rig.manager.dispatch(Start(
         receiver_id=destination.receiver_id,
         request=StartRequest(
             mode=Mode.MIRROR, source=physical(),
-            audio=audio if audio is not None else AudioPolicy(),
+            audio=audio if audio is not None else AudioPolicy(), volume=volume,
         ),
     ))
     await settle(rig)
     return rig.manager.snapshot(destination.receiver_id)
 
 
-async def start_virtual(rig, destination, *, audio=True):
+async def start_virtual(rig, destination, *, audio=True, volume: VolumeLevel | None = None):
     rig.discovery.add_target(destination)
     rig.capture.add_physical(physical())
     await rig.manager.dispatch(Start(
         receiver_id=destination.receiver_id,
         request=StartRequest(
             mode=Mode.VIRTUAL, resolution=decision(destination),
-            audio=AudioPolicy(enabled=audio),
+            audio=AudioPolicy(enabled=audio), volume=volume,
         ),
     ))
     await settle(rig)
@@ -235,6 +263,1487 @@ def _streaming_snapshot():
 @pytest.fixture
 def streaming_snapshot():
     return _streaming_snapshot()
+
+
+# ------------------------------------------------------ composed public controls
+
+
+def published_audio_status(*, state="applied", level=30, closed=False, capable=True, audio=True):
+    """Published status shape: no private handshake or aggregate volume fields."""
+    stream = {
+        "device": "TV", "device_ip": "192.0.2.10", "state": "streaming",
+        "has_audio": audio, "audio_muted": level == 0,
+        "source": {"type": 1, "width": 1920, "height": 1080,
+                   "x": 0, "y": 0, "has_position": True},
+    }
+    if capable:
+        stream["audio_closed"] = closed
+        if state is not None:
+            stream["volume_state"] = state
+        if level is not None:
+            stream["volume"] = level
+    return {
+        "ok": True, "state": "streaming", "device": "TV", "device_ip": "192.0.2.10",
+        "has_audio": audio, "audio_muted": level == 0, "streams": [stream],
+    }
+
+
+class AudioReplyBarrier:
+    def __init__(self, reply):
+        self.reply = reply
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def wait(self):
+        self.entered.set()
+        await self.release.wait()
+        return self.reply
+
+
+class AudioProcess:
+    """Only the process boundary is scripted; the typed control decodes every reply."""
+
+    def __init__(self, *, capable):
+        self.argv = []
+        self.responses = defaultdict(deque)
+        self.barriers = []
+        self.status_replies = []
+        self.status_reads = 0
+        self.active_volume = 0
+        self.max_active_volume = 0
+        self.current = published_audio_status(capable=capable)
+
+    def hold(self, command, reply):
+        barrier = AudioReplyBarrier(reply)
+        self.barriers.append(barrier)
+        self.responses[command].append(barrier)
+        return barrier
+
+    def commands(self, command):
+        return [argv for argv in self.argv if argv[3] == command]
+
+    async def run(self, spec, timeout, stdin=None):
+        argv = tuple(spec.argv)
+        self.argv.append(argv)
+        command = argv[3]
+        assert argv[:2] == ("doubletake-ctl", "-socket")
+        assert stdin is None
+        if command == "status":
+            self.status_reads += 1
+        if command == "volume":
+            self.active_volume += 1
+            self.max_active_volume = max(self.max_active_volume, self.active_volume)
+        try:
+            if self.responses[command]:
+                reply = self.responses[command].popleft()
+                if isinstance(reply, AudioReplyBarrier):
+                    reply = await reply.wait()
+            elif command == "status":
+                reply = self.current
+            elif command == "connect":
+                reply = {"ok": True, "state": "connecting", "device": "192.0.2.10",
+                         "has_audio": False, "audio_muted": False}
+            elif command == "disconnect":
+                reply = {"ok": True, "state": "idle", "has_audio": False, "audio_muted": False}
+            else:
+                raise AssertionError(f"unscripted audio control: {command}")
+            if command == "status":
+                self.status_replies.append(reply)
+            return Ok(value=CommandOutput(
+                exit_code=0 if reply["ok"] else 1,
+                stdout=json.dumps(reply).encode() + b"\n", stderr=b"",
+            ))
+        finally:
+            if command == "volume":
+                self.active_volume -= 1
+
+
+class AudioEvidence:
+    """Scripted receipt authority, independent of the public status JSON."""
+
+    def __init__(self, record, features):
+        self.record, self.features = record, features
+        self.proof = OwnershipProof(
+            kind="evidence", daemon=record.daemon, socket_entry=(1, 2),
+            generation=1, handshake=None,
+        )
+        self.authorized = []
+
+    def allows(self, operation):
+        return operation in {
+            BackendOperation.status, BackendOperation.connect, BackendOperation.disconnect,
+            BackendOperation.mute, BackendOperation.unmute,
+        } or (self.features.target_volume and operation in {
+            BackendOperation.volume, BackendOperation.audio_off,
+        })
+
+    async def prove(self, record):
+        assert record == self.record
+        return Ok(value=self.proof)
+
+    async def authorize(self, record, operation, receiver, fence):
+        assert record == self.record and self.allows(operation)
+        checked = fence()
+        if isinstance(checked, Err):
+            return checked
+        self.authorized.append((operation, receiver))
+        return Ok(value=self.proof)
+
+    async def confirm(self, record, proof):
+        assert record == self.record and proof == self.proof
+        return Ok(value=None)
+
+
+class AudioDaemonRegistry:
+    def __init__(self, record):
+        self.record = record
+
+    def subscribe(self, callback):
+        class Subscription:
+            def close(self):
+                pass
+        return Subscription()
+
+    async def ensure(self):
+        return Ok(value=self.record)
+
+    async def shutdown(self):
+        return Ok(value=None)
+
+
+class AudioSourceVerifier:
+    async def verify(self, requested, reported):
+        return verify_reported_source(requested, reported, (MonitoredOutput(
+            name="DP-1", enabled=True, connected=True, output_type=14,
+            size=Size(width=1920, height=1080), position=(0, 0), virtual=False, scale=1,
+        ),))
+
+
+class ObservedAudioTransport(DoubleTakeTransport):
+    """Observe the real receipt without changing transport/control behavior."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.receipts = []
+
+    async def start_audio(self, handle, context):
+        result = await super().start_audio(handle, context)
+        self.receipts.append(result)
+        return result
+
+
+@pytest.fixture
+async def composed_audio():
+    rigs = []
+
+    def make(*, capable=True, compose=audio_handlers):
+        rig = SessionRig()
+        for subscription in rig.manager._subscriptions:
+            subscription.close()
+        record = DaemonRecord(
+            schema_version=1, instance_uuid=InstanceId(UUID(int=9)), owner_token="test-owner",
+            app=ProcessIdentity(pid=100, start_ticks=1),
+            supervisor=ProcessIdentity(pid=209, start_ticks=2),
+            daemon=ProcessIdentity(pid=309, start_ticks=3), protocol_version="v1",
+            socket_path="/run/private/9/daemon.sock", lifecycle="running",
+            runtime_directory="/run/private/9",
+        )
+        profile = PublishedDoubletakeProfile(socket_path=record.socket_path)
+        features = replace(
+            profile.features, profile="doubletake-0.5+source", owned_daemon_control=True,
+            physical_source=True, source_reporting=True, source_reporting_complete=True,
+            keyring=True, target_volume=capable,
+        )
+        rig.process = AudioProcess(capable=capable)
+        rig.evidence = AudioEvidence(record, features)
+        rig.control = PublishedDoubletakeControl(
+            rig.process, replace(profile, features=features), record=record,
+            authority=rig.evidence, clock=rig.clock,
+        )
+        rig.transport = ObservedAudioTransport(
+            lambda received: rig.control, AudioDaemonRegistry(record), rig.capture,
+            BackendKeyringStore(rig.control, features), rig.receivers, rig.fences,
+            features, rig.clock, rig.scheduler, rig.ids, source_verifier=AudioSourceVerifier(),
+        )
+        report = replace(rig.deps.capabilities(), volume=capable)
+        rig.deps = replace(rig.deps, transport=rig.transport, capabilities=lambda: report)
+        for adapter in (rig.capture, rig.audio, rig.receivers, rig.activity):
+            adapter.journal = rig.journal
+        rig.manager = SessionManager(rig.deps, compose(rig.deps))
+        rig.transport_events = []
+        rig.transport.subscribe(rig.transport_events.append)
+        rig.discovery.add_target(target())
+        rig.capture.add_physical(physical())
+        rigs.append(rig)
+        return rig
+
+    yield make
+    for rig in rigs:
+        for barrier in rig.process.barriers:
+            barrier.release.set()
+        await settle(rig)
+        assert isinstance(await rig.manager.shutdown(), Ok)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case,state,level,audio,stage", [
+    ("applied-positive", "applied", 30, AudioState.Enabled, IntentStage.active),
+    ("applied-zero", "applied", 0, AudioState.Muted, IntentStage.active),
+    ("refused", "refused", None, AudioState.Unavailable, IntentStage.audio_decision),
+    ("pending", "pending", None, AudioState.Unavailable, IntentStage.audio_decision),
+    ("missing", None, None, AudioState.Unavailable, IntentStage.audio_decision),
+    ("legacy", None, None, AudioState.Enabled, IntentStage.active),
+])
+async def test_manager_transport_control_start_volume_receipt(composed_audio, case, state, level, audio, stage):
+    """Breaks if connect invents a receipt, the carrier polls twice, or early recovery wins."""
+    capable = case != "legacy"
+    rig = composed_audio(capable=capable)
+    value = 0 if case == "applied-zero" else 30
+    ready = rig.process.hold("status", published_audio_status(capable=capable))
+    source = rig.process.hold("status", published_audio_status(capable=capable))
+    receipt = rig.process.hold("status", published_audio_status(state=state, level=level, capable=capable))
+    await start_mirror(rig, target(), volume=VolumeLevel(value=value))
+    assert ready.entered.is_set() and not source.entered.is_set()
+    prefix = ("doubletake-ctl", "-socket", "/run/private/9/daemon.sock")
+    suffix = ("--audio", "on", "--volume", str(value)) if capable else ()
+    assert rig.process.commands("connect") == [(*prefix, "connect", "192.0.2.10", *suffix)]
+    assert rig.manager.snapshot(target().receiver_id).audio is AudioState.Starting
+    ready.release.set()
+    await settle(rig)
+    assert source.entered.is_set() and not receipt.entered.is_set()
+    assert "audio.recovered" not in activity_codes(rig)
+    source.release.set()
+    await settle(rig)
+    assert receipt.entered.is_set() and rig.process.status_reads == 3
+    pending = rig.manager.snapshot(target().receiver_id)
+    assert pending.effective_volume is None and pending.last_audible_volume is None
+    assert pending.audio is AudioState.Starting and not pending.muted
+    assert not rig.transport.receipts and "audio.recovered" not in activity_codes(rig)
+    receipt.release.set()
+    await settle(rig)
+    result = rig.manager.snapshot(target().receiver_id)
+    assert rig.transport.receipts == [Ok(value=AudioStartReceipt(audio=True, volume_state=state, level=level))]
+    assert result.audio is audio and result.intent_stage is stage
+    assert result.transport is TransportState.Streaming and result.stream is not None
+    assert result.effective_volume == level
+    assert result.last_audible_volume == (30 if case == "applied-positive" else None)
+    assert result.remembered_volume == (30 if capable and value else None)
+    assert result.muted is (case == "applied-zero")
+    assert rig.process.status_reads == 3 and rig.scheduler.pending() == ()
+    if capable:
+        assert not any(event.kind is TransportEventKind.audio_recovered for event in rig.transport_events)
+    if stage is IntentStage.audio_decision:
+        assert result.last_error.code is ErrorCode.volume_unavailable
+        assert "audio.recovered" not in activity_codes(rig)
+    if case == "refused":
+        rig.process.responses["volume"].append(published_audio_status())
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        recovered = rig.manager.snapshot(target().receiver_id)
+        assert recovered.stream == result.stream and recovered.effective_volume == 30
+        assert recovered.audio is AudioState.Enabled and recovered.intent_stage is IntentStage.active
+        assert rig.process.commands("volume") == [(*prefix, "volume", "30", "192.0.2.10")]
+        assert rig.process.status_reads == 3 and not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,level,has_audio,want,error,reason", [
+    (None, None, True, AudioState.Unavailable, ErrorCode.volume_unavailable, "receipt_missing"),
+    (None, None, False, AudioState.Unavailable, ErrorCode.volume_unavailable, "receipt_missing"),
+    ("pending", None, True, AudioState.Unavailable, ErrorCode.volume_unavailable, "receipt_pending"),
+    ("pending", None, False, AudioState.Unavailable, ErrorCode.volume_unavailable, "receipt_pending"),
+    ("refused", None, True, AudioState.Unavailable, ErrorCode.volume_unavailable, "startup_refused"),
+    ("refused", None, False, AudioState.Unavailable, ErrorCode.volume_unavailable, "startup_refused"),
+    ("unrequested", None, True, AudioState.Enabled, None, None),
+    ("unrequested", None, False, AudioState.Unavailable, ErrorCode.audio_unavailable, "no_audio"),
+    ("applied", 30, True, AudioState.Enabled, None, None),
+    ("applied", 0, True, AudioState.Muted, None, None),
+    ("applied", 30, False, AudioState.Unavailable, ErrorCode.audio_unavailable, "no_audio"),
+])
+async def test_capable_receipt_without_saved_volume_uses_complete_outcome_table(
+    composed_audio, state, level, has_audio, want, error, reason,
+):
+    """Removing capable receipt interpretation must not enable unconfirmed audio."""
+    rig = composed_audio()
+    ready = published_audio_status(state="unrequested", level=None)
+    rig.process.responses["status"].extend([ready, ready])
+    held = rig.process.hold("status", published_audio_status(
+        state=state, level=level, audio=has_audio,
+    ))
+    before = await start_mirror(rig, target())
+    assert held.entered.is_set() and before.audio is AudioState.Starting
+    assert before.remembered_volume is None and before.effective_volume is None
+    assert "audio.recovered" not in activity_codes(rig)
+    held.release.set()
+    await settle(rig)
+    result = rig.manager.snapshot(target().receiver_id)
+    assert result.audio is want
+    assert result.intent_stage is (IntentStage.active if error is None else IntentStage.audio_decision)
+    assert result.stream == before.stream and result.transport is TransportState.Streaming
+    assert result.remembered_volume is None
+    assert result.effective_volume == (level if error is None else None)
+    assert result.last_audible_volume == (30 if state == "applied" and level == 30 and has_audio else None)
+    assert result.muted is (want is AudioState.Muted)
+    assert rig.transport.receipts == [Ok(value=AudioStartReceipt(
+        audio=has_audio, volume_state=state, level=level,
+    ))]
+    assert rig.process.commands("connect") == [(
+        "doubletake-ctl", "-socket", "/run/private/9/daemon.sock", "connect", "192.0.2.10", "--audio", "on",
+    )]
+    assert rig.process.status_reads == 3 and not rig.process.commands("volume")
+    assert not any(event.kind is TransportEventKind.audio_recovered for event in rig.transport_events)
+    if error is not None:
+        assert result.last_error.code is error and result.last_error.detail == reason
+        assert "audio.recovered" not in activity_codes(rig)
+        failures = [event for event in rig.activity.events if event.code == "audio.volume_unavailable"]
+        assert len(failures) == 1 and failures[0].fields["reason"] == reason
+    if state in (None, "pending"):
+        rig.process.responses["status"].append(ready)
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        recovered = rig.manager.snapshot(target().receiver_id)
+        assert recovered.audio is AudioState.Enabled and recovered.stream == result.stream
+        assert recovered.effective_volume is None and not rig.process.commands("volume")
+        assert rig.process.status_reads == 4
+
+
+@pytest.fixture(scope="module")
+def production_volume_traces():
+    """Load only the proof file; its cache executes exact carried Go declarations."""
+    path = Path(__file__).parents[1] / "backend" / "test_carried_source_patch.py"
+    spec = importlib.util.spec_from_file_location("audio_volume_carried_proof", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    traces = module.carried_volume_status_traces()
+    assert {trace["trace"] for trace in traces} >= {
+        "ack30_reject40", "unrequested_reject_first", "queued_pending", "queued_applied",
+        "partial_setup_refused", "partial_retry_refused", "partial_retry_applied",
+    }
+    for trace in traces:
+        for stream in trace["status"]["streams"]:
+            assert stream["volume_state"] != "applied" or "volume" in stream
+            if trace["quiescent"]:
+                assert stream["volume_state"] != "pending"
+    return {trace["trace"]: trace for trace in traces}
+
+
+async def start_composed_audio(rig, *, initial=None, receipt=None):
+    # These are precisely readiness, source verification, and audio-start reads.
+    ready = published_audio_status()
+    rig.process.responses["status"].extend([ready, ready, receipt if receipt is not None else ready])
+    return await start_mirror(rig, target(), volume=None if initial is None else VolumeLevel(value=initial))
+
+
+async def composed_audio_loss(rig):
+    # Fail the real transport's existing audio observation. Its failure path
+    # clears transport mute before delivering the typed audio_failed event.
+    state = rig.manager.snapshot(target().receiver_id)
+    operation = audio_event(rig, TransportEventKind.audio_failed).context
+    rig.process.responses["status"].append({
+        "ok": False, "state": "streaming", "has_audio": False,
+        "audio_muted": False, "error": "audio observation failed",
+    })
+    result = await rig.transport.start_audio(state.stream, operation)
+    assert isinstance(result, Err)
+    await settle(rig)
+    state = rig.manager.snapshot(target().receiver_id)
+    assert state.audio is AudioState.Unavailable and state.transport is TransportState.Streaming
+    return state
+
+
+@pytest.mark.asyncio
+async def test_reconnect_refused_retry_uses_current_lease_admitted_level(composed_audio):
+    """The previous lease's start_volume=55 must not override a reconnect's 30."""
+    rig = composed_audio(compose=reconnecting_audio_handlers)
+    before = await start_composed_audio(
+        rig, initial=55, receipt=published_audio_status(level=55),
+    )
+    rig.process.responses["volume"].append(published_audio_status(level=30))
+    await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=30)))
+    assert rig.manager.snapshot(target().receiver_id).remembered_volume == 30
+    assert rig.receivers.receivers[target().receiver_id].remembered_volume == 30
+    ready = published_audio_status(level=30)
+    rig.process.responses["status"].extend([
+        ready, ready, published_audio_status(state="refused", level=None),
+    ])
+    rig.manager.ingest(audio_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    reconnecting = rig.manager.snapshot(target().receiver_id)
+    assert reconnecting.next_retry_at is not None
+    rig.scheduler.advance(reconnecting.next_retry_at - rig.clock.now())
+    await settle(rig)
+    refused = rig.manager.snapshot(target().receiver_id)
+    assert refused.audio is AudioState.Unavailable and refused.volume_state == "refused"
+    assert refused.stream != before.stream and refused.transport is TransportState.Streaming
+    assert refused.effective_volume is None and refused.last_audible_volume is None
+    assert rig.process.commands("connect")[-1][-4:] == ("--audio", "on", "--volume", "30")
+    rig.process.responses["volume"].append(ready)
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    recovered = rig.manager.snapshot(target().receiver_id)
+    assert recovered.audio is AudioState.Enabled and recovered.effective_volume == 30
+    assert recovered.stream == refused.stream and recovered.intent_stage is IntentStage.active
+    assert rig.process.commands("volume")[-1][-3:] == ("volume", "30", "192.0.2.10")
+    assert len(rig.process.commands("connect")) == 2
+    assert rig.transport._streams[recovered.stream.lease_id].initial_volume == VolumeLevel(value=30)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("initial", [None, 0])
+async def test_refused_retry_distinguishes_absent_seed_from_explicit_zero(composed_audio, initial):
+    """A newly saved preference cannot invent or replace this lease's retry seed."""
+    rig = composed_audio()
+    await start_composed_audio(rig, initial=initial, receipt=published_audio_status(
+        state="unrequested" if initial is None else "applied", level=initial,
+    ))
+    rig.process.responses["volume"].append(published_audio_status(level=30))
+    await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=30)))
+    assert rig.manager.snapshot(target().receiver_id).remembered_volume == 30
+    await composed_audio_loss(rig)
+    rig.process.responses["status"].append(published_audio_status(state="refused", level=None))
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    refused = rig.manager.snapshot(target().receiver_id)
+    assert refused.volume_state == "refused" and refused.audio is AudioState.Unavailable
+    if initial is None:
+        rig.process.responses["status"].append(published_audio_status(state="unrequested", level=None))
+    else:
+        rig.process.responses["volume"].append(published_audio_status(level=0))
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    recovered = rig.manager.snapshot(target().receiver_id)
+    assert recovered.stream == refused.stream
+    assert recovered.audio is (AudioState.Enabled if initial is None else AudioState.Muted)
+    assert recovered.effective_volume == (30 if initial is None else 0)
+    assert recovered.remembered_volume == 30
+    assert [argv[-2] for argv in rig.process.commands("volume")] == (["30"] if initial is None else ["30", "0"])
+
+
+@pytest.mark.asyncio
+async def test_virtual_replacement_refused_retry_uses_current_lease_admitted_level():
+    rig, destination, before = await capable_session(level=55, mode=Mode.VIRTUAL)
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=30)))
+    assert rig.manager.snapshot(destination.receiver_id).remembered_volume == 30
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(audio=True, volume_state="refused")))
+    await dispatch(rig, Retry(receiver_id=destination.receiver_id))
+    refused = rig.manager.snapshot(destination.receiver_id)
+    assert refused.stream != before.stream and refused.volume_state == "refused"
+    assert rig.journal.calls("transport.start_stream")[-1]["initial_volume"] == {"value": 30}
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    recovered = rig.manager.snapshot(destination.receiver_id)
+    assert recovered.audio is AudioState.Enabled and recovered.effective_volume == 30
+    assert recovered.stream == refused.stream and recovered.display_handle == before.display_handle
+    assert rig.journal.calls("transport.set_volume")[-1]["level"] == {"value": 30}
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).start_volume == VolumeLevel(value=30)
+    await rig.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retire", ["stop", "replacement"])
+async def test_composed_volume_receipt_retired_before_completion_is_silent(composed_audio, retire):
+    rig = composed_audio()
+    ready = published_audio_status()
+    rig.process.responses["status"].extend([ready, ready])
+    held = rig.process.hold("status", ready)
+    await start_mirror(rig, target(), volume=VolumeLevel(value=30))
+    assert held.entered.is_set()
+    if retire == "stop":
+        await dispatch(rig, Stop(receiver_id=target().receiver_id))
+    else:
+        rig.discovery.add_target(target(endpoint_generation=2, address="192.0.2.44"))
+        await settle(rig)
+    before = rig.manager.snapshot(target().receiver_id)
+    audio_activities = [event for event in rig.activity.events if event.code.startswith("audio.")]
+    held.release.set()
+    await settle(rig)
+    after = rig.manager.snapshot(target().receiver_id)
+    assert after.effective_volume is None and after.last_audible_volume is None
+    assert after.audio not in (AudioState.Enabled, AudioState.Muted)
+    assert after.last_error == before.last_error
+    assert [event for event in rig.activity.events if event.code.startswith("audio.")] == audio_activities
+    assert not rig.journal.calls("receiver_store.put")
+    if retire == "stop":
+        assert after.stream is None and after.transport is TransportState.Idle
+    else:
+        assert after == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("variant", ["unremembered", "remembered", "first_rejection", "queued", "partial_setup"])
+async def test_live_volume_rejection_never_becomes_a_startup_refusal(composed_audio, production_volume_traces, variant):
+    """Breaks on leftover pending/refused state or recovery tied to initial_volume."""
+    traces = production_volume_traces
+    rig = composed_audio()
+    if variant == "partial_setup":
+        startup = traces["partial_setup_refused"]["status"]
+        before = await start_composed_audio(rig, initial=30, receipt=startup)
+        assert before.audio is AudioState.Unavailable and before.volume_state == "refused"
+        assert before.effective_volume is None  # partial 200 is history, not audio admission
+        rejected = traces["partial_retry_refused"]["status"]
+        rig.process.responses["volume"].append(rejected | {"ok": False, "error": "receiver rejected volume"})
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        failed = rig.manager.snapshot(target().receiver_id)
+        assert failed.stream == before.stream and failed.intent_stage is IntentStage.audio_decision
+        assert failed.volume_state == "refused" and failed.audio is AudioState.Unavailable
+        rig.process.responses["volume"].append(traces["partial_retry_applied"]["status"])
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        result = rig.manager.snapshot(target().receiver_id)
+        assert result.audio is AudioState.Enabled and result.effective_volume == 30
+        assert len(rig.process.commands("volume")) == 2
+        assert startup in rig.process.status_replies
+    else:
+        remembered = variant == "remembered"
+        before = await start_composed_audio(
+            rig, initial=55 if remembered else None,
+            receipt=published_audio_status(state="applied" if remembered else "unrequested",
+                                           level=55 if remembered else None),
+        )
+        assert before.audio is AudioState.Enabled
+        if variant != "first_rejection":
+            rig.process.responses["volume"].append(published_audio_status(level=30))
+            await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=30)))
+            assert rig.manager.snapshot(target().receiver_id).effective_volume == 30
+        name = ("unrequested_reject_first" if variant == "first_rejection"
+                else "queued_pending" if variant == "queued" else "ack30_reject40")
+        trace = traces[name]
+        produced = trace["status"]
+        rig.process.responses["volume"].append(produced | {"ok": False, "error": "receiver rejected volume"})
+        await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=40)))
+        failed = rig.manager.snapshot(target().receiver_id)
+        history = None if variant == "first_rejection" else 30
+        assert failed.effective_volume == history and failed.last_audible_volume == history
+        assert failed.audio is AudioState.Enabled and failed.stream == before.stream
+        assert failed.last_error.code is ErrorCode.audio_volume_failed
+        assert activity_codes(rig).count("audio.volume_failed") == 1
+        await composed_audio_loss(rig)
+        rig.process.responses["status"].append(produced)  # exact Go envelope, unchanged
+        count = rig.process.status_reads
+        recovered_count = activity_codes(rig).count("audio.recovered")
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        result = rig.manager.snapshot(target().receiver_id)
+        assert rig.process.status_reads == count + 1
+        assert rig.process.status_replies[-1] is produced
+        assert result.stream == before.stream and result.effective_volume == history
+        assert result.last_audible_volume == history
+        if variant == "queued":
+            assert result.audio is AudioState.Unavailable and result.intent_stage is IntentStage.audio_decision
+            assert result.volume_state == "pending" and result.last_error.detail == "receipt_pending"
+            assert activity_codes(rig).count("audio.recovered") == recovered_count
+            rig.process.responses["status"].append(traces["queued_applied"]["status"])
+            await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+            result = rig.manager.snapshot(target().receiver_id)
+            assert result.effective_volume == 60 and result.last_audible_volume == 60
+        assert result.audio is AudioState.Enabled and result.intent_stage is IntentStage.active
+        assert len(rig.process.commands("volume")) == (1 if variant == "first_rejection" else 2)
+    assert result.stream == before.stream and result.transport is TransportState.Streaming
+    assert len(rig.process.commands("connect")) == 1 and not rig.process.commands("disconnect")
+    assert not rig.process.commands("mute") and not rig.process.commands("unmute")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("trace_name", ["closed_refused", "closed_partial"])
+async def test_foreign_audio_close_is_never_an_enabling_receipt(composed_audio, production_volume_traces, trace_name):
+    """A foreign latch reports history; it cannot confirm sound or local quiescence."""
+    rig = composed_audio()
+    before = await start_composed_audio(rig, initial=30)
+    await composed_audio_loss(rig)
+    produced = production_volume_traces[trace_name]["status"]
+    rig.process.responses["status"].append(produced)
+    checkpoint = activity_codes(rig).count("audio.recovered")
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    result = rig.manager.snapshot(target().receiver_id)
+    assert rig.process.status_replies[-1] is produced
+    assert isinstance(rig.transport.receipts[-1], Err)
+    assert rig.transport.receipts[-1].error.code is ErrorCode.audio_unavailable
+    assert result.audio is AudioState.Unavailable and result.audio_policy.enabled
+    assert not result.audio_close_pending and result.last_error.code is ErrorCode.audio_unavailable
+    assert result.stream == before.stream and result.transport is TransportState.Streaming
+    assert activity_codes(rig).count("audio.recovered") == checkpoint
+    assert not any(event.kind is TransportEventKind.audio_recovered for event in rig.transport_events)
+    assert not rig.process.commands("audio") and not rig.process.commands("disconnect")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("second_ok", [True, False])
+async def test_repeated_retry_keeps_the_occupied_worker_fence(composed_audio, second_ok):
+    """Rotating the audio fence at timeout would strand the original worker here."""
+    rig = composed_audio()
+    before = await start_composed_audio(
+        rig, initial=30, receipt=published_audio_status(state="refused", level=None),
+    )
+    first = rig.process.hold("volume", published_audio_status())
+    second = rig.process.hold("volume", published_audio_status() if second_ok else
+                              published_audio_status(state="refused", level=None) |
+                              {"ok": False, "error": "receiver rejected volume"})
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    assert first.entered.is_set() and not second.entered.is_set()
+    runtime = audio_runtime(rig.manager.context(target().receiver_id))
+    original, audio_id = runtime.volume_inflight, rig.manager.snapshot(target().receiver_id).audio_operation_id
+    stream = rig.transport._streams[before.stream.lease_id]
+    worker = stream.volume_task.task
+    settlements = []
+    rig.transport.subscribe(lambda event: settlements.append((event, worker.done(), stream.lock.locked()))
+                            if event.kind is TransportEventKind.volume_result else None)
+    rig.scheduler.advance(5)
+    await settle(rig)
+    expired = rig.manager.snapshot(target().receiver_id)
+    assert expired.audio is AudioState.Unavailable and expired.intent_stage is IntentStage.audio_decision
+    assert expired.last_error.code is ErrorCode.audio_volume_failed
+    assert runtime.volume_inflight == original and expired.audio_operation_id == audio_id
+    assert not worker.done() and stream.lock.locked() and not settlements
+    for _ in range(3):
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    assert runtime.retry_requested and runtime.volume_inflight == original
+    assert rig.manager.snapshot(target().receiver_id).audio_operation_id == audio_id
+    assert len(rig.process.commands("volume")) == 1 and not second.entered.is_set()
+    first.release.set()
+    # The manager no longer owns the expired public effect. Await the actual
+    # transport task so its done callback can deliver the settlement input.
+    await asyncio.wait_for(asyncio.shield(worker), timeout=1)
+    await settle(rig)
+    assert worker.done() and second.entered.is_set()
+    assert len(rig.process.commands("volume")) == 2 and rig.process.max_active_volume == 1
+    assert len(settlements) == 1
+    event, done, locked = settlements[0]
+    assert event.context.operation_id == original[0] and event.context.audio_operation_id == audio_id
+    assert event.payload == VolumePayload(level=30, ok=False) and done and not locked
+    # Acceptance of that exact settlement is what retires the occupied slot and
+    # dispatches exactly one new worker under the new audio fence.
+    assert runtime.volume_inflight[0] != original[0] and not runtime.retry_requested
+    assert rig.manager.snapshot(target().receiver_id).audio_operation_id != audio_id
+    assert rig.manager.snapshot(target().receiver_id).effective_volume is None
+    second.release.set()
+    await settle(rig)
+    result = rig.manager.snapshot(target().receiver_id)
+    assert runtime.volume_inflight is None and runtime.volume_desired is None
+    assert len(settlements) == 2 and activity_codes(rig).count("audio.volume_failed") == (1 if second_ok else 2)
+    if not second_ok:
+        assert result.audio is AudioState.Unavailable and result.intent_stage is IntentStage.audio_decision
+        assert result.volume_state == "refused" and result.audio_operation_id is not None
+        rig.process.responses["volume"].append(published_audio_status())
+        await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+        result = rig.manager.snapshot(target().receiver_id)
+        assert len(rig.process.commands("volume")) == 3
+    assert result.audio is AudioState.Enabled and result.effective_volume == 30
+    assert result.last_audible_volume == 30 and result.remembered_volume == 30
+    assert result.stream == before.stream and result.intent_stage is IntentStage.active
+    assert rig.process.status_reads == 3 and len(rig.process.commands("connect")) == 1
+    assert rig.process.max_active_volume == 1 and not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_ok", [True, False])
+async def test_composed_audio_close_during_retry_requires_its_own_receipt(composed_audio, close_ok):
+    rig = composed_audio()
+    before = await start_composed_audio(
+        rig, initial=30, receipt=published_audio_status(state="refused", level=None),
+    )
+    volume = rig.process.hold("volume", published_audio_status())
+    close = rig.process.hold("audio", published_audio_status(closed=True) if close_ok else
+                             published_audio_status(closed=True) |
+                             {"ok": False, "error": "audio close not confirmed"})
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    await dispatch(rig, StartVideoOnly(receiver_id=target().receiver_id))
+    pending = rig.manager.snapshot(target().receiver_id)
+    assert volume.entered.is_set() and close.entered.is_set()  # close bypassed the occupied lock
+    assert not pending.audio_policy.enabled and pending.audio_close_pending
+    assert pending.audio is AudioState.Unavailable
+    assert rig.process.commands("audio") == [
+        ("doubletake-ctl", "-socket", "/run/private/9/daemon.sock", "audio", "off", "192.0.2.10"),
+    ]
+    volume.release.set()
+    await settle(rig)
+    assert rig.manager.snapshot(target().receiver_id).effective_volume is None
+    assert "audio.recovered" not in activity_codes(rig)
+    close.release.set()
+    await settle(rig)
+    result = rig.manager.snapshot(target().receiver_id)
+    if not close_ok:
+        assert result.audio is AudioState.Unavailable and result.audio_close_pending
+        assert result.last_error.detail == "close_unconfirmed"
+        rig.process.responses["audio"].append(published_audio_status(closed=True))
+        await dispatch(rig, StartVideoOnly(receiver_id=target().receiver_id))
+        result = rig.manager.snapshot(target().receiver_id)
+    assert result.audio is AudioState.Disabled and not result.audio_close_pending
+    assert result.stream == before.stream and result.transport is TransportState.Streaming
+    assert not result.muted and result.effective_volume is None
+    assert not rig.journal.calls("receiver_store.put") and not rig.process.commands("disconnect")
+
+
+@pytest.mark.asyncio
+async def test_composed_zero_loss_recovery_and_positive_keep_all_mute_states_consistent(composed_audio):
+    rig = composed_audio()
+    before = await start_composed_audio(rig, initial=30)
+    rig.process.responses["volume"].append(published_audio_status(level=0))
+    await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=0)))
+    stream = rig.transport._streams[before.stream.lease_id]
+    runtime = audio_runtime(rig.manager.context(target().receiver_id))
+    muted = rig.manager.snapshot(target().receiver_id)
+    assert muted.audio is stream.audio is AudioState.Muted
+    assert muted.muted and stream.muted and runtime.muted_lease == before.stream.lease_id
+    assert muted.effective_volume == 0 and muted.last_audible_volume == 30
+    lost = await composed_audio_loss(rig)
+    assert lost.audio is stream.audio is AudioState.Unavailable
+    assert not lost.muted and not stream.muted and runtime.muted_lease is None
+    assert lost.effective_volume == 0 and lost.last_audible_volume == 30
+    rig.process.responses["status"].append(published_audio_status(level=0))
+    await dispatch(rig, RetryAudio(receiver_id=target().receiver_id))
+    restored = rig.manager.snapshot(target().receiver_id)
+    assert restored.audio is stream.audio is AudioState.Muted
+    assert restored.muted and stream.muted and runtime.muted_lease == before.stream.lease_id
+    assert restored.effective_volume == 0 and restored.last_audible_volume == 30
+    rig.process.responses["volume"].append(published_audio_status(level=65))
+    await dispatch(rig, SetVolume(receiver_id=target().receiver_id, level=VolumeLevel(value=65)))
+    positive = rig.manager.snapshot(target().receiver_id)
+    assert positive.audio is stream.audio is AudioState.Enabled
+    assert not positive.muted and not stream.muted and runtime.muted_lease is None
+    assert positive.effective_volume == positive.last_audible_volume == positive.remembered_volume == 65
+    assert positive.stream == before.stream
+    assert rig.process.commands("volume") == [
+        ("doubletake-ctl", "-socket", "/run/private/9/daemon.sock", "volume", str(level), "192.0.2.10")
+        for level in (0, 65)
+    ]
+    assert not rig.process.commands("mute") and not rig.process.commands("unmute")
+    assert len(rig.journal.calls("receiver_store.put")) == 1
+
+
+async def capable_session(*, level=30, receipt=None, mode=Mode.MIRROR, transport=None):
+    rig = (mirror_rig(volume=True, transport=transport) if mode is Mode.MIRROR
+           else virtual_rig(ready=True, volume=True))
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    if receipt is None:
+        receipt = AudioStartReceipt(audio=True, volume_state="applied", level=level)
+    rig.transport.queue_result("start_audio", Ok(value=receipt))
+    if mode is Mode.MIRROR:
+        state = await start_mirror(rig, destination, volume=VolumeLevel(value=level))
+    else:
+        state = await start_virtual(rig, destination, volume=VolumeLevel(value=level))
+    return rig, destination, state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("level", [0, 33])
+async def test_volume_refused_retry_reissues_original_level_on_same_stream(level):
+    rig, destination, before = await capable_session(
+        level=level, receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    assert before.audio is AudioState.Unavailable
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    after = rig.manager.snapshot(destination.receiver_id)
+    calls = rig.journal.calls("transport.set_volume")
+    assert len(calls) == 1 and calls[0]["level"] == {"value": level}
+    assert after.stream == before.stream and after.transport_lease_id == before.transport_lease_id
+    assert after.effective_volume == level
+    assert after.audio is (AudioState.Muted if level == 0 else AudioState.Enabled)
+    assert len(rig.journal.calls("transport.start_audio")) == 1
+    assert not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("volume_state", ["pending", None])
+async def test_volume_pending_retry_resamples_one_receipt_without_timer(volume_state):
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state=volume_state),
+    )
+    timers = rig.scheduler.pending()
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=True, volume_state="applied", level=30,
+    )))
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.audio is AudioState.Enabled and after.effective_volume == 30
+    assert len(rig.journal.calls("transport.start_audio")) == 2
+    assert not rig.journal.calls("transport.set_volume")
+    assert after.stream == before.stream and rig.scheduler.pending() == timers
+
+
+@pytest.mark.asyncio
+async def test_volume_drag_public_timeout_does_not_release_worker_or_publish_late_ack():
+    timeout = asyncio.Event()
+    tasks = []
+    class PublicTimeout(AudioTransport):
+        async def set_volume(self, handle, level, operation):
+            if tasks:
+                return await super().set_volume(handle, level, operation)
+            task = asyncio.create_task(super().set_volume(handle, level, operation))
+            tasks.append(task)
+            await timeout.wait()
+            self._volume_tasks[handle.lease_id].expired = True
+            return Err(error=diagnostic(ErrorCode.audio_volume_failed))
+    transport = PublicTimeout()
+    rig, destination, before = await capable_session(transport=transport)
+    first, second = Deferred(), Deferred()
+    transport.queue_result("set_volume", first)
+    transport.queue_result("set_volume", second)
+    for level in (40, 50, 60):
+        await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=level)))
+    timeout.set()
+    await settle(rig)
+    pending = rig.manager.snapshot(destination.receiver_id)
+    assert pending.effective_volume == 30 and pending.remembered_volume == 30
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).volume_inflight is not None
+    assert activity_codes(rig).count("audio.volume_failed") == 1
+    first.resolve(Ok(value=40))
+    await tasks[0]
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).effective_volume == 30
+    assert len(rig.journal.calls("transport.set_volume")) == 2
+    assert rig.journal.calls("transport.set_volume")[-1]["level"] == {"value": 60}
+    second.resolve(Ok(value=60))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).effective_volume == 60
+    assert rig.manager.snapshot(destination.receiver_id).remembered_volume == 60
+    assert activity_codes(rig).count("audio.volume_failed") == 1
+    assert [event.fields["level"] for event in rig.activity.events if event.code == "audio.volume_applied"] == [60]
+    await asyncio.gather(*tasks)
+
+
+@pytest.mark.asyncio
+async def test_volume_occupied_refused_retry_does_not_rotate_audio_fence():
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    gate = Deferred()
+    rig.transport.queue_result("set_volume", gate)
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    pending = rig.manager.snapshot(destination.receiver_id)
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    assert rig.manager.snapshot(destination.receiver_id).audio_operation_id == pending.audio_operation_id
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    gate.resolve(Err(error=diagnostic(ErrorCode.audio_volume_failed)))
+    await settle(rig)
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert len(rig.journal.calls("transport.set_volume")) == 2
+    assert after.audio_operation_id != pending.audio_operation_id
+    assert after.effective_volume == 30 and after.audio is AudioState.Enabled
+    assert after.stream == before.stream
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt", [
+    AudioStartReceipt(audio=True, volume_state="pending", level=0),
+    AudioStartReceipt(audio=False, volume_state="refused"),
+    AudioStartReceipt(audio=True),
+])
+async def test_volume_non_enabling_retry_keeps_same_lease_historical_levels(receipt):
+    rig, destination, before = await capable_session()
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=True))
+    rig.transport.emit(audio_event(rig, TransportEventKind.audio_failed))
+    await settle(rig)
+    rig.transport.queue_result("start_audio", Ok(value=receipt))
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.audio is AudioState.Unavailable and not after.muted
+    assert after.effective_volume == 0 and after.last_audible_volume == 30
+    assert after.stream == before.stream
+    assert after.last_error.code is ErrorCode.volume_unavailable
+    assert after.last_error.detail in ("receipt_pending", "startup_refused", "receipt_missing")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["trust_generation", "trust_block", "cleanup", "endpoint", "stop", "loss"])
+async def test_volume_stale_settlement_is_silent_and_never_drains_or_saves(change):
+    rig, destination, before = await capable_session()
+    first = Deferred()
+    rig.transport.queue_result("set_volume", first)
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=40)))
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=70)))
+    if change in ("trust_generation", "trust_block", "cleanup"):
+        old = rig.manager.handlers[Route.audio]
+        def controlled(ctx, message):
+            if isinstance(message, SetMuted):
+                kwargs = ({"trust_generation": ctx.state.trust_generation + 1} if change == "trust_generation"
+                          else {"trust": TrustState.CleanupRequired} if change == "trust_block"
+                          else {"cleanup_pending": True})
+                ctx.apply(**kwargs)
+                return True
+            return old(ctx, message)
+        rig.manager.handlers[Route.audio] = controlled
+        await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=False))
+    elif change == "endpoint":
+        new = target(endpoint_generation=2, address="192.0.2.44")
+        rig.discovery.views[destination.receiver_id] = rig.discovery.build_view(new, True)
+    elif change == "stop":
+        await dispatch(rig, Stop(receiver_id=destination.receiver_id))
+    else:
+        rig.transport.emit(audio_event(rig, TransportEventKind.audio_failed))
+        await settle(rig)
+    checkpoint = rig.manager.snapshot(destination.receiver_id)
+    activities = list(rig.activity.events)
+    first.resolve(Ok(value=40))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id) == checkpoint
+    assert rig.activity.events == activities
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    assert not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed", [False, True])
+async def test_volume_close_during_retry_retires_level_and_requires_fresh_close(closed):
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    level, close = Deferred(), Deferred()
+    rig.transport.queue_result("set_volume", level)
+    rig.transport.queue_result("close_audio", close)
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    await rig.manager.dispatch(StartVideoOnly(receiver_id=destination.receiver_id))
+    pending = rig.manager.snapshot(destination.receiver_id)
+    assert not pending.audio_policy.enabled and pending.audio_close_pending
+    await settle(rig)
+    for command in (RetryAudio(receiver_id=destination.receiver_id),
+                    SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=70)),
+                    SetMuted(receiver_id=destination.receiver_id, muted=False)):
+        await dispatch(rig, command)
+    level.resolve(Ok(value=30))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).audio is AudioState.Unavailable
+    close.resolve(Ok(value=None) if closed else Err(error=diagnostic(ErrorCode.audio_volume_failed)))
+    await settle(rig)
+    result = rig.manager.snapshot(destination.receiver_id)
+    if not closed:
+        assert result.audio_close_pending and result.audio is AudioState.Unavailable
+        assert result.last_error.detail == "close_unconfirmed"
+        await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+        result = rig.manager.snapshot(destination.receiver_id)
+    assert result.audio is AudioState.Disabled and not result.audio_close_pending
+    assert result.stream == before.stream and result.transport is TransportState.Streaming
+    assert result.effective_volume is None
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    assert not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+async def test_volume_capability_absence_is_reported_once_per_session():
+    rig, destination = await online_mirror_rig()
+    await start_mirror(rig, destination)
+    for level in (30, 40):
+        await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=level)))
+    events = [event for event in rig.activity.events if event.code == "audio.volume_unavailable"]
+    assert len(events) == 1 and events[0].fields["reason"] == "backend_unsupported"
+    assert not rig.journal.calls("transport.set_volume")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["trust_generation", "trust_block", "cleanup", "endpoint"])
+async def test_volume_receipt_rechecks_full_publication_authority(change):
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    held = Deferred()
+    rig.transport.queue_result("start_audio", held)
+    await start_mirror(rig, destination, volume=VolumeLevel(value=30))
+    old = rig.manager.handlers[Route.audio]
+    def controlled(ctx, message):
+        if isinstance(message, SetMuted):
+            changes = ({"trust_generation": ctx.state.trust_generation + 1} if change == "trust_generation"
+                       else {"trust": TrustState.Pairing} if change == "trust_block"
+                       else {"cleanup_pending": True})
+            ctx.apply(**changes)
+            return True
+        return old(ctx, message)
+    if change == "endpoint":
+        replacement = target(endpoint_generation=2, address="192.0.2.55")
+        rig.discovery.views[destination.receiver_id] = rig.discovery.build_view(replacement, True)
+    else:
+        rig.manager.handlers[Route.audio] = controlled
+        await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=False))
+    before = rig.manager.snapshot(destination.receiver_id)
+    events = list(rig.activity.events)
+    held.resolve(Ok(value=AudioStartReceipt(audio=True, volume_state="applied", level=30)))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id) == before
+    assert rig.activity.events == events
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["pairing", "cleanup", "closed", "starting", "decision", "identity"])
+async def test_volume_blocked_controls_do_no_mutation_io(change):
+    rig, destination, before = await capable_session()
+    if change == "identity":
+        view = rig.discovery.views[destination.receiver_id]
+        rig.discovery.views[destination.receiver_id] = replace(
+            view, record_set=replace(view.record_set, replacement_of=destination.receiver_id),
+        )
+    else:
+        original = rig.manager.handlers[Route.audio]
+        changes = {"pairing": {"trust": TrustState.Pairing}, "cleanup": {"cleanup_pending": True},
+                   "closed": {"audio_policy": AudioPolicy(enabled=False)},
+                   "starting": {"audio": AudioState.Starting},
+                   "decision": {"intent_stage": IntentStage.audio_decision}}[change]
+        def controlled(ctx, message):
+            if isinstance(message, RetryAudio):
+                ctx.apply(**changes)
+                return True
+            return original(ctx, message)
+        rig.manager.handlers[Route.audio] = controlled
+        await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    rig.journal.clear()
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=51)))
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=True))
+    assert not rig.journal.calls("transport.set_volume")
+    assert not rig.journal.calls("transport.set_muted")
+    assert not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+async def test_volume_delayed_old_save_cannot_overwrite_newer_remembered_publication(monkeypatch):
+    rig, destination, before = await capable_session()
+    update = rig.deps.preferences.update
+    gate = Deferred()
+    async def held(record_set, **kwargs):
+        result = await update(record_set, **kwargs)
+        if kwargs["remembered_volume"].value == 40:
+            await gate.wait()
+        return result
+    monkeypatch.setattr(rig.deps.preferences, "update", held)
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=40)))
+    assert rig.manager.snapshot(destination.receiver_id).remembered_volume == 30
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=70)))
+    assert rig.manager.snapshot(destination.receiver_id).remembered_volume == 70
+    assert rig.receivers.receivers[destination.receiver_id].remembered_volume == 70
+    events = list(rig.activity.events)
+    gate.resolve(None)
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).remembered_volume == 70
+    assert rig.activity.events == events
+
+
+@pytest.mark.asyncio
+async def test_volume_close_pending_ignores_audio_loss_until_its_own_ack():
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    close = Deferred()
+    rig.transport.queue_result("close_audio", close)
+    await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+    rig.transport.emit(audio_event(rig, TransportEventKind.audio_failed))
+    await settle(rig)
+    close.resolve(Ok(value=None))
+    await settle(rig)
+    result = rig.manager.snapshot(destination.receiver_id)
+    assert result.audio is AudioState.Disabled and not result.audio_close_pending
+
+
+@pytest.mark.asyncio
+async def test_volume_close_timeout_late_ack_cannot_confirm_without_fresh_request():
+    expire = asyncio.Event()
+    tasks = []
+    class CloseTimeout(AudioTransport):
+        async def close_audio(self, handle, operation):
+            if tasks:
+                return await super().close_audio(handle, operation)
+            task = asyncio.create_task(super().close_audio(handle, operation))
+            tasks.append(task)
+            await expire.wait()
+            return Err(error=diagnostic(ErrorCode.audio_volume_failed))
+    rig, destination, before = await capable_session(
+        transport=CloseTimeout(), receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    gate = Deferred()
+    rig.transport.queue_result("close_audio", gate)
+    await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+    expire.set()
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).audio_close_pending
+    events = list(rig.activity.events)
+    gate.resolve(Ok(value=None))
+    await tasks[0]
+    await settle(rig)
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.audio is AudioState.Unavailable and state.audio_close_pending
+    assert rig.activity.events == events
+    await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+    assert rig.manager.snapshot(destination.receiver_id).audio is AudioState.Disabled
+    assert len(rig.journal.calls("transport.close_audio")) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block", ["pairing", "close_pending"])
+async def test_volume_receipt_retry_is_blocked_before_transport_mutation(block):
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state="pending"),
+    )
+    original = rig.manager.handlers[Route.audio]
+    def controlled(ctx, message):
+        if isinstance(message, SetMuted):
+            ctx.apply(**({"trust": TrustState.Pairing} if block == "pairing"
+                         else {"audio_close_pending": True}))
+            return True
+        return original(ctx, message)
+    rig.manager.handlers[Route.audio] = controlled
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=False))
+    rig.journal.clear()
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    assert not rig.journal.calls("transport.start_audio")
+    assert not rig.journal.calls("transport.set_volume")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_volume_pending_close_reconnect_uses_off_policy_on_fresh_lease(mode):
+    rig = mirror_rig(volume=True, compose=reconnecting_audio_handlers)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(audio=False, volume_state="refused")))
+    if mode is Mode.MIRROR:
+        before = await start_mirror(rig, destination, volume=VolumeLevel(value=30))
+    else:
+        before = await start_virtual(rig, destination, volume=VolumeLevel(value=30))
+        rig.transport.emit(stream_event(rig, TransportEventKind.ready))
+        await settle(rig)
+    close = Deferred()
+    rig.transport.queue_result("close_audio", close)
+    await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+    rig.transport.emit(stream_event(rig, TransportEventKind.network_lost))
+    await settle(rig)
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.next_retry_at is not None
+    rig.scheduler.advance(state.next_retry_at - rig.clock.now())
+    await settle(rig)
+    call = rig.journal.calls("transport.start_stream")[-1]
+    assert call["audio_policy"] == {"enabled": False} and call["initial_volume"] is None
+    replacement = rig.manager.snapshot(destination.receiver_id)
+    assert replacement.transport_lease_id != before.transport_lease_id
+    assert replacement.effective_volume is None and replacement.last_audible_volume is None
+    close.resolve(Ok(value=None))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id) == replacement
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("remembered,expected", [(45, 45), (None, 100)])
+async def test_volume_unmute_without_last_audible_uses_remembered_else_default(remembered, expected):
+    rig, destination, before = await capable_session(level=0)
+    original = rig.manager.handlers[Route.audio]
+    def controlled(ctx, message):
+        if isinstance(message, RetryAudio):
+            ctx.apply(remembered_volume=remembered)
+            return True
+        return original(ctx, message)
+    rig.manager.handlers[Route.audio] = controlled
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    assert rig.manager.snapshot(destination.receiver_id).audio is AudioState.Muted
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=False))
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.effective_volume == expected and state.last_audible_volume == expected
+    assert state.remembered_volume == remembered
+    assert not rig.journal.calls("receiver_store.put")
+
+
+@pytest.mark.asyncio
+async def test_volume_positive_slider_save_is_independent_of_consumed_worker(monkeypatch):
+    rig, destination, before = await capable_session()
+    writer = rig.deps.preferences
+    update = writer.update
+    entered, gate = [], Deferred()
+    async def held(record_set, **kwargs):
+        entered.append(kwargs)
+        await gate.wait()
+        return await update(record_set, **kwargs)
+    monkeypatch.setattr(writer, "update", held)
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=66)))
+    pending = rig.manager.snapshot(destination.receiver_id)
+    assert pending.effective_volume == 66 and pending.last_audible_volume == 66
+    assert pending.remembered_volume == 30
+    assert len(entered) == 1 and entered[0]["still_current"]()
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).volume_inflight is None
+    gate.resolve(None)
+    await settle(rig)
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.remembered_volume == 66 and not after.volume_save_failed
+    assert rig.receivers.receivers[destination.receiver_id].remembered_volume == 66
+
+
+@pytest.mark.asyncio
+async def test_volume_save_failure_keeps_applied_level_and_recovers_on_next_save():
+    rig, destination, before = await capable_session()
+    rig.receivers.queue_result("put", Err(error=diagnostic(ErrorCode.persistence_failed)))
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=66)))
+    failed = rig.manager.snapshot(destination.receiver_id)
+    assert failed.effective_volume == 66 and failed.last_audible_volume == 66
+    assert failed.remembered_volume == 30 and failed.volume_save_failed
+    assert failed.last_error.code is ErrorCode.volume_preference_failed
+    assert "audio.volume_failed" not in activity_codes(rig)
+    publications = []
+    subscription = rig.manager.subscribe(publications.append)
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=66)))
+    subscription.close()
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.remembered_volume == 66 and not after.volume_save_failed
+    assert after.last_error is None and publications
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_volume_zero_and_speaker_share_one_knob_without_saving_zero(mode):
+    rig, destination, before = await capable_session(mode=mode)
+    rig.journal.clear()
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=0)))
+    muted = rig.manager.snapshot(destination.receiver_id)
+    assert muted.effective_volume == 0 and muted.last_audible_volume == 30
+    assert muted.audio is AudioState.Muted and muted.muted
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).muted_lease == muted.transport_lease_id
+    assert rig.transport.muted[muted.transport_lease_id]
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=False))
+    restored = rig.manager.snapshot(destination.receiver_id)
+    assert restored.effective_volume == 30 and restored.audio is AudioState.Enabled
+    assert not restored.muted and not rig.transport.muted[restored.transport_lease_id]
+    assert restored.remembered_volume == 30
+    assert not rig.journal.calls("transport.set_muted") and not rig.journal.calls("receiver_store.put")
+    assert [call["level"]["value"] for call in rig.journal.calls("transport.set_volume")] == [0, 30]
+
+
+@pytest.mark.asyncio
+async def test_volume_loss_preserves_history_clears_mute_and_zero_receipt_restores_it():
+    rig, destination, before = await capable_session()
+    await dispatch(rig, SetMuted(receiver_id=destination.receiver_id, muted=True))
+    rig.transport.emit(audio_event(rig, TransportEventKind.audio_failed))
+    await settle(rig)
+    lost = rig.manager.snapshot(destination.receiver_id)
+    assert lost.effective_volume == 0 and lost.last_audible_volume == 30
+    assert not lost.muted and lost.audio is AudioState.Unavailable
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).muted_lease is None
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=True, volume_state="applied", level=0,
+    )))
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    restored = rig.manager.snapshot(destination.receiver_id)
+    assert restored.audio is AudioState.Muted and restored.muted
+    assert restored.effective_volume == 0 and restored.last_audible_volume == 30
+    assert rig.transport.muted[restored.transport_lease_id]
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).muted_lease == restored.transport_lease_id
+    await dispatch(rig, SetVolume(receiver_id=destination.receiver_id, level=VolumeLevel(value=65)))
+    positive = rig.manager.snapshot(destination.receiver_id)
+    assert positive.audio is AudioState.Enabled and not positive.muted
+    assert positive.effective_volume == positive.last_audible_volume == positive.remembered_volume == 65
+    assert not rig.transport.muted[positive.transport_lease_id]
+    assert audio_runtime(rig.manager.context(destination.receiver_id)).muted_lease is None
+    assert positive.stream == before.stream
+    assert not rig.journal.calls("transport.set_muted")
+
+
+@pytest.mark.asyncio
+async def test_volume_refused_decision_ignores_unowned_recovery_and_deduplicates_availability():
+    rig, destination, before = await capable_session(
+        receipt=AudioStartReceipt(audio=False, volume_state="refused"),
+    )
+    for _ in range(2):
+        rig.transport.emit(audio_event(rig, TransportEventKind.audio_recovered))
+        await settle(rig)
+    after = rig.manager.snapshot(destination.receiver_id)
+    assert after.audio is AudioState.Unavailable and after.intent_stage is IntentStage.audio_decision
+    assert activity_codes(rig).count("audio.volume_unavailable") == 1
+    assert "audio.recovered" not in activity_codes(rig)
+
+
+@pytest.mark.asyncio
+async def test_volume_result_is_not_projected_before_actual_worker_settlement():
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=True, volume_state="applied", level=30,
+    )))
+    await start_mirror(
+        rig, destination, audio=AudioPolicy(enabled=True), volume=VolumeLevel(value=30),
+    )
+    held = Deferred()
+    rig.transport.queue_result("set_volume", held)
+    receipt = await rig.manager.dispatch(SetVolume(
+        receiver_id=destination.receiver_id, level=VolumeLevel(value=64),
+    ))
+    await settle(rig)
+    assert receipt.accepted
+    pending = rig.manager.snapshot(destination.receiver_id)
+    assert pending.effective_volume == 30 and pending.last_audible_volume == 30
+    assert pending.audio is AudioState.Enabled and not pending.muted
+    held.resolve(Ok(value=64))
+    await settle(rig)
+    applied = rig.manager.snapshot(destination.receiver_id)
+    assert applied.effective_volume == 64 and applied.last_audible_volume == 64
+    assert applied.audio is AudioState.Enabled and not applied.muted
+
+
+@pytest.mark.asyncio
+async def test_volume_drag_keeps_one_worker_and_applies_intermediate_then_latest_ack():
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=True, volume_state="applied", level=30,
+    )))
+    await start_mirror(
+        rig, destination, audio=AudioPolicy(enabled=True), volume=VolumeLevel(value=30),
+    )
+    first, second = Deferred(), Deferred()
+    rig.transport.queue_result("set_volume", first)
+    rig.transport.queue_result("set_volume", second)
+    for level in (41, 52, 73):
+        await rig.manager.dispatch(SetVolume(
+            receiver_id=destination.receiver_id, level=VolumeLevel(value=level),
+        ))
+        await settle(rig)
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    first.resolve(Ok(value=41))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).effective_volume == 41
+    assert len(rig.journal.calls("transport.set_volume")) == 2
+    assert rig.journal.calls("transport.set_volume")[-1]["level"] == {"value": 73}
+    second.resolve(Ok(value=73))
+    await settle(rig)
+    result = rig.manager.snapshot(destination.receiver_id)
+    assert result.effective_volume == 73 and result.last_audible_volume == 73
+
+
+@pytest.mark.asyncio
+async def test_capable_video_only_waits_for_current_close_acknowledgement():
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=False, volume_state="refused",
+    )))
+    await start_mirror(
+        rig, destination, audio=AudioPolicy(enabled=True), volume=VolumeLevel(value=30),
+    )
+    held = Deferred()
+    rig.transport.queue_result("close_audio", held)
+    await dispatch(rig, StartVideoOnly(receiver_id=destination.receiver_id))
+    pending = rig.manager.snapshot(destination.receiver_id)
+    assert pending.audio_policy.enabled is False
+    assert pending.audio_close_pending is True
+    assert pending.audio is AudioState.Unavailable
+    assert len(rig.journal.calls("transport.close_audio")) == 1
+    held.resolve(Ok(value=None))
+    await settle(rig)
+    closed = rig.manager.snapshot(destination.receiver_id)
+    assert closed.audio is AudioState.Disabled and not closed.muted
+    assert not closed.audio_close_pending
+    assert closed.transport is TransportState.Streaming and closed.stream is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("receipt,state,expected_error", [
+    (AudioStartReceipt(audio=True, volume_state="applied", level=37), AudioState.Enabled, None),
+    (AudioStartReceipt(audio=True, volume_state="pending"), AudioState.Unavailable, ErrorCode.volume_unavailable),
+    (AudioStartReceipt(audio=True, volume_state="refused"), AudioState.Unavailable, ErrorCode.volume_unavailable),
+    (AudioStartReceipt(audio=True), AudioState.Unavailable, ErrorCode.volume_unavailable),
+    (AudioStartReceipt(audio=False, volume_state="applied", level=37), AudioState.Unavailable, ErrorCode.audio_unavailable),
+])
+async def test_capable_startup_receipt_controls_audio_and_volume_state(receipt, state, expected_error):
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=receipt))
+    result = await start_mirror(
+        rig, destination, audio=AudioPolicy(enabled=True), volume=VolumeLevel(value=37),
+    )
+    assert result.audio is state
+    assert result.effective_volume == (37 if expected_error is None else None)
+    assert result.last_audible_volume == (37 if expected_error is None else None)
+    if expected_error is None:
+        assert result.volume_state == "applied"
+        assert result.intent_stage is IntentStage.active
+        assert activity_codes(rig).count("audio.recovered") == 1
+    else:
+        assert result.intent_stage is IntentStage.audio_decision
+        assert result.last_error.code is expected_error
+        assert "audio.recovered" not in activity_codes(rig)
+
+
+@pytest.mark.asyncio
+async def test_set_volume_command_routes_through_audio_and_applies_only_acknowledged_level():
+    rig = mirror_rig(volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    rig.transport.queue_result("start_audio", Ok(value=AudioStartReceipt(
+        audio=True, volume_state="applied", level=30,
+    )))
+    await start_mirror(
+        rig, destination, audio=AudioPolicy(enabled=True), volume=VolumeLevel(value=30),
+    )
+    receipt = await rig.manager.dispatch(SetVolume(
+        receiver_id=destination.receiver_id, level=VolumeLevel(value=64),
+    ))
+    await settle(rig)
+    assert receipt.accepted
+    assert len(rig.journal.calls("transport.set_volume")) == 1
+    state = rig.manager.snapshot(destination.receiver_id)
+    assert state.effective_volume == 64
+    assert state.last_audible_volume == 64
+    assert state.audio is AudioState.Enabled and not state.muted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+@pytest.mark.parametrize("capable,enabled,value,want", [
+    (True, True, 30, {"value": 30}), (True, True, 0, {"value": 0}),
+    (True, True, None, None), (True, False, 30, None), (False, True, 30, None),
+])
+async def test_volume_startup_input_reaches_actual_transport(mode, capable, enabled, value, want):
+    rig = mirror_rig(volume=capable) if mode is Mode.MIRROR else virtual_rig(ready=True, volume=capable)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    volume = None if value is None else VolumeLevel(value=value)
+    if mode is Mode.MIRROR:
+        state = await start_mirror(rig, destination, audio=AudioPolicy(enabled=enabled), volume=volume)
+    else:
+        state = await start_virtual(rig, destination, audio=enabled, volume=volume)
+    calls = rig.journal.calls("transport.start_stream")
+    assert len(calls) == 1
+    assert calls[0]["initial_volume"] == want
+    assert calls[0]["audio_policy"] == {"enabled": enabled}
+    assert state.effective_volume is None and state.last_audible_volume is None
+    assert state.remembered_volume == (value if value and capable else None)
+
+
+async def test_volume_initial_value_survives_resolution_choice():
+    rig = virtual_rig(ready=True, volume=True)
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.receivers.queue_result("query_modes", Ok(value=ReceiverCapabilities(
+        modes=(decision(destination).size,), reliable=True, evidence="receiver query",
+    )))
+    rig.capture.add_physical(physical())
+    await rig.manager.dispatch(Start(
+        receiver_id=destination.receiver_id,
+        request=StartRequest(mode=Mode.VIRTUAL, volume=VolumeLevel(value=0)),
+    ))
+    await settle(rig)
+    assert rig.manager.snapshot(destination.receiver_id).phase is SessionPhase.ResolutionRequired
+    await rig.manager.dispatch(ChooseResolution(
+        receiver_id=destination.receiver_id, decision=decision(destination),
+    ))
+    await settle(rig)
+    calls = rig.journal.calls("transport.start_stream")
+    assert len(calls) == 1
+    assert calls[0]["initial_volume"] == {"value": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [Mode.MIRROR, Mode.VIRTUAL])
+async def test_volume_initial_value_survives_audio_decision_continuation(mode):
+    rig = mirror_rig(volume=True) if mode is Mode.MIRROR else virtual_rig(ready=True, volume=True)
+    rig.audio.queue_result("check", Err(error=diagnostic(ErrorCode.audio_unavailable)))
+    destination = target()
+    rig.discovery.add_target(destination)
+    rig.capture.add_physical(physical())
+    if mode is Mode.MIRROR:
+        await start_mirror(rig, destination, volume=VolumeLevel(value=0))
+    else:
+        await start_virtual(rig, destination, volume=VolumeLevel(value=0))
+    assert not rig.journal.calls("transport.start_stream")
+    await dispatch(rig, RetryAudio(receiver_id=destination.receiver_id))
+    assert rig.journal.calls("transport.start_stream")[0]["initial_volume"] == {"value": 0}
 
 
 def test_audio_unavailable_projection_retains_stream(streaming_snapshot):

@@ -7,6 +7,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from .identity import _validate_generation
+from .resources import VolumeLevel
 
 if TYPE_CHECKING:
     from .identity import ReceiverId, ReceiverView
@@ -87,6 +88,16 @@ class SetMuted:
 
 
 @dataclass(frozen=True, kw_only=True)
+class SetVolume:
+    receiver_id: ReceiverId
+    level: VolumeLevel
+
+    def __post_init__(self) -> None:
+        if type(self.level) is not VolumeLevel:
+            raise TypeError("volume command requires a VolumeLevel")
+
+
+@dataclass(frozen=True, kw_only=True)
 class RetryAudio:
     receiver_id: ReceiverId
 
@@ -127,7 +138,7 @@ class ConfirmOrphanRemoval:
 
 Command: TypeAlias = (
     Start | Stop | Cancel | Retry | SubmitPairing | Pair | Forget
-    | ChooseResolution | ChangeResolution | RecreateAccepted | SetMuted
+    | ChooseResolution | ChangeResolution | RecreateAccepted | SetMuted | SetVolume
     | RetryAudio | StartVideoOnly | RetryCleanup | RetryRevocation
     | KeepCleanup | ConfirmSwitch | ConfirmOrphanRemoval
 )
@@ -152,6 +163,7 @@ class TransportEventKind(StrEnum):
     audio_failed = "audio_failed"
     audio_recovered = "audio_recovered"
     mute_result = "mute_result"
+    volume_result = "volume_result"
     accepted_mode = "accepted_mode"
     failed = "failed"
     daemon_exit = "daemon_exit"
@@ -177,6 +189,17 @@ class ModePayload:
 class MutePayload:
     muted: bool
     ok: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class VolumePayload:
+    level: int
+    ok: bool
+
+    def __post_init__(self) -> None:
+        VolumeLevel(value=self.level)
+        if type(self.ok) is not bool:
+            raise TypeError("volume result ok must be a boolean")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -206,7 +229,7 @@ class ChallengePayload:
 
 
 TransportPayload: TypeAlias = (
-    EmptyPayload | FailurePayload | ModePayload | MutePayload | ChallengePayload
+    EmptyPayload | FailurePayload | ModePayload | MutePayload | VolumePayload | ChallengePayload
     | SourceVerificationPayload
 )
 

@@ -17,57 +17,126 @@ The captured command output is retained in:
 - `tests/fixtures/backend/status-0.5.json` (concurrent PIN-waiting and streaming)
 - `tests/fixtures/backend/status-0.5-password.json` (password-waiting and streaming)
 
-## Verified v0.5 surface
+The historical source record above and `contract-v1.json` contain a transcription discrepancy:
+they spell the peeled commit `e18f85d07f74a3b9d49f448762d28f3f7feb3938`. Fresh local
+`rev-parse` of the supplied tag and HEAD of the prepared clone both return
+**`e18f85d07f74a3b9d49f448762d28f3b7feb3938`**. The prepared pair uses this measured commit.
+The older strings/links remain recorded fixture provenance and must not substitute for the
+[measured build identity](backend-fork.md#prepared-volume-helper-pair-2026-11-05).
 
-The sender and control help, the release source, and the status fixture prove
-these operations and fields:
+## Recognized help and capability contracts
 
-| Surface | Contract evidence | Adapter policy |
-| --- | --- | --- |
-| `status` | `doubletake-ctl` command; JSON `ok`, `state`, audio fields, and `streams` | Supported through an explicit `-socket` path |
-| `discover` | `doubletake-ctl` command; `devices` response entries | Supported through an explicit `-socket` path |
-| `devices` | `doubletake-ctl` command; `devices` response entries | Supported through an explicit `-socket` path |
-| target `connect` | documented `connect [target]` and request `target` field | Mapped only when a target is supplied; credential arguments are rejected |
-| target `disconnect` | documented `disconnect [target]` and request `target` field | Mapped only when a target is supplied |
-| target `mute`/`unmute` | documented target forms and request `target` field | Mapped only when a target is supplied |
-| status credentials | `needs_credential`, `credential_kind`, legacy `needs_pin` | Decoded as `pin` or `password`; unknown values fail closed |
-| status streams | `device`, `device_ip`, `state`, `has_audio`, `audio_muted`, `credential_kind` | Decoded into immutable typed records |
+The historical v0.5 release capture and the locally extended volume surface are two exact
+accepted tables. The sender retains the pinned flag set, optionally plus the existing
+`-capabilities` flag. Volume introduces no sender flag or profile name.
 
-All commands use `doubletake-ctl -socket <explicit-private-path> ...`. The
-adapter never emits the unqualified destructive commands and never places a
-PIN or password in process arguments.
+The legacy ctl command table is:
 
-## Absent or unverified capabilities
+```text
+  status                              Show daemon state and all active streams
+  discover                            Discover AirPlay devices on the network
+  devices                             List cached discovered devices
+  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)
+  pin <PIN-or-password>               Submit pairing credentials for a waiting device
+  disconnect [target]                 Stop mirroring (all streams, or only the given IP)
+  mute [target]                       Mute mirrored audio (all streams, or only the given IP)
+  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)
+```
 
-The 0.5 help and release source do **not** independently prove the following:
+Patch 0004 carries this extended table, with the three changed/new rows in connect, volume,
+audio, pin order:
 
-- an application-owned foreground daemon mode;
-- an authenticated owner token and daemon-instance handshake;
-- typed physical-monitor or virtual-output source verification;
-- target-bound pairing through a secret-safe application channel;
-- transactional keyring prepare/commit or provisional trust records;
-- cancellation, revocation, or invalidation of pairing trust;
-- audio restart, mode querying, or a typed resolution capability response.
+```text
+  status                              Show daemon state and all active streams
+  discover                            Discover AirPlay devices on the network
+  devices                             List cached discovered devices
+  connect [target] [--audio on|off] [--volume <0-100>] [PIN-or-password]  Start mirroring (to target IP, or first free device)
+  volume <0-100> [target]             Set mirrored audio level (all streams, or only the given IP)
+  audio off [target]                  Close mirrored audio (all streams, or only the given IP)
+  pin <PIN-or-password>               Submit pairing credentials for a waiting device
+  disconnect [target]                 Stop mirroring (all streams, or only the given IP)
+  mute [target]                       Mute mirrored audio (all streams, or only the given IP)
+  unmute [target]                     Unmute mirrored audio (all streams, or only the given IP)
+```
 
-The decoder therefore leaves those capability flags false. `-daemonize` does
-not prove foreground ownership, `-cred-backend keyring` does not prove keyring
-transactions, and generic screen-capture flags do not prove a typed physical or
-virtual source contract. A start or trust operation that requires these flags
-returns `dependency_incompatible` or `unsupported_operation`; unknown or
-ambiguous values cannot enable it.
+Recognition checks the complete argument-signature table. Each of `volume` and `audio` must
+independently affirm **"only the given IP"** without a negation; a scope statement on another
+row cannot prove either operation. The existing disconnect/mute/unmute scope checks remain.
+The four-token advertisement produced by the full carried chain is exactly:
 
-The installed 0.5 release also accepts a positional PIN/password on the
-`connect` and `pin` CLI forms. Those forms are intentionally not used by the
-application adapter because process arguments and shell-facing interfaces are
-not a verified secret-safe channel. Pairing remains unsupported until an
-independently verified channel and ownership handshake exist.
+```text
+capabilities-v1
+status-source
+status-source-complete
+target-volume
+```
 
-## Why daemon ownership cannot be closed on doubletake 0.5.0
+| Help and token evidence | Recognition |
+| --- | --- |
+| Exact legacy table, pinned sender | `doubletake-0.5`, `target_volume=false` |
+| Exact legacy table, source sender plus `capabilities-v1` and `status-source` | `doubletake-0.5+source`, `target_volume=false` |
+| Exact extended table, either accepted sender flag set, `capabilities-v1`, `status-source`, `target-volume` | Existing sender-derived profile, `target_volume=true` |
+| Extended table without its tokens; `target-volume` with the old table; partial, malformed, negated or borrowed new scope | `doubletake-unknown`, all gates false; refuse the whole backend |
 
-The design specifies a *proposed* ownership model ("Daemon ownership by evidence") in which the application starts its own
-daemonised backend on a private socket and proves that the daemon it talks to is the one it started. This section records
-why the hardened form of that model cannot be completed against this backend, so the gate stays closed for a reason a
-future maintainer can audit rather than re-derive.
+Source reporting still requires the source sender help surface and its existing tokens.
+`source_reporting_complete` independently requires `status-source-complete`; `target-volume`
+cannot grant completeness, physical identity, owned control or any private trust gate. Unknown
+tokens grant nothing. A half-installed sender/ctl pair must be repaired as a pair.
+
+## Typed operations and receipts
+
+All application commands use `doubletake-ctl -socket <explicit-private-path> ...`. Status,
+discover and devices are read operations. Connect, disconnect, mute and unmute retain their
+published target forms. A capable connect adds `--audio on`, optionally `--volume N`, or
+`--audio off` for video-only. Live changes use `volume N T`; closure uses `audio off T`.
+The application always supplies the target for mutation, never emits the targetless broadcast
+forms, and never places a PIN/password in process arguments. There is no `audio on` command.
+
+A legacy saved level cannot send new flags: connect remains `connect T`, and target
+mute/unmute keep their existing semantics. Version strings and remembered preferences cannot
+promote support.
+
+Status retains `ok`, `state`, audio fields, `needs_credential`, `credential_kind`, legacy
+`needs_pin` and per-stream identity. Credential kinds decode only as `pin` or `password`;
+unknown values refuse. Optional `streams[i].volume` is an exact integer 0..100;
+`volume_state` is unrequested/pending/applied/refused;
+`audio_closed` is an exact boolean. Missing evidence stays absent, applied requires a level,
+and present null/invalid members refuse decoding. These facts never come from an aggregate or
+another stream. Successful live volume/close replies contain full status for the exact target;
+a connect acknowledgement carries no volume receipt. The existing audio-start status read
+carries the receipt, with no additional polling owner.
+
+Only a receiver RTSP 200 acknowledges a requested level. Remote-control changes are not sensed,
+and an acknowledgement cannot prove the receiver honored audible gain. Operational readouts,
+last audible restore, save failures and audio decisions are described in [Operations](operations.md).
+
+## Public evidence and composition evidence
+
+The public help/token decoder leaves foreground control, owner handshake, physical/virtual
+source identity, keyring transactions, target-bound pairing, provisional commit, cancellation,
+revocation and mode querying unproven. `-daemonize`, `-cred-backend keyring` and capture flags
+alone cannot prove those permissions. Credential-bearing connect and pin forms stay outside
+the application adapter's secret-safe contract.
+
+Current production composition can derive `owned_daemon_control` from receipt-backed launch,
+endpoint and teardown evidence, `keyring` from its isolated credential-service witness, and
+physical-source eligibility from complete source reporting plus a fresh KScreen verifier.
+The public `owner_handshake`/`foreground_control` flags stay false; receipt-backed transport
+admission uses its own authority. Every start, mutation and cleanup still checks the current
+receiver, daemon, endpoint, lease and trust evidence. Missing or stale evidence refuses.
+These implementation facts do not establish an installed pair or a live receiver result. The
+[2026-11-05 prepared-pair receipt](backend-fork.md#prepared-volume-helper-pair-2026-11-05)
+records both artifacts in `/tmp/av-delivery.7OYAi0`, their measured hashes, source/patch chain,
+Go/native versions and operator command groups. Status is **prepared, not installed**. The
+rebuilt help/capability probes remain unexecuted under the user's restriction, as do installation,
+installed observations and rollback. The older installations below that receipt remain dated
+historical evidence.
+
+## Historical release-only ownership observations
+
+The following receiver-free spike predates the 2026-11-05 volume work and describes unmodified
+v0.5.0. It is retained as historical evidence about the release's launch surface. The current
+receipt-backed composition is described above and in [Backend activation](backend-fork.md#activation-in-the-application).
 
 ### What the backend offers (observed, receiver-free spike)
 
@@ -95,53 +164,41 @@ same-user environment**, where no process is trying to impersonate our daemon. I
 malicious same-UID process, which can bind the socket first, rewrite a receipt it can read, or simply issue its own
 commands to the daemon.
 
-The design therefore requires, for `owner_handshake`, launch-bound peer authentication that the backend cannot supply. Two
-ways forward exist and both are decisions rather than implementation tasks:
+The earlier design considered authenticated backend control and a cooperative single-user
+ownership model. The implemented receipt-backed authority adopts the latter boundary and
+refuses incomplete evidence. It does not claim authenticated backend control or promote the
+public `owner_handshake` flag. The release observations above explain that residual limit;
+they no longer imply that all production transport admission is unconditionally disabled.
 
-1. **Adopt the cooperative single-user threat model explicitly.** Ownership is then evidence-based, the daemon is trusted
-   because it lives in a directory only we created and its identity matches a launch receipt, and Mirror becomes
-   implementable. The residual is stated plainly: a hostile same-UID process is out of scope, which is defensible on a
-   single-user desktop because such a process already owns the session.
-2. **Require authenticated control.** Then this backend can never satisfy the model, and Mirror/Virtual remain gated until
-   a backend exposes an owner token or an authenticated socket protocol.
-
-Until one of those is chosen, `foreground_control` and `owner_handshake` stay false, admission refuses, and the shipped
-application does not stream. That is the correct fail-closed behaviour, not a defect to work around.
-
-## Why Mirror mode cannot be delivered by this backend
+## Historical release-only source observations
 
 Mirror mode's promise is specific: send **a chosen physical monitor**, and never a virtual or helper-created output. The
 design treats that restriction as a safety property (HR-03), not a preference, because mirroring an inferred source would
 send the wrong screen or a display the application itself created.
 
-The installed backend cannot express that request:
+The unmodified v0.5.0 backend examined in the historical spike could not express that request:
 
 - `doubletake` has **no source, monitor or output selector**. Its capture is the desktop as a whole on Wayland.
-- The only source-adjacent flags are `-x11-window-id` / `-x11-window-name` (X11 windows, not Wayland outputs) and
-  `-synthetic` (a `videotestsrc` test pattern).
+- The original spike also recorded X11 window selectors and a synthetic test pattern; neither
+  established Wayland output identity.
 - Consequently the application's `physical_source` affirmation cannot be proven: the backend cannot be told which monitor
   to send, and it does not report which one it captured.
 
-This is independent of the daemon-ownership question. Even with a fully owned, correctly terminated, private-socket daemon
-(the proposed `owned_daemon_control` model), Mirror-as-specified would still be refused, because the source gate is a
-separate gate and it is unprovable.
+This remains independent of daemon ownership: a private owned socket alone cannot establish
+which output was captured. The source-reporting chain now supplies complete per-stream portal
+metadata, and the application correlates it with fresh compositor identity and ownership
+exclusions before ready. It still adds no source-selector flag. The historical prerequisites
+and their present implementation boundaries are:
 
-Three independent prerequisites therefore stand between this codebase and a working Mirror, and this backend satisfies
-none of them:
+| Prerequisite | Unmodified v0.5.0 evidence | Current composition requirement |
+| --- | --- | --- |
+| owned daemon control | No authenticated backend channel | Current receipt/endpoint authority and strict teardown in the cooperative same-user scope |
+| physical source identity | No monitor selector or source report | Complete source tokens, per-stream metadata and a unique fresh physical-output match |
+| credential service and pairing transactions | Storage selector alone proves neither | Isolated service witness; pairing transaction gates remain independent |
 
-| Prerequisite | Status on `doubletake` 0.5.0 |
-| --- | --- |
-| owned daemon control (`owned_daemon_control`) | achievable by the proposed evidence model, cooperative same-user scope |
-| physical source selection (`physical_source`) | **not expressible** - no monitor/output selector, no report of what was captured |
-| credential service (`keyring`) and pairing transactions | unproven - `-cred-backend keyring` selects storage, not a proven Secret Service path |
-
-Virtual mode is separately blocked on the absent `krfb-virtualmonitor` helper and its association verifier.
-
-### What this means
-The application, as specified, cannot stream with this backend. That is a backend capability boundary, not a defect to be
-worked around: any "fix" would have to infer the source, and inference is exactly what this design forbids. A working
-product needs a backend that can be told which output to send and can report which one it sent - or an explicit product
-decision to redefine Mirror as whole-screen sending, which is a different promise and would change HR-03.
+Virtual mode separately requires an available helper and its exact ownership association.
+Neither source metadata nor the new volume token establishes those facts. Live host/receiver
+acceptance is separate from the offline implementation evidence.
 
 ## Application contract fixture
 

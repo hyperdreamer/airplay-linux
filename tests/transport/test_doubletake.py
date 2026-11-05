@@ -21,9 +21,9 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import MutePayload, SourceVerificationPayload, TransportEventKind
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandOutput
-from airplay_linux.domain.records import DaemonRecord
+from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
 from airplay_linux.domain.resources import (
-    AudioPolicy, AudioState, Err, ErrorCode, Ok, PhysicalMonitorSource,
+    AudioPolicy, AudioState, Err, ErrorCode, Ok, PhysicalMonitorSource, VolumeLevel,
 )
 from airplay_linux.storage import AtomicFiles, JsonReceiverStore
 from airplay_linux.testing.adapters import Deferred, FakeCapture, Journal, SequenceIds
@@ -173,7 +173,8 @@ class Control:
             ))
         if operation is BackendOperation.connect:
             # The adjudicated payload works even with the published CLI profile.
-            argv = PublishedDoubletakeProfile(socket_path=self.record.socket_path).try_argv(
+            profile_kwargs = {"features": self.profile_features} if hasattr(self, "profile_features") else {}
+            argv = PublishedDoubletakeProfile(socket_path=self.record.socket_path, **profile_kwargs).try_argv(
                 operation, receiver, payload,
             )
             assert isinstance(argv, Ok), argv
@@ -250,9 +251,9 @@ class Harness:
         ))
         self.transport.update_target(receiver, receiver.receiver_id)
 
-    async def start(self, receiver=None, source=None, ctx=None, enabled=True):
+    async def start(self, receiver=None, source=None, ctx=None, enabled=True, **kwargs):
         return await self.transport.start_stream(
-            receiver or self.a, source or self.source, AudioPolicy(enabled=enabled), ctx or context(),
+            receiver or self.a, source or self.source, AudioPolicy(enabled=enabled), ctx or context(), **kwargs,
         )
 
     async def handle(self, receiver=None, **kwargs):
@@ -2639,3 +2640,205 @@ async def test_a_transient_status_timeout_does_not_abort_the_permission_wait(tmp
 
     assert isinstance(result, Ok), result
     assert result.value.source_connector == "DP-1"
+
+
+class VolumeControl(Control):
+    receipt_state = "applied"
+    receipt_level = 30
+    receipt_audio = True
+    receipt_closed = False
+
+    def status(self, receiver=None, **changes):
+        receiver = receiver or target()
+        entry = BackendStream(
+            device="Receiver", target=receiver.canonical_host, state="streaming",
+            has_audio=changes.get("audio", self.receipt_audio), audio_muted=False,
+            volume_state=changes.get("state", self.receipt_state),
+            volume=changes.get("level", self.receipt_level),
+            audio_closed=changes.get("closed", self.receipt_closed),
+        )
+        return Ok(value=StatusReply(
+            state="streaming", device="Receiver", target=receiver.canonical_host,
+            has_audio=entry.has_audio, audio_muted=False, needs_credential=False,
+            credential_kind=None, streams=(entry,),
+        ))
+
+    async def request(self, operation, receiver, payload, ctx, *, dispatch_fence=None):
+        result = await super().request(operation, receiver, payload, ctx, dispatch_fence=dispatch_fence)
+        if isinstance(result, Ok) and isinstance(result.value, AckReply):
+            if operation is BackendOperation.status:
+                return self.status()
+            if operation is BackendOperation.volume:
+                return self.status(receiver, state="applied", level=payload.level.value, closed=False)
+            if operation is BackendOperation.audio_off:
+                return self.status(receiver, closed=True)
+        return result
+
+
+@pytest.fixture
+def volume_control(tmp_path):
+    class VolumeHarness(Harness):
+        def factory(self, record):
+            control = self.controls.setdefault(record.instance_uuid, VolumeControl(record))
+            control.profile_features = self.features
+            return control
+    return VolumeHarness(tmp_path, profile="doubletake-0.5+source", target_volume=True,
+                         owned_daemon_control=True, audio_restart=False)
+
+
+@pytest.fixture
+async def held_volume(volume_control):
+    h = volume_control
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    gate = h.control.gates[(BackendOperation.volume, h.a.receiver_id)] = Gate()
+    return h, handle, gate
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state,level,audio,closed", [
+    ("applied", 30, True, False), ("applied", 0, True, False),
+    ("refused", None, False, False), ("pending", 30, False, False),
+    (None, None, False, False), ("unrequested", None, True, False),
+    ("applied", 30, False, False), ("applied", 30, True, True),
+])
+async def test_volume_startup_receipt_uses_existing_status_read(volume_control, state, level, audio, closed):
+    h = volume_control
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    h.control.receipt_state, h.control.receipt_level = state, level
+    h.control.receipt_audio, h.control.receipt_closed = audio, closed
+    before = len(h.control.calls(BackendOperation.status))
+    result = await h.transport.start_audio(handle, context())
+    assert len(h.control.calls(BackendOperation.status)) == before + 1
+    if closed:
+        assert_error(result, ErrorCode.audio_unavailable)
+    else:
+        assert result == Ok(value=AudioStartReceipt(audio=audio, volume_state=state, level=level))
+    assert not any(e.kind is TransportEventKind.audio_recovered for e in h.events)
+    stream = h.transport._streams[handle.lease_id]
+    assert stream.muted is (state == "applied" and level == 0 and audio and not closed)
+    if not closed:
+        assert stream.volume_state == state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capable,enabled,level,want", [
+    (True, True, 30, ("--audio", "on", "--volume", "30")),
+    (True, True, 0, ("--audio", "on", "--volume", "0")),
+    (True, True, None, ("--audio", "on")),
+    (True, False, 30, ("--audio", "off")),
+    (False, True, 30, ()), (False, False, 30, ()),
+])
+async def test_volume_connect_payload_is_capability_conditioned(volume_control, capable, enabled, level, want):
+    h = volume_control
+    h.transport._features = replace(h.features, target_volume=capable)
+    h.control.profile_features = h.transport._features
+    payloads = []
+    original = h.control.request
+    async def observe(operation, receiver, payload, ctx, *, dispatch_fence=None):
+        if operation is BackendOperation.connect:
+            payloads.append(payload)
+        return await original(operation, receiver, payload, ctx, dispatch_fence=dispatch_fence)
+    h.control.request = observe
+    await h.handle(enabled=enabled, initial_volume=None if level is None else VolumeLevel(value=level))
+    argv = PublishedDoubletakeProfile(socket_path=h.registry.record.socket_path,
+                                      features=h.transport._features).try_argv(
+        BackendOperation.connect, h.a, payloads[0])
+    assert argv == Ok(value=("doubletake-ctl", "-socket", h.registry.record.socket_path,
+                             "connect", h.a.canonical_host, *want))
+
+
+@pytest.mark.asyncio
+async def test_volume_invalid_input_precedes_allocation(volume_control):
+    h = volume_control
+    assert_error(await h.start(initial_volume=30), ErrorCode.invalid_input)
+    assert not h.transport._streams and h.registry.ensure_calls == 0
+    assert_error(await h.transport.set_volume(None, VolumeLevel(value=30), context()), ErrorCode.invalid_input)
+    assert not h.events
+
+
+@pytest.mark.asyncio
+async def test_held_volume_timeout_settles_only_after_worker_and_close_bypasses_lock(held_volume):
+    from airplay_linux.domain.messages import VolumePayload as EventVolume
+    h, handle, gate = held_volume
+    observed = []
+    stream = h.transport._streams[handle.lease_id]
+    h.transport.subscribe(lambda e: observed.append((e, stream.lock.locked()))
+                          if e.kind is TransportEventKind.volume_result else None)
+    call = asyncio.create_task(h.transport.set_volume(handle, VolumeLevel(value=0), context()))
+    await gate.entered.wait()
+    worker = stream.volume_task.task
+    h.scheduler.advance(5)
+    assert_error(await call, ErrorCode.audio_volume_failed)
+    assert not worker.done() and stream.lock.locked() and not observed
+    assert isinstance(await h.transport.close_audio(handle, context()), Ok)
+    assert stream.audio_closed and not stream.audio_policy.enabled and not worker.done()
+    gate.release()
+    await worker
+    await asyncio.sleep(0)
+    assert worker.done() and not stream.lock.locked()
+    assert [(e.payload, locked) for e, locked in observed] == [(EventVolume(level=0, ok=False), False)]
+    assert observed[0][0].context == context() and observed[0][0].stream == handle
+    assert not stream.muted and stream.audio is AudioState.Enabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["none", "handle", "target", "daemon", "trust", "session", "lease"])
+async def test_volume_preflight_always_settles_original_typed_call(volume_control, change):
+    h = volume_control
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    supplied, operation = handle, context()
+    if change == "handle":
+        supplied = replace(handle, backend_stream_id="foreign")
+    elif change == "target":
+        h.admit(target("replacement"))
+    elif change == "daemon":
+        h.registry.emit("exit")
+    elif change == "trust":
+        h.fences.set(replace(h.fences.get(h.a.receiver_id), trust_generation=1))
+    elif change == "session":
+        operation = context(generation=2)
+    elif change == "lease":
+        operation = context(lease=2)
+    result = await h.transport.set_volume(supplied, VolumeLevel(value=0), operation)
+    await asyncio.sleep(0)
+    settlements = [e for e in h.events if e.kind is TransportEventKind.volume_result]
+    assert len(settlements) == 1
+    assert settlements[0].stream == supplied and settlements[0].context == operation
+    assert settlements[0].payload.ok is (change == "none")
+    if change == "none":
+        assert result == Ok(value=0)
+        assert h.transport._streams[handle.lease_id].muted
+    else:
+        assert isinstance(result, Err) and not h.control.calls(BackendOperation.volume)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", [BackendOperation.volume, BackendOperation.audio_off])
+async def test_volume_new_operations_require_original_dispatch_fence(volume_control, operation):
+    h = volume_control
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    assert isinstance(await h.transport.start_audio(handle, context()), Ok)
+    wrapper = _LegacyControl(h.control)
+    h.transport._streams[handle.lease_id].daemon.control = wrapper
+    result = (await h.transport.set_volume(handle, VolumeLevel(value=40), context())
+              if operation is BackendOperation.volume else await h.transport.close_audio(handle, context()))
+    assert_error(result, ErrorCode.dependency_incompatible)
+    assert not wrapper.calls
+
+
+@pytest.mark.asyncio
+async def test_volume_close_timeout_needs_fresh_acknowledgement(volume_control):
+    h = volume_control
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    gate = h.control.gates[(BackendOperation.audio_off, h.a.receiver_id)] = Gate()
+    pending = asyncio.create_task(h.transport.close_audio(handle, context()))
+    await gate.entered.wait()
+    h.scheduler.advance(5)
+    assert_error(await pending, ErrorCode.audio_volume_failed)
+    gate.release()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert isinstance(await h.transport.close_audio(handle, context()), Ok)
+    assert len(h.control.calls(BackendOperation.audio_off)) == 2

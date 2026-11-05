@@ -33,17 +33,19 @@ from pathlib import Path
 
 import pytest
 
-from airplay_linux.backend.contract import probe_backend
+from airplay_linux.backend.contract import features_from_help, probe_backend
 from airplay_linux.backend.control import (
     ApplicationContractProfile,
+    AudioGatePayload,
     BackendOperation,
     ConnectPayload,
     EmptyPayload,
     PublishedDoubletakeControl,
     PublishedDoubletakeProfile,
+    VolumePayload,
 )
 from airplay_linux.domain.operations import InstanceId, SensitiveText
-from airplay_linux.domain.resources import Err, ErrorCode, Ok
+from airplay_linux.domain.resources import Err, ErrorCode, Ok, VolumeLevel
 from airplay_linux.process.linux import LinuxProcessRunner
 from airplay_linux.testing.builders import context, physical, target
 
@@ -130,9 +132,26 @@ async def test_installed_help_surface_proves_no_application_owned_gates():
         assert refused.error.code is ErrorCode.dependency_incompatible
 
 
-def test_profile_maps_exactly_the_documented_operations():
-    """Unsupported operations are recorded, never invented."""
-    profile = PublishedDoubletakeProfile(socket_path="/run/user/0/private.sock")
+@pytest.mark.parametrize("capable", [False, True])
+def test_profile_maps_exactly_the_documented_operations(capable):
+    """Only the coherent extended help/token pair admits the extra operations."""
+    fixtures = Path(__file__).parents[1] / "fixtures" / "backend"
+    sender_help = (fixtures / "doubletake-0.5-source-help.txt").read_text()
+    ctl_help = (fixtures / "doubletake-ctl-0.5-help.txt").read_text()
+    tokens = frozenset({"capabilities-v1", "status-source", "status-source-complete"})
+    if capable:
+        ctl_help = ctl_help.replace(
+            "  connect [target] [PIN-or-password]  Start mirroring (to target IP, or first free device)",
+            "  connect [target] [--audio on|off] [--volume <0-100>] [PIN-or-password]  Start mirroring (to target IP, or first free device)\n"
+            "  volume <0-100> [target]             Set mirrored audio level (all streams, or only the given IP)\n"
+            "  audio off [target]                  Close mirrored audio (all streams, or only the given IP)",
+        )
+        tokens |= {"target-volume"}
+    features = features_from_help(sender_help, ctl_help, advertised=tokens)
+    assert features.profile == "doubletake-0.5+source" and features.target_volume is capable
+    for gate in APPLICATION_OWNED_GATES:
+        assert getattr(features, gate) is False
+    profile = PublishedDoubletakeProfile(socket_path="/run/user/0/private.sock", features=features)
     receiver = target("a")
     read_operations = {
         BackendOperation.status, BackendOperation.discover, BackendOperation.devices,
@@ -145,6 +164,8 @@ def test_profile_maps_exactly_the_documented_operations():
         BackendOperation.disconnect: EmptyPayload(),
         BackendOperation.mute: EmptyPayload(),
         BackendOperation.unmute: EmptyPayload(),
+        BackendOperation.volume: VolumePayload(level=VolumeLevel(value=30)),
+        BackendOperation.audio_off: AudioGatePayload(),
     }
     supported = set()
     unsupported = set()
@@ -153,8 +174,10 @@ def test_profile_maps_exactly_the_documented_operations():
         addressed = None if operation in read_operations else receiver
         result = profile.try_argv(operation, addressed, payloads.get(operation, EmptyPayload()))
         (supported if isinstance(result, Ok) else unsupported).add(operation)
-    assert supported == PUBLISHED_OPERATIONS
-    assert unsupported == set(BackendOperation) - PUBLISHED_OPERATIONS
+    expected = (PUBLISHED_OPERATIONS | {BackendOperation.volume, BackendOperation.audio_off}
+                if features.target_volume else PUBLISHED_OPERATIONS)
+    assert supported == expected
+    assert unsupported == set(BackendOperation) - expected
 
     # Secrets and physical-source descriptors have no published argv mapping: they
     # must be refused rather than smuggled into a command line.
