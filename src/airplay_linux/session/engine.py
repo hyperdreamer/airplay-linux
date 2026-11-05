@@ -33,6 +33,7 @@ from airplay_linux.domain.messages import (
     RetryCleanup,
     RetryRevocation,
     SetMuted,
+    SetVolume,
     Start,
     StartVideoOnly,
     Stop,
@@ -789,7 +790,7 @@ class SessionManager:
             return Route.trust
         if isinstance(message, (ChooseResolution, ChangeResolution, RecreateAccepted)):
             return Route.resolution
-        if isinstance(message, (SetMuted, RetryAudio)):
+        if isinstance(message, (SetMuted, SetVolume, RetryAudio)):
             return Route.audio
         if isinstance(message, (RetryCleanup, KeepCleanup, ConfirmOrphanRemoval)):
             return Route.cleanup
