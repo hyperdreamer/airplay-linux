@@ -292,6 +292,7 @@ def test_target_volume_patch_executes_carried_contract(tmp_path) -> None:
     assert {item["trace"] for item in traces} >= {
         "ack30_reject40", "unrequested_reject_first", "queued_pending",
         "queued_applied", "closed_refused", "closed_partial",
+        "partial_setup_refused", "partial_retry_refused", "partial_retry_applied",
     }
     expected = {
         "ack30_reject40": (30, "applied", False),
@@ -300,6 +301,9 @@ def test_target_volume_patch_executes_carried_contract(tmp_path) -> None:
         "queued_applied": (60, "applied", False),
         "closed_refused": (None, "unrequested", True),
         "closed_partial": (30, "applied", True),
+        "partial_setup_refused": (30, "refused", False),
+        "partial_retry_refused": (30, "refused", False),
+        "partial_retry_applied": (30, "applied", False),
     }
     for item in traces:
         decoded = decode_status(item["status"])
@@ -428,6 +432,12 @@ func (c *ProofConn) SetDeadline(t time.Time) error { return nil }
 func (c *ProofConn) SetReadDeadline(t time.Time) error { c.Deadlines=append(c.Deadlines,t); if t.IsZero() && c.ClearFails { return io.ErrClosedPipe }; return nil }
 func (c *ProofConn) SetWriteDeadline(t time.Time) error { return c.SetReadDeadline(t) }
 func ProofSession(level *int, state string, exchange func([]byte)([]byte,error)) *MirrorSession { return &MirrorSession{client:&AirPlayClient{conn:&ProofConn{Exchange:exchange}}, sessionURI:"rtsp://proof/audio",audioStream:&AudioStream{},initialVolume:level,initialVolumeState:state} }
+// The setup outcome comes from the exact carried helper, never fixture arithmetic.
+func ProofSetupSession(percent int, exchange func([]byte)([]byte,error)) (*MirrorSession,error) {
+ c:=&AirPlayClient{conn:&ProofConn{Exchange:exchange}}
+ level,state,err:=c.setupAudioLevel(StreamConfig{InitialVolume:&percent},"rtsp://proof/audio",nil)
+ return &MirrorSession{client:c,sessionURI:"rtsp://proof/audio",audioStream:&AudioStream{},initialVolume:level,initialVolumeState:state},err
+}
 type SourceInfo struct { Type uint32 `json:"type"`; Width int `json:"width"`; Height int `json:"height"`; X int `json:"x"`; Y int `json:"y"`; HasPosition bool `json:"has_position"` }
 type BroadcastSink struct{}
 func (*BroadcastSink) Close() {}
@@ -536,6 +546,19 @@ func TestRecoverySerializerTraces(t *testing.T) {
   d.mu.Lock();if !e.audioLevelReady||e.volumeState!="pending"||*e.volume!=30{t.Fatal(e.volumeState)};d.mu.Unlock()
   onceNext.Do(func(){close(releaseNext)});if r:=<-r60;!r.OK{t.Fatal(r)};settled(t,d,e);if e.volumeState!="applied"||*e.volume!=60||calls.Load()!=3{t.Fatal(e.volumeState,e.volume,calls.Load())};trace(t,d,"queued_applied",true)
  })
+}
+func TestPartialStartupRecoveryTraces(t *testing.T) {
+ var calls atomic.Int32
+ exchange:=func([]byte)([]byte,error){n:=calls.Add(1);if n==2||n==3{return wire(403),nil};return wire(200),nil}
+ session,err:=airplay.ProofSetupSession(30,exchange);if err!=nil{t.Fatal(err)}
+ percent,state:=session.InitialAudioLevel();if state!="refused"||percent==nil||*percent!=30||calls.Load()!=2{t.Fatal(percent,state,calls.Load())}
+ d,e,capture:=fixture(t,false,percent,exchange);e.session=session;e.volume=percent;e.volumeState=state
+ d.maybeStartAudio(e);if e.audioDone!=nil{t.Fatal("partial setup admitted audio")};trace(t,d,"partial_setup_refused",true)
+ if level(d,30).OK{t.Fatal("rejected retry acknowledged")};settled(t,d,e)
+ if e.audioLevelReady||e.audioDone!=nil||capture.Stops.Load()!=0{t.Fatal("rejected retry admitted audio")};trace(t,d,"partial_retry_refused",true)
+ if !level(d,30).OK{t.Fatal("later retry rejected")};settled(t,d,e)
+ await(t,func()bool{d.mu.Lock();defer d.mu.Unlock();return e.audioCapture!=nil})
+ if !e.audioLevelReady||calls.Load()!=4{t.Fatal("later 200 did not admit audio",calls.Load())};trace(t,d,"partial_retry_applied",true)
 }
 func TestClosedTerminalTracesAndLateRetry(t *testing.T){for _,partial:=range []bool{false,true}{t.Run(fmt.Sprint(partial),func(t *testing.T){
  var initial *int;if partial{n:=30;initial=&n};entered:=make(chan struct{});release:=make(chan struct{});var once sync.Once;defer once.Do(func(){close(release)})
