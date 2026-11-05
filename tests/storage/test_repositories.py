@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import sys
 from dataclasses import replace
 from uuid import UUID
 
@@ -113,6 +114,57 @@ async def test_receiver_volume_warnings_are_content_sensitive_and_never_rewrite(
     files.write(key, json.dumps(raw | {"receiver_id": "secret-invalid-identity", "remembered_volume": 0}).encode())
     assert isinstance(await store.all(), Err)
     assert len(warnings) == 3
+
+
+@pytest.mark.parametrize("first_read", ["get", "all"])
+@pytest.mark.parametrize("shape", ["integer", "negative", "array", "object"])
+async def test_oversized_volume_token_drops_only_preference(tmp_path, first_read, shape):
+    """Raw numeric tokens beyond int's digit limit must not block the receiver list."""
+    from urllib.parse import quote
+
+    files = AtomicFiles(tmp_path)
+    warnings = []
+    store = repositories.JsonReceiverStore(files, on_diagnostic=warnings.append)
+    original = saved(remembered_volume=30)
+    sibling = saved(receiver_id="airplay-device:b", last_endpoint=None)
+    assert await store.put(sibling) == Ok(value=None)
+    digits = b"9" * max(5000, sys.get_int_max_str_digits() + 1)
+    leaf = {"integer": digits, "negative": b"-" + digits,
+            "array": b"[" + digits + b"]", "object": b'{"level":' + digits + b"}"}[shape]
+    payload = codecs.encode_receiver(original).replace(b'"remembered_volume":30', b'"remembered_volume":' + leaf)
+    key = "receivers/" + quote(original.receiver_id, safe="") + ".json"
+    files.write(key, payload)
+    clean = replace(original, remembered_volume=None)
+    if first_read == "get":
+        assert await store.get(original.receiver_id) == Ok(value=clean)
+    else:
+        assert await store.all() == Ok(value=(clean, sibling))
+    assert warnings == [diagnostic(ErrorCode.volume_preference_invalid, original.receiver_id)]
+    assert await store.get(original.receiver_id) == Ok(value=clean)
+    assert await store.all() == Ok(value=(clean, sibling))
+    assert len(warnings) == 1 and files.read(key) == payload
+
+
+@pytest.mark.parametrize("field", [
+    "receiver_id", "service_metadata", "display_name", "last_endpoint",
+    "continuity_fingerprint", "remembered_resolution", "version", "schema",
+])
+async def test_oversized_old_receiver_field_still_refuses_record(tmp_path, field):
+    from urllib.parse import quote
+
+    files = AtomicFiles(tmp_path)
+    warnings = []
+    store = repositories.JsonReceiverStore(files, on_diagnostic=warnings.append)
+    original = saved(remembered_volume=30)
+    raw = json.loads(codecs.encode_receiver(original))
+    # A placeholder lets the test inject an unquoted integer without int()/dumps().
+    raw[field] = "oversized-numeric-token"
+    payload = json.dumps(raw).encode().replace(b'"oversized-numeric-token"', b"9" * max(5000, sys.get_int_max_str_digits() + 1))
+    key = "receivers/" + quote(original.receiver_id, safe="") + ".json"
+    files.write(key, payload)
+    assert isinstance(await store.get(original.receiver_id), Err)
+    assert isinstance(await store.all(), Err)
+    assert not warnings and files.read(key) == payload
 
 
 @pytest.fixture

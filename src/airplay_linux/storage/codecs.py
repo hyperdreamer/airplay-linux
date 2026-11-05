@@ -764,12 +764,29 @@ def _reject_constant(token: str) -> NoReturn:
     raise RecordError("malformed_json")
 
 
+@dataclass(frozen=True, repr=False)
+class _OversizedInteger:
+    """Keep a JSON integer token that Python cannot convert for field validation."""
+
+    token: str
+
+
+def _parse_integer(token: str) -> int | _OversizedInteger:
+    try:
+        return int(token)
+    except ValueError:
+        # Do not turn it into a string: that could satisfy an old text field.
+        # Only remembered_volume may discard an invalid leaf; every other
+        # field still rejects this non-primitive value through its own codec.
+        return _OversizedInteger(token)
+
+
 def _load_document(payload: object, schema: str, fields: tuple[tuple[str, _Codec], ...]) -> dict[str, object]:
     if type(payload) is not bytes:
         raise RecordError("malformed_json")
     try:
         text = payload.decode("utf-8")
-        document = json.loads(text, parse_constant=_reject_constant)
+        document = json.loads(text, parse_constant=_reject_constant, parse_int=_parse_integer)
     except (UnicodeDecodeError, ValueError, RecursionError):
         raise RecordError("malformed_json") from None
     if type(document) is not dict:

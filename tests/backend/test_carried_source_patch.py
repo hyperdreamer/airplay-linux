@@ -332,7 +332,8 @@ def _volume_proof_files(sources: dict[str, str]) -> dict[str, str]:
     assert "streamCfg.InitialVolume = copyVolume(entry.initialVolume)" in connect
     assert "streamCfg.AudioEnabled = copyAudio(entry.initialAudio)" in connect
     assert connect.count("SetupMirrorWithCalibratedVideoPreparation(ctx, streamCfg, prepareVideo)") == 2
-    assert "session.InitialAudioLevel()" in connect and "d.maybeStartAudio(entry)" in connect
+    assert "sink, published := d.publishStreamSessionLocked(entry, target, session, client, broadcast)" in connect
+    assert "session.InitialAudioLevel()" not in connect and "d.maybeStartAudio(entry)" in connect
     assert "audioCapture.Stop()" not in connect
     assert '"target-volume"}' in sources["cmd/doubletake/main.go"]
     assert cli.index("if parseErr != nil") < cli.index("daemonclient.New(")
@@ -363,7 +364,8 @@ def _volume_proof_files(sources: dict[str, str]) -> dict[str, str]:
         "type Config struct", "type activeStream struct", "type volumeRequest struct",
         "type videoCaptureKey struct", "type videoCaptureGroup struct", "type daemonCleanup struct",
         "type Daemon struct", "func copyVolume(", "func copyAudio(", "func decodeControlRequest(",
-        "func updateVolumeState(", "func (d *Daemon) audioTargetsLocked(",
+        "func updateVolumeState(", "func (d *Daemon) publishStreamSessionLocked(",
+        "func (d *Daemon) audioTargetsLocked(",
         "func (d *Daemon) handleVolume(", "func (d *Daemon) runVolume(",
         "func (d *Daemon) maybeStartAudio(", "func (d *Daemon) handleAudioOff(",
         "func (d *Daemon) handleConn(", "func (d *Daemon) handleRequest(",
@@ -434,14 +436,19 @@ func (c *ProofConn) SetWriteDeadline(t time.Time) error { return c.SetReadDeadli
 func ProofSession(level *int, state string, exchange func([]byte)([]byte,error)) *MirrorSession { return &MirrorSession{client:&AirPlayClient{conn:&ProofConn{Exchange:exchange}}, sessionURI:"rtsp://proof/audio",audioStream:&AudioStream{},initialVolume:level,initialVolumeState:state} }
 // The setup outcome comes from the exact carried helper, never fixture arithmetic.
 func ProofSetupSession(percent int, exchange func([]byte)([]byte,error)) (*MirrorSession,error) {
+ return ProofSetupWithConfig(StreamConfig{InitialVolume:&percent},exchange)
+}
+func ProofSetupWithConfig(cfg StreamConfig, exchange func([]byte)([]byte,error)) (*MirrorSession,error) {
+ cfg=copyAudioIntent(cfg)
  c:=&AirPlayClient{conn:&ProofConn{Exchange:exchange}}
- level,state,err:=c.setupAudioLevel(StreamConfig{InitialVolume:&percent},"rtsp://proof/audio",nil)
- return &MirrorSession{client:c,sessionURI:"rtsp://proof/audio",audioStream:&AudioStream{},initialVolume:level,initialVolumeState:state},err
+ level,state,err:=c.setupAudioLevel(cfg,"rtsp://proof/audio",c.rtspRequest)
+ return &MirrorSession{client:c,sessionURI:"rtsp://proof/audio",audioStream:&AudioStream{},noAudio:cfg.NoAudio,initialVolume:level,initialVolumeState:state},err
 }
 type SourceInfo struct { Type uint32 `json:"type"`; Width int `json:"width"`; Height int `json:"height"`; X int `json:"x"`; Y int `json:"y"`; HasPosition bool `json:"has_position"` }
 type BroadcastSink struct{}
 func (*BroadcastSink) Close() {}
-type BroadcastCapture struct{}
+type BroadcastCapture struct { Sinks int }
+func (b *BroadcastCapture) AddSink() *BroadcastSink { b.Sinks++;return &BroadcastSink{} }
 type ScreenCapture struct{}
 func (*ScreenCapture) Stop() {}
 type CredentialStore struct{}
@@ -518,6 +525,12 @@ var _ = airplay.VideoCodec("")
 '''
 
 
+# Disposable-postimage mutation probe: replace publishStreamSessionLocked's
+# `current.audioLevelReady = current.volumeState == "applied" || current.volumeState == "unrequested"`
+# with `current.audioLevelReady = true`. `go test -count=1 -v -run
+# '^TestSetupReceiptPublicationAdmission$' .` exited 1 in refused, partial, and
+# refused_then_ack; exact failure: `carried_test.go:34: refused or closed setup admitted audio`.
+# The unmutated baseline and restored postimage both exited 0.
 _VOLUME_DAEMON_TESTS = r'''package daemon
 import ("context"; "encoding/json"; "errors"; "fmt"; "net"; "strings"; "sync"; "sync/atomic"; "testing"; "time"; "doubletake/internal/airplay")
 func wire(code int) []byte {return []byte(fmt.Sprintf("RTSP/1.0 %d Result\r\nContent-Length: 0\r\n\r\n",code))}
@@ -525,10 +538,45 @@ func await(t *testing.T, predicate func()bool) {t.Helper();deadline:=time.Now().
 func fixture(t *testing.T, ready bool, level *int, exchange func([]byte)([]byte,error)) (*Daemon,*activeStream,*airplay.AudioCapture) {
  t.Helper();capture:=airplay.ProofCapture();old:=airplay.CaptureStart;airplay.CaptureStart=func(context.Context,bool,int)(*airplay.AudioCapture,error){return capture,nil};t.Cleanup(func(){airplay.CaptureStart=old})
  state:="refused";if ready {state="unrequested";if level!=nil{state="applied"}}
- entry:=&activeStream{device:"TV",deviceIP:"192.0.2.10",state:StateStreaming,session:airplay.ProofSession(level,state,exchange),volume:copyVolume(level),volumeState:state,audioLevelReady:ready}
+ entry:=&activeStream{device:"TV",deviceIP:"192.0.2.10",state:StateConnecting}
  d:=&Daemon{streams:map[string]*activeStream{entry.deviceIP:entry},captureGroups:make(map[videoCaptureKey]*videoCaptureGroup)}
+ d.mu.Lock();_,published:=d.publishStreamSessionLocked(entry,entry.deviceIP,airplay.ProofSession(level,state,exchange),nil,&airplay.BroadcastCapture{});d.mu.Unlock();if !published{t.Fatal("fixture session was not published")}
  t.Cleanup(func(){d.mu.Lock();cleanup:=d.detachAllLocked();d.mu.Unlock();cleanup.run();d.streamWorkers.Wait()})
  return d,entry,capture
+}
+func TestSetupReceiptPublicationAdmission(t *testing.T) {
+ for _,tc:=range []struct{name string;requested bool;percent int;codes [2]int;off,closed,ready bool;state string;hasLevel bool;writes int}{
+  {name:"unrequested",codes:[2]int{200,200},ready:true,state:"unrequested",writes:2},
+  {name:"applied",requested:true,percent:30,codes:[2]int{200,200},ready:true,state:"applied",hasLevel:true,writes:2},
+  {name:"zero",requested:true,codes:[2]int{200,200},ready:true,state:"applied",hasLevel:true,writes:2},
+  {name:"refused",requested:true,percent:30,codes:[2]int{403,403},state:"refused",writes:2},
+  {name:"partial",requested:true,percent:30,codes:[2]int{200,403},state:"refused",hasLevel:true,writes:2},
+  {name:"refused_then_ack",requested:true,percent:30,codes:[2]int{403,200},state:"refused",hasLevel:true,writes:2},
+  {name:"audio_off",requested:true,percent:30,off:true,closed:true,state:"unrequested"},
+  {name:"latched_during_setup",requested:true,percent:30,codes:[2]int{200,200},closed:true,state:"applied",hasLevel:true,writes:2},
+ } {t.Run(tc.name,func(t *testing.T){
+  capture:=airplay.ProofCapture();old:=airplay.CaptureStart;var starts atomic.Int32;airplay.CaptureStart=func(context.Context,bool,int)(*airplay.AudioCapture,error){starts.Add(1);return capture,nil};defer func(){airplay.CaptureStart=old}()
+  cfg:=airplay.StreamConfig{};if tc.requested{cfg.InitialVolume=&tc.percent};if tc.off{off:=false;cfg.AudioEnabled=&off}
+  calls:=0;session,err:=airplay.ProofSetupWithConfig(cfg,func([]byte)([]byte,error){code:=tc.codes[calls];calls++;return wire(code),nil});if err!=nil{t.Fatal(err)}
+  entry:=&activeStream{device:"TV",deviceIP:"192.0.2.10",state:StateConnecting,audioClosed:tc.closed}
+  d:=&Daemon{streams:map[string]*activeStream{entry.deviceIP:entry},captureGroups:make(map[videoCaptureKey]*videoCaptureGroup)}
+  t.Cleanup(func(){d.mu.Lock();cleanup:=d.detachAllLocked();d.mu.Unlock();cleanup.run();d.streamWorkers.Wait()})
+  client:=&airplay.AirPlayClient{};broadcast:=&airplay.BroadcastCapture{}
+  d.mu.Lock();sink,published:=d.publishStreamSessionLocked(entry,entry.deviceIP,session,client,broadcast);d.mu.Unlock()
+  if !published||sink==nil||entry.sink!=sink||entry.session!=session||entry.client!=client||entry.state!=StateStreaming||broadcast.Sinks!=1{t.Fatal("setup session was not fully published")}
+  if !tc.ready&&entry.audioLevelReady{t.Fatal("refused or closed setup admitted audio")}
+  if entry.audioLevelReady!=tc.ready||entry.volumeState!=tc.state||calls!=tc.writes||entry.audioClosed!=tc.closed{t.Fatal(entry.audioLevelReady,entry.volumeState,calls,entry.audioClosed)}
+  if (entry.volume!=nil)!=tc.hasLevel||tc.hasLevel&&*entry.volume!=tc.percent||entry.audioMuted!=(tc.hasLevel&&tc.percent==0){t.Fatal("incorrect setup receipt publication")}
+  d.maybeStartAudio(entry)
+  if tc.ready{await(t,func()bool{d.mu.Lock();defer d.mu.Unlock();return entry.audioCapture!=nil})}else if starts.Load()!=0||entry.audioDone!=nil{t.Fatal("withheld setup started capture")}
+  status:=d.handleStatus();stream:=status.Streams[0];if stream.VolumeState!=tc.state||(stream.Volume!=nil)!=tc.hasLevel||stream.AudioClosed!=tc.closed{t.Fatal("setup status lost receipt",stream)}
+ })}
+ t.Run("replaced",func(t *testing.T){
+  entry:=&activeStream{deviceIP:"192.0.2.10",state:StateConnecting};replacement:=&activeStream{deviceIP:entry.deviceIP,state:StateConnecting}
+  d:=&Daemon{streams:map[string]*activeStream{entry.deviceIP:replacement}};broadcast:=&airplay.BroadcastCapture{}
+  d.mu.Lock();sink,published:=d.publishStreamSessionLocked(entry,entry.deviceIP,airplay.ProofSession(nil,"unrequested",nil),nil,broadcast);d.mu.Unlock()
+  if published||sink!=nil||broadcast.Sinks!=0||replacement.session!=nil||replacement.audioLevelReady||entry.session!=nil{t.Fatal("obsolete setup published into replacement")}
+ })
 }
 func level(d *Daemon,n int) Response {return d.handleVolume(Request{Cmd:"volume",Target:"192.0.2.10",Volume:&n})}
 func closeAudio(d *Daemon) Response {off:=false;return d.handleAudioOff(Request{Cmd:"audio",Target:"192.0.2.10",Audio:&off})}
@@ -552,7 +600,7 @@ func TestPartialStartupRecoveryTraces(t *testing.T) {
  exchange:=func([]byte)([]byte,error){n:=calls.Add(1);if n==2||n==3{return wire(403),nil};return wire(200),nil}
  session,err:=airplay.ProofSetupSession(30,exchange);if err!=nil{t.Fatal(err)}
  percent,state:=session.InitialAudioLevel();if state!="refused"||percent==nil||*percent!=30||calls.Load()!=2{t.Fatal(percent,state,calls.Load())}
- d,e,capture:=fixture(t,false,percent,exchange);e.session=session;e.volume=percent;e.volumeState=state
+ d,e,capture:=fixture(t,false,percent,exchange);d.mu.Lock();d.publishStreamSessionLocked(e,e.deviceIP,session,nil,&airplay.BroadcastCapture{});d.mu.Unlock()
  d.maybeStartAudio(e);if e.audioDone!=nil{t.Fatal("partial setup admitted audio")};trace(t,d,"partial_setup_refused",true)
  if level(d,30).OK{t.Fatal("rejected retry acknowledged")};settled(t,d,e)
  if e.audioLevelReady||e.audioDone!=nil||capture.Stops.Load()!=0{t.Fatal("rejected retry admitted audio")};trace(t,d,"partial_retry_refused",true)

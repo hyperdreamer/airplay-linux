@@ -7046,10 +7046,10 @@ index 30c6cd6..68b944c 100644
  	}
  }
 diff --git a/internal/daemon/daemon.go b/internal/daemon/daemon.go
-index 10c8d9a..1aeade0 100644
+index 10c8d9a..eed221b 100644
 --- a/internal/daemon/daemon.go
 +++ b/internal/daemon/daemon.go
-@@ -1,1804 +1,2258 @@
+@@ -1,1804 +1,2268 @@
  package daemon
  
  import (
@@ -8387,6 +8387,30 @@ index 10c8d9a..1aeade0 100644
  	return "", 0
  }
  
++// publishStreamSessionLocked attaches only the current entry after successful
++// SETUP and admits audio from the complete setup receipt. d.mu must be held.
++func (d *Daemon) publishStreamSessionLocked(entry *activeStream, target string, session *airplay.MirrorSession, client *airplay.AirPlayClient, broadcast *airplay.BroadcastCapture) (*airplay.BroadcastSink, bool) {
++	current, ok := d.streams[target]
++	if !ok || current != entry {
++		return nil, false
++	}
++	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
++	// receiver which is still pairing, prompting, or negotiating its media ports.
++	sink := broadcast.AddSink()
++	current.state = StateStreaming
++	current.session = session
++	current.client = client
++	current.sink = sink
++	current.audioMuted = false
++	current.volume, current.volumeState = session.InitialAudioLevel()
++	if !current.audioClosed {
++		current.audioLevelReady = current.volumeState == "applied" || current.volumeState == "unrequested"
++	}
++	current.audioMuted = current.volume != nil && *current.volume == 0
++	updateVolumeState(current)
++	return sink, true
++}
++
  func (d *Daemon) connectAndStream(ctx context.Context, entry *activeStream, target string, port int, suppliedCredential string) {
  	// removeStream cleans up this stream's entry and tears down its capture group
  	// if no other streams use that group.
@@ -8743,8 +8767,10 @@ index 10c8d9a..1aeade0 100644
  	}
  
  	d.mu.Lock()
- 	current, ok := d.streams[target]
- 	if !ok || current != entry {
+-	current, ok := d.streams[target]
+-	if !ok || current != entry {
++	sink, published := d.publishStreamSessionLocked(entry, target, session, client, broadcast)
++	if !published {
  		// Stream was cancelled while we were setting up
  		d.mu.Unlock()
  		_ = session.Close()
@@ -8754,20 +8780,14 @@ index 10c8d9a..1aeade0 100644
  		cleanup.run()
  		return
  	}
- 	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
- 	// receiver which is still pairing, prompting, or negotiating its media ports.
- 	sink := broadcast.AddSink()
- 	current.state = StateStreaming
- 	current.session = session
- 	current.client = client
- 	current.sink = sink
- 	current.audioMuted = false
-+	current.volume, current.volumeState = session.InitialAudioLevel()
-+	if !current.audioClosed {
-+		current.audioLevelReady = current.volumeState == "applied" || current.volumeState == "unrequested"
-+	}
-+	current.audioMuted = current.volume != nil && *current.volume == 0
-+	updateVolumeState(current)
+-	// Attach only after SETUP succeeds. This avoids buffering encoded data for a
+-	// receiver which is still pairing, prompting, or negotiating its media ports.
+-	sink := broadcast.AddSink()
+-	current.state = StateStreaming
+-	current.session = session
+-	current.client = client
+-	current.sink = sink
+-	current.audioMuted = false
  	d.mu.Unlock()
  
  	log.Printf("[daemon] streaming to %s (%s) at %dx%d using %s",
