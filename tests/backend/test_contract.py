@@ -808,7 +808,11 @@ def test_application_contract_fixture_is_explicitly_non_live_and_has_conformance
         "status", "discover", "devices", "connect", "disconnect", "mute", "unmute", "query_modes",
         "start_audio", "restart_audio", "begin_pairing", "submit_pairing", "cancel_pairing",
         "prepare_pairing", "commit_pairing", "revoke_pairing", "mark_invalid",
-        "shutdown",
+        "shutdown", "volume", "audio_off",
+    }
+    assert contract["features"]["target_volume"] is False
+    assert {item["operation"]: item["tag"] for item in contract["replies"] if item["operation"] in {"volume", "audio_off"}} == {
+        "volume": "status_reply", "audio_off": "status_reply",
     }
     assert all("secret" not in json.dumps(item).lower() for item in contract["notices"])
 

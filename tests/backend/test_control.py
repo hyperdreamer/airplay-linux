@@ -29,7 +29,7 @@ from airplay_linux.backend.control import (
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId, ProcessIdentity
 from airplay_linux.domain.ports import CommandOutput
-from airplay_linux.domain.resources import Err, ErrorCode, Ok
+from airplay_linux.domain.resources import AudioPolicy, Err, ErrorCode, Ok, VolumeLevel
 from airplay_linux.testing.builders import physical, target
 
 
@@ -76,6 +76,8 @@ class _ApplicationContractProcess:
                 "audio_muted": operation == "mute",
             }]
             return output(json.dumps(status))
+        if operation in {"volume", "audio_off"}:
+            return output(json.dumps(volume_status(closed=operation == "audio_off")))
         return output(json.dumps({"ok": True, "state": "streaming"}))
 
 
@@ -158,6 +160,291 @@ def context():
     )
 
 
+def volume_profile():
+    profile = secure_profile()
+    return replace(profile, features=replace(profile.features, target_volume=True))
+
+
+def control_volume_payload(operation="volume"):
+    from airplay_linux.backend.control import AudioGatePayload, VolumePayload
+    return VolumePayload(level=VolumeLevel(value=30)) if operation == "volume" else AudioGatePayload()
+
+
+def test_volume_profile_uses_exact_targeted_argv():
+    from airplay_linux.backend.control import AudioGatePayload, VolumePayload
+    profile = PublishedDoubletakeProfile(socket_path="/run/private/control.sock")
+    profile = replace(profile, features=replace(profile.features, target_volume=True))
+    receiver = target()
+    assert profile.argv(BackendOperation.volume, receiver, VolumePayload(level=VolumeLevel(value=30))) == (
+        "doubletake-ctl", "-socket", "/run/private/control.sock", "volume", "30", receiver.canonical_host,
+    )
+    assert profile.argv(BackendOperation.audio_off, receiver, AudioGatePayload()) == (
+        "doubletake-ctl", "-socket", "/run/private/control.sock", "audio", "off", receiver.canonical_host,
+    )
+
+
+@pytest.mark.parametrize("audio,level,suffix", [
+    (AudioPolicy(enabled=True), VolumeLevel(value=30), ("--audio", "on", "--volume", "30")),
+    (AudioPolicy(enabled=True), None, ("--audio", "on")),
+    (AudioPolicy(enabled=False), None, ("--audio", "off")),
+    (None, None, ()),
+])
+def test_volume_capable_connect_argv_and_legacy_refusal(audio, level, suffix):
+    profile = volume_profile()
+    payload = ConnectPayload(audio=audio, initial_volume=level)
+    base = ("doubletake-ctl", "-socket", profile.socket_path, "connect", "192.0.2.10")
+    assert profile.argv(BackendOperation.connect, target(), payload) == base + suffix
+    legacy = replace(profile, features=replace(profile.features, target_volume=False))
+    result = legacy.try_argv(BackendOperation.connect, target(), payload)
+    if audio is None and level is None:
+        assert result == Ok(value=base)
+    else:
+        assert isinstance(result, Err) and result.error.code is ErrorCode.unsupported_operation
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+def test_volume_operations_require_feature_target_and_exact_payload(operation):
+    profile, payload = volume_profile(), control_volume_payload(operation)
+    op = BackendOperation(operation)
+    for receiver, argument, expected in (
+        (None, payload, ErrorCode.unsupported_operation),
+        (target(), EmptyPayload(), ErrorCode.invalid_input),
+        (target(), object(), ErrorCode.invalid_input),
+        (target(), control_volume_payload("audio_off" if operation == "volume" else "volume"), ErrorCode.invalid_input),
+    ):
+        result = profile.try_argv(op, receiver, argument)
+        assert isinstance(result, Err) and result.error.code is expected
+    legacy = replace(profile, features=replace(profile.features, target_volume=False))
+    result = legacy.try_argv(op, target(), payload)
+    assert isinstance(result, Err) and result.error.code is ErrorCode.unsupported_operation
+
+
+@pytest.mark.parametrize("value", [True, 0, 30, 30.0, "30", None, object()])
+def test_volume_payloads_reject_wrong_domain_types(value):
+    from airplay_linux.backend.control import VolumePayload
+    with pytest.raises((TypeError, ValueError)):
+        VolumePayload(level=value)
+    if value is not None:
+        with pytest.raises((TypeError, ValueError)):
+            ConnectPayload(initial_volume=value)
+
+
+@pytest.mark.parametrize("value", [True, 0, 1, None, "off", object()])
+def test_volume_audio_gate_is_false_only(value):
+    from airplay_linux.backend.control import AudioGatePayload
+    with pytest.raises((TypeError, ValueError)):
+        AudioGatePayload(enabled=value)
+
+
+@pytest.mark.parametrize("value", [True, False, "on", 1, object()])
+def test_volume_connect_policy_is_exact_domain_type(value):
+    with pytest.raises((TypeError, ValueError)):
+        ConnectPayload(audio=value)
+
+
+def test_volume_connect_forbids_disabled_level_and_preserves_secret_source_refusals():
+    profile = volume_profile()
+    for payload, expected in (
+        (ConnectPayload(audio=AudioPolicy(enabled=False), initial_volume=VolumeLevel(value=30)), ErrorCode.invalid_input),
+        (ConnectPayload(audio=AudioPolicy(), credential="canary-secret"), ErrorCode.unsupported_operation),
+        (ConnectPayload(audio=AudioPolicy(), source=physical("canary-secret")), ErrorCode.unsupported_source),
+    ):
+        result = profile.try_argv(BackendOperation.connect, target(), payload)
+        assert isinstance(result, Err) and result.error.code is expected
+        assert "canary-secret" not in repr(payload)
+        assert "canary-secret" not in repr(result)
+
+
+def volume_status(*, closed=False, connecting=False):
+    status = owned_status()
+    status["streams"][0].update(volume=30, volume_state="applied", audio_closed=closed)
+    if connecting:
+        status.update(state="connecting", has_audio=False, audio_muted=False)
+        status.pop("device")
+        status.pop("device_ip")
+        status["streams"][0].update(state="connecting", has_audio=False)
+    return status
+
+
+@pytest.mark.parametrize("operation,connecting", [("volume", False), ("audio_off", False), ("audio_off", True)])
+async def test_volume_live_success_returns_full_status(operation, connecting):
+    from airplay_linux.backend.contract import decode_status
+    reply = volume_status(closed=operation == "audio_off", connecting=connecting)
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply))])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    notices = []
+    control.subscribe(notices.append)
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=_open_fence)
+    assert result == Ok(value=decode_status(reply))
+    assert type(result.value) is StatusReply
+    assert notices[-1].status == result.value
+    assert len(process.calls) == 3
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("damage", ["aggregate_only", "foreign", "duplicate", "no_latch", "wrong_latch", "missing_entry"])
+async def test_volume_live_requires_exact_target_confirmation(operation, damage):
+    reply = volume_status(closed=operation == "audio_off")
+    if damage in {"aggregate_only", "missing_entry"}:
+        reply["streams"] = []
+        reply.update(state="idle", has_audio=False, audio_muted=False)
+        reply.pop("device")
+        reply.pop("device_ip")
+    elif damage == "foreign":
+        reply["streams"][0]["device_ip"] = reply["device_ip"] = "192.0.2.11"
+    elif damage == "duplicate":
+        reply["streams"] *= 2
+    elif damage == "no_latch":
+        del reply["streams"][0]["audio_closed"]
+    else:
+        reply["streams"][0]["audio_closed"] = operation != "audio_off"
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply))])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=_open_fence)
+    assert isinstance(result, Err) and result.error.code is ErrorCode.audio_volume_failed
+
+
+@pytest.mark.parametrize("change", [
+    {"volume": 40}, {"volume_state": "pending"}, {"volume_state": "refused"},
+    {"volume_state": "unrequested"}, {"has_audio": False}, {"volume": None},
+])
+async def test_volume_live_requires_applied_matching_level_with_audio(change):
+    reply = volume_status()
+    reply["streams"][0].update(change)
+    if "has_audio" in change:
+        reply["has_audio"] = change["has_audio"]
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply))])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(BackendOperation.volume, target(), control_volume_payload(), context(), dispatch_fence=_open_fence)
+    assert isinstance(result, Err) and result.error.code is ErrorCode.audio_volume_failed
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("ok,exit_code,expected", [
+    (False, 1, ErrorCode.audio_volume_failed), (False, 0, ErrorCode.daemon_failed),
+    (False, 2, ErrorCode.daemon_failed), (True, 1, ErrorCode.daemon_failed),
+    ("false", 0, ErrorCode.dependency_incompatible), (None, 0, ErrorCode.dependency_incompatible),
+])
+async def test_volume_live_rejection_envelope_is_strict_and_sanitized(operation, ok, exit_code, expected):
+    reply = volume_status(closed=operation == "audio_off") | {"ok": ok, "error": "canary-secret"}
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply), exit_code=exit_code)])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=_open_fence)
+    assert isinstance(result, Err) and result.error.code is expected
+    assert "canary-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("exit_code,expected", [(0, ErrorCode.dependency_incompatible), (1, ErrorCode.daemon_failed)])
+async def test_volume_live_malformed_json_preserves_dependency_errors(operation, exit_code, expected):
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output("canary-secret", exit_code=exit_code)])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=_open_fence)
+    assert isinstance(result, Err) and result.error.code is expected
+    assert "canary-secret" not in repr(result)
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("change,expected", [
+    ({"owner_token": "foreign"}, ErrorCode.ownership_mismatch),
+    ({"instance_uuid": str(UUID(int=99))}, ErrorCode.ownership_mismatch),
+    ({"socket_path": "/foreign.sock"}, ErrorCode.stale_socket),
+    ({"protocol_version": "foreign"}, ErrorCode.dependency_incompatible),
+])
+async def test_volume_live_checks_ownership_metadata(operation, change, expected):
+    reply = volume_status(closed=operation == "audio_off") | change
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply))])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=_open_fence)
+    assert isinstance(result, Err) and result.error.code is expected
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+async def test_volume_live_missing_fence_never_does_any_io(operation):
+    process = _Process([])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context())
+    assert isinstance(result, Err) and result.error.code is ErrorCode.dependency_incompatible
+    assert process.calls == []
+
+
+@pytest.mark.parametrize("level", [0, 100])
+async def test_volume_live_receipt_uses_original_target_in_multistream_status(level):
+    from airplay_linux.backend.control import VolumePayload
+    reply = volume_status()
+    reply["streams"][0]["volume"] = 70
+    reply["streams"].append({
+        "device": "Office", "device_ip": "192.0.2.11", "state": "streaming",
+        "has_audio": True, "audio_muted": level == 0,
+        "volume": level, "volume_state": "applied", "audio_closed": False,
+    })
+    process = _Process([output(json.dumps(owned_status())), output(json.dumps(owned_status())), output(json.dumps(reply))])
+    control = PublishedDoubletakeControl(process, volume_profile())
+    assert isinstance(await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok)
+    result = await control.request(
+        BackendOperation.volume, target("b", address="192.0.2.11"), VolumePayload(level=VolumeLevel(value=level)),
+        context(), dispatch_fence=_open_fence,
+    )
+    assert isinstance(result, Ok) and isinstance(result.value, StatusReply)
+    assert result.value.streams[1].volume == level
+    assert process.calls[-1][0].argv[-3:] == ("volume", str(level), "192.0.2.11")
+
+
+@pytest.mark.parametrize("operation", ["volume", "audio_off"])
+@pytest.mark.parametrize("stage", ["missing_fence", "stale_target", "rejected_owner", "late_owner", "valid"])
+async def test_volume_live_public_authority_keeps_fence_and_confirmation(operation, stage):
+    proof = OwnershipProof(kind="evidence", daemon=ProcessIdentity(pid=300, start_ticks=3), socket_entry=(1, 2), generation=1, handshake=None)
+    calls, current = [], True
+    class Authority:
+        def allows(self, operation):
+            return True
+        async def authorize(self, record, operation, target, fence):
+            nonlocal current
+            calls.append("authorize")
+            if stage == "rejected_owner":
+                return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+            if stage == "stale_target":
+                current = False
+            return Ok(value=proof)
+        async def prove(self, record):
+            calls.append("prove")
+            return Ok(value=proof)
+        async def confirm(self, record, original):
+            calls.append("confirm")
+            assert original == proof
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch)) if stage == "late_owner" else Ok(value=None)
+    reply = volume_status(closed=operation == "audio_off")
+    for key in ("owner_token", "instance_uuid", "socket_path", "protocol_version", "daemon_pid", "daemon_start_ticks"):
+        del reply[key]
+    process = _Process([output(json.dumps(reply))])
+    profile = volume_profile()
+    profile = replace(profile, owner_token=None, instance_uuid=None, protocol_version=None, features=replace(profile.features, profile="doubletake-0.5+source", owned_daemon_control=True, owner_handshake=False))
+    control = PublishedDoubletakeControl(process, profile, record=object(), authority=Authority())
+    def fence():
+        calls.append("fence")
+        return Ok(value=None) if current else Err(error=diagnostic(ErrorCode.stale_target))
+    result = await control.request(BackendOperation(operation), target(), control_volume_payload(operation), context(), dispatch_fence=None if stage == "missing_fence" else fence)
+    if stage == "valid":
+        assert isinstance(result, Ok) and isinstance(result.value, StatusReply)
+    else:
+        expected = {
+            "missing_fence": ErrorCode.dependency_incompatible, "stale_target": ErrorCode.stale_target,
+            "rejected_owner": ErrorCode.ownership_mismatch, "late_owner": ErrorCode.ownership_mismatch,
+        }[stage]
+        assert isinstance(result, Err) and result.error.code is expected
+    assert len(process.calls) == (1 if stage in {"valid", "late_owner"} else 0)
+    if stage == "missing_fence":
+        assert calls == []
+    elif stage in {"valid", "late_owner"}:
+        assert calls == ["authorize", "prove", "fence", "confirm"]
+
+
 def test_application_contract_profile_is_explicitly_non_live_and_secret_free():
     profile = ApplicationContractProfile(socket_path="/run/user/1000/private.sock")
     argv = profile.argv(
@@ -202,6 +489,8 @@ def test_application_contract_fake_exercises_every_typed_operation():
         BackendOperation.disconnect: EmptyPayload(),
         BackendOperation.mute: MutePayload(muted=True),
         BackendOperation.unmute: MutePayload(muted=False),
+        BackendOperation.volume: control_volume_payload(),
+        BackendOperation.audio_off: control_volume_payload("audio_off"),
         BackendOperation.query_modes: ModesPayload(),
         BackendOperation.start_audio: SourcePayload(source=physical()),
         BackendOperation.restart_audio: SourcePayload(source=physical()),
@@ -214,18 +503,28 @@ def test_application_contract_fake_exercises_every_typed_operation():
         BackendOperation.mark_invalid: EmptyPayload(),
         BackendOperation.shutdown: EmptyPayload(),
     }
+    assert set(payloads) == set(BackendOperation)
+    assert {op.value for op in payloads} == operations
     for operation, payload in payloads.items():
+        selected_control = control
+        if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+            assert control._profile.features.target_volume is False
+            capable = replace(control._profile, features=replace(control._profile.features, target_volume=True))
+            selected_control = PublishedDoubletakeControl(process, capable)
+            assert isinstance(asyncio.run(selected_control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
         operation_target = None if operation in {
             BackendOperation.status,
             BackendOperation.discover,
             BackendOperation.devices,
             BackendOperation.shutdown,
         } else target()
-        result = asyncio.run(control.request(
+        result = asyncio.run(selected_control.request(
             operation, operation_target, payload, context(), dispatch_fence=_open_fence,
         ))
         assert isinstance(result, Ok), operation
-        if operation not in {
+        if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+            assert isinstance(result.value, StatusReply)
+        elif operation not in {
             BackendOperation.status,
             BackendOperation.discover,
             BackendOperation.devices,
@@ -246,6 +545,12 @@ def test_application_contract_fake_exercises_every_typed_operation():
         (BackendOperation.disconnect, "multi_target"),
         (BackendOperation.mute, "target_mute"),
         (BackendOperation.unmute, "target_mute"),
+        (BackendOperation.volume, "multi_target"),
+        (BackendOperation.audio_off, "multi_target"),
+        (BackendOperation.volume, "owner_handshake"),
+        (BackendOperation.audio_off, "owner_handshake"),
+        (BackendOperation.volume, "target_volume"),
+        (BackendOperation.audio_off, "target_volume"),
         (BackendOperation.query_modes, "query_modes"),
         (BackendOperation.start_audio, "audio_restart"),
         (BackendOperation.restart_audio, "audio_restart"),
@@ -262,11 +567,16 @@ def test_application_contract_fake_exercises_every_typed_operation():
 def test_application_contract_capability_denial_is_fail_closed(operation, feature):
     profile = ApplicationContractProfile(
         socket_path="/run/user/1000/private.sock",
-        features=replace(secure_features(), **{feature: False}),
+        features=replace(secure_features(), **{
+            "target_volume": operation in {BackendOperation.volume, BackendOperation.audio_off},
+            feature: False,
+        }),
     )
     process = _Process([])
     control = PublishedDoubletakeControl(process, profile)
     payload = MutePayload(muted=True) if operation in {BackendOperation.mute, BackendOperation.unmute} else EmptyPayload()
+    if operation in {BackendOperation.volume, BackendOperation.audio_off}:
+        payload = control_volume_payload(operation.value)
     if operation in {BackendOperation.query_modes}:
         payload = ModesPayload()
     if operation in {BackendOperation.start_audio, BackendOperation.restart_audio}:
@@ -282,7 +592,9 @@ def test_application_contract_capability_denial_is_fail_closed(operation, featur
     ))
 
     assert isinstance(result, Err)
-    assert result.error.code is ErrorCode.dependency_incompatible
+    assert result.error.code is (
+        ErrorCode.unsupported_operation if feature == "target_volume" else ErrorCode.dependency_incompatible
+    )
     assert process.calls == []
 
 
@@ -304,11 +616,16 @@ def test_profile_maps_only_explicit_target_scoped_published_commands():
     )
 
 
-def test_profile_refuses_unqualified_destructive_controls():
+@pytest.mark.parametrize("capable", [False, True])
+def test_profile_refuses_unqualified_destructive_controls(capable):
     profile = PublishedDoubletakeProfile(socket_path="/run/user/1000/private.sock")
-
-    for operation in (BackendOperation.disconnect, BackendOperation.mute, BackendOperation.unmute):
-        result = profile.try_argv(operation, None, EmptyPayload())
+    profile = replace(profile, features=replace(profile.features, target_volume=capable))
+    operations = (BackendOperation.disconnect, BackendOperation.mute, BackendOperation.unmute)
+    if capable:
+        operations += (BackendOperation.volume, BackendOperation.audio_off)
+    for operation in operations:
+        payload = control_volume_payload(operation.value) if operation in {BackendOperation.volume, BackendOperation.audio_off} else EmptyPayload()
+        result = profile.try_argv(operation, None, payload)
         assert isinstance(result, Err)
         assert result.error.code is ErrorCode.unsupported_operation
 
@@ -397,11 +714,14 @@ def test_control_decodes_status_reply_without_exposing_backend_error_text():
     assert result.value.streams[0].target == "192.0.2.10"
 
 
-def test_mutation_requires_authenticated_owner_before_any_mutation_io():
+@pytest.mark.parametrize("operation", [BackendOperation.disconnect, BackendOperation.volume, BackendOperation.audio_off])
+def test_mutation_requires_authenticated_owner_before_any_mutation_io(operation):
     process = _Process([])
-    control = PublishedDoubletakeControl(process, secure_profile())
+    profile = secure_profile() if operation is BackendOperation.disconnect else volume_profile()
+    payload = EmptyPayload() if operation is BackendOperation.disconnect else control_volume_payload(operation.value)
+    control = PublishedDoubletakeControl(process, profile)
 
-    result = asyncio.run(control.request(BackendOperation.disconnect, target(), EmptyPayload(), context(),
+    result = asyncio.run(control.request(operation, target(), payload, context(),
             dispatch_fence=_open_fence,
         ))
 
@@ -567,12 +887,16 @@ async def test_pairing_operation_flag_truth_table_rejects_only_missing_own_flags
     BackendOperation.status, BackendOperation.discover, BackendOperation.devices,
 }])
 def test_fixture_mutations_still_require_owner_handshake(operation):
-    profile = replace(secure_profile(), features=replace(secure_features(), owner_handshake=False))
+    profile = replace(secure_profile(), features=replace(
+        secure_features(), owner_handshake=False,
+        target_volume=operation in {BackendOperation.volume, BackendOperation.audio_off},
+    ))
     control = PublishedDoubletakeControl(_Process([]), profile)
     assert control._available(operation) is False
 
 
-def test_replacement_between_authorization_and_dispatch_refuses():
+@pytest.mark.parametrize("operation", [BackendOperation.connect, BackendOperation.volume, BackendOperation.audio_off])
+def test_replacement_between_authorization_and_dispatch_refuses(operation):
     daemon = ProcessIdentity(pid=300, start_ticks=3)
     first = OwnershipProof(
         kind="evidence", daemon=daemon, socket_entry=(1, 2), generation=1,
@@ -587,8 +911,8 @@ def test_replacement_between_authorization_and_dispatch_refuses():
         async def prove(self, record):
             return Ok(value=replacement)
 
-        def allows(self, operation):
-            return operation is BackendOperation.connect
+        def allows(self, requested):
+            return requested is operation
 
         async def confirm(self, record, proof):
             return Ok(value=None)
@@ -602,13 +926,14 @@ def test_replacement_between_authorization_and_dispatch_refuses():
                 secure_features(), profile="doubletake-0.5", version="0.5.0",
                 foreground_control=False, owner_handshake=False,
                 owned_daemon_control=True, physical_source=True,
+                target_volume=operation in {BackendOperation.volume, BackendOperation.audio_off},
             ),
         ),
         record=object(), authority=Authority(),
     )
 
     result = asyncio.run(control.request(
-        BackendOperation.connect, target(), ConnectPayload(), context(),
+        operation, target(), ConnectPayload() if operation is BackendOperation.connect else control_volume_payload(operation.value), context(),
         dispatch_fence=_open_fence, ownership_proof=first,
     ))
 
@@ -641,14 +966,17 @@ class _GatedProcess:
         return self.outputs.pop(0)
 
 
-def test_dispatch_fence_runs_after_ownership_revalidation_and_blocks_spawn():
+@pytest.mark.parametrize("operation", [BackendOperation.disconnect, BackendOperation.volume, BackendOperation.audio_off])
+def test_dispatch_fence_runs_after_ownership_revalidation_and_blocks_spawn(operation):
     async def scenario():
         process = _GatedProcess([
             output(json.dumps(owned_status())),
             output(json.dumps(owned_status())),
             output(json.dumps({"ok": True, "state": "idle"})),
         ])
-        control = PublishedDoubletakeControl(process, secure_profile())
+        profile = secure_profile() if operation is BackendOperation.disconnect else volume_profile()
+        payload = EmptyPayload() if operation is BackendOperation.disconnect else control_volume_payload(operation.value)
+        control = PublishedDoubletakeControl(process, profile)
         assert isinstance(
             await control.handshake("owner-token", InstanceId(UUID(int=9))), Ok,
         )
@@ -660,7 +988,7 @@ def test_dispatch_fence_runs_after_ownership_revalidation_and_blocks_spawn():
             return Err(error=diagnostic(ErrorCode.stale_target))
 
         pending = asyncio.create_task(control.request(
-            BackendOperation.disconnect, target(), EmptyPayload(), context(),
+            operation, target(), payload, context(),
             dispatch_fence=fence,
         ))
         await asyncio.wait_for(process.entered.wait(), timeout=1)
@@ -675,13 +1003,17 @@ def test_dispatch_fence_runs_after_ownership_revalidation_and_blocks_spawn():
     asyncio.run(scenario())
 
 
-def test_dispatch_fence_passing_allows_exactly_one_mutating_command():
+@pytest.mark.parametrize("operation", [BackendOperation.disconnect, BackendOperation.volume, BackendOperation.audio_off])
+def test_dispatch_fence_passing_allows_exactly_one_mutating_command(operation):
+    reply = {"ok": True, "state": "idle"} if operation is BackendOperation.disconnect else volume_status(closed=operation is BackendOperation.audio_off)
     process = _Process([
         output(json.dumps(owned_status())),
         output(json.dumps(owned_status())),
-        output(json.dumps({"ok": True, "state": "idle"})),
+        output(json.dumps(reply)),
     ])
-    control = PublishedDoubletakeControl(process, secure_profile())
+    profile = secure_profile() if operation is BackendOperation.disconnect else volume_profile()
+    payload = EmptyPayload() if operation is BackendOperation.disconnect else control_volume_payload(operation.value)
+    control = PublishedDoubletakeControl(process, profile)
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
     seen = []
 
@@ -690,34 +1022,38 @@ def test_dispatch_fence_passing_allows_exactly_one_mutating_command():
         return Ok(value=None)
 
     result = asyncio.run(control.request(
-        BackendOperation.disconnect, target(), EmptyPayload(), context(),
+        operation, target(), payload, context(),
         dispatch_fence=fence,
     ))
 
     assert isinstance(result, Ok)
     assert seen == [2]
-    assert [call[0].argv[3] for call in process.calls] == ["status", "status", "disconnect"]
+    wire_operation = "audio" if operation is BackendOperation.audio_off else operation.value
+    assert [call[0].argv[3] for call in process.calls] == ["status", "status", wire_operation]
 
 
-def test_failed_ownership_revalidation_never_consults_the_dispatch_fence():
+@pytest.mark.parametrize("operation", [BackendOperation.disconnect, BackendOperation.volume, BackendOperation.audio_off])
+def test_failed_ownership_revalidation_never_consults_the_dispatch_fence(operation):
     process = _Process([
         output(json.dumps(owned_status())),
         output(json.dumps(owned_status(instance=10))),
     ])
-    control = PublishedDoubletakeControl(process, secure_profile())
+    profile = secure_profile() if operation is BackendOperation.disconnect else volume_profile()
+    payload = EmptyPayload() if operation is BackendOperation.disconnect else control_volume_payload(operation.value)
+    control = PublishedDoubletakeControl(process, profile)
     assert isinstance(asyncio.run(control.handshake("owner-token", InstanceId(UUID(int=9)))), Ok)
 
     def fence():
         raise AssertionError("fence must not run when ownership revalidation failed")
 
     result = asyncio.run(control.request(
-        BackendOperation.disconnect, target(), EmptyPayload(), context(),
+        operation, target(), payload, context(),
         dispatch_fence=fence,
     ))
 
     assert isinstance(result, Err)
     assert result.error.code is ErrorCode.ownership_mismatch
-    assert all(call[0].argv[3] != "disconnect" for call in process.calls)
+    assert [call[0].argv[3] for call in process.calls] == ["status", "status"]
 
 
 def test_dispatch_fence_does_not_gate_read_only_commands():
