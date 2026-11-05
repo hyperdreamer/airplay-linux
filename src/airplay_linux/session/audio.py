@@ -504,16 +504,10 @@ class AudioLifecycle:
     def _start_result(self, ctx: SessionContext, message: EffectEvent) -> bool:
         if isinstance(message.result, Ok):
             receipt = message.result.value
-            runtime = audio_runtime(ctx)
             capable = self.deps.capabilities().volume
             if capable and not self._receipt_current(ctx, message):
                 return True
-            if (
-                capable and isinstance(receipt, AudioStartReceipt)
-                and (receipt.volume_state not in (None, "unrequested")
-                     or (receipt.volume_state is None and (runtime.start_volume is not None
-                                                         or ctx.state.remembered_volume is not None)))
-            ):
+            if capable and isinstance(receipt, AudioStartReceipt):
                 return self._volume_start_result(ctx, receipt)
             self._confirm(ctx)
             return True
@@ -542,6 +536,9 @@ class AudioLifecycle:
     def _volume_start_result(self, ctx: SessionContext, receipt: AudioStartReceipt) -> bool:
         state = ctx.state
         runtime = audio_runtime(ctx)
+        if receipt.volume_state == "unrequested" and receipt.audio:
+            self._confirm(ctx)
+            return True
         if receipt.volume_state == "applied" and receipt.audio and receipt.level is not None:
             muted = receipt.level == 0
             runtime.muted_lease = state.transport_lease_id if muted else None
@@ -564,7 +561,7 @@ class AudioLifecycle:
             if changed:
                 self._emit(ctx, "audio.recovered", {"audio": changes["audio"]})
             return True
-        if not receipt.audio and receipt.volume_state == "applied":
+        if not receipt.audio and receipt.volume_state in ("applied", "unrequested"):
             error = replace(
                 diagnostic(ErrorCode.audio_unavailable, state.receiver_id), detail="no_audio",
             )
@@ -652,8 +649,7 @@ class AudioLifecycle:
         if not self._volume_allowed(ctx, retry=True):
             return False
         runtime = audio_runtime(ctx)
-        level = (runtime.start_volume.value if runtime.start_volume is not None
-                 else ctx.state.remembered_volume)
+        level = runtime.start_volume.value if runtime.start_volume is not None else None
         if level is None:
             return self._start_audio(ctx, ctx.state.stream)
         audio_id = ctx.operation().operation_id

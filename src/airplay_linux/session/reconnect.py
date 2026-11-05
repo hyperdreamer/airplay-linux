@@ -333,6 +333,7 @@ class ReconnectLifecycle(VirtualLifecycle):
             _virtual_runtime(ctx).request = None
         if not self.deps.capabilities().volume or not policy.enabled:
             initial = None
+        audio_runtime(ctx).start_volume = initial
         operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
 

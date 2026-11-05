@@ -663,6 +663,7 @@ class VirtualLifecycle(MirrorLifecycle):
                    if ctx.state.remembered_volume is not None else None)
         if not self.deps.capabilities().volume or not policy.enabled:
             initial = None
+        audio_runtime(ctx).start_volume = initial
         runtime.request = None
         operation = ctx.new_transport_lease(_current_context(ctx))
         ctx.apply(transport=TransportState.Connecting, intent_stage=IntentStage.starting)
