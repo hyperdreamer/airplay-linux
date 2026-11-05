@@ -100,9 +100,11 @@ prove that a receiver honored the requested audible gain. A 50% command maps to 
 amplitude (`20 log10(0.5)`), which is not a claim of half perceived loudness.
 
 Implementation proof, a prepared helper build, an installed pair and a live receiver observation
-are separate evidence. See [Carried backend provenance](backend-fork.md) for the patch chain and
-offline proof. This change has no installation receipt yet; helper preparation and the operator
-handoff are recorded separately there.
+are separate evidence. The [prepared-pair receipt and operator rollback](backend-fork.md#prepared-volume-helper-pair-2026-11-05)
+record the rebuilt artifacts in `/tmp/av-delivery.7OYAi0` and their measured hashes. Status is
+**prepared, not installed**. Rebuilt-helper help/capability checks, pair installation, installed
+observations and rollback are unexecuted. The receipt contains the separate operator command
+groups and the two-file revert path; offline preparation changes no installed helper.
 
 ### Live acceptance and residual guarantees
 

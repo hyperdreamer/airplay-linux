@@ -112,7 +112,7 @@ and empty `GOFLAGS`; it needs no GStreamer, receiver, daemon or host portal.
 The supplied base is annotated v0.5.0 **tag object**
 `c896e3689ab85c3ed520e502308dedfbb5a4c221`. The read-only local source
 `/tmp/doubletake-pr76-audit.G2sjMn` resolves it to peeled commit
-`e18f85d07f74a3b9d49f448762d28f3f7feb3938`. Apply 0001 → 0002 → 0003 → 0004 to a fresh
+`e18f85d07f74a3b9d49f448762d28f3b7feb3938`. Apply 0001 → 0002 → 0003 → 0004 to a fresh
 local clone of that commit, checking each patch with `git apply --check --whitespace=error-all`
 before `git apply --whitespace=error-all`. Never build in the reference clone or in
 `/tmp/delivery-reconcile.GMO4Nx/reapply`.
@@ -125,7 +125,7 @@ sha256sum vendor/doubletake/0001-capture-report-selected-source.patch vendor/dou
 ```
 
 ```text
-peeled commit       e18f85d07f74a3b9d49f448762d28f3f7feb3938
+peeled commit       e18f85d07f74a3b9d49f448762d28f3b7feb3938
 0001 sha256         622ecded534be335557b61332cd66d57cecfdea869abc00f5e58f6f75a84d687
 0002 sha256         0927e2d24abf63f413441a3a291c545288eb09e7b3dca102d3f328bb4b764dc7
 0003 sha256         482e7ec85940b35381686730ae248b491065bfc66d28ec449b62717e0d803567
@@ -158,9 +158,232 @@ report Go **1.27.3 linux/amd64** and **1.28.8** for both `gstreamer-1.0` and
 `gstreamer-app-1.0`. A missing cached module/tool/library is a preparation failure, not permission
 to download anything.
 
-This four-patch source change has not yet produced a prepared-build or installation receipt.
-The measured pair and its build/install/rollback command groups belong to a separate delivery
-receipt after artifacts exist. Historical hashes below identify only their dated builds.
+The measured four-patch build and operator handoff are recorded below. Historical hashes in
+later sections identify only their dated builds.
+
+## Prepared volume helper pair (2026-11-05)
+
+Status: **prepared, not installed**. The automatic build ran from
+`2026-11-05T11:45:34.796712+00:00` through `2026-11-05T11:45:43.896966+00:00`, exit **0**.
+The build directory is **`/tmp/av-delivery.7OYAi0`**, its fresh patched source is
+`/tmp/av-delivery.7OYAi0/source`, and the local evidence is `build.sh`, `build.log` and
+`build-result.json` in that directory. The application source commit used was `257df34`,
+following the composed-proof commit `1aaf0fe`.
+
+| Item | Measured identity |
+| --- | --- |
+| Supplied v0.5.0 tag object | `c896e3689ab85c3ed520e502308dedfbb5a4c221` |
+| Peeled source commit | `e18f85d07f74a3b9d49f448762d28f3b7feb3938` |
+| 0001 SHA-256 | `622ecded534be335557b61332cd66d57cecfdea869abc00f5e58f6f75a84d687` |
+| 0002 SHA-256 | `0927e2d24abf63f413441a3a291c545288eb09e7b3dca102d3f328bb4b764dc7` |
+| 0003 SHA-256 | `482e7ec85940b35381686730ae248b491065bfc66d28ec449b62717e0d803567` |
+| 0004 SHA-256 | `8fc2a133fae50c0383bdf257199e3f119377d0721baceaa8b78463a3534eb191` |
+| `/tmp/av-delivery.7OYAi0/doubletake` SHA-256 | `a4542ba42c6da4a9553131d45b8376bd49343ca1599f3a2782e7793036f6fed4` |
+| `/tmp/av-delivery.7OYAi0/doubletake-ctl` SHA-256 | `56dbf542d89d75e23dbe25c379bfa90daa77328267fec28a0270edf1b4f1bd23` |
+
+All four ordered `git apply --check --whitespace=error-all` checks and applications passed in
+the fresh local clone. Both explicit builds exited 0 using Go **1.27.3 linux/amd64**,
+`CGO_ENABLED=1`, `GOPROXY=off`, `GOSUMDB=off`, `GOTOOLCHAIN=local`, `GOWORK=off`,
+`GOPATH=/tmp/gopath`, `GOMODCACHE=/tmp/gopath/pkg/mod`, `GOFLAGS=-mod=readonly`, and GStreamer
+**1.28.8** for both native packages. The mapping command passed with
+`ok doubletake/internal/airplay 0.008s`, exit 0. `file` identified both artifacts as x86-64 ELF
+executables, independent SHA-256 reads matched the table, and patched-source `git diff --check`
+passed. No module/library download or reference-checkout modification was needed.
+
+| Delivery step | Observed status |
+| --- | --- |
+| Fresh clone, patch checks, two builds, native mapping test, digest collection | Passed, exit 0 |
+| Prepared sender `-capabilities` / ctl `--help` | **Unexecuted**: the user prohibits running rebuilt helpers |
+| Pair installation and `.prev` backup creation | **Unexecuted**: no separate installation authorization |
+| Installed hash/help/token observation | **Unexecuted**; no current installed or backup hashes claimed |
+| Rollback | **Unexecuted** |
+| Receiver acceptance, audible gain, remote readback | Unobserved; outside offline preparation |
+
+There is no authorization reference or installation time for this pair. The exact stdout/exit
+conditions below are **expected checks**, not observed results. The user restriction leaves
+the executable help/capability check incomplete. This receipt must retain that limitation until
+an authorized operator actually runs it. The artifacts and logs are temporary; preserve this
+whole directory before `/tmp` is cleared, or rebuild from the recorded source and patch chain.
+
+Delivery documentation validation passed **138 tests, 2 deselected**, exit 0, using
+`/data/home/henry-arch/.venvs/airplay-linux/bin/python -m pytest -q tests/backend/test_contract.py tests/environment/test_installed_contracts.py -m 'not live_backend and not live_kde and not live_hardware' --basetemp=/tmp/av-volume-delivery`.
+The five runbook groups below match the approved brief verbatim and pass `bash -n`; embedded
+Python parses without executing it. A separate receipt check matches both source HEAD and the
+fresh tag peel to the measured commit, plus all four patch and both binary hashes.
+
+The final unfiltered command was
+`/data/home/henry-arch/.venvs/airplay-linux/bin/python -m pytest -q` from the lane worktree.
+It finished at `2026-11-05T11:52:25.918358+00:00` with **5,809 passed, 12 skipped, 166 warnings**,
+exit **0**. Live opt-ins stayed 0; `PYTEST_ADDOPTS` supplied only the short temporary root
+`--basetemp=/tmp/av-volume-final`, with no marker filter. The warnings are qasync deprecations.
+The exact log and command/exit receipt are `/tmp/av-delivery.7OYAi0/final-suite.log` and
+`/tmp/av-delivery.7OYAi0/final-suite-result.json`. These application tests did not execute the
+newly rebuilt helper pair.
+
+### Offline rebuild command group
+
+Run from the application repository. This is the command group used, with the generated
+`volume_delivery` resolving to `/tmp/av-delivery.7OYAi0` for the measured build:
+
+```bash
+volume_repo="$PWD"
+volume_delivery=$(mktemp -d /tmp/av-delivery.XXXXXX)
+git clone --no-hardlinks --no-checkout /tmp/doubletake-pr76-audit.G2sjMn "$volume_delivery/source"
+git -C "$volume_delivery/source" checkout --detach c896e3689ab85c3ed520e502308dedfbb5a4c221
+git -C "$volume_delivery/source" rev-parse 'c896e3689ab85c3ed520e502308dedfbb5a4c221^{commit}'
+for volume_patch in 0001-capture-report-selected-source.patch 0002-status-report-selected-source.patch 0003-capability-tokens.patch 0004-target-volume.patch; do
+    git -C "$volume_delivery/source" apply --check --whitespace=error-all "$volume_repo/vendor/doubletake/$volume_patch" || exit 1
+    git -C "$volume_delivery/source" apply --whitespace=error-all "$volume_repo/vendor/doubletake/$volume_patch" || exit 1
+done
+export PATH="/home/henry-arch/.local/go/bin:$PATH" CGO_ENABLED=1 GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local GOWORK=off GOPATH=/tmp/gopath GOMODCACHE=/tmp/gopath/pkg/mod GOFLAGS=-mod=readonly
+cd "$volume_delivery/source"
+go version
+go env CGO_ENABLED GOPROXY GOSUMDB GOTOOLCHAIN GOWORK GOPATH GOMODCACHE GOFLAGS
+pkg-config --modversion gstreamer-1.0 gstreamer-app-1.0
+go build -trimpath -buildvcs=false -o "$volume_delivery/doubletake" ./cmd/doubletake
+go build -trimpath -buildvcs=false -o "$volume_delivery/doubletake-ctl" ./cmd/doubletake-ctl
+go test -count=1 -run '^TestAudioVolumeBody$' ./internal/airplay
+cd "$volume_repo"
+sha256sum vendor/doubletake/0001-capture-report-selected-source.patch vendor/doubletake/0002-status-report-selected-source.patch vendor/doubletake/0003-capability-tokens.patch vendor/doubletake/0004-target-volume.patch "$volume_delivery/doubletake" "$volume_delivery/doubletake-ctl"
+```
+
+### Prepared executable verification — unexecuted
+
+For the existing measured pair, set this path in the operator's shell:
+
+```bash
+volume_delivery=/tmp/av-delivery.7OYAi0
+```
+
+The following receiver-free checks require authorization to run the rebuilt helpers. They
+supply no command operand and do not construct a daemon or connect a control socket. The sender
+must exit 0 with exactly four lines and empty stderr. The ctl deliberately preserves
+`flag.ContinueOnError`: help exits **2**, stdout is empty, and its table is on stderr.
+
+```bash
+python3 - "$volume_delivery" <<'PY'
+import pathlib
+import subprocess
+import sys
+root = pathlib.Path(sys.argv[1])
+cap = subprocess.run([str(root / "doubletake"), "-capabilities"], capture_output=True, timeout=5)
+assert cap.returncode == 0, cap.returncode
+assert cap.stdout == b"capabilities-v1\nstatus-source\nstatus-source-complete\ntarget-volume\n"
+assert cap.stderr == b""
+ctl = subprocess.run([str(root / "doubletake-ctl"), "--help"], capture_output=True, timeout=5)
+assert ctl.returncode == 2, ctl.returncode
+assert ctl.stdout == b""
+rows = [
+    b"  connect [target] [--audio on|off] [--volume <0-100>] [PIN-or-password]  Start mirroring (to target IP, or first free device)",
+    b"  volume <0-100> [target]             Set mirrored audio level (all streams, or only the given IP)",
+    b"  audio off [target]                  Close mirrored audio (all streams, or only the given IP)",
+]
+positions = [ctl.stderr.index(row) for row in rows]
+assert positions == sorted(positions)
+assert positions[-1] < ctl.stderr.index(b"  pin <PIN-or-password>")
+print("prepared pair: exact four-token and target-scoped help contracts verified")
+PY
+```
+
+Expected on a future successful run: exit 0 and
+`prepared pair: exact four-token and target-scoped help contracts verified`. That message has
+not been observed for this prepared pair.
+
+### Operator-only pair installation — unexecuted
+
+Separate installation authorization is required. Use the measured directory above, complete
+its pending executable verification, and retain both old files before replacing either.
+The command stages both new files and restores both previous files on a replacement or
+verification error. It performs no process stop/start or service action.
+
+```bash
+python3 - "$volume_delivery" <<'PY'
+from pathlib import Path
+import hashlib
+import os
+import shutil
+import sys
+build = Path(sys.argv[1])
+bin_dir = Path("/home/bin")
+names = ("doubletake", "doubletake-ctl")
+for name in names:
+    assert (build / name).is_file()
+    assert (bin_dir / name).is_file()
+old_hashes = {name: hashlib.sha256((bin_dir / name).read_bytes()).hexdigest() for name in names}
+new_hashes = {name: hashlib.sha256((build / name).read_bytes()).hexdigest() for name in names}
+for name in names:
+    shutil.copy2(bin_dir / name, bin_dir / (name + ".prev"))
+for name in names:
+    shutil.copy2(build / name, bin_dir / (name + ".volume-new"))
+    os.chmod(bin_dir / (name + ".volume-new"), 0o755)
+try:
+    for name in names:
+        os.replace(bin_dir / (name + ".volume-new"), bin_dir / name)
+    for name in names:
+        assert hashlib.sha256((bin_dir / name).read_bytes()).hexdigest() == new_hashes[name]
+except BaseException:
+    for name in names:
+        shutil.copy2(bin_dir / (name + ".prev"), bin_dir / (name + ".volume-restore"))
+        os.replace(bin_dir / (name + ".volume-restore"), bin_dir / name)
+    raise
+for name in names:
+    print(name, "previous=" + old_hashes[name], "installed=" + new_hashes[name])
+PY
+```
+
+Only an actual successful execution establishes two previous/installed hash lines and the
+immediately prior `.prev` pair. Record the authorization reference, installation time, exact
+hashes and exit status before changing this receipt's installation status. An already running
+daemon keeps its earlier executable; replacing paths does not update it. Delivery waits for an
+ordinary separately managed next application start. No running session is manipulated here.
+
+### Installed observation — unexecuted
+
+After separately authorized installation only:
+
+```bash
+sha256sum /home/bin/doubletake /home/bin/doubletake-ctl /home/bin/doubletake.prev /home/bin/doubletake-ctl.prev
+/home/bin/doubletake -capabilities
+/home/bin/doubletake-ctl --help
+```
+
+Expected: installed hashes match the measured prepared pair; sender exit 0 with exactly the
+four tokens; ctl exit 2 with the extended table on stderr. Record both backup hashes and
+observed outputs/exits. Until then the status remains **prepared, not installed**. Neither the
+offline suite nor the older historical hashes below supplies that observation.
+
+### Operator-only two-file rollback — unexecuted
+
+If the operator elects rollback after an installation, restore both files together:
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import hashlib
+import os
+import shutil
+root = Path("/home/bin")
+names = ("doubletake", "doubletake-ctl")
+for name in names:
+    assert (root / (name + ".prev")).is_file()
+for name in names:
+    shutil.copy2(root / (name + ".prev"), root / (name + ".volume-restore"))
+for name in names:
+    os.replace(root / (name + ".volume-restore"), root / name)
+for name in names:
+    assert (root / name).read_bytes() == (root / (name + ".prev")).read_bytes()
+    print(name, hashlib.sha256((root / name).read_bytes()).hexdigest())
+PY
+/home/bin/doubletake -capabilities
+/home/bin/doubletake-ctl --help
+```
+
+Expected: both restored hashes equal their recorded previous hashes and that pair's earlier
+help/token surface returns. The legacy pair lacks `target-volume`, so the volume row becomes
+disabled while existing mute behavior remains. Restore both sides; a one-file downgrade can
+produce an incoherent pair that refuses the whole backend. This command includes no restart,
+receiver or session action. Record a rollback result only if it is actually executed.
+
 
 ## Reconciled rebuild identity (2026-11-02)
 

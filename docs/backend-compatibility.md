@@ -17,6 +17,13 @@ The captured command output is retained in:
 - `tests/fixtures/backend/status-0.5.json` (concurrent PIN-waiting and streaming)
 - `tests/fixtures/backend/status-0.5-password.json` (password-waiting and streaming)
 
+The historical source record above and `contract-v1.json` contain a transcription discrepancy:
+they spell the peeled commit `e18f85d07f74a3b9d49f448762d28f3f7feb3938`. Fresh local
+`rev-parse` of the supplied tag and HEAD of the prepared clone both return
+**`e18f85d07f74a3b9d49f448762d28f3b7feb3938`**. The prepared pair uses this measured commit.
+The older strings/links remain recorded fixture provenance and must not substitute for the
+[measured build identity](backend-fork.md#prepared-volume-helper-pair-2026-11-05).
+
 ## Recognized help and capability contracts
 
 The historical v0.5 release capture and the locally extended volume surface are two exact
@@ -117,9 +124,13 @@ physical-source eligibility from complete source reporting plus a fresh KScreen 
 The public `owner_handshake`/`foreground_control` flags stay false; receipt-backed transport
 admission uses its own authority. Every start, mutation and cleanup still checks the current
 receiver, daemon, endpoint, lease and trust evidence. Missing or stale evidence refuses.
-These implementation facts do not establish the identity of an installed pair or a live
-receiver result. [Backend provenance](backend-fork.md) records offline source proof and dated
-historical installations; this volume source change has no installation receipt yet.
+These implementation facts do not establish an installed pair or a live receiver result. The
+[2026-11-05 prepared-pair receipt](backend-fork.md#prepared-volume-helper-pair-2026-11-05)
+records both artifacts in `/tmp/av-delivery.7OYAi0`, their measured hashes, source/patch chain,
+Go/native versions and operator command groups. Status is **prepared, not installed**. The
+rebuilt help/capability probes remain unexecuted under the user's restriction, as do installation,
+installed observations and rollback. The older installations below that receipt remain dated
+historical evidence.
 
 ## Historical release-only ownership observations
 
