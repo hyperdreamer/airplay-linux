@@ -1,0 +1,32 @@
+digraph execution_manifest {
+    rankdir=TB;
+    node [shape=box, style=rounded, fontsize=10];
+    subgraph cluster_audio_volume {
+        label="lane: audio-volume";
+        "T-001" [label="T-001\nCarry the bounded volume producer, stream latch and offline Go proof"];
+        "T-002" [label="T-002\nDefine frozen domain contracts and safe diagnostics"];
+        "T-003" [label="T-003\nRecognize only coherent volume surfaces and decode per-stream evidence"];
+        "T-004" [label="T-004\nStore receiver v2 preferences without blocking recovery on a bad level"];
+        "T-005" [label="T-005\nShare one continuity-checked preference writer at composition"];
+        "T-006" [label="T-006\nAdd target-fenced typed controls and full-status acknowledgements"];
+        "T-007" [label="T-007\nCarry receipts through transport and emit actual worker settlement"];
+        "T-008" [label="T-008\nPropagate startup volume and strip transient authority on recovery"];
+        "T-009" [label="T-009\nImplement actor receipt, single-knob, settlement and close authority"];
+        "T-010" [label="T-010\nProject the acknowledged volume row and dispatch typed UI requests"];
+        "T-011" [label="T-011\nProve composed receipts, live-failure recovery and complete offline regression"];
+        "T-012" [label="T-012\nDocument operational behavior, coherent compatibility and carried provenance"];
+        "T-013" [label="T-013\nPrepare the rebuilt helper pair and receipt the operator installation"];
+        "T-001" -> "T-002";
+        "T-002" -> "T-003";
+        "T-003" -> "T-004";
+        "T-004" -> "T-005";
+        "T-005" -> "T-006";
+        "T-006" -> "T-007";
+        "T-007" -> "T-008";
+        "T-008" -> "T-009";
+        "T-009" -> "T-010";
+        "T-010" -> "T-011";
+        "T-011" -> "T-012";
+        "T-012" -> "T-013";
+    }
+}

@@ -1,0 +1,451 @@
+schema: 1
+topic: audio-volume-control
+source_plan:
+  path: docs/superpowers/plans/2026-11-05-audio-volume-control.md
+  sha256: 71c0dfb757e84e10d60692902ba8f8fe0343484425a2fd818db1626baa153e8e
+  digest: 71c0dfb757e84e10d60692902ba8f8fe0343484425a2fd818db1626baa153e8e
+  task_count: 13
+lanes:
+- id: audio-volume
+  task_ids:
+  - T-001
+  - T-002
+  - T-003
+  - T-004
+  - T-005
+  - T-006
+  - T-007
+  - T-008
+  - T-009
+  - T-010
+  - T-011
+  - T-012
+  - T-013
+tasks:
+- id: T-001
+  plan_task: 1
+  title: Carry the bounded volume producer, stream latch and offline Go proof
+  lane: audio-volume
+  sequence: 1
+  depends_on: []
+  ownership:
+  - vendor/doubletake/0004-target-volume.patch
+  exclusive_resources: []
+  interfaces:
+    produces: []
+    consumes: []
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-002
+  plan_task: 2
+  title: Define frozen domain contracts and safe diagnostics
+  lane: audio-volume
+  sequence: 2
+  depends_on:
+  - T-001
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: VolumeLevel
+      signature: 'VolumeLevel(value: int), frozen, range 1..100'
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: AudioStartReceipt
+      signature: 'AudioStartReceipt(audio: bool, volume_state: str | None, level: int | None)'
+      digest: sha256:f7fa2601bfdd5fd481b01a62d4fbbf6f667c1dcc3b60b472cd74367eae3e1539
+    - name: VolumeEventPayload
+      signature: 'VolumePayload(level: int, ok: bool)'
+      digest: sha256:7e9ebcb5b5665df878e951e872b9e56994529c83b50983477730540e5602d987
+    - name: SetVolume
+      signature: 'SetVolume(receiver_id: ReceiverId, level: VolumeLevel)'
+      digest: sha256:ac0c5cd8375c94dcc942c9bd29bade529d45deadc4e32eb7f89c515197356c36
+    - name: SnapshotVolumeFields
+      signature: SessionSnapshot.remembered_volume/effective_volume/last_audible_volume
+      digest: sha256:28079d61c815910d6485e1437f382a28360790d384b92eb2bd9c85a2d4ff3e1f
+    - name: BackendStreamVolume
+      signature: 'BackendStream.volume: int | None, volume_state: str, audio_closed: bool'
+      digest: sha256:d879d90bb53a3143ff85d5d7592c7fdb319945be82399e7ac6f5a82ce7a43d0e
+    - name: CapabilityReportVolume
+      signature: 'CapabilityReport.volume: bool'
+      digest: sha256:a08a790b2ba92bda998f1015391fe183ac8cdcec0b553f3265c741099fe9a1d6
+    - name: VolumeDiagnostics
+      signature: ErrorCode.audio_volume_failed/volume_unavailable/volume_preference_invalid
+      digest: sha256:a3138bd72282771c03e93e06f2267b782fa7ffdb19b5575c413757b6563329e9
+    consumes: []
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-003
+  plan_task: 3
+  title: Recognize only coherent volume surfaces and decode per-stream evidence
+  lane: audio-volume
+  sequence: 3
+  depends_on:
+  - T-002
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: Recognition
+      signature: features_from_help(sender_help, ctl_help, *, advertised) -> BackendFeatures.target_volume
+      digest: sha256:ce49891690b39a41738019b708914ed77abfa38440ec29da24d30b2796cb4afb
+    - name: StatusDecode
+      signature: 'decode_status(value: object) -> StatusReply | Err'
+      digest: sha256:763975331f0d9f9eae587fb39cd4d7632b79d8433a7a11577d6ab5173379a56b
+    consumes:
+    - name: VolumeLevel
+      from_task: T-002
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: AudioStartReceipt
+      from_task: T-002
+      digest: sha256:f7fa2601bfdd5fd481b01a62d4fbbf6f667c1dcc3b60b472cd74367eae3e1539
+    - name: BackendStreamVolume
+      from_task: T-002
+      digest: sha256:d879d90bb53a3143ff85d5d7592c7fdb319945be82399e7ac6f5a82ce7a43d0e
+    - name: CapabilityReportVolume
+      from_task: T-002
+      digest: sha256:a08a790b2ba92bda998f1015391fe183ac8cdcec0b553f3265c741099fe9a1d6
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-004
+  plan_task: 4
+  title: Store receiver v2 preferences without blocking recovery on a bad level
+  lane: audio-volume
+  sequence: 4
+  depends_on:
+  - T-003
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: ReceiverV2
+      signature: encode_receiver/decode_receiver receiver v2 with droppable remembered_volume
+      digest: sha256:fe9f0935b8db53c8f5c50f64237bf5630486d9a9ba817cbaa10e61bc349cbb35
+    consumes:
+    - name: VolumeLevel
+      from_task: T-002
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: VolumeDiagnostics
+      from_task: T-002
+      digest: sha256:a3138bd72282771c03e93e06f2267b782fa7ffdb19b5575c413757b6563329e9
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-005
+  plan_task: 5
+  title: Share one continuity-checked preference writer at composition
+  lane: audio-volume
+  sequence: 5
+  depends_on:
+  - T-004
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: PreferenceWriter
+      signature: ReceiverPreferenceWriter.save_volume(record_set, receiver_id, level, *, context) -> Result[None]
+      digest: sha256:f4fe4cc619915a4aca0d36aa20145a4633bdf9d41bc7b7b2ce92217f245aa564
+    consumes:
+    - name: ReceiverV2
+      from_task: T-004
+      digest: sha256:fe9f0935b8db53c8f5c50f64237bf5630486d9a9ba817cbaa10e61bc349cbb35
+    - name: Recognition
+      from_task: T-003
+      digest: sha256:ce49891690b39a41738019b708914ed77abfa38440ec29da24d30b2796cb4afb
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-006
+  plan_task: 6
+  title: Add target-fenced typed controls and full-status acknowledgements
+  lane: audio-volume
+  sequence: 6
+  depends_on:
+  - T-005
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: TypedControl
+      signature: BackendOperation.volume/audio_off with VolumePayload/AudioGatePayload and ack decode
+      digest: sha256:36d45df21b628b35b866d4f2a1e63a95c9a418645ca8c23d54ea4ed491b7b9e1
+    consumes:
+    - name: Recognition
+      from_task: T-003
+      digest: sha256:ce49891690b39a41738019b708914ed77abfa38440ec29da24d30b2796cb4afb
+    - name: StatusDecode
+      from_task: T-003
+      digest: sha256:763975331f0d9f9eae587fb39cd4d7632b79d8433a7a11577d6ab5173379a56b
+    - name: VolumeLevel
+      from_task: T-002
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: BackendStreamVolume
+      from_task: T-002
+      digest: sha256:d879d90bb53a3143ff85d5d7592c7fdb319945be82399e7ac6f5a82ce7a43d0e
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-007
+  plan_task: 7
+  title: Carry receipts through transport and emit actual worker settlement
+  lane: audio-volume
+  sequence: 7
+  depends_on:
+  - T-006
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: StartStreamVolume
+      signature: 'start_stream(..., *, initial_volume: VolumeLevel | None) -> Result[StreamHandle]'
+      digest: sha256:5cc0298adb3e82bf186fffbe2107d0b14d0065b518283238a6d0776183659780
+    - name: TransportVolume
+      signature: set_volume(handle, level, context) -> Result[int]; close_audio(handle, context) -> Result[None]
+      digest: sha256:ffd3b4b3b417983b522ae1a6621b98c1aed2e48f55c8f723e0b3fe58ed064414
+    consumes:
+    - name: VolumeLevel
+      from_task: T-002
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: AudioStartReceipt
+      from_task: T-002
+      digest: sha256:f7fa2601bfdd5fd481b01a62d4fbbf6f667c1dcc3b60b472cd74367eae3e1539
+    - name: VolumeEventPayload
+      from_task: T-002
+      digest: sha256:7e9ebcb5b5665df878e951e872b9e56994529c83b50983477730540e5602d987
+    - name: TypedControl
+      from_task: T-006
+      digest: sha256:36d45df21b628b35b866d4f2a1e63a95c9a418645ca8c23d54ea4ed491b7b9e1
+    - name: SnapshotVolumeFields
+      from_task: T-002
+      digest: sha256:28079d61c815910d6485e1437f382a28360790d384b92eb2bd9c85a2d4ff3e1f
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-008
+  plan_task: 8
+  title: Propagate startup volume and strip transient authority on recovery
+  lane: audio-volume
+  sequence: 8
+  depends_on:
+  - T-007
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: StartupPropagation
+      signature: StartRequest.volume -> connect argv; transient volume authority stripped on load
+      digest: sha256:1993ae7783c334ccb5f517cd281cc3820eb4ab1e83470c959194f5e648224e74
+    consumes:
+    - name: StartStreamVolume
+      from_task: T-007
+      digest: sha256:5cc0298adb3e82bf186fffbe2107d0b14d0065b518283238a6d0776183659780
+    - name: SnapshotVolumeFields
+      from_task: T-002
+      digest: sha256:28079d61c815910d6485e1437f382a28360790d384b92eb2bd9c85a2d4ff3e1f
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-009
+  plan_task: 9
+  title: Implement actor receipt, single-knob, settlement and close authority
+  lane: audio-volume
+  sequence: 9
+  depends_on:
+  - T-008
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: AuthorityRules
+      signature: AudioLifecycle receipt/one-knob/coalescing/close authority
+      digest: sha256:3d39c36c90691d714f18c3609a59f9f97d8d2468184a4323bf3c2749c0babafb
+    consumes:
+    - name: AudioStartReceipt
+      from_task: T-002
+      digest: sha256:f7fa2601bfdd5fd481b01a62d4fbbf6f667c1dcc3b60b472cd74367eae3e1539
+    - name: SetVolume
+      from_task: T-002
+      digest: sha256:ac0c5cd8375c94dcc942c9bd29bade529d45deadc4e32eb7f89c515197356c36
+    - name: TransportVolume
+      from_task: T-007
+      digest: sha256:ffd3b4b3b417983b522ae1a6621b98c1aed2e48f55c8f723e0b3fe58ed064414
+    - name: TypedControl
+      from_task: T-006
+      digest: sha256:36d45df21b628b35b866d4f2a1e63a95c9a418645ca8c23d54ea4ed491b7b9e1
+    - name: PreferenceWriter
+      from_task: T-005
+      digest: sha256:f4fe4cc619915a4aca0d36aa20145a4633bdf9d41bc7b7b2ce92217f245aa564
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-010
+  plan_task: 10
+  title: Project the acknowledged volume row and dispatch typed UI requests
+  lane: audio-volume
+  sequence: 10
+  depends_on:
+  - T-009
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: UiVolumeRow
+      signature: PaneState volume fields + Volume row widget + SetVolume dispatch
+      digest: sha256:485472f53d38e4ca422061a3eb1daca97d613c11f68b03dc19578c1ed76f1dc6
+    consumes:
+    - name: CapabilityReportVolume
+      from_task: T-002
+      digest: sha256:a08a790b2ba92bda998f1015391fe183ac8cdcec0b553f3265c741099fe9a1d6
+    - name: SetVolume
+      from_task: T-002
+      digest: sha256:ac0c5cd8375c94dcc942c9bd29bade529d45deadc4e32eb7f89c515197356c36
+    - name: VolumeLevel
+      from_task: T-002
+      digest: sha256:32bed0177f6ced96636cc0ee7a84d9214422153d1b6c024a278342c6ff323e75
+    - name: SnapshotVolumeFields
+      from_task: T-002
+      digest: sha256:28079d61c815910d6485e1437f382a28360790d384b92eb2bd9c85a2d4ff3e1f
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-011
+  plan_task: 11
+  title: Prove composed receipts, live-failure recovery and complete offline regression
+  lane: audio-volume
+  sequence: 11
+  depends_on:
+  - T-010
+  ownership:
+  - tests/diagnostics/test_safety.py
+  - tests/storage/test_atomic_records.py
+  - tests/storage/test_repositories.py
+  - tests/testing/test_fakes.py
+  - tests/ui/test_presenter.py
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: ComposedProofs
+      signature: composed SessionManager -> transport -> scripted control proofs
+      digest: sha256:68b43b4e502e24d5746c54add4c922b883747def0c27b2c1e1a5e1274b18b4b7
+    consumes:
+    - name: ComposedProofs
+      from_task: T-011
+      digest: sha256:68b43b4e502e24d5746c54add4c922b883747def0c27b2c1e1a5e1274b18b4b7
+    - name: StatusDecode
+      from_task: T-003
+      digest: sha256:763975331f0d9f9eae587fb39cd4d7632b79d8433a7a11577d6ab5173379a56b
+    - name: Recognition
+      from_task: T-003
+      digest: sha256:ce49891690b39a41738019b708914ed77abfa38440ec29da24d30b2796cb4afb
+    - name: ReceiverV2
+      from_task: T-004
+      digest: sha256:fe9f0935b8db53c8f5c50f64237bf5630486d9a9ba817cbaa10e61bc349cbb35
+    - name: Docs
+      from_task: T-012
+      digest: sha256:15bddd998420ec603ac998d6d321ce7be5c158c20185a4805d908231ad5d551a
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/diagnostics/test_safety.py
+    - tests/storage/test_atomic_records.py
+- id: T-012
+  plan_task: 12
+  title: Document operational behavior, coherent compatibility and carried provenance
+  lane: audio-volume
+  sequence: 12
+  depends_on:
+  - T-011
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces:
+    - name: Docs
+      signature: operations/backend-fork/backend-compatibility updates
+      digest: sha256:15bddd998420ec603ac998d6d321ce7be5c158c20185a4805d908231ad5d551a
+    consumes:
+    - name: Recognition
+      from_task: T-003
+      digest: sha256:ce49891690b39a41738019b708914ed77abfa38440ec29da24d30b2796cb4afb
+    - name: StatusDecode
+      from_task: T-003
+      digest: sha256:763975331f0d9f9eae587fb39cd4d7632b79d8433a7a11577d6ab5173379a56b
+    - name: Docs
+      from_task: T-012
+      digest: sha256:15bddd998420ec603ac998d6d321ce7be5c158c20185a4805d908231ad5d551a
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
+- id: T-013
+  plan_task: 13
+  title: Prepare the rebuilt helper pair and receipt the operator installation
+  lane: audio-volume
+  sequence: 13
+  depends_on:
+  - T-012
+  ownership: []
+  exclusive_resources: []
+  interfaces:
+    produces: []
+    consumes:
+    - name: Docs
+      from_task: T-012
+      digest: sha256:15bddd998420ec603ac998d6d321ce7be5c158c20185a4805d908231ad5d551a
+    - name: ComposedProofs
+      from_task: T-011
+      digest: sha256:68b43b4e502e24d5746c54add4c922b883747def0c27b2c1e1a5e1274b18b4b7
+  validation:
+    argv:
+    - python3
+    - -m
+    - pytest
+    - -q
+    - tests/backend/test_carried_source_patch.py
