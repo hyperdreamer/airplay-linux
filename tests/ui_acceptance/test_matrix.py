@@ -179,8 +179,8 @@ class AcceptanceTransport(FakeTransport):
         self.streams[handle.lease_id] = handle
         return handle
 
-    async def start_stream(self, destination, source, audio, operation):
-        result = await super().start_stream(destination, source, audio, operation)
+    async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+        result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
         if isinstance(result, Ok) and self.ready:
             self.emit(TransportEvent(
                 kind=TransportEventKind.ready,

@@ -44,6 +44,7 @@ from airplay_linux.domain.operations import (
 )
 from airplay_linux.domain.records import (
     ActivityEvent,
+    AudioStartReceipt,
     DaemonRecord,
     LayoutSnapshot,
     OwnershipRecord,
@@ -63,6 +64,7 @@ from airplay_linux.domain.resources import (
     Result,
     Size,
     VirtualOutputSource,
+    VolumeLevel,
 )
 
 from .time import FakeClock
@@ -348,6 +350,15 @@ class SequenceIds:
 # --------------------------------------------------------------------------- transport
 
 
+@dataclass(kw_only=True)
+class _FakeVolumeTask:
+    handle: StreamHandle
+    context: OperationContext
+    level: VolumeLevel
+    task: asyncio.Task | None = None
+    expired: bool = False
+
+
 class FakeTransport(_Scripted, _EventSource):
     """Transport double that fences targets, daemon instances, and exact streams."""
 
@@ -361,6 +372,12 @@ class FakeTransport(_Scripted, _EventSource):
         self.streams: dict[LeaseId, StreamHandle] = {}
         self.muted: dict[LeaseId, bool] = {}
         self.audio_started: dict[LeaseId, bool] = {}
+        self.levels: dict[LeaseId, int] = {}
+        self.audio_closed: dict[LeaseId, bool] = {}
+        self._contexts: dict[LeaseId, OperationContext] = {}
+        self._policies: dict[LeaseId, AudioPolicy] = {}
+        self._volume_tasks: dict[LeaseId, _FakeVolumeTask] = {}
+        self._close_tasks: dict[LeaseId, asyncio.Task] = {}
         self.shutdown_called = False
         self._ids = SequenceIds(seed=500)
 
@@ -414,7 +431,7 @@ class FakeTransport(_Scripted, _EventSource):
             endpoint_fingerprint=target.endpoint_fingerprint,
             backend_stream_id=f"stream-{self._ids.new()}",
             daemon_instance_uuid=self.daemon_instance_uuid,
-            lease_id=LeaseId(self._ids.new()),
+            lease_id=context.transport_lease_id or LeaseId(self._ids.new()),
             start_operation_id=context.operation_id,
         )
         self.streams[handle.lease_id] = handle
@@ -432,11 +449,13 @@ class FakeTransport(_Scripted, _EventSource):
         return Ok(value=None)
 
     async def start_stream(
-        self, target: ReceiverTarget, source: resources.CaptureSource,
-        audio_policy: AudioPolicy, context: OperationContext,
+        self, target: ReceiverTarget, source: resources.CaptureSource | None,
+        audio_policy: AudioPolicy, context: OperationContext, *, initial_volume: VolumeLevel | None = None,
     ) -> Result[StreamHandle]:
+        if initial_volume is not None and type(initial_volume) is not VolumeLevel:
+            return _failure(ErrorCode.invalid_input, "Invalid initial volume")
         self._record(
-            "start_stream", target=target, source=source,
+            "start_stream", target=target, source=source, initial_volume=initial_volume,
             audio_policy=audio_policy, context=context,
         )
         if not self._fresh(target):
@@ -445,9 +464,17 @@ class FakeTransport(_Scripted, _EventSource):
             source, (PhysicalMonitorSource, VirtualOutputSource)
         ):
             return _failure(ErrorCode.unsupported_source, "Capture source is not a monitor")
-        scripted = await self._take("start_stream", adopt=self._adopt_stream)
+        def adopt(result):
+            self._adopt_stream(result)
+            if isinstance(result, Ok) and isinstance(result.value, StreamHandle):
+                lease = result.value.lease_id
+                self._contexts[lease] = context
+                self._policies[lease] = audio_policy
+                self.audio_closed[lease] = not audio_policy.enabled
+        scripted = await self._take("start_stream", adopt=adopt)
         if scripted is _UNSET:
-            return Ok(value=self._new_handle(target, context))
+            scripted = Ok(value=self._new_handle(target, context))
+            adopt(scripted)
         return scripted
 
     async def stop_stream(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
@@ -461,6 +488,13 @@ class FakeTransport(_Scripted, _EventSource):
             self.streams.pop(handle.lease_id, None)
             self.muted.pop(handle.lease_id, None)
             self.audio_started.pop(handle.lease_id, None)
+            self.levels.pop(handle.lease_id, None)
+            self.audio_closed.pop(handle.lease_id, None)
+            self._contexts.pop(handle.lease_id, None)
+            self._policies.pop(handle.lease_id, None)
+            work = self._volume_tasks.get(handle.lease_id)
+            if work is not None:
+                work.expired = True
         return result
 
     async def set_muted(
@@ -476,15 +510,117 @@ class FakeTransport(_Scripted, _EventSource):
             self.muted[handle.lease_id] = muted
         return result
 
-    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
+    async def start_audio(self, handle: StreamHandle, context: OperationContext) -> Result[AudioStartReceipt]:
         self._record("start_audio", handle=handle, context=context)
         stale = self._stale_stream(handle, context, active_control=True)
         if stale is not None:
             return stale
+        if self.audio_closed.get(handle.lease_id, False):
+            return _failure(ErrorCode.audio_unavailable, "Audio is closed")
         scripted = await self._take("start_audio")
+        stale = self._stale_stream(handle, context, active_control=True)
+        if stale is not None:
+            return stale
+        if self.audio_closed.get(handle.lease_id, False):
+            return _failure(ErrorCode.audio_unavailable, "Audio is closed")
+        result = Ok(value=AudioStartReceipt(audio=True)) if scripted is _UNSET or scripted == Ok(value=None) else scripted
+        if isinstance(result, Ok):
+            receipt = result.value
+            self.audio_started[handle.lease_id] = receipt.audio and receipt.volume_state not in ("pending", "refused")
+            if receipt.volume_state == "applied" and receipt.audio:
+                self.levels[handle.lease_id] = receipt.level
+                self.muted[handle.lease_id] = receipt.level == 0
+            elif not self.audio_started[handle.lease_id]:
+                self.muted[handle.lease_id] = False
+        return result
+
+    def _volume_current(self, handle, context):
+        stale = self._stale_stream(handle, context, active_control=True)
+        if stale is not None:
+            return stale
+        admitted = self._contexts.get(handle.lease_id)
+        if context.transport_lease_id != handle.lease_id or (
+            admitted is not None and (admitted.session_generation != context.session_generation
+                                     or admitted.trust_generation != context.trust_generation)
+        ):
+            return _failure(ErrorCode.stale_event, "Operation is no longer current")
+        return None
+
+    async def set_volume(self, handle: StreamHandle, level: VolumeLevel, context: OperationContext) -> Result[int]:
+        if type(handle) is not StreamHandle or type(level) is not VolumeLevel or type(context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input, "Invalid volume request")
+        self._record("set_volume", handle=handle, level=level, context=context)
+        record = _FakeVolumeTask(handle=handle, context=context, level=level)
+        record.task = asyncio.create_task(self._set_volume(record))
+        def settled(task):
+            result = None if task.cancelled() else task.result()
+            ok = (not record.expired and isinstance(result, Ok)
+                  and self._volume_current(handle, context) is None
+                  and not self.audio_closed.get(handle.lease_id, False))
+            if self._volume_tasks.get(handle.lease_id) is record:
+                del self._volume_tasks[handle.lease_id]
+            self.emit(messages.TransportEvent(
+                kind=messages.TransportEventKind.volume_result, receiver_id=handle.receiver_id,
+                stream=handle, endpoint_fingerprint=handle.endpoint_fingerprint,
+                endpoint_generation=handle.endpoint_generation, daemon_instance_uuid=handle.daemon_instance_uuid,
+                context=context, payload=messages.VolumePayload(level=result.value if ok else level.value, ok=ok),
+            ))
+        record.task.add_done_callback(settled)
+        try:
+            return await asyncio.shield(record.task)
+        except asyncio.CancelledError:
+            record.expired = True
+            raise
+
+    async def _set_volume(self, record):
+        handle, context = record.handle, record.context
+        stale = self._volume_current(handle, context)
+        if stale is not None:
+            return stale
+        if self.audio_closed.get(handle.lease_id, False) or handle.lease_id in self._volume_tasks:
+            return _failure(ErrorCode.audio_volume_failed, "Audio control is unavailable")
+        self._volume_tasks[handle.lease_id] = record
+        scripted = await self._take("set_volume")
+        stale = self._volume_current(handle, context)
+        if stale is not None:
+            return stale
+        if record.expired or self.audio_closed.get(handle.lease_id, False):
+            return _failure(ErrorCode.audio_volume_failed, "Audio control is unavailable")
+        result = Ok(value=record.level.value) if scripted is _UNSET else scripted
+        if isinstance(result, Ok):
+            if type(result.value) is not int or not 0 <= result.value <= 100:
+                return _failure(ErrorCode.audio_volume_failed, "Volume was not acknowledged")
+            self.levels[handle.lease_id] = result.value
+            self.muted[handle.lease_id] = result.value == 0
+            self.audio_started[handle.lease_id] = True
+        return result
+
+    async def close_audio(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
+        if type(handle) is not StreamHandle or type(context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input, "Invalid audio close")
+        self._record("close_audio", handle=handle, context=context)
+        stale = self._volume_current(handle, context)
+        if stale is not None:
+            return stale
+        self.audio_closed[handle.lease_id] = True
+        self._policies[handle.lease_id] = AudioPolicy(enabled=False)
+        work = self._volume_tasks.get(handle.lease_id)
+        if work is not None:
+            work.expired = True
+        task = self._close_tasks.get(handle.lease_id)
+        if task is None or task.done():
+            task = asyncio.create_task(self._close_audio(handle, context))
+            self._close_tasks[handle.lease_id] = task
+        return await asyncio.shield(task)
+
+    async def _close_audio(self, handle, context):
+        scripted = await self._take("close_audio")
+        stale = self._volume_current(handle, context)
+        if stale is not None:
+            return stale
         result = _ok() if scripted is _UNSET else scripted
         if isinstance(result, Ok):
-            self.audio_started[handle.lease_id] = True
+            self.audio_started[handle.lease_id] = False
         return result
 
     async def shutdown(self) -> Result[None]:

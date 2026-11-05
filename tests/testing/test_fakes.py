@@ -25,7 +25,7 @@ from airplay_linux.domain.operations import (
     SensitiveText,
     StreamHandle,
 )
-from airplay_linux.domain.records import ActivityEvent, DaemonRecord, SessionSnapshot, SavedReceiver
+from airplay_linux.domain.records import AudioStartReceipt, ActivityEvent, DaemonRecord, SessionSnapshot, SavedReceiver
 from airplay_linux.domain.resources import (
     AudioPolicy,
     Diagnostic,
@@ -39,6 +39,7 @@ from airplay_linux.domain.resources import (
     Size,
     TransportState,
     TrustState,
+    VolumeLevel,
 )
 from airplay_linux.testing.adapters import (
     Deferred,
@@ -85,6 +86,59 @@ def stream_handle(lease: int = 42) -> StreamHandle:
         lease_id=LeaseId(UUID(int=lease)),
         start_operation_id=OperationId(UUID(int=3)),
     )
+
+
+def test_volume_fake_normalizes_legacy_start_and_passes_explicit_receipt():
+    async def scenario():
+        transport = FakeTransport()
+        t, operation = target(), context()
+        transport.update_target(t, t.receiver_id)
+        handle = (await transport.start_stream(t, None, AudioPolicy(), operation,
+                                               initial_volume=VolumeLevel(value=30))).value
+        operation = replace(operation, transport_lease_id=handle.lease_id)
+        transport.queue_result("start_audio", Ok(value=None))
+        result = await transport.start_audio(handle, operation)
+        assert result == Ok(value=AudioStartReceipt(audio=True))
+        assert result.value.level is None
+        receipt = AudioStartReceipt(audio=True, volume_state="applied", level=0)
+        transport.queue_result("start_audio", Ok(value=receipt))
+        assert await transport.start_audio(handle, operation) == Ok(value=receipt)
+        assert transport.muted[handle.lease_id]
+        assert transport.journal.calls("transport.start_stream")[0]["initial_volume"] == {"value": 30}
+    run(scenario())
+
+
+@pytest.mark.parametrize("change", ["none", "handle", "target", "daemon", "lease"])
+def test_volume_fake_fences_and_settles_once(change):
+    async def scenario():
+        transport, events = FakeTransport(), []
+        transport.subscribe(events.append)
+        t, operation = target(), context()
+        transport.update_target(t, t.receiver_id)
+        handle = (await transport.start_stream(t, None, AudioPolicy(), operation)).value
+        operation = replace(operation, transport_lease_id=handle.lease_id)
+        await transport.start_audio(handle, operation)
+        if change == "handle":
+            handle = replace(handle, backend_stream_id="wrong")
+        elif change == "target":
+            transport.update_target(target(endpoint_generation=2), t.receiver_id)
+        elif change == "daemon":
+            transport.daemon_instance_uuid = InstanceId(UUID(int=99))
+        elif change == "lease":
+            operation = replace(operation, transport_lease_id=LeaseId(UUID(int=999)))
+        result = await transport.set_volume(handle, VolumeLevel(value=0), operation)
+        await asyncio.sleep(0)
+        assert len(events) == 1
+        assert events[0].stream == handle and events[0].context == operation
+        assert events[0].payload.ok is (change == "none")
+        if change == "none":
+            assert result == Ok(value=0) and transport.muted[handle.lease_id]
+            assert await transport.close_audio(handle, operation) == Ok(value=None)
+            assert isinstance(await transport.set_volume(handle, VolumeLevel(value=30), operation), Err)
+        else:
+            assert isinstance(result, Err)
+            assert isinstance(await transport.close_audio(handle, operation), Err)
+    run(scenario())
 
 
 def test_equal_deadlines_run_in_fifo_order_and_cancel_is_permanent():
@@ -872,7 +926,7 @@ def test_deferred_results_can_be_used_for_independent_audio_mute_and_teardown():
         audio_call = asyncio.ensure_future(transport.start_audio(handle, context()))
         await asyncio.sleep(0)
         audio_deferred.resolve(Ok(value=None))
-        assert await audio_call == Ok(value=None)
+        assert await audio_call == Ok(value=AudioStartReceipt(audio=True))
         assert transport.audio_started[handle.lease_id] is True
         mute_deferred.resolve(failure(ErrorCode.audio_mute_failed, "mute rejected"))
         mute = await mute_call

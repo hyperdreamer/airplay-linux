@@ -33,8 +33,8 @@ class ContextTransport(FakeTransport):
         super().__init__()
         self.ready = ready
 
-    async def start_stream(self, destination, source, audio, operation):
-        result = await super().start_stream(destination, source, audio, operation)
+    async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+        result = await super().start_stream(destination, source, audio, operation, initial_volume=initial_volume)
         if isinstance(result, Ok) and self.ready:
             self.emit(TransportEvent(
                 kind=TransportEventKind.ready, receiver_id=destination.receiver_id,

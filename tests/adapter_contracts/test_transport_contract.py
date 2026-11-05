@@ -72,6 +72,30 @@ from airplay_linux.transport.doubletake import DoubleTakeTransport
 from airplay_linux.trust.fences import TrustFenceRegistry
 from airplay_linux.trust.keyring import BackendKeyringStore
 
+async def test_volume_port_contract_over_explicit_fake():
+    import inspect
+    from airplay_linux.domain.ports import TransportPort
+    from airplay_linux.domain.records import AudioStartReceipt
+    from airplay_linux.domain.resources import VolumeLevel
+    from airplay_linux.testing.adapters import FakeTransport
+    for implementation in (DoubleTakeTransport, FakeTransport):
+        for name in ("start_stream", "start_audio", "set_volume", "close_audio"):
+            assert tuple(inspect.signature(getattr(implementation, name)).parameters) == tuple(
+                inspect.signature(getattr(TransportPort, name)).parameters)
+    transport = FakeTransport()
+    receiver, operation = target(), context()
+    transport.update_target(receiver, receiver.receiver_id)
+    result = await transport.start_stream(receiver, None, AudioPolicy(), operation,
+                                          initial_volume=VolumeLevel(value=30))
+    assert isinstance(result, Ok)
+    handle = result.value
+    assert await transport.start_audio(handle, operation) == Ok(value=AudioStartReceipt(audio=True))
+    assert await transport.set_volume(handle, VolumeLevel(value=0), operation) == Ok(value=0)
+    assert await transport.close_audio(handle, operation) == Ok(value=None)
+    assert isinstance(await transport.set_volume(handle, VolumeLevel(value=30), operation), Err)
+    assert ApplicationContractProfile(socket_path="/run/private/test.sock").features.target_volume is False
+
+
 PROCESS_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "processes"
 if str(PROCESS_FIXTURES) not in sys.path:
     sys.path.insert(0, str(PROCESS_FIXTURES))
