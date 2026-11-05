@@ -132,6 +132,9 @@ peeled commit       e18f85d07f74a3b9d49f448762d28f3b7feb3938
 0004 sha256         8fc2a133fae50c0383bdf257199e3f119377d0721baceaa8b78463a3534eb191
 ```
 
+> **Superseded by the audit correction below.** That 0004 digest identifies patch 0004 as it stood
+> at commit `257df34`. The final patch in this tree is different; see “Final 0004 provenance”.
+
 The observed proof commands used this environment and the supplied local Python interpreter:
 
 ```bash
@@ -198,6 +201,27 @@ passed. No module/library download or reference-checkout modification was needed
 | Installed hash/help/token observation | **Unexecuted**; no current installed or backup hashes claimed |
 | Rollback | **Unexecuted** |
 | Receiver acceptance, audible gain, remote readback | Unobserved; outside offline preparation |
+
+### Final 0004 provenance (2026-11-05, post-audit)
+
+The frontier audit compared the digest recorded above with the patch actually shipped in this tree
+and found they differ. The record above is preserved unchanged as the history of what was prepared;
+this section states what a future installation must build from.
+
+```text
+0004 sha256 (final)  d5d3359c93fcaf408e7495053de029194c47c193b5e1bf1a33d2466eafaae5c5
+```
+
+Consequences, stated plainly:
+
+- the digest `8fc2a133…` in the measured-identity table belongs to patch 0004 at commit `257df34`;
+  that revision predates the audit fixes, so the prepared pair described above does **not**
+  represent the final source;
+- any installation must rebuild the sender and ctl from the current tree and verify
+  `d5d3359c…` first — do not install a pair prepared from the earlier revision;
+- the ordered `git apply --check --whitespace=error-all` and application of the final patch against
+  the peeled commit `e18f85d0…` passed during the audit, and the offline production-declaration
+  proof passed against that same application, so the final patch is buildable as recorded here.
 
 There is no authorization reference or installation time for this pair. The exact stdout/exit
 conditions below are **expected checks**, not observed results. The user restriction leaves
