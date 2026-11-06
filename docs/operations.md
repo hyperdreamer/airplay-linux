@@ -101,10 +101,12 @@ amplitude (`20 log10(0.5)`), which is not a claim of half perceived loudness.
 
 Implementation proof, a prepared helper build, an installed pair and a live receiver observation
 are separate evidence. The [prepared-pair receipt and operator rollback](backend-fork.md#prepared-volume-helper-pair-2026-11-05)
-record the rebuilt artifacts in `/tmp/av-delivery.7OYAi0` and their measured hashes. Status is
-**prepared, not installed**. Rebuilt-helper help/capability checks, pair installation, installed
-observations and rollback are unexecuted. The receipt contains the separate operator command
-groups and the two-file revert path; offline preparation changes no installed helper.
+records a build in `/tmp/av-delivery.7OYAi0` from a superseded patch revision; that pair was not
+installed. The [installed final-source pair](backend-fork.md#installed-final-source-pair-2026-11-06)
+records the four-token pair actually installed in `/home/bin` on 2026-11-06, its observed
+help/capability contracts and the two rollback backups. Audible gain and live receiver acceptance
+remain unobserved, and an already running daemon keeps its earlier executable. The receipt
+contains the separate operator command groups and the two-file revert path.
 
 ### Live acceptance and residual guarantees
 

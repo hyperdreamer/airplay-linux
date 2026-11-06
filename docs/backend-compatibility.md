@@ -124,13 +124,13 @@ physical-source eligibility from complete source reporting plus a fresh KScreen 
 The public `owner_handshake`/`foreground_control` flags stay false; receipt-backed transport
 admission uses its own authority. Every start, mutation and cleanup still checks the current
 receiver, daemon, endpoint, lease and trust evidence. Missing or stale evidence refuses.
-These implementation facts do not establish an installed pair or a live receiver result. The
+These implementation facts do not establish a live receiver result. The
 [2026-11-05 prepared-pair receipt](backend-fork.md#prepared-volume-helper-pair-2026-11-05)
-records both artifacts in `/tmp/av-delivery.7OYAi0`, their measured hashes, source/patch chain,
-Go/native versions and operator command groups. Status is **prepared, not installed**. The
-rebuilt help/capability probes remain unexecuted under the user's restriction, as do installation,
-installed observations and rollback. The older installations below that receipt remain dated
-historical evidence.
+records the build prepared in `/tmp/av-delivery.7OYAi0` from a superseded patch revision, which was
+not installed. The [2026-11-06 installed final-source pair](backend-fork.md#installed-final-source-pair-2026-11-06)
+records the four-token pair installed in `/home/bin`, its measured source/patch/binary hashes,
+Go/native versions, observed sender token and ctl help contracts, the production probe result and
+both rollback backups. The older installations below that receipt remain dated historical evidence.
 
 ## Historical release-only ownership observations
 

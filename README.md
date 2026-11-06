@@ -62,12 +62,15 @@ network namespace pins in the child's argv and the child requires both to differ
 process inside a user namespace may not read its parent's `/proc/<pid>/ns` entries. Public
 admission requires `owned_daemon_control`, `keyring` and `multi_target`.
 
-A full-chain source-reporting build must advertise `capabilities-v1`, `status-source` and
-`status-source-complete`. That build is installed in `/home/bin`; the rebuild identity and artifact
-hashes are recorded in [docs/backend-fork.md](docs/backend-fork.md). The previous two-token build is
-retained as `/home/bin/doubletake.prev` for rollback. Recognition still requires the matching
-sender/ctl help surface as well as the tokens, so a later or foreign build cannot inherit this
-profile.
+A full-chain build must advertise `capabilities-v1`, `status-source` and
+`status-source-complete`; the installed four-token pair additionally advertises `target-volume`.
+That pair is installed in `/home/bin`; the rebuild identity, artifact hashes and observed
+sender/ctl contracts are recorded in [docs/backend-fork.md](docs/backend-fork.md). The previous
+three-token build is retained as `/home/bin/doubletake.prev` (the older two-token pair as
+`*.prev-2token`) for rollback. Recognition still requires the matching sender/ctl help surface as
+well as the tokens, so a later or foreign build cannot inherit this profile. The upstream fork
+branch `capture-report-selected-source` advertises no tokens, so it is not an installation
+candidate.
 
 Startup capability evidence is derived from the composition's own admission result, not from the public
 help probe: the report sees exactly the `owned_daemon_control`, `keyring`, `physical_source` and

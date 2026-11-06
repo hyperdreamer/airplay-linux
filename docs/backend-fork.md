@@ -229,6 +229,69 @@ the executable help/capability check incomplete. This receipt must retain that l
 an authorized operator actually runs it. The artifacts and logs are temporary; preserve this
 whole directory before `/tmp` is cleared, or rebuild from the recorded source and patch chain.
 
+### Installed final-source pair (2026-11-06)
+
+Status: **installed and verified**. The operator instruction "Install the backend." authorized the
+replacement. The pair was rebuilt from this tree's final source; nothing from
+`/tmp/av-delivery.7OYAi0` (built from the superseded 0004 revision) was installed.
+
+| Item | Measured identity |
+| --- | --- |
+| Supplied base archive | `codeload` tar of tag `c896e368…`, root `doubletake-c896e368…/`, 373,690 bytes |
+| 0001–0003 SHA-256 | `622ecded…`, `0927e2d2…`, `482e7ec8…` (as recorded above) |
+| 0004 SHA-256 | `d5d3359c93fcaf408e7495053de029194c47c193b5e1bf1a33d2466eafaae5c5` |
+| `/home/bin/doubletake` SHA-256 | `3d50ab13904738c73c6eaaec11c4bce7d596348bc74c6d7f08ab4f5788c2abf6` |
+| `/home/bin/doubletake-ctl` SHA-256 | `85eb4d3140f6dc5a2f8105d245027479f04da6b7d014107facd681ac7a507f12` |
+
+The ordered `git apply --check --whitespace=error-all` and application of 0001 → 0004 to a fresh
+extraction at `/tmp/dt-build/source` passed, and `git diff --check` was clean. The build used Go
+**1.27.3-X:nodwarf5** (`/usr/bin/go`, package `go 2:1.27.3-1`) — this host's `/usr/local/bin/go`
+symlink shadows it with **1.14.2**, so the build put `/usr/bin` first — with `CGO_ENABLED=1`,
+`GOFLAGS=-mod=mod`, `GOPROXY=https://goproxy.cn,direct`, `GOSUMDB=off`, `GOTOOLCHAIN=local`,
+`GOWORK=off`, `GOPATH=/tmp/dt-gopath`, `GOMODCACHE=/tmp/dt-gopath/pkg/mod` and GStreamer
+**1.28.8**. The module cache was empty, so dependencies were downloaded through `goproxy.cn`;
+`proxy.golang.org` timed out on this host. `go vet ./...` was clean and `go test -count=1 ./...`
+passed (four tested packages, two without test files).
+
+Observed executable evidence, not expected values:
+
+- `/home/bin/doubletake -capabilities` exits 0 with empty stderr and exactly the four lines
+  `capabilities-v1`, `status-source`, `status-source-complete`, `target-volume`;
+- `/home/bin/doubletake-ctl --help` exits 2 with empty stdout and the extended
+  `connect … --volume`, `volume <0-100> [target]` and `audio off [target]` rows in the
+  documented order before `pin`;
+- `probe_backend(LinuxProcessRunner())` returns `profile=doubletake-0.5+source` with
+  `source_reporting=True`, `source_reporting_complete=True`, `target_volume=True`,
+  `multi_target=True` and `target_mute=True`. `physical_source` stays False because composition,
+  not the public probe, derives it.
+
+Both files were replaced atomically with hash re-verification. Backups:
+
+| Backup | Pair |
+| --- | --- |
+| `/home/bin/*.prev` | previous three-token source chain, `44d85c94…` / `3a1018bb…` |
+| `/home/bin/*.prev-2token` | 2026-10-31 two-token build, `22187a18…` / `6da62590…` |
+
+The documented two-file rollback restores `.prev`; restoring `*.prev-2token` returns to the state
+where Mirror is gated by incomplete source reporting. No daemon, session, service or receiver was
+started, stopped or contacted, so an already running daemon keeps its earlier executable. Audible
+gain, receiver readback and live acceptance remain unobserved. The repository's own
+`tests/environment/test_installed_contracts.py` was not run on this host because it has no pytest
+or application venv; the probe above was executed directly with the standard interpreter.
+
+### The fork branch is not an installation candidate (2026-11-06 observation)
+
+`https://github.com/hyperdreamer/doubletake/tree/capture-report-selected-source` carries the
+reopened PR-76 source-reporting commits only: `internal/airplay/capture.go`, its tests, the daemon
+status/source wiring and its tests. It adds no `-capabilities` flag and no volume surface. Built
+from that branch, `doubletake -capabilities` exits 2 with
+`flag provided but not defined: -capabilities`, and the production probe decodes the pair as
+`profile=doubletake-0.5` with `source_reporting=False`, `source_reporting_complete=False` and
+`target_volume=False` — the plain release profile. Installing it would therefore gate Mirror,
+which requires complete source reporting, and disable the volume row, even though the branch does
+report metadata to a Go caller. The carried chain stays the installation source; PR-76 remains
+upstream provenance, not a deliverable binary.
+
 Delivery documentation validation passed **138 tests, 2 deselected**, exit 0, using
 `/data/home/henry-arch/.venvs/airplay-linux/bin/python -m pytest -q tests/backend/test_contract.py tests/environment/test_installed_contracts.py -m 'not live_backend and not live_kde and not live_hardware' --basetemp=/tmp/av-volume-delivery`.
 The five runbook groups below match the approved brief verbatim and pass `bash -n`; embedded
@@ -361,9 +424,13 @@ hashes and exit status before changing this receipt's installation status. An al
 daemon keeps its earlier executable; replacing paths does not update it. Delivery waits for an
 ordinary separately managed next application start. No running session is manipulated here.
 
-### Installed observation — unexecuted
+### Installed observation — applied to the final-source pair
 
-After separately authorized installation only:
+This group was written for the superseded prepared pair. It was executed on 2026-11-06 against
+the final-source pair instead; the observed outputs are in the
+[installed final-source pair receipt](#installed-final-source-pair-2026-11-06).
+
+The same commands, if an operator repeats them:
 
 ```bash
 sha256sum /home/bin/doubletake /home/bin/doubletake-ctl /home/bin/doubletake.prev /home/bin/doubletake-ctl.prev
@@ -371,10 +438,11 @@ sha256sum /home/bin/doubletake /home/bin/doubletake-ctl /home/bin/doubletake.pre
 /home/bin/doubletake-ctl --help
 ```
 
-Expected: installed hashes match the measured prepared pair; sender exit 0 with exactly the
+Expected: installed hashes match the built pair; sender exit 0 with exactly the
 four tokens; ctl exit 2 with the extended table on stderr. Record both backup hashes and
-observed outputs/exits. Until then the status remains **prepared, not installed**. Neither the
-offline suite nor the older historical hashes below supplies that observation.
+observed outputs/exits. The `/tmp/av-delivery.7OYAi0` pair itself was never installed, so its
+status remains **prepared, not installed**; neither the offline suite nor the older historical
+hashes below supplies an installation observation.
 
 ### Operator-only two-file rollback — unexecuted
 
