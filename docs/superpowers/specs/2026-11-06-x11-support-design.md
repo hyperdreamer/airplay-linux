@@ -1,14 +1,27 @@
 # X11 mirror support (KDE Plasma 6 on X11) — design
 
-- **Status:** design revision 2 after independent review round 1 (2 blockers, 3 majors, all
-  resolved); awaiting review round 2.
-- **Date:** 2026-11-06 (revision 2)
+- **Status:** design revision 3 after independent review rounds 1–2 (round 2 confirmed all five
+  round-1 findings resolved; it raised one blocker, four majors and two minors, all resolved here);
+  awaiting review round 3.
+- **Date:** 2026-11-06 (revision 3)
 - **Delivery target:** `/data/home/guest/Development/airplay-linux`, branch `master`, no usable
   remote (the configured `origin` reports `Repository not found`).
 - **Mockup record:** `docs/superpowers/specs/assets/2026-11-06-x11-mode-reason-mockup.png`,
   option **A** chosen by the operator (line under the mode selector).
 
 ## Revision history
+
+**Revision 3** answers review round 2. Round 2 confirmed all five round-1 findings resolved and
+raised six new items, all accepted:
+
+| Round-2 item | Resolution |
+| --- | --- |
+| 6 blocker: the `(Mode, ModeRefusal)` table is contradictory — mirror/helper is blank while the table must be total, and virtual display has no inventory input | §5.5 defines totality over the **reachable** pairs only, one closed set per mode, and forbids the computation from returning an unreachable value |
+| 7 major: the `backend` sentence blames capture when start admission is what failed | §5.5 adds `admission` as its own refusal with its own sentence, ahead of `backend` in the precedence |
+| 8 major: the new report fields have no specified migration | §5.5 states they default to `None`, that the enforced invariant is one-directional (`available ⇒ None`), and that probe-produced reports are pinned by a totality test; §6 names the constructors |
+| 9 major: per-mode environment diagnostics have no pinned identity or count | §5.2 fixes one distinct detail per mode, prefixed `session-profile`, and §8 pins the exact count and details per profile |
+| 10 minor: the live X11 opt-in is unspecified | §8.8 names the guard variable, the session checks and the command |
+| 11 minor: no rule for other `KDE_SESSION_VERSION` values | §5.1 states that any value other than `5` or `6` maps to `kde-x11-unverified` |
 
 **Revision 2** answers review round 1. Every finding was reproduced against the code before it was
 accepted:
@@ -129,6 +142,10 @@ tokens, case-insensitive, trimmed). The version comes from `KDE_SESSION_VERSION`
 `DESKTOP_SESSION` string is not evidence of a Plasma version. Every other profile keeps its current
 token and meaning, so `gnome-wayland` is still refused by the mirror gate.
 
+A reported `KDE_SESSION_VERSION` that is neither `5` nor `6` — including an empty or unparseable
+value — maps to `kde-x11-unverified`, exactly as the Wayland branch maps it. That profile satisfies
+no mode requirement, so it is refused by both, and §8.1 pins the case.
+
 Rationale: the gate is per mode (§5.2), so the profile must be as specific as the Wayland branch. If
 X11 collapsed to one token, a future widening for Plasma 6 X11 would silently admit every X11
 desktop.
@@ -146,18 +163,28 @@ VIRTUAL_DISPLAY_ENVIRONMENTS   = {kde-plasma-6-wayland}
 physical-source capability, and a non-empty physical inventory. `virtual_display` keeps requiring
 its Wayland profile, `kscreen-doctor`, a probed helper contract, and its backend capability.
 
-The environment diagnostic becomes per mode rather than per session: one diagnostic per unmet mode
-requirement, naming the requirement and the observed profile.
+The environment diagnostic becomes per mode rather than per session: **one distinct diagnostic per
+unmet mode requirement**, whose `detail` is exactly
+
+```
+session-profile <mode>: needs KDE Plasma 6 on Wayland or X11; observed <profile>
+session-profile <mode>: needs KDE Plasma 6 on Wayland; observed <profile>
+```
+
+with `<mode>` one of `mirror` / `virtual-display` and `<profile>` the classified token. Two modes
+that fail therefore produce two different strings, so `note()`'s equality-based deduplication can
+never collapse them, and a test can assert the exact count and the exact details per profile:
 
 | Profile | Environment diagnostics added |
 | --- | --- |
 | `kde-plasma-6-wayland` | none — both requirements are met |
-| `kde-plasma-6-x11` | one, naming `KDE Plasma 6 on Wayland` as the virtual-display requirement |
-| `kde-plasma-5-x11`, `x11`, `gnome-wayland`, `unknown` | one per unmet requirement (two) |
+| `kde-plasma-6-x11` | exactly one, for `virtual-display` |
+| `kde-plasma-5-x11`, `x11`, `gnome-wayland`, `unknown` | exactly two, one per mode |
 
-An admitted capability never carries a refusal beside it: on `kde-plasma-6-x11` mirror is available
-and the only environment diagnostic belongs to virtual display. `note()` already deduplicates
-identical diagnostics, so the table above is the complete set.
+The `session-profile` prefix is deliberate: `ui/state.py`'s mode-keyword diagnostic selection
+(`_MODE_KEYWORDS`) must never pick an environment diagnostic as the pane's error line, and §8 pins
+that it does not. An admitted capability never carries a refusal beside it: on `kde-plasma-6-x11`
+mirror is available and the only environment diagnostic belongs to virtual display.
 
 ### 5.3 Capture and inventory are unchanged
 
@@ -203,15 +230,31 @@ mode therefore explains nothing specific, and an X11 user would be told to "upda
 Wayland-only feature. The design closes that gap with a closed vocabulary rather than by exposing
 diagnostic internals:
 
-- **`domain/resources.py`** gains `ModeRefusal(StrEnum)` with exactly
-  `session`, `dependency`, `backend`, `inventory`, `helper`, and `CapabilityReport` gains
-  `mirror_refusal: ModeRefusal | None` and `virtual_display_refusal: ModeRefusal | None`.
-- **`policy/capabilities.py`** computes both from the same evidence that sets the booleans, with the
-  documented precedence `session → dependency → backend → inventory → helper`. The invariant
-  `report.mirror is (report.mirror_refusal is None)` (and its virtual-display twin) is enforced by
-  test, so the two forms of the same fact cannot drift.
-- **`ui/state.py`** gains `PaneState.mode_reason: str | None`, filled by `project()` from a table
-  that is total over `(Mode, ModeRefusal)`; when the visible mode is available the field is `None`.
+- **`domain/resources.py`** gains `ModeRefusal(StrEnum)` with exactly six values — `session`,
+  `dependency`, `admission`, `backend`, `inventory`, `helper` — and `CapabilityReport` gains
+  `mirror_refusal: ModeRefusal | None = None` and `virtual_display_refusal: ModeRefusal | None = None`.
+  Both default to `None`, so the 19 existing constructors (`ui/presenter.py:217`, `session/testing.py:54`,
+  and every test fixture) keep compiling; a report that simply asserts a boolean keeps saying nothing
+  about why, which is the honest default for a hand-built fixture. The enforced invariant is
+  one-directional and lives in `CapabilityReport.__post_init__`:
+  `mirror is True ⇒ mirror_refusal is None` (and the virtual-display twin). The reverse direction —
+  every probe-produced report with `mirror is False` naming a refusal — is pinned by the totality test
+  in §8.3, which runs the real probe over the whole evidence matrix.
+- **`policy/capabilities.py`** computes both from the same evidence that sets the booleans. Each mode
+  has a closed reachable set, and the computation may never return a value outside it:
+
+  | Mode | Reachable refusals | Admission inputs it reflects |
+  | --- | --- | --- |
+  | mirror | `session`, `dependency`, `admission`, `backend`, `inventory` | `environment_supported`, `_module`/`_command` evidence, `mode_ready`, `physical_source`, inventory |
+  | virtual display | `session`, `dependency`, `admission`, `backend`, `helper` | the same, plus `virtual_source` and the helper probe |
+
+  `admission` is separate from `backend` because `mode_ready` (`capabilities.py:430-431`) can fail on
+  `owned_daemon_control`, `keyring` or `multi_target` while the backend still proves monitor capture;
+  blaming capture there would be false. Precedence, in both modes:
+  `session → dependency → admission → backend → inventory|helper`.
+- **`ui/state.py`** gains `PaneState.mode_reason: str | None`, filled by `project()` from a sentence
+  table that is total over exactly those ten reachable `(Mode, ModeRefusal)` pairs; when the visible
+  mode is available, or no refusal was recorded, the field is `None`.
 - **`ui/window.py`** renders it as one muted line under the mode selector, hidden when `None`
   (mockup option A).
 
@@ -220,13 +263,15 @@ Fixed sentences (pinned byte-for-byte by the specification):
 | Refusal | Mirror | Virtual display |
 | --- | --- | --- |
 | `session` | `Mirror needs KDE Plasma 6 on Wayland or X11.` | `Virtual display needs KDE Plasma 6 on Wayland.` |
-| `dependency` | `A required component is missing; see the diagnostics.` | same sentence |
+| `dependency` | `A required system component is missing; see the diagnostics.` | same sentence |
+| `admission` | `The backend cannot be started from this application yet; its control or keyring evidence is missing.` | same sentence |
 | `backend` | `The installed backend does not provide monitor capture.` | `The installed backend does not provide virtual outputs.` |
-| `inventory` | `No physical monitor could be verified in this session.` | `No output inventory could be verified in this session.` |
-| `helper` | — (not reachable for mirror) | `The virtual-display helper (krfb-virtualmonitor) is not available or unsupported.` |
+| `inventory` | `No physical monitor could be verified in this session.` | unreachable |
+| `helper` | unreachable | `The virtual-display helper (krfb-virtualmonitor) is not available or unsupported.` |
 
 No diagnostic token (`x11`, `physical_source`, `owned_daemon_control`) ever reaches the user through
-this line. The existing diagnostic area keeps its current behaviour.
+this line, and the environment diagnostics of §5.2 are never selected as the pane's error line. The
+existing diagnostic area keeps its current behaviour.
 
 ### 5.6 Virtual display stays Wayland-only
 
@@ -248,13 +293,13 @@ cannot silently become a false claim in either direction.
 | File | Change |
 | --- | --- |
 | `src/airplay_linux/policy/capabilities.py` | X11 profile tokens; `classify_environment` branch; `MIRROR_ENVIRONMENTS` / `VIRTUAL_DISPLAY_ENVIRONMENTS`; per-mode gating and environment diagnostics; label mapping; `ModeRefusal` computation |
-| `src/airplay_linux/domain/resources.py` | `ModeRefusal`; `CapabilityReport.mirror_refusal` / `.virtual_display_refusal`; docstring: `environment` is a display label |
+| `src/airplay_linux/domain/resources.py` | `ModeRefusal`; `CapabilityReport.mirror_refusal` / `.virtual_display_refusal` defaulting to `None`; the one-direction invariant in `__post_init__`; docstring: `environment` is a display label |
 | `src/airplay_linux/diagnostics/activity.py` | `_SAFE_ENVIRONMENTS` becomes the label set |
 | `src/airplay_linux/ui/state.py` | `PaneState.mode_reason`; total `(Mode, ModeRefusal) → sentence` table |
 | `src/airplay_linux/ui/window.py` | one muted reason line under the mode selector, hidden when `None` |
 | `docs/superpowers/specs/assets/2026-11-06-x11-mode-reason-mockup.png` | chosen mockup (option A) |
-| `tests/policy/test_capabilities.py` | environment matrix; mirror admitted on `kde-plasma-6-x11`; virtual display refused there with its own detail; refusal/boolean invariant |
-| `tests/runtime/test_capability_report.py` | expected environment label (was the token) and refusal fields |
+| `tests/policy/test_capabilities.py` | environment matrix; mirror admitted on `kde-plasma-6-x11`; virtual display refused there with its own detail; reachable-refusal sets and the refusal/boolean invariant |
+| `tests/runtime/test_capability_report.py` | expected environment label (was the token) and the refusal fields |
 | `tests/diagnostics/test_safety.py` | the label set is accepted; unknown labels still normalise to `Unknown` |
 | `tests/ui/test_state_projection.py`, `tests/ui/test_presenter.py`, `tests/ui/test_dashboard_widgets.py` | `mode_reason` mapping totality; the line renders; the line hides when the mode is available |
 | `tests/environment/test_live_x11.py` | new, opt-in, mirror-only live checks (session profile, inventory parse, portal introspection) |
@@ -263,13 +308,18 @@ cannot silently become a false claim in either direction.
 
 No new dependency, command or D-Bus interface is introduced.
 
+The other constructors of `CapabilityReport` (`ui/presenter.py:217` `_DISABLED_REPORT`,
+`session/testing.py:54`, and the test fixtures) need no edit: the two new fields default to `None`,
+which means "no refusal recorded", and the invariant they must satisfy (`available ⇒ None`) already
+holds for them.
+
 ## 7. Error handling
 
 | Situation | Observed behaviour |
 | --- | --- |
 | Plasma 6 X11, all mirror evidence present | mirror available; no environment diagnostic; mode-reason line hidden |
 | Plasma 6 X11, virtual display selected | pane line `Virtual display needs KDE Plasma 6 on Wayland.` |
-| Plasma 6 X11, backend or inventory proof missing | that proof's own diagnostic, and the mode-reason line naming it (`backend` or `inventory`) |
+| Plasma 6 X11, backend or inventory proof missing | that proof's own diagnostic, and the mode-reason line naming it (`admission`, `backend` or `inventory`) |
 | Plasma 5 X11, other X11 desktop, unknown session | one environment diagnostic per unmet mode requirement; pane line `Mirror needs KDE Plasma 6 on Wayland or X11.` |
 | Portal returns a non-monitor or unbindable stream on X11 | existing `unsupported_source` / `non_monitor_source` refusal |
 | Layout lacks a position on X11 | existing `missing_position` refusal |
@@ -283,22 +333,30 @@ No new `ErrorCode` is added. No refusal is downgraded to a warning.
    and non-string values falling back to `unknown`.
 2. **Label mapping** (unit): total over the profile set, labels unique, and the diagnostics set equal
    to the mapped labels.
-3. **Refusal vocabulary** (unit): `mirror_refusal is None iff mirror`, same for virtual display; the
-   documented precedence is exercised for every refusal value.
+3. **Refusal vocabulary** (unit): each mode's reachable set is exactly the table in §5.5 and the
+   computation never returns a value outside it; `mirror is True ⇒ mirror_refusal is None` (and its
+   twin) is enforced by `__post_init__`; and the probe, run over the full evidence matrix, always
+   names a refusal whenever it withholds a mode. Precedence is exercised for every reachable value.
 4. **Mode admission** (policy): mirror admitted for `kde-plasma-6-x11` when every other proof is
    present; refused when any single proof is removed, naming that proof; virtual display refused for
    `kde-plasma-6-x11` with `session`; both refused for `kde-plasma-5-x11`, `x11`, `gnome-wayland`.
-5. **Pane reason** (projection): the `(Mode, ModeRefusal)` table is total and its sentences match
-   §5.5 byte-for-byte; `mode_reason` is `None` for an available mode; the widget renders the line and
-   hides it when `None`.
-6. **Diagnostics** (boundary): each new label survives normalisation verbatim; an unknown label stays
-   `Unknown`; the export never carries a token.
+5. **Pane reason** (projection): the sentence table is total over exactly the ten reachable
+   `(Mode, ModeRefusal)` pairs and its sentences match §5.5 byte-for-byte; an unreachable pair is
+   absent from the table; `mode_reason` is `None` for an available mode and for a report that recorded
+   no refusal; the widget renders the line and hides it when `None`.
+6. **Diagnostics** (boundary and policy): each new label survives normalisation verbatim; an unknown
+   label stays `Unknown`; the export never carries a token; every profile produces exactly the
+   environment diagnostics of the §5.2 table, with the exact `session-profile …` details; and
+   `_diagnostic()` still selects none of them as the pane's error line.
 7. **Bootstrap limitation** (runtime): `--check-environment`'s report keeps `mirror=False` on an X11
    profile with the "physical capture provider" diagnostic, documenting the unchanged limitation.
-8. **Live** (opt-in, `tests/environment/test_live_x11.py`): the session classifies as
-   `kde-plasma-6-x11` on a real Plasma 6 X11 session; `kscreen-doctor -j` parses into a non-empty
-   physical inventory; the portal advertises `MONITOR`; no helper is required. It never creates an
-   output and never starts a stream.
+8. **Live** (opt-in, `tests/environment/test_live_x11.py`, run as
+   `AIRPLAY_LIVE_X11=1 pytest -q tests/environment/test_live_x11.py`): module-level guards skip before
+   any host probe when `AIRPLAY_LIVE_X11` is not `1`, when `XDG_SESSION_TYPE` is not `x11`, when the
+   desktop is not KDE, or when `KDE_SESSION_VERSION` is not `6` — the same shape as
+   `tests/environment/test_live_kde.py:50-83`. When it runs, the session classifies as
+   `kde-plasma-6-x11`, `kscreen-doctor -j` parses into a non-empty physical inventory, and the portal
+   advertises `MONITOR`. It never creates an output and never starts a stream.
 9. **Regression**: the full existing suite, unchanged expectations for Wayland, virtual display and
    every refusal already pinned.
 
