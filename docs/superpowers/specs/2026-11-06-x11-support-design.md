@@ -1,15 +1,22 @@
 # X11 mirror support (KDE Plasma 6 on X11) — design
 
-- **Status:** design revision 3 after independent review rounds 1–2 (round 2 confirmed all five
-  round-1 findings resolved; it raised one blocker, four majors and two minors, all resolved here);
-  awaiting review round 3.
-- **Date:** 2026-11-06 (revision 3)
+- **Status:** design revision 4 after independent review rounds 1–3 (round 3 passed with zero
+  blockers and left two majors and one minor, all resolved here); awaiting review round 4.
+- **Date:** 2026-11-06 (revision 4)
 - **Delivery target:** `/data/home/guest/Development/airplay-linux`, branch `master`, no usable
   remote (the configured `origin` reports `Repository not found`).
 - **Mockup record:** `docs/superpowers/specs/assets/2026-11-06-x11-mode-reason-mockup.png`,
   option **A** chosen by the operator (line under the mode selector).
 
 ## Revision history
+
+**Revision 4** answers review round 3, which passed with zero blockers and left three items:
+
+| Round-3 item | Resolution |
+| --- | --- |
+| 2 major: the `admission` sentence is false when only `multi_target` is missing | §5.5's sentence is broadened to "a required start operation is not proven", which is true for `owned_daemon_control`, `keyring` and `multi_target` alike |
+| 4 major: the claim that no environment diagnostic can be selected as the pane's error line is false — `virtual-display` contains the `virtual` keyword and `_capability_diagnostic` has a first-candidate fallback | §5.5 now specifies an explicit exclusion by the shared `session-profile ` prefix, and that the no-candidate case yields **no** pane diagnostic instead of a fabricated `unsupported_operation`; §8.6 pins both |
+| 6 minor: the non-string and unsupported-version rules were ambiguous | §8.1 names the three session variables it covers and pins `KDE_SESSION_VERSION=7` as `kde-x11-unverified` |
 
 **Revision 3** answers review round 2. Round 2 confirmed all five round-1 findings resolved and
 raised six new items, all accepted:
@@ -181,10 +188,11 @@ never collapse them, and a test can assert the exact count and the exact details
 | `kde-plasma-6-x11` | exactly one, for `virtual-display` |
 | `kde-plasma-5-x11`, `x11`, `gnome-wayland`, `unknown` | exactly two, one per mode |
 
-The `session-profile` prefix is deliberate: `ui/state.py`'s mode-keyword diagnostic selection
-(`_MODE_KEYWORDS`) must never pick an environment diagnostic as the pane's error line, and §8 pins
-that it does not. An admitted capability never carries a refusal beside it: on `kde-plasma-6-x11`
-mirror is available and the only environment diagnostic belongs to virtual display.
+The `session-profile` prefix is deliberate and shared: `policy/capabilities.py` writes it from
+`SESSION_PROFILE_DETAIL_PREFIX` in `domain/resources.py`, and `ui/state.py` uses the same constant to
+exclude these diagnostics from the pane's error line, because the plain-words reason of §5.5 already
+covers them. An admitted capability never carries a refusal beside it: on `kde-plasma-6-x11` mirror
+is available and the only environment diagnostic belongs to virtual display.
 
 ### 5.3 Capture and inventory are unchanged
 
@@ -264,14 +272,20 @@ Fixed sentences (pinned byte-for-byte by the specification):
 | --- | --- | --- |
 | `session` | `Mirror needs KDE Plasma 6 on Wayland or X11.` | `Virtual display needs KDE Plasma 6 on Wayland.` |
 | `dependency` | `A required system component is missing; see the diagnostics.` | same sentence |
-| `admission` | `The backend cannot be started from this application yet; its control or keyring evidence is missing.` | same sentence |
+| `admission` | `The backend cannot start a stream from this application yet; a required start operation is not proven.` | same sentence |
 | `backend` | `The installed backend does not provide monitor capture.` | `The installed backend does not provide virtual outputs.` |
 | `inventory` | `No physical monitor could be verified in this session.` | unreachable |
 | `helper` | unreachable | `The virtual-display helper (krfb-virtualmonitor) is not available or unsupported.` |
 
 No diagnostic token (`x11`, `physical_source`, `owned_daemon_control`) ever reaches the user through
-this line, and the environment diagnostics of §5.2 are never selected as the pane's error line. The
-existing diagnostic area keeps its current behaviour.
+this line, and the environment diagnostics of §5.2 are never selected as the pane's error line: the
+prefix is a shared constant (`domain/resources.py`), and `ui/state.py`'s `_capability_diagnostic`
+excludes every diagnostic whose detail starts with it, **before** its keyword match and **before**
+its first-candidate fallback (`state.py:1256-1265`). When that exclusion leaves no candidate, the
+function returns `None` rather than manufacturing `unsupported_operation`, so a session that fails
+only on the environment shows the reason line and no contradictory "update doubletake" message.
+This also corrects the same false message for a GNOME Wayland user today. The existing diagnostic
+area keeps its current behaviour for every other kind of refusal.
 
 ### 5.6 Virtual display stays Wayland-only
 
@@ -293,9 +307,9 @@ cannot silently become a false claim in either direction.
 | File | Change |
 | --- | --- |
 | `src/airplay_linux/policy/capabilities.py` | X11 profile tokens; `classify_environment` branch; `MIRROR_ENVIRONMENTS` / `VIRTUAL_DISPLAY_ENVIRONMENTS`; per-mode gating and environment diagnostics; label mapping; `ModeRefusal` computation |
-| `src/airplay_linux/domain/resources.py` | `ModeRefusal`; `CapabilityReport.mirror_refusal` / `.virtual_display_refusal` defaulting to `None`; the one-direction invariant in `__post_init__`; docstring: `environment` is a display label |
+| `src/airplay_linux/domain/resources.py` | `ModeRefusal`; `SESSION_PROFILE_DETAIL_PREFIX`; `CapabilityReport.mirror_refusal` / `.virtual_display_refusal` defaulting to `None`; the one-direction invariant in `__post_init__`; docstring: `environment` is a display label |
 | `src/airplay_linux/diagnostics/activity.py` | `_SAFE_ENVIRONMENTS` becomes the label set |
-| `src/airplay_linux/ui/state.py` | `PaneState.mode_reason`; total `(Mode, ModeRefusal) → sentence` table |
+| `src/airplay_linux/ui/state.py` | `PaneState.mode_reason`; total `(Mode, ModeRefusal) → sentence` table; `_capability_diagnostic` excludes `session-profile ` diagnostics and returns `None` instead of a fabricated `unsupported_operation` when nothing remains |
 | `src/airplay_linux/ui/window.py` | one muted reason line under the mode selector, hidden when `None` |
 | `docs/superpowers/specs/assets/2026-11-06-x11-mode-reason-mockup.png` | chosen mockup (option A) |
 | `tests/policy/test_capabilities.py` | environment matrix; mirror admitted on `kde-plasma-6-x11`; virtual display refused there with its own detail; reachable-refusal sets and the refusal/boolean invariant |
@@ -329,8 +343,12 @@ No new `ErrorCode` is added. No refusal is downgraded to a warning.
 ## 8. Test strategy
 
 1. **Classification matrix** (unit): every profile token from its environment mapping, including X11
-   with and without KDE, `KDE_SESSION_VERSION=5`, a missing version, mixed case, padded whitespace,
-   and non-string values falling back to `unknown`.
+   with and without KDE, `KDE_SESSION_VERSION` of `5`, `7`, absent, empty and padded, mixed case, and
+   whitespace-padded desktop values. An unsupported version (`7`) maps to `kde-x11-unverified`, never
+   to a supported profile. A non-string value for any of `XDG_SESSION_TYPE`, `XDG_CURRENT_DESKTOP` or
+   `KDE_SESSION_VERSION` is read as empty text — never coerced — so a non-string session type falls
+   back to `unknown`, while a non-string desktop or version falls back to the unverified profile the
+   remaining evidence supports.
 2. **Label mapping** (unit): total over the profile set, labels unique, and the diagnostics set equal
    to the mapped labels.
 3. **Refusal vocabulary** (unit): each mode's reachable set is exactly the table in §5.5 and the
@@ -346,8 +364,9 @@ No new `ErrorCode` is added. No refusal is downgraded to a warning.
    no refusal; the widget renders the line and hides it when `None`.
 6. **Diagnostics** (boundary and policy): each new label survives normalisation verbatim; an unknown
    label stays `Unknown`; the export never carries a token; every profile produces exactly the
-   environment diagnostics of the §5.2 table, with the exact `session-profile …` details; and
-   `_diagnostic()` still selects none of them as the pane's error line.
+   environment diagnostics of the §5.2 table, with the exact `session-profile …` details; and a
+   projection whose only diagnostics are `session-profile` ones returns `diagnostics is None` for both
+   selected modes, while a projection with a real capture or helper refusal still selects that one.
 7. **Bootstrap limitation** (runtime): `--check-environment`'s report keeps `mirror=False` on an X11
    profile with the "physical capture provider" diagnostic, documenting the unchanged limitation.
 8. **Live** (opt-in, `tests/environment/test_live_x11.py`, run as
