@@ -37,6 +37,12 @@ desktop, and a usable Secret Service. Virtual mode additionally requires `krfb-v
 and its ownership association verifier. Availability must be observed on the intended host;
 the offline suite supplies controlled boundaries and proves no current host readiness.
 
+Portal-backed Mirror is offered on KDE Plasma 6 X11 as well as KDE Plasma 6 Wayland, and
+X11 adds no new capture path: the same backend, physical-monitor inventory and per-stream
+source-verification proofs must pass first. The bootstrap `--check-environment` report
+cannot establish those proofs, so it never proves production capture. Virtual display
+remains KDE Plasma 6 Wayland-only; X11 has no virtual-output provider.
+
 ## Receiver volume and session mute
 
 The **Volume** row stays visible below the primary actions, including with no receiver selected
