@@ -49,9 +49,11 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     IntentStage,
     Mode,
+    ModeRefusal,
     PhysicalMonitorSource,
     ResolutionDecision,
     ResolutionEvidence,
+    SESSION_PROFILE_DETAIL_PREFIX,
     SessionPhase,
     Size,
     TransportState,
@@ -1037,6 +1039,130 @@ def test_a_mismatch_still_stopping_the_old_stream_is_not_recreatable() -> None:
 
 # ---------------------------------------------------------------- capability failure
 
+_DEPENDENCY_SENTENCE = "A required system component is missing; see the diagnostics."
+_ADMISSION_SENTENCE = (
+    "The backend cannot start a stream from this application yet; a required "
+    "start operation is not proven."
+)
+
+_MIRROR_MODE_REASONS = {
+    ModeRefusal.session: "Mirror needs KDE Plasma 6 on Wayland or X11.",
+    ModeRefusal.dependency: _DEPENDENCY_SENTENCE,
+    ModeRefusal.admission: _ADMISSION_SENTENCE,
+    ModeRefusal.backend: "The installed backend does not provide monitor capture.",
+    ModeRefusal.inventory: "No physical monitor could be verified in this session.",
+}
+_VIRTUAL_MODE_REASONS = {
+    ModeRefusal.session: "Virtual display needs KDE Plasma 6 on Wayland.",
+    ModeRefusal.dependency: _DEPENDENCY_SENTENCE,
+    ModeRefusal.admission: _ADMISSION_SENTENCE,
+    ModeRefusal.backend: "The installed backend does not provide virtual outputs.",
+    ModeRefusal.helper: (
+        "The virtual-display helper (krfb-virtualmonitor) is not available or "
+        "unsupported."
+    ),
+}
+
+
+def _withheld_report(mode: Mode, refusal: ModeRefusal) -> CapabilityReport:
+    """A report withholding exactly the named mode for the named reason."""
+    if mode is Mode.MIRROR:
+        return capabilities(mirror=False, mirror_refusal=refusal)
+    return capabilities(virtual_display=False, virtual_display_refusal=refusal)
+
+
+def test_mode_reason_table_covers_exactly_the_ten_reachable_pairs() -> None:
+    from airplay_linux.ui.state import _MODE_REFUSAL_SENTENCES
+
+    expected = {
+        (Mode.MIRROR, refusal): sentence
+        for refusal, sentence in _MIRROR_MODE_REASONS.items()
+    } | {
+        (Mode.VIRTUAL, refusal): sentence
+        for refusal, sentence in _VIRTUAL_MODE_REASONS.items()
+    }
+    # Exact equality proves the table has no extra pair and no renamed copy.
+    assert dict(_MODE_REFUSAL_SENTENCES) == expected
+
+    # Each refusal belongs only to the modes whose table declares it.
+    modes_by_refusal: dict[ModeRefusal, set[Mode]] = {}
+    for mode, refusal in _MODE_REFUSAL_SENTENCES:
+        modes_by_refusal.setdefault(refusal, set()).add(mode)
+    assert modes_by_refusal[ModeRefusal.inventory] == {Mode.MIRROR}
+    assert modes_by_refusal[ModeRefusal.helper] == {Mode.VIRTUAL}
+    for refusal in (
+        ModeRefusal.session,
+        ModeRefusal.dependency,
+        ModeRefusal.admission,
+        ModeRefusal.backend,
+    ):
+        assert modes_by_refusal[refusal] == {Mode.MIRROR, Mode.VIRTUAL}
+
+    # Every declared pair is what the projection actually renders.
+    for (mode, refusal), sentence in expected.items():
+        pane = project(
+            idle(),
+            inputs(
+                selected_mode=mode,
+                capabilities=_withheld_report(mode, refusal),
+            ),
+        )
+        assert pane.mode_reason == sentence
+
+
+def test_mode_reason_is_none_for_available_or_unrecorded_visible_mode() -> None:
+    available = project(idle(), inputs(selected_mode=Mode.MIRROR))
+    assert available.mode_reason is None
+
+    # An unavailable hand-built report need not record a refusal.
+    unrecorded = project(
+        idle(),
+        inputs(
+            selected_mode=Mode.VIRTUAL,
+            capabilities=capabilities(virtual_display=False),
+        ),
+    )
+    assert unrecorded.mode_reason is None
+
+    # The active session's own mode stays authoritative over the selection.
+    active = _mirroring_state()
+    withheld_virtual = capabilities(
+        virtual_display=False,
+        virtual_display_refusal=ModeRefusal.session,
+    )
+    pane = project(
+        active, inputs(selected_mode=Mode.VIRTUAL, capabilities=withheld_virtual)
+    )
+    assert pane.visible_mode is Mode.MIRROR
+    assert pane.mode_reason is None
+
+    withheld_mirror = capabilities(mirror=False, mirror_refusal=ModeRefusal.backend)
+    pane = project(
+        active, inputs(selected_mode=Mode.VIRTUAL, capabilities=withheld_mirror)
+    )
+    assert pane.visible_mode is Mode.MIRROR
+    assert pane.mode_reason == "The installed backend does not provide monitor capture."
+
+
+def test_mode_reason_falls_back_for_a_constructible_unreachable_pair() -> None:
+    mirror = project(
+        idle(),
+        inputs(
+            selected_mode=Mode.MIRROR,
+            capabilities=_withheld_report(Mode.MIRROR, ModeRefusal.helper),
+        ),
+    )
+    virtual = project(
+        idle(),
+        inputs(
+            selected_mode=Mode.VIRTUAL,
+            capabilities=_withheld_report(Mode.VIRTUAL, ModeRefusal.inventory),
+        ),
+    )
+
+    assert mirror.mode_reason == "Mirror is not available in this session."
+    assert virtual.mode_reason == "Virtual display is not available in this session."
+
 
 def test_capability_failure_names_the_missing_command_and_offers_retry() -> None:
     state = idle()
@@ -1140,6 +1266,127 @@ def test_a_mode_gate_never_reports_an_audio_diagnostic_alone() -> None:
     assert pane.diagnostic is not None
     assert pane.diagnostic.code is ErrorCode.unsupported_operation
     assert "audio" not in pane.diagnostic.message.lower()
+
+
+def test_session_profile_diagnostics_are_excluded_before_keyword_matching() -> None:
+    profile = replace(
+        diagnostic(ErrorCode.unsupported_operation),
+        detail=(
+            f"{SESSION_PROFILE_DETAIL_PREFIX}virtual-display: needs KDE Plasma 6 on "
+            "Wayland; observed kde-plasma-6-x11"
+        ),
+    )
+
+    # The session-profile detail names the selected mode's keyword, so an
+    # unfiltered ranking would select it before the real provider cause.
+    report = capabilities(
+        virtual_display=False,
+        virtual_display_refusal=ModeRefusal.session,
+        diagnostics=(
+            profile,
+            replace(
+                diagnostic(ErrorCode.dependency_incompatible),
+                detail="kscreen output contract",
+            ),
+            replace(diagnostic(ErrorCode.keyring_unavailable), detail="Secret Service"),
+        ),
+    )
+    pane = project(idle(), inputs(selected_mode=Mode.VIRTUAL, capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.detail == "kscreen output contract"
+
+    # Concrete-cause ranking among the remaining diagnostics is unchanged.
+    report = capabilities(
+        virtual_display=False,
+        virtual_display_refusal=ModeRefusal.session,
+        diagnostics=(
+            profile,
+            replace(diagnostic(ErrorCode.keyring_unavailable), detail="Secret Service"),
+            replace(
+                diagnostic(ErrorCode.dependency_incompatible),
+                detail="unrelated_contract",
+            ),
+        ),
+    )
+    pane = project(idle(), inputs(selected_mode=Mode.VIRTUAL, capabilities=report))
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.code is ErrorCode.keyring_unavailable
+    assert pane.diagnostic.detail == "Secret Service"
+
+
+def test_environment_only_mode_refusal_has_no_synthetic_diagnostic() -> None:
+    mirror_profile = replace(
+        diagnostic(ErrorCode.unsupported_operation),
+        detail=(
+            f"{SESSION_PROFILE_DETAIL_PREFIX}mirror: needs KDE Plasma 6 on Wayland or "
+            "X11; observed x11"
+        ),
+    )
+    mirror = project(
+        idle(),
+        inputs(
+            selected_mode=Mode.MIRROR,
+            capabilities=capabilities(
+                mirror=False,
+                mirror_refusal=ModeRefusal.session,
+                diagnostics=(mirror_profile,),
+            ),
+        ),
+    )
+
+    assert mirror.mode_reason == "Mirror needs KDE Plasma 6 on Wayland or X11."
+    assert mirror.diagnostic is None
+
+    virtual_profile = replace(
+        diagnostic(ErrorCode.unsupported_operation),
+        detail=(
+            f"{SESSION_PROFILE_DETAIL_PREFIX}virtual-display: needs KDE Plasma 6 on "
+            "Wayland; observed x11"
+        ),
+    )
+    virtual = project(
+        idle(),
+        inputs(
+            selected_mode=Mode.VIRTUAL,
+            capabilities=capabilities(
+                virtual_display=False,
+                virtual_display_refusal=ModeRefusal.session,
+                diagnostics=(virtual_profile,),
+            ),
+        ),
+    )
+
+    assert virtual.mode_reason == "Virtual display needs KDE Plasma 6 on Wayland."
+    assert virtual.diagnostic is None
+
+
+def test_non_environment_empty_candidates_keep_unsupported_operation() -> None:
+    empty = project(
+        idle(),
+        inputs(capabilities=capabilities(mirror=False, mirror_refusal=ModeRefusal.backend)),
+    )
+    assert empty.diagnostic is not None
+    assert empty.diagnostic.code is ErrorCode.unsupported_operation
+
+    audio_only = project(
+        idle(),
+        inputs(
+            capabilities=capabilities(
+                mirror=False,
+                mirror_refusal=ModeRefusal.backend,
+                diagnostics=(
+                    replace(
+                        diagnostic(ErrorCode.audio_unavailable),
+                        detail="org.freedesktop.portal.Desktop",
+                    ),
+                ),
+            )
+        ),
+    )
+    assert audio_only.diagnostic is not None
+    assert audio_only.diagnostic.code is ErrorCode.unsupported_operation
 
 
 def test_a_blocked_mode_names_the_keyring_cause_not_a_generic_incompatibility() -> None:

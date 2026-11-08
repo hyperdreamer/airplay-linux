@@ -45,7 +45,9 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     IntentStage,
     Mode,
+    ModeRefusal,
     PhysicalMonitorSource,
+    SESSION_PROFILE_DETAIL_PREFIX,
     SessionPhase,
     Size,
     TransportState,
@@ -142,6 +144,7 @@ class PaneState:
     actions: frozenset[Action]
     mode_enabled: bool
     visible_mode: Mode
+    mode_reason: str | None
     primary_label: str
     source_enabled: bool
     resolution_enabled: bool
@@ -385,6 +388,7 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         actions=actions,
         mode_enabled=_mode_enabled(snapshot, ownership),
         visible_mode=_visible_mode(snapshot, inputs),
+        mode_reason=_mode_reason(snapshot, inputs),
         primary_label=decision.primary,
         source_enabled=_source_enabled(snapshot, inputs),
         resolution_enabled=_resolution_enabled(snapshot, inputs),
@@ -1234,9 +1238,77 @@ def _names_mode(item: Diagnostic, keywords: tuple[str, ...]) -> bool:
     return any(word in detail for word in keywords)
 
 
+#: The exact reason line for every reachable withheld mode.  The pairs are
+#: exhaustive over the policy probe's closed refusal tables; a constructible
+#: pair outside it still renders the fixed per-mode fallback below.
+_MODE_REFUSAL_SENTENCES: Final[Mapping[tuple[Mode, ModeRefusal], str]] = (
+    MappingProxyType(
+        {
+            (Mode.MIRROR, ModeRefusal.session): (
+                "Mirror needs KDE Plasma 6 on Wayland or X11."
+            ),
+            (Mode.MIRROR, ModeRefusal.dependency): (
+                "A required system component is missing; see the diagnostics."
+            ),
+            (Mode.MIRROR, ModeRefusal.admission): (
+                "The backend cannot start a stream from this application yet; a "
+                "required start operation is not proven."
+            ),
+            (Mode.MIRROR, ModeRefusal.backend): (
+                "The installed backend does not provide monitor capture."
+            ),
+            (Mode.MIRROR, ModeRefusal.inventory): (
+                "No physical monitor could be verified in this session."
+            ),
+            (Mode.VIRTUAL, ModeRefusal.session): (
+                "Virtual display needs KDE Plasma 6 on Wayland."
+            ),
+            (Mode.VIRTUAL, ModeRefusal.dependency): (
+                "A required system component is missing; see the diagnostics."
+            ),
+            (Mode.VIRTUAL, ModeRefusal.admission): (
+                "The backend cannot start a stream from this application yet; a "
+                "required start operation is not proven."
+            ),
+            (Mode.VIRTUAL, ModeRefusal.backend): (
+                "The installed backend does not provide virtual outputs."
+            ),
+            (Mode.VIRTUAL, ModeRefusal.helper): (
+                "The virtual-display helper (krfb-virtualmonitor) is not available "
+                "or unsupported."
+            ),
+        }
+    )
+)
+
+
+def _mode_reason(state: SessionSnapshot, inputs: ViewInputs) -> str | None:
+    """The sentence for a withheld *visible* mode, or ``None`` when it is usable.
+
+    The displayed mode follows the active session, not the pending selection, so
+    the reason always describes the control the user is actually looking at.
+    """
+    mode = _visible_mode(state, inputs)
+    report = inputs.capabilities
+    if mode is Mode.MIRROR:
+        available, refusal = report.mirror, report.mirror_refusal
+    else:
+        available, refusal = report.virtual_display, report.virtual_display_refusal
+    if available or refusal is None:
+        return None
+    sentence = _MODE_REFUSAL_SENTENCES.get((mode, refusal))
+    if sentence is not None:
+        return sentence
+    return (
+        "Mirror is not available in this session."
+        if mode is Mode.MIRROR
+        else "Virtual display is not available in this session."
+    )
+
+
 def _capability_diagnostic(
     state: SessionSnapshot, inputs: ViewInputs
-) -> Diagnostic:
+) -> Diagnostic | None:
     """The most specific frozen failure that actually explains this mode.
 
     Ranking keeps the pane from blaming an unrelated lane or an unrelated mode:
@@ -1249,8 +1321,16 @@ def _capability_diagnostic(
     """
     report = inputs.capabilities
     keywords = _MODE_KEYWORDS[inputs.selected_mode]
+    # A per-mode session profile explains the mode gate through ``mode_reason``;
+    # it is never the error line, even when its detail names this mode.
+    non_environment = tuple(
+        item
+        for item in report.diagnostics
+        if not (item.detail or "").startswith(SESSION_PROFILE_DETAIL_PREFIX)
+    )
+    removed_environment = len(non_environment) != len(report.diagnostics)
     candidates = tuple(
-        item for item in report.diagnostics if item.code not in _FOREIGN_LANE_CODES
+        item for item in non_environment if item.code not in _FOREIGN_LANE_CODES
     )
     for item in candidates:
         if _names_mode(item, keywords):
@@ -1263,6 +1343,8 @@ def _capability_diagnostic(
             return item
     if candidates:
         return candidates[0]
+    if not non_environment and removed_environment:
+        return None
     return _catalog(ErrorCode.unsupported_operation, state.receiver_id)
 
 
