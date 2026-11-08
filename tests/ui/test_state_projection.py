@@ -1389,6 +1389,42 @@ def test_non_environment_empty_candidates_keep_unsupported_operation() -> None:
     assert audio_only.diagnostic.code is ErrorCode.unsupported_operation
 
 
+def test_removed_environment_with_only_foreign_lane_keeps_unsupported_operation() -> None:
+    """Removing a session profile must not swallow the foreign-lane fallback.
+
+    The profile is excluded before ranking, but it still leaves a non-empty
+    non-environment list behind; that list holds only an audio diagnostic, which
+    may never become the mode's cause.  The withheld operation is still the
+    answer, so dropping the profile alone may not suppress it.
+    """
+    profile = replace(
+        diagnostic(ErrorCode.unsupported_operation),
+        detail=(
+            f"{SESSION_PROFILE_DETAIL_PREFIX}mirror: needs KDE Plasma 6 on Wayland "
+            "or X11; observed x11"
+        ),
+    )
+    pane = project(
+        idle(),
+        inputs(
+            capabilities=capabilities(
+                mirror=False,
+                mirror_refusal=ModeRefusal.backend,
+                diagnostics=(
+                    profile,
+                    replace(
+                        diagnostic(ErrorCode.audio_unavailable),
+                        detail="org.freedesktop.portal.Desktop",
+                    ),
+                ),
+            )
+        ),
+    )
+
+    assert pane.diagnostic is not None
+    assert pane.diagnostic.code is ErrorCode.unsupported_operation
+
+
 def test_a_blocked_mode_names_the_keyring_cause_not_a_generic_incompatibility() -> None:
     """Admission evidence is the real blocker when the backend affirms the rest."""
     report = capabilities(
