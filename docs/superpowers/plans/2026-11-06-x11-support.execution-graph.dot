@@ -1,0 +1,22 @@
+digraph x11_support {
+  rankdir=TB;
+  node [shape=box, style=rounded, fontsize=10];
+  subgraph cluster_policy {
+    label="policy";
+    "T-001" [label="T-001 (plan 1)\nImplement session profiles, independent mode gates, and refusal contracts\nAdvanced"];
+    "T-002" [label="T-002 (plan 2)\nNormalize environment labels at the diagnostics boundary\nStandard"];
+  }
+  subgraph cluster_ui {
+    label="ui";
+    "T-003" [label="T-003 (plan 3)\nProject mode refusal reasons and filter session diagnostics\nAdvanced"];
+    "T-004" [label="T-004 (plan 4)\nRender the mode reason under the selector\nStandard"];
+  }
+  subgraph cluster_docs {
+    label="docs";
+    "T-005" [label="T-005 (plan 5)\nDocument X11 Mirror and add guarded read-only checks\nStandard"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-003" -> "T-004";
+  "T-001" -> "T-005";
+}

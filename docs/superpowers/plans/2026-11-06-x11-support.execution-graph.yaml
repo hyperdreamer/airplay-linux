@@ -1,0 +1,129 @@
+schema: 1
+topic: x11-support
+source_plan:
+  path: docs/superpowers/plans/2026-11-06-x11-support.md
+  sha256: 74e540f91b5a5b250185a3779a3961b97ca1808b611581c5fcd437f581490b16
+  digest: 74e540f91b5a5b250185a3779a3961b97ca1808b611581c5fcd437f581490b16
+  task_count: 5
+lanes:
+  - id: policy
+    task_ids:
+      - T-001
+      - T-002
+  - id: ui
+    task_ids:
+      - T-003
+      - T-004
+  - id: docs
+    task_ids:
+      - T-005
+tasks:
+  - id: T-001
+    plan_task: 1
+    title: Implement session profiles, independent mode gates, and refusal contracts
+    lane: policy
+    sequence: 1
+    depends_on: []
+    owns:
+      - src/airplay_linux/domain/resources.py
+      - src/airplay_linux/policy/capabilities.py
+      - tests/policy/test_capabilities.py
+      - tests/runtime/test_capability_report.py
+    exclusive_resources: []
+    interfaces:
+      produces: []
+      consumes: []
+    validation:
+      argv:
+        - /data/home/guest/Development/airplay-linux/.venv/bin/python
+        - -m
+        - pytest
+        - -q
+        - tests/policy/test_capabilities.py
+        - tests/runtime/test_capability_report.py
+  - id: T-002
+    plan_task: 2
+    title: Normalize environment labels at the diagnostics boundary
+    lane: policy
+    sequence: 2
+    depends_on:
+      - T-001
+    owns:
+      - src/airplay_linux/diagnostics/activity.py
+      - tests/diagnostics/test_safety.py
+    exclusive_resources: []
+    interfaces:
+      produces: []
+      consumes: []
+    validation:
+      argv:
+        - /data/home/guest/Development/airplay-linux/.venv/bin/python
+        - -m
+        - pytest
+        - -q
+        - tests/diagnostics/test_safety.py
+  - id: T-003
+    plan_task: 3
+    title: Project mode refusal reasons and filter session diagnostics
+    lane: ui
+    sequence: 1
+    depends_on:
+      - T-001
+    owns:
+      - src/airplay_linux/ui/state.py
+      - tests/ui/test_state_projection.py
+    exclusive_resources: []
+    interfaces:
+      produces: []
+      consumes: []
+    validation:
+      argv:
+        - /data/home/guest/Development/airplay-linux/.venv/bin/python
+        - -m
+        - pytest
+        - -q
+        - tests/ui/test_state_projection.py
+  - id: T-004
+    plan_task: 4
+    title: Render the mode reason under the selector
+    lane: ui
+    sequence: 2
+    depends_on:
+      - T-003
+    owns:
+      - src/airplay_linux/ui/window.py
+      - tests/ui/test_dashboard_widgets.py
+      - tests/ui/test_presenter.py
+    exclusive_resources: []
+    interfaces:
+      produces: []
+      consumes: []
+    validation:
+      argv:
+        - /data/home/guest/Development/airplay-linux/.venv/bin/python
+        - -m
+        - pytest
+        - -q
+        - tests/ui/test_dashboard_widgets.py
+        - tests/ui/test_presenter.py
+  - id: T-005
+    plan_task: 5
+    title: Document X11 Mirror and add guarded read-only checks
+    lane: docs
+    sequence: 1
+    depends_on:
+      - T-001
+    owns:
+      - docs/operations.md
+      - tests/environment/test_live_x11.py
+    exclusive_resources: []
+    interfaces:
+      produces: []
+      consumes: []
+    validation:
+      argv:
+        - /data/home/guest/Development/airplay-linux/.venv/bin/python
+        - -m
+        - pytest
+        - -q
+        - tests/environment/test_live_x11.py
