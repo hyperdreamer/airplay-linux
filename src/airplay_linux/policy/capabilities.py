@@ -104,15 +104,19 @@ KDE_PLASMA_6_WAYLAND: Final[str] = DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value
 
 #: The profiles where portal-backed Mirror may be offered. The portal owns the
 #: capture on both KDE Plasma 6 sessions, so no direct X11 capture path exists.
-MIRROR_ENVIRONMENTS: Final[set[str]] = {
-    DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
-    DesktopEnvironment.KDE_PLASMA_6_X11.value,
-}
+MIRROR_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {
+        DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
+        DesktopEnvironment.KDE_PLASMA_6_X11.value,
+    }
+)
 
 #: The profiles where the KDE virtual-output provider may be offered.
-VIRTUAL_DISPLAY_ENVIRONMENTS: Final[set[str]] = {
-    DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
-}
+VIRTUAL_DISPLAY_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {
+        DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
+    }
+)
 
 #: The one token-to-label map. Every consumer reports these exact strings, and
 #: a token outside it is exactly ``"Unknown"``.

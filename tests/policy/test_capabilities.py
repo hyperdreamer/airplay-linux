@@ -1252,7 +1252,7 @@ async def test_bootstrap_probe_without_capture_keeps_mirror_false_on_x11():
         ({**PLASMA, "KDE_SESSION_VERSION": ""}, "kde-wayland-unverified", False),
     ],
 )
-async def test_other_or_unproven_desktops_are_reported_separately_and_gated(
+async def test_profile_labels_and_independent_mode_gates_across_supported_and_unsupported_profiles(
     environment: dict[str, str], token: str, mirror: bool,
 ):
     report = await probe(environment=environment).check()
