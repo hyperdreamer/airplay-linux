@@ -135,6 +135,28 @@ class RecoveryAction(StrEnum):
     keep = "keep"
 
 
+class ModeRefusal(StrEnum):
+    """Why one mode is withheld, named by the first unmet requirement.
+
+    This is an explanation carried beside a mode's availability, never an
+    ``ErrorCode``: ``can_start`` still refuses an unavailable mode with
+    ``unsupported_operation`` and the catalog's fixed copy.
+    """
+
+    session = "session"
+    dependency = "dependency"
+    admission = "admission"
+    backend = "backend"
+    inventory = "inventory"
+    helper = "helper"
+
+
+#: Shared prefix of the per-mode session-profile diagnostics. Policy creation
+#: and UI filtering consume this one constant, so neither can drift from the
+#: other.
+SESSION_PROFILE_DETAIL_PREFIX: str = "session-profile "
+
+
 @dataclass(frozen=True, kw_only=True)
 class Diagnostic:
     """A sanitized message; adapters must never include raw backend exceptions."""
@@ -235,6 +257,15 @@ class ReceiverCapabilities:
 
 @dataclass(frozen=True, kw_only=True)
 class CapabilityReport:
+    """Affirmative capability evidence for one startup environment.
+
+    ``environment`` is the human-readable session label; the internal profile
+    token stays in the policy probe, where it decides the per-mode session gate
+    and the ``session-profile`` diagnostic details. A withheld mode records the
+    first unmet requirement in its own ``*_refusal`` field; an available mode
+    must not carry one.
+    """
+
     environment: str
     discovery: bool
     mirror: bool
@@ -244,10 +275,18 @@ class CapabilityReport:
     additional_virtual_outputs: bool
     diagnostics: tuple[Diagnostic, ...]
     volume: bool = False
+    mirror_refusal: ModeRefusal | None = None
+    virtual_display_refusal: ModeRefusal | None = None
 
     def __post_init__(self) -> None:
         if type(self.volume) is not bool:
             raise TypeError("volume capability must be a boolean")
+        # Only this direction is an invariant. A hand-built report may withhold
+        # a mode without recording why; the probe itself records every refusal.
+        if self.mirror is True and self.mirror_refusal is not None:
+            raise ValueError("an available Mirror cannot carry a refusal")
+        if self.virtual_display is True and self.virtual_display_refusal is not None:
+            raise ValueError("an available Virtual display cannot carry a refusal")
 
 
 @dataclass(frozen=True, kw_only=True)

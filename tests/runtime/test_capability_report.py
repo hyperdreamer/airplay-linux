@@ -26,7 +26,13 @@ from airplay_linux import runtime as composition
 from airplay_linux.backend.contract import CredentialProofVerdict
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.ports import CommandOutput
-from airplay_linux.domain.resources import Err, ErrorCode, Ok
+from airplay_linux.domain.resources import (
+    CapabilityReport,
+    Err,
+    ErrorCode,
+    ModeRefusal,
+    Ok,
+)
 from airplay_linux.runtime import RuntimeConfig, build_runtime
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -140,6 +146,50 @@ async def _report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capabilities:
         await runtime.shutdown()
 
 
+def _hand_built_report(*, mirror: bool, virtual_display: bool) -> CapabilityReport:
+    """A constructible report with no explicit refusal fields, as fixtures build it."""
+    return CapabilityReport(
+        environment="KDE Plasma 6 Wayland",
+        discovery=True,
+        mirror=mirror,
+        virtual_display=virtual_display,
+        audio=True,
+        remembered_pairing=True,
+        additional_virtual_outputs=False,
+        diagnostics=(),
+    )
+
+
+def test_capability_report_refusal_invariant_is_one_directional() -> None:
+    """Availability forbids a refusal; unavailability permits either value."""
+    mirror_only = _hand_built_report(mirror=True, virtual_display=False)
+    virtual_only = _hand_built_report(mirror=False, virtual_display=True)
+
+    assert mirror_only.mirror_refusal is None
+    assert mirror_only.virtual_display_refusal is None
+    assert virtual_only.mirror_refusal is None
+    assert virtual_only.virtual_display_refusal is None
+
+    # An available mode may not carry a refusal, in either direction.
+    with pytest.raises(ValueError):
+        replace(mirror_only, mirror_refusal=ModeRefusal.session)
+    with pytest.raises(ValueError):
+        replace(virtual_only, virtual_display_refusal=ModeRefusal.session)
+
+    # An unavailable mode stays constructible both with and without a refusal.
+    refused = replace(
+        _hand_built_report(mirror=False, virtual_display=False),
+        mirror_refusal=ModeRefusal.backend,
+        virtual_display_refusal=ModeRefusal.helper,
+    )
+    assert refused.mirror_refusal is ModeRefusal.backend
+    assert refused.virtual_display_refusal is ModeRefusal.helper
+
+    unrecorded = _hand_built_report(mirror=False, virtual_display=False)
+    assert unrecorded.mirror_refusal is None
+    assert unrecorded.virtual_display_refusal is None
+
+
 @pytest.mark.asyncio
 async def test_complete_source_and_proven_keyring_make_mirror_startable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
@@ -153,8 +203,9 @@ async def test_complete_source_and_proven_keyring_make_mirror_startable(
     assert features.source_reporting_complete is True
     assert features.keyring is True
 
-    assert report.environment == "kde-plasma-6-wayland"
+    assert report.environment == "KDE Plasma 6 Wayland"
     assert report.mirror is True
+    assert report.mirror_refusal is None
     details = {item.detail for item in report.diagnostics}
     assert "physical_source" not in details
     assert "owned_daemon_control" not in details
@@ -177,6 +228,7 @@ async def test_withheld_source_token_keeps_mirror_refused(
     assert features.source_reporting_complete is False
     assert features.physical_source is False
     assert report.mirror is False
+    assert report.mirror_refusal is ModeRefusal.backend
     assert "physical_source" in {
         item.detail for item in report.diagnostics
         if item.code is ErrorCode.dependency_incompatible
@@ -215,6 +267,7 @@ async def test_unusable_backend_keeps_its_own_typed_diagnostic(
         await runtime.shutdown()
 
     assert report.mirror is False
+    assert report.mirror_refusal is ModeRefusal.admission
     missing_commands = [
         item for item in report.diagnostics if item.code is ErrorCode.dependency_missing
     ]
