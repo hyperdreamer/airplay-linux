@@ -32,6 +32,7 @@ from airplay_linux.diagnostics.activity import (
     ALLOWED_FIELDS,
     FIELD_SHAPES,
     MAX_FIELD_TEXT,
+    _SAFE_ENVIRONMENTS,
     _Subscription,
     _VOCABULARIES,
     _bounded,
@@ -56,6 +57,7 @@ from airplay_linux.domain.resources import (
     TransportState,
     TrustState,
 )
+from airplay_linux.policy.capabilities import environment_label
 from airplay_linux.testing import MemoryActivity, SequenceIds
 
 RECEIVER = ReceiverId("airplay-device:001122334455")
@@ -2050,6 +2052,54 @@ def test_capability_environment_rejects_non_string_data_cleanly():
 
     assert_clean_boundary_error(caught.value, TypeError)
     assert log.entries() == ()
+
+
+#: The complete token-to-label map, transcribed from the specification. The
+#: policy classifier owns the mapping; this table pins its exact output and the
+#: export allowlist that has to agree with it.
+ENVIRONMENT_LABELS: dict[str, str] = {
+    "kde-plasma-6-wayland": "KDE Plasma 6 Wayland",
+    "kde-plasma-6-x11": "KDE Plasma 6 X11",
+    "kde-plasma-5-wayland": "KDE Plasma 5 Wayland",
+    "kde-plasma-5-x11": "KDE Plasma 5 X11",
+    "kde-wayland-unverified": "KDE Wayland (version unverified)",
+    "kde-x11-unverified": "KDE X11 (version unverified)",
+    "gnome-wayland": "GNOME Wayland",
+    "x11": "X11 (other desktop)",
+    "unknown": "Unknown",
+}
+
+
+def test_environment_label_mapping_is_total_unique_and_allowlisted():
+    """The label map is total, its labels are unique, and export allows them all."""
+    mapped = {token: environment_label(token) for token in ENVIRONMENT_LABELS}
+
+    assert mapped == ENVIRONMENT_LABELS
+    # A token outside the map is exactly ``Unknown``, never the raw token.
+    assert environment_label("kde-plasma-9-wayland") == "Unknown"
+    assert environment_label("") == "Unknown"
+    # Every label is distinct, and none of them is a profile token.
+    assert len(set(mapped.values())) == len(mapped) == 9
+    assert not set(mapped.values()) & set(mapped)
+    # The export allowlist is exactly the mapped label set, so a report printed
+    # by the probe is retained verbatim rather than replaced with ``Unknown``.
+    assert set(mapped.values()) == set(_SAFE_ENVIRONMENTS)
+
+    for label in mapped.values():
+        log = ActivityLog(
+            capabilities=replace(capability_report(), environment=label),
+        )
+        assert log._capabilities.environment == label
+        assert json.loads(log.export())["capabilities"]["environment"] == label
+
+    # An unrecognized label is still exported as ``Unknown``, and the retained
+    # snapshot never holds the caller's text.
+    unrecognized = "KDE Plasma 9 Wayland"
+    log = ActivityLog(
+        capabilities=replace(capability_report(), environment=unrecognized),
+    )
+    assert json.loads(log.export())["capabilities"]["environment"] == "Unknown"
+    assert log._capabilities.environment == "Unknown"
 
 
 @pytest.mark.parametrize(
@@ -4390,8 +4440,15 @@ def test_the_retained_environment_leaf_is_the_safe_label():
     ("environment", "expected"),
     [
         ("KDE Plasma 6 Wayland", "KDE Plasma 6 Wayland"),
+        ("KDE Plasma 6 X11", "KDE Plasma 6 X11"),
+        ("KDE Plasma 5 Wayland", "KDE Plasma 5 Wayland"),
+        ("KDE Plasma 5 X11", "KDE Plasma 5 X11"),
+        ("KDE Wayland (version unverified)", "KDE Wayland (version unverified)"),
+        ("KDE X11 (version unverified)", "KDE X11 (version unverified)"),
+        ("GNOME Wayland", "GNOME Wayland"),
+        ("X11 (other desktop)", "X11 (other desktop)"),
+        ("Unknown", "Unknown"),
         ("GNOME 47 Wayland", "Unknown"),
-        ("KDE Plasma 6 X11", "Unknown"),
         ("kde plasma 6 wayland", "Unknown"),
         ("", "Unknown"),
     ],

@@ -176,7 +176,20 @@ FIELD_SHAPES: Final[Mapping[str, str]] = MappingProxyType(
 )
 
 EXPORT_SCHEMA: Final[str] = "airplay-linux-diagnostics/1"
-_SAFE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({"KDE Plasma 6 Wayland"})
+#: Exactly the human-readable session labels the capability probe can report, in
+#: the policy classifier's own wording. A well-typed but unrecognized label is
+#: still replaced with ``Unknown`` at this boundary.
+_SAFE_ENVIRONMENTS: Final[frozenset[str]] = frozenset({
+    "KDE Plasma 6 Wayland",
+    "KDE Plasma 6 X11",
+    "KDE Plasma 5 Wayland",
+    "KDE Plasma 5 X11",
+    "KDE Wayland (version unverified)",
+    "KDE X11 (version unverified)",
+    "GNOME Wayland",
+    "X11 (other desktop)",
+    "Unknown",
+})
 _UNKNOWN_ENVIRONMENT: Final[str] = "Unknown"
 
 #: The environment labels a report may carry, captured once so membership is

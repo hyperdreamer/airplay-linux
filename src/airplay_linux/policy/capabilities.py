@@ -16,8 +16,9 @@ capability it belongs to:
   is distinct from pairing: remembered pairing still only needs admission plus
   its trust transactions, so a backend without multi-target loses streaming but
   keeps its pairing capability;
-* mirror needs the proven physical-source backend capability, a physical capture
-  provider, and a physical monitor inventory;
+* mirror needs a KDE Plasma 6 session on either Wayland or X11, the proven
+  physical-source backend capability, a physical capture provider, and a
+  non-empty physical monitor inventory;
 * virtual display needs the KDE Plasma 6 Wayland provider, a proven
   virtual-source backend, ``kscreen-doctor``, and a probed helper contract;
 * audio needs both the backend's proven audio surface and the repeatable
@@ -28,12 +29,18 @@ capability it belongs to:
   distinct outputs with an exact ``True``; a truthy non-boolean is not proof and
   never blocks the first output.
 
-The guaranteed v1 environment is KDE Plasma 6 Wayland. Another desktop is
-reported by name but never enables a mode from command presence alone: no
-alternate capture/display provider is part of this probe, so a non-KDE session
-stays gated until one is added and proves the requested operation. Startup
-probes are read-only: they run help/version commands, introspect the portal, and
-list physical monitors, but they never create an output, start a helper, open a
+The guaranteed v1 environments are KDE Plasma 6 Wayland and KDE Plasma 6 X11.
+Portal-backed Mirror is available on both, because the portal owns the capture on
+either session; Virtual display remains Wayland-only because the KDE
+``krfb-virtualmonitor`` provider creates a compositor output. Every other desktop,
+and a KDE session whose version is not positively reported, is named but never
+enables a mode from command presence alone: no alternate display provider is part
+of this probe, so such a session stays gated until one is added and proves the
+requested operation. Each withheld mode also carries the first unmet requirement
+as a :class:`~airplay_linux.domain.resources.ModeRefusal`, and the report's
+``environment`` field carries the human-readable session label. Startup probes
+are read-only: they run help/version commands, introspect the portal, and list
+physical monitors, but they never create an output, start a helper, open a
 stream, or prompt for a PIN or audio permission.
 
 The UI runtime is probed from import metadata only; this module never imports
@@ -57,11 +64,13 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.display.helper import HelperFeatures
 from airplay_linux.domain.ports import AudioProbe, CapturePort, ProcessPort
 from airplay_linux.domain.resources import (
+    SESSION_PROFILE_DETAIL_PREFIX,
     CapabilityReport,
     Diagnostic,
     Err,
     ErrorCode,
     Mode,
+    ModeRefusal,
     Ok,
     PhysicalMonitorSource,
     Result,
@@ -80,15 +89,54 @@ class DesktopEnvironment(StrEnum):
     """The desktop/session profiles the startup probe can distinguish."""
 
     KDE_PLASMA_6_WAYLAND = "kde-plasma-6-wayland"
+    KDE_PLASMA_6_X11 = "kde-plasma-6-x11"
     KDE_PLASMA_5_WAYLAND = "kde-plasma-5-wayland"
+    KDE_PLASMA_5_X11 = "kde-plasma-5-x11"
     KDE_WAYLAND_UNVERIFIED = "kde-wayland-unverified"
+    KDE_X11_UNVERIFIED = "kde-x11-unverified"
     GNOME_WAYLAND = "gnome-wayland"
     X11 = "x11"
     UNKNOWN = "unknown"
 
 
-#: The only environment with a concrete v1 capture/display provider path.
+#: The KDE Plasma 6 Wayland profile token, the only virtual-display provider path.
 KDE_PLASMA_6_WAYLAND: Final[str] = DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value
+
+#: The profiles where portal-backed Mirror may be offered. The portal owns the
+#: capture on both KDE Plasma 6 sessions, so no direct X11 capture path exists.
+MIRROR_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {
+        DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
+        DesktopEnvironment.KDE_PLASMA_6_X11.value,
+    }
+)
+
+#: The profiles where the KDE virtual-output provider may be offered.
+VIRTUAL_DISPLAY_ENVIRONMENTS: Final[frozenset[str]] = frozenset(
+    {
+        DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value,
+    }
+)
+
+#: The one token-to-label map. Every consumer reports these exact strings, and
+#: a token outside it is exactly ``"Unknown"``.
+_ENVIRONMENT_LABELS: Final[dict[str, str]] = {
+    DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value: "KDE Plasma 6 Wayland",
+    DesktopEnvironment.KDE_PLASMA_6_X11.value: "KDE Plasma 6 X11",
+    DesktopEnvironment.KDE_PLASMA_5_WAYLAND.value: "KDE Plasma 5 Wayland",
+    DesktopEnvironment.KDE_PLASMA_5_X11.value: "KDE Plasma 5 X11",
+    DesktopEnvironment.KDE_WAYLAND_UNVERIFIED.value: "KDE Wayland (version unverified)",
+    DesktopEnvironment.KDE_X11_UNVERIFIED.value: "KDE X11 (version unverified)",
+    DesktopEnvironment.GNOME_WAYLAND.value: "GNOME Wayland",
+    DesktopEnvironment.X11.value: "X11 (other desktop)",
+    DesktopEnvironment.UNKNOWN.value: "Unknown",
+}
+
+
+def environment_label(profile: str) -> str:
+    """The human-readable session label for one classified profile token."""
+    return _ENVIRONMENT_LABELS.get(profile, "Unknown")
+
 
 #: Backend operations every stream start needs before any backend I/O.
 #: ``DoubleTakeTransport._admit`` refuses with ``dependency_incompatible``
@@ -131,10 +179,12 @@ def _text(value: object) -> str:
 def classify_environment(environment: Mapping[str, str]) -> str:
     """Classify the session without guessing a desktop or compositor version.
 
-    ``XDG_SESSION_TYPE`` decides X11/Wayland; only Wayland can use the portal
-    capture path. KDE additionally needs a reported Plasma 6 session, because
-    "KDE" alone does not prove the guaranteed v1 environment. Every desktop we
-    cannot name positively is ``unknown`` rather than assumed.
+    ``XDG_SESSION_TYPE`` decides X11/Wayland; both can use the portal capture
+    path, so Mirror is no longer Wayland-only, while the KDE virtual-output
+    provider still is. KDE additionally needs a positively reported Plasma
+    session, because "KDE" alone does not prove a supported profile. Every
+    desktop or version we cannot name positively is ``unknown`` rather than
+    assumed.
     """
     if not isinstance(environment, Mapping):
         raise TypeError("environment must be a mapping of session values")
@@ -143,13 +193,22 @@ def classify_environment(environment: Mapping[str, str]) -> str:
     desktop = {
         token.strip().lower() for token in raw_desktop.split(":") if token.strip()
     }
+    version = _text(environment.get("KDE_SESSION_VERSION")).strip()
+    kde = "kde" in desktop or "plasma" in desktop
 
     if session == "x11":
+        if kde:
+            if version == "6":
+                return DesktopEnvironment.KDE_PLASMA_6_X11.value
+            if version == "5":
+                return DesktopEnvironment.KDE_PLASMA_5_X11.value
+            return DesktopEnvironment.KDE_X11_UNVERIFIED.value
+        # GNOME is recognised only in the Wayland branch; every other X11
+        # desktop shares the same profile token.
         return DesktopEnvironment.X11.value
     if session != "wayland":
         return DesktopEnvironment.UNKNOWN.value
-    if "kde" in desktop or "plasma" in desktop:
-        version = _text(environment.get("KDE_SESSION_VERSION")).strip()
+    if kde:
         if version == "6":
             return DesktopEnvironment.KDE_PLASMA_6_WAYLAND.value
         if version == "5":
@@ -171,6 +230,11 @@ def _module_available(name: str) -> bool:
 def _capability_failure(detail: str) -> Diagnostic:
     """A typed, actionable "this operation is not proven" failure."""
     return replace(diagnostic(ErrorCode.unsupported_operation), detail=detail)
+
+
+def _session_profile_failure(detail: str) -> Diagnostic:
+    """One per-mode session-profile refusal, sharing the UI's detail prefix."""
+    return _capability_failure(f"{SESSION_PROFILE_DETAIL_PREFIX}{detail}")
 
 
 def _incompatible(detail: str) -> Diagnostic:
@@ -214,6 +278,54 @@ def _physical_inventory(value: object) -> tuple[PhysicalMonitorSource, ...] | No
     if not all(isinstance(source, PhysicalMonitorSource) for source in value):
         return None
     return value
+
+
+def _refuse_mirror(
+    *,
+    environment_supported: bool,
+    capture_present: bool,
+    mode_ready: bool,
+    physical_source: bool,
+    inventory: tuple[PhysicalMonitorSource, ...],
+) -> ModeRefusal | None:
+    """The first unmet Mirror requirement, in the closed precedence table.
+
+    The rows are ordered and mutually exclusive in effect: simultaneous failed
+    evidence always resolves to the earlier row.
+    """
+    if not environment_supported:
+        return ModeRefusal.session
+    if not capture_present:
+        return ModeRefusal.dependency
+    if not mode_ready:
+        return ModeRefusal.admission
+    if not physical_source:
+        return ModeRefusal.backend
+    if not inventory:
+        return ModeRefusal.inventory
+    return None
+
+
+def _refuse_virtual_display(
+    *,
+    environment_supported: bool,
+    kscreen: bool,
+    mode_ready: bool,
+    virtual_source: bool,
+    helper: HelperFeatures | None,
+) -> ModeRefusal | None:
+    """The first unmet Virtual display requirement, in the same table shape."""
+    if not environment_supported:
+        return ModeRefusal.session
+    if not kscreen:
+        return ModeRefusal.dependency
+    if not mode_ready:
+        return ModeRefusal.admission
+    if not virtual_source:
+        return ModeRefusal.backend
+    if helper is None:
+        return ModeRefusal.helper
+    return None
 
 
 class EnvironmentProbe:
@@ -385,7 +497,10 @@ class EnvironmentProbe:
 
     async def _probe(self) -> CapabilityReport:
         environment = classify_environment(self._environment)
-        environment_supported = environment == KDE_PLASMA_6_WAYLAND
+        mirror_environment_supported = environment in MIRROR_ENVIRONMENTS
+        virtual_display_environment_supported = (
+            environment in VIRTUAL_DISPLAY_ENVIRONMENTS
+        )
         diagnostics: list[Diagnostic] = []
 
         def note(item: Diagnostic) -> None:
@@ -399,8 +514,18 @@ class EnvironmentProbe:
         if not discovery:
             note(_module_failure("zeroconf"))
 
-        if not environment_supported:
-            note(_capability_failure(environment))
+        # One diagnostic per unmet mode, each naming the exact profile token.
+        # The two details stay distinct, so neither replaces the other.
+        if not mirror_environment_supported:
+            note(_session_profile_failure(
+                "mirror: needs KDE Plasma 6 on Wayland or X11; "
+                f"observed {environment}",
+            ))
+        if not virtual_display_environment_supported:
+            note(_session_profile_failure(
+                "virtual-display: needs KDE Plasma 6 on Wayland; "
+                f"observed {environment}",
+            ))
 
         # Backend evidence. A failure here is reported as its own typed cause;
         # an absent or malformed probe is never treated as support.
@@ -517,14 +642,31 @@ class EnvironmentProbe:
         remembered_pairing = keyring and backend_pairing and admitted
 
         mirror = bool(
-            environment_supported and mode_ready and inventory and physical_source
+            mirror_environment_supported
+            and mode_ready
+            and inventory
+            and physical_source
         )
         virtual_display = bool(
-            environment_supported
+            virtual_display_environment_supported
             and mode_ready
             and kscreen
             and helper is not None
             and virtual_source
+        )
+        mirror_refusal = _refuse_mirror(
+            environment_supported=mirror_environment_supported,
+            capture_present=self._capture is not None,
+            mode_ready=mode_ready,
+            physical_source=physical_source,
+            inventory=inventory,
+        )
+        virtual_display_refusal = _refuse_virtual_display(
+            environment_supported=virtual_display_environment_supported,
+            kscreen=kscreen,
+            mode_ready=mode_ready,
+            virtual_source=virtual_source,
+            helper=helper,
         )
         # An exact boolean is the only proof of distinct concurrent outputs. A
         # truthy string or integer is malformed evidence, and it only withholds
@@ -534,7 +676,7 @@ class EnvironmentProbe:
         )
 
         return CapabilityReport(
-            environment=environment,
+            environment=environment_label(environment),
             discovery=discovery,
             mirror=mirror,
             virtual_display=virtual_display,
@@ -543,6 +685,8 @@ class EnvironmentProbe:
             additional_virtual_outputs=additional_outputs,
             diagnostics=tuple(diagnostics),
             volume=backend is not None and backend.target_volume,
+            mirror_refusal=mirror_refusal,
+            virtual_display_refusal=virtual_display_refusal,
         )
 
 
@@ -578,8 +722,11 @@ __all__ = [
     "DesktopEnvironment",
     "EnvironmentProbe",
     "KDE_PLASMA_6_WAYLAND",
+    "MIRROR_ENVIRONMENTS",
     "PAIRING_BACKEND_CAPABILITIES",
     "START_BACKEND_CAPABILITIES",
+    "VIRTUAL_DISPLAY_ENVIRONMENTS",
     "can_start",
     "classify_environment",
+    "environment_label",
 ]

@@ -11,7 +11,7 @@ failures, and no mode is enabled because an error was merely absent.
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import pytest
@@ -20,9 +20,11 @@ from airplay_linux.backend.contract import BackendFeatures, features_from_help
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.display.helper import HelperFeatures, VirtualHelper
 from airplay_linux.domain.resources import (
+    SESSION_PROFILE_DETAIL_PREFIX,
     Err,
     ErrorCode,
     Mode,
+    ModeRefusal,
     Ok,
     PhysicalMonitorSource,
     RecoveryAction,
@@ -34,8 +36,12 @@ from airplay_linux.domain.resources import (
 from airplay_linux.policy.audio import REQUIRED_PORTAL_INTERFACES
 from airplay_linux.policy.capabilities import (
     KDE_PLASMA_6_WAYLAND,
+    MIRROR_ENVIRONMENTS,
+    VIRTUAL_DISPLAY_ENVIRONMENTS,
     EnvironmentProbe,
     can_start,
+    classify_environment,
+    environment_label,
 )
 from airplay_linux.testing.adapters import FakeCapture, FakeProcess
 from airplay_linux.testing.time import FakeClock
@@ -46,7 +52,138 @@ PLASMA = {
     "KDE_SESSION_VERSION": "6",
     "XDG_RUNTIME_DIR": "/run/user/1000",
 }
-KDE_ENVIRONMENT = "kde-plasma-6-wayland"
+
+#: The complete 27-cell profile truth table: nine desktop/version rows by the
+#: three normalized session columns (``x11``, ``wayland``, other/empty).
+PROFILE_MATRIX: tuple[tuple[str, str, str, str], ...] = (
+    # desktop, version, session, expected profile token
+    ("KDE", "6", "x11", "kde-plasma-6-x11"),
+    ("KDE", "6", "wayland", "kde-plasma-6-wayland"),
+    ("KDE", "6", "", "unknown"),
+    ("KDE", "5", "x11", "kde-plasma-5-x11"),
+    ("KDE", "5", "wayland", "kde-plasma-5-wayland"),
+    ("KDE", "5", "", "unknown"),
+    ("KDE", "", "x11", "kde-x11-unverified"),
+    ("KDE", "", "wayland", "kde-wayland-unverified"),
+    ("KDE", "", "", "unknown"),
+    ("GNOME", "6", "x11", "x11"),
+    ("GNOME", "6", "wayland", "gnome-wayland"),
+    ("GNOME", "6", "", "unknown"),
+    ("GNOME", "5", "x11", "x11"),
+    ("GNOME", "5", "wayland", "gnome-wayland"),
+    ("GNOME", "5", "", "unknown"),
+    ("GNOME", "", "x11", "x11"),
+    ("GNOME", "", "wayland", "gnome-wayland"),
+    ("GNOME", "", "", "unknown"),
+    ("XFCE", "6", "x11", "x11"),
+    ("XFCE", "6", "wayland", "unknown"),
+    ("XFCE", "6", "", "unknown"),
+    ("XFCE", "5", "x11", "x11"),
+    ("XFCE", "5", "wayland", "unknown"),
+    ("XFCE", "5", "", "unknown"),
+    ("XFCE", "", "x11", "x11"),
+    ("XFCE", "", "wayland", "unknown"),
+    ("XFCE", "", "", "unknown"),
+)
+
+#: Each of the nine profile tokens with an environment that proves it.
+PROFILE_ENVIRONMENTS: dict[str, dict[str, str]] = {
+    "kde-plasma-6-wayland": {
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "6",
+    },
+    "kde-plasma-6-x11": {
+        "XDG_SESSION_TYPE": "x11",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "6",
+    },
+    "kde-plasma-5-wayland": {
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "5",
+    },
+    "kde-plasma-5-x11": {
+        "XDG_SESSION_TYPE": "x11",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "5",
+    },
+    "kde-wayland-unverified": {
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "plasma",
+    },
+    "kde-x11-unverified": {
+        "XDG_SESSION_TYPE": "x11",
+        "XDG_CURRENT_DESKTOP": "plasma",
+    },
+    "gnome-wayland": {
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "ubuntu:GNOME",
+    },
+    "x11": {
+        "XDG_SESSION_TYPE": "x11",
+        "XDG_CURRENT_DESKTOP": "XFCE",
+    },
+    "unknown": {
+        "XDG_SESSION_TYPE": "tty",
+        "XDG_CURRENT_DESKTOP": "XFCE",
+    },
+}
+
+#: The fixed catalog copy every session-profile diagnostic carries.
+UNSUPPORTED_OPERATION_MESSAGE = (
+    "The installed backend does not expose this operation. Update doubletake or go back "
+    "and choose an operation it reports as available."
+)
+
+#: Section 3's table: the exact session-profile details each profile adds, in
+#: order. Written out per token so the probe cannot agree with itself by reading
+#: the same gate set the assertion reads.
+SESSION_DETAIL_TABLE: dict[str, tuple[str, ...]] = {
+    "kde-plasma-6-wayland": (),
+    "kde-plasma-6-x11": (
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed kde-plasma-6-x11",
+    ),
+    "kde-plasma-5-wayland": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; "
+        "observed kde-plasma-5-wayland",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed kde-plasma-5-wayland",
+    ),
+    "kde-plasma-5-x11": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; "
+        "observed kde-plasma-5-x11",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed kde-plasma-5-x11",
+    ),
+    "kde-wayland-unverified": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; "
+        "observed kde-wayland-unverified",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed kde-wayland-unverified",
+    ),
+    "kde-x11-unverified": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; "
+        "observed kde-x11-unverified",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed kde-x11-unverified",
+    ),
+    "gnome-wayland": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; "
+        "observed gnome-wayland",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; "
+        "observed gnome-wayland",
+    ),
+    "x11": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; observed x11",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; observed x11",
+    ),
+    "unknown": (
+        "session-profile mirror: needs KDE Plasma 6 on Wayland or X11; observed unknown",
+        "session-profile virtual-display: needs KDE Plasma 6 on Wayland; observed unknown",
+    ),
+}
 MONITOR = PhysicalMonitorSource(connector="DP-1", portal_restore_token=None)
 FINGERPRINT = "a" * 64
 
@@ -182,6 +319,125 @@ def probe(
     )
 
 
+_DEFAULT: object = object()
+
+
+class _RaisingFinder:
+    """A command finder whose lookup raises, so nothing is proven."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error or RuntimeError("command lookup exploded")
+        self.looked_up: list[str] = []
+
+    def __call__(self, name: str) -> str | None:
+        self.looked_up.append(name)
+        raise self.error
+
+
+class _MalformedFinder:
+    """A command finder that returns a value that is not a path string."""
+
+    def __init__(self, value: object = 17) -> None:
+        self.value = value
+        self.looked_up: list[str] = []
+
+    def __call__(self, name: str):
+        self.looked_up.append(name)
+        return self.value
+
+
+def scenario(
+    *,
+    environment: dict[str, str] | None = None,
+    backend_probe: object = _DEFAULT,
+    backend_features: Mapping[str, object] | None = None,
+    capture_port: object = _DEFAULT,
+    command: object = _DEFAULT,
+    helper_probe: object = _DEFAULT,
+) -> EnvironmentProbe:
+    """A probe where every evidence source is a proven double unless overridden.
+
+    ``_DEFAULT`` keeps the proven double; an explicit ``None`` means the probe
+    itself is absent, which is evidence the composition never installed it.
+    """
+    if backend_probe is _DEFAULT:
+        backend_probe = backend(Ok(value=features(**(backend_features or {}))))
+    return EnvironmentProbe(
+        environment=PLASMA if environment is None else environment,
+        command_finder=_Missing() if command is _DEFAULT else command,
+        module_finder=_Modules(),
+        backend_probe=backend_probe,  # type: ignore[arg-type]
+        helper_probe=helper() if helper_probe is _DEFAULT else helper_probe,  # type: ignore[arg-type]
+        capture=capture() if capture_port is _DEFAULT else capture_port,  # type: ignore[arg-type]
+        audio_probe=audio(),
+        keyring_probe=_Keyring(),
+    )
+
+
+#: The evidence failures a probe can be built from, one token per probe input.
+#: A scenario is the set of tokens it breaks, so first-match precedence can be
+#: read off the refusal table instead of a hand-written probe per combination.
+_EVIDENCE_TOKENS = frozenset(
+    {
+        "session",
+        "capture",
+        "inventory",
+        "kscreen",
+        "admission",
+        "multi_target",
+        "physical_source",
+        "virtual_source",
+        "helper",
+    },
+)
+
+
+def evidence_probe(
+    *,
+    profile: str = "kde-plasma-6-wayland",
+    broken: frozenset[str] = frozenset(),
+) -> EnvironmentProbe:
+    """A probe whose unproven evidence is exactly the named ``broken`` tokens."""
+    assert broken <= _EVIDENCE_TOKENS, broken - _EVIDENCE_TOKENS
+    environment = (
+        PROFILE_ENVIRONMENTS["gnome-wayland"]
+        if "session" in broken
+        else PROFILE_ENVIRONMENTS[profile]
+    )
+    if "capture" in broken:
+        capture_port: FakeCapture | None = None
+    elif "inventory" in broken:
+        capture_port = capture(Ok(value=()))
+    else:
+        capture_port = capture()
+    command: object = _Missing("kscreen-doctor") if "kscreen" in broken else _Missing()
+    if "helper" in broken:
+        helper_probe: object = helper(
+            Err(error=diagnostic(ErrorCode.dependency_incompatible)),
+        )
+    else:
+        helper_probe = helper()
+    overrides: dict[str, object] = {}
+    if "admission" in broken:
+        overrides.update(foreground_control=False, owner_handshake=False)
+    if "multi_target" in broken:
+        overrides["multi_target"] = False
+    if "physical_source" in broken:
+        overrides["physical_source"] = False
+    if "virtual_source" in broken:
+        overrides["virtual_source"] = False
+    return EnvironmentProbe(
+        environment=environment,
+        command_finder=command,  # type: ignore[arg-type]
+        module_finder=_Modules(),
+        backend_probe=backend(Ok(value=features(**overrides))),
+        helper_probe=helper_probe,  # type: ignore[arg-type]
+        capture=capture_port,
+        audio_probe=audio(),
+        keyring_probe=_Keyring(),
+    )
+
+
 def _codes(report) -> set[ErrorCode]:
     return {item.code for item in report.diagnostics}
 
@@ -263,13 +519,16 @@ async def test_volume_report_from_classified_surface(mode):
 async def test_complete_kde_plasma_6_wayland_enables_every_proven_capability():
     report = await probe().check()
 
-    assert report.environment == KDE_PLASMA_6_WAYLAND == KDE_ENVIRONMENT
+    assert report.environment == environment_label(KDE_PLASMA_6_WAYLAND)
+    assert report.environment == "KDE Plasma 6 Wayland"
     assert report.discovery is True
     assert report.mirror is True
     assert report.virtual_display is True
     assert report.audio is True
     assert report.remembered_pairing is True
     assert report.additional_virtual_outputs is True
+    assert report.mirror_refusal is None
+    assert report.virtual_display_refusal is None
     assert report.diagnostics == ()
 
 
@@ -438,23 +697,569 @@ async def test_an_exact_boolean_True_enables_additional_outputs():
     assert report.additional_virtual_outputs is True
 
 
+class _StrSubclass(str):
+    """A ``str`` subclass, which is not an exact built-in ``str`` value."""
+
+    __slots__ = ()
+
+
+def _environment_for(desktop: str, version: str, session: str) -> dict[str, str]:
+    """The environment mapping for one row of the normalized profile matrix."""
+    values = {"XDG_CURRENT_DESKTOP": desktop}
+    if version:
+        values["KDE_SESSION_VERSION"] = version
+    if session:
+        values["XDG_SESSION_TYPE"] = session
+    return values
+
+
 @pytest.mark.parametrize(
-    ("environment", "token"),
-    [
-        ({**PLASMA, "XDG_SESSION_TYPE": "x11"}, "x11"),
-        ({**PLASMA, "XDG_CURRENT_DESKTOP": "GNOME"}, "gnome-wayland"),
-        ({"XDG_SESSION_TYPE": "wayland"}, "unknown"),
-        ({**PLASMA, "KDE_SESSION_VERSION": "5"}, "kde-plasma-5-wayland"),
-        ({**PLASMA, "KDE_SESSION_VERSION": ""}, "kde-wayland-unverified"),
+    ("desktop", "version", "session", "expected"),
+    PROFILE_MATRIX,
+    ids=[
+        f"{desktop}-{version or 'unverified'}-{session or 'other'}"
+        for desktop, version, session, _ in PROFILE_MATRIX
     ],
 )
-async def test_other_or_unproven_desktops_are_reported_separately_and_gated(
-    environment: dict[str, str], token: str,
+def test_classify_environment_covers_the_complete_profile_matrix(
+    desktop: str, version: str, session: str, expected: str,
+):
+    """All 27 normalized desktop/version/session cells, exactly as tabulated."""
+    assert len(PROFILE_MATRIX) == 27
+    assert len({row[:3] for row in PROFILE_MATRIX}) == 27
+    assert {row[3] for row in PROFILE_MATRIX} == set(PROFILE_ENVIRONMENTS)
+
+    assert classify_environment(_environment_for(desktop, version, session)) == expected
+
+
+def test_classify_environment_normalizes_all_three_session_values():
+    """Trim/lower/colon rules, KDE precedence, and the exact non-string rule."""
+    # Session: strip and lowercase, and never colon-split.
+    assert classify_environment({
+        "XDG_SESSION_TYPE": " X11 ",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "6",
+    }) == "kde-plasma-6-x11"
+    assert classify_environment({
+        "XDG_SESSION_TYPE": " WayLand ",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "6",
+    }) == "kde-plasma-6-wayland"
+    assert classify_environment({
+        "XDG_SESSION_TYPE": "x11:wayland",
+        "XDG_CURRENT_DESKTOP": "KDE",
+        "KDE_SESSION_VERSION": "6",
+    }) == "unknown"
+
+    # Desktop: colon-separated whole tokens, each stripped and lowercased.
+    assert classify_environment({
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "ubuntu:GNOME",
+    }) == "gnome-wayland"
+    assert classify_environment({
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": "kde4:gnome-shell",
+        "KDE_SESSION_VERSION": "6",
+    }) == "unknown"
+    # KDE/Plasma wins over a GNOME token, and the version is trimmed, not parsed.
+    assert classify_environment({
+        "XDG_SESSION_TYPE": "wayland",
+        "XDG_CURRENT_DESKTOP": " gNoMe : pLaSmA ",
+        "KDE_SESSION_VERSION": " 6 ",
+    }) == "kde-plasma-6-wayland"
+    assert classify_environment({
+        "XDG_SESSION_TYPE": "x11",
+        "XDG_CURRENT_DESKTOP": " gNoMe : pLaSmA ",
+        "KDE_SESSION_VERSION": " 6 ",
+    }) == "kde-plasma-6-x11"
+
+    # Version: only the exact trimmed "5" and "6" are verified versions.
+    for version in ("7", "06", "6.0", "six", "  "):
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "wayland",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": version,
+        }) == "kde-wayland-unverified", version
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "x11",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": version,
+        }) == "kde-x11-unverified", version
+
+    # A non-string value is empty text, separately for each variable.
+    for value in (None, 7, object(), _StrSubclass("x11")):
+        assert classify_environment({
+            "XDG_SESSION_TYPE": value,
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": "6",
+        }) == "unknown", value
+    for value in (None, 7, object(), _StrSubclass("KDE")):
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "wayland",
+            "XDG_CURRENT_DESKTOP": value,
+            "KDE_SESSION_VERSION": "6",
+        }) == "unknown", value
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "x11",
+            "XDG_CURRENT_DESKTOP": value,
+            "KDE_SESSION_VERSION": "6",
+        }) == "x11", value
+    for value in (None, 7, object(), _StrSubclass("6")):
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "wayland",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": value,
+        }) == "kde-wayland-unverified", value
+        assert classify_environment({
+            "XDG_SESSION_TYPE": "x11",
+            "XDG_CURRENT_DESKTOP": "KDE",
+            "KDE_SESSION_VERSION": value,
+        }) == "kde-x11-unverified", value
+
+    with pytest.raises(TypeError):
+        classify_environment(["XDG_SESSION_TYPE"])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("profile", sorted(PROFILE_ENVIRONMENTS))
+async def test_per_mode_environment_diagnostics_have_exact_details_and_counts(
+    profile: str,
+):
+    report = await probe(environment=PROFILE_ENVIRONMENTS[profile]).check()
+
+    expected = list(SESSION_DETAIL_TABLE[profile])
+
+    environment_diagnostics = [
+        item for item in report.diagnostics
+        if (item.detail or "").startswith(SESSION_PROFILE_DETAIL_PREFIX)
+    ]
+    assert [item.detail for item in environment_diagnostics] == expected
+    assert len(environment_diagnostics) == len(expected)
+    # Nothing else is unproven in this fixture, so these are the whole report.
+    assert report.diagnostics == tuple(environment_diagnostics)
+
+    for item in environment_diagnostics:
+        assert item.code is ErrorCode.unsupported_operation
+        assert item.message == UNSUPPORTED_OPERATION_MESSAGE
+        assert item.recovery == (RecoveryAction.retry, RecoveryAction.back)
+        assert item.receiver_id is None
+
+    # The withdrawn generic environment diagnostic (the bare token) is absent.
+    assert profile not in {item.detail for item in report.diagnostics}
+
+
+async def test_mode_environment_sets_gate_mirror_and_virtual_display_independently():
+    """Membership decides each mode's session gate, never the other mode's."""
+    # The two closed sets, exactly as the specification tabulates them.
+    assert MIRROR_ENVIRONMENTS == {"kde-plasma-6-wayland", "kde-plasma-6-x11"}
+    assert VIRTUAL_DISPLAY_ENVIRONMENTS == {"kde-plasma-6-wayland"}
+
+    for profile, environment in PROFILE_ENVIRONMENTS.items():
+        report = await probe(environment=environment).check()
+
+        assert report.mirror is (profile in MIRROR_ENVIRONMENTS), profile
+        assert report.virtual_display is (
+            profile in VIRTUAL_DISPLAY_ENVIRONMENTS
+        ), profile
+        if report.mirror:
+            assert report.mirror_refusal is None, profile
+        else:
+            assert report.mirror_refusal is ModeRefusal.session, profile
+        if report.virtual_display:
+            assert report.virtual_display_refusal is None, profile
+        else:
+            assert report.virtual_display_refusal is ModeRefusal.session, profile
+
+    # With every other proof complete, each mode's own evidence is removed once.
+    isolation = (
+        (
+            "mode-ready",
+            {"backend_probe": backend(Ok(value=features(multi_target=False)))},
+            ModeRefusal.admission,
+            ModeRefusal.admission,
+        ),
+        (
+            "mirror-absent-provider",
+            {"capture_port": None},
+            ModeRefusal.dependency,
+            None,
+        ),
+        (
+            "mirror-physical-source",
+            {"backend_probe": backend(Ok(value=features(physical_source=False)))},
+            ModeRefusal.backend,
+            None,
+        ),
+        (
+            "mirror-empty-inventory",
+            {"capture_port": capture(Ok(value=()))},
+            ModeRefusal.inventory,
+            None,
+        ),
+        (
+            "virtual-kscreen",
+            {"command": _Missing("kscreen-doctor")},
+            None,
+            ModeRefusal.dependency,
+        ),
+        (
+            "virtual-absent-helper",
+            {"helper_probe": None},
+            None,
+            ModeRefusal.helper,
+        ),
+        (
+            "virtual-source",
+            {"backend_probe": backend(Ok(value=features(virtual_source=False)))},
+            None,
+            ModeRefusal.backend,
+        ),
+    )
+    for name, knobs, mirror_refusal, virtual_refusal in isolation:
+        report = await scenario(**knobs).check()  # type: ignore[arg-type]
+
+        assert report.mirror is (mirror_refusal is None), name
+        assert report.mirror_refusal is mirror_refusal, name
+        assert report.virtual_display is (virtual_refusal is None), name
+        assert report.virtual_display_refusal is virtual_refusal, name
+
+
+#: Each mode's closed refusal set, in exactly the order it is evaluated.
+MIRROR_REFUSAL_ORDER: tuple[ModeRefusal, ...] = (
+    ModeRefusal.session,
+    ModeRefusal.dependency,
+    ModeRefusal.admission,
+    ModeRefusal.backend,
+    ModeRefusal.inventory,
+)
+VIRTUAL_REFUSAL_ORDER: tuple[ModeRefusal, ...] = (
+    ModeRefusal.session,
+    ModeRefusal.dependency,
+    ModeRefusal.admission,
+    ModeRefusal.backend,
+    ModeRefusal.helper,
+)
+
+#: The evidence token that breaks each row of Mirror's refusal table.
+MIRROR_ROW_TOKENS: tuple[frozenset[str], ...] = (
+    frozenset({"session"}),
+    frozenset({"capture"}),
+    frozenset({"admission"}),
+    frozenset({"physical_source"}),
+    frozenset({"inventory"}),
+)
+#: The evidence token that breaks each row of Virtual display's table.
+VIRTUAL_ROW_TOKENS: tuple[frozenset[str], ...] = (
+    frozenset({"session"}),
+    frozenset({"kscreen"}),
+    frozenset({"multi_target"}),
+    frozenset({"virtual_source"}),
+    frozenset({"helper"}),
+)
+
+
+async def test_mode_refusal_uses_the_closed_precedence_table():
+    """Every row is reachable, and simultaneous failures resolve by first match.
+
+    The ten pairwise unions per mode are the complete pairwise cross product of
+    each table, so a row that could be shadowed by an earlier one is exercised
+    exactly as the ordered table says it must resolve.
+    """
+    # Every single refusal is reachable from its own evidence failure.
+    for row, refusal in enumerate(MIRROR_REFUSAL_ORDER):
+        report = await evidence_probe(broken=MIRROR_ROW_TOKENS[row]).check()
+        assert report.mirror is False, refusal
+        assert report.mirror_refusal is refusal
+    for row, refusal in enumerate(VIRTUAL_REFUSAL_ORDER):
+        report = await evidence_probe(broken=VIRTUAL_ROW_TOKENS[row]).check()
+        assert report.virtual_display is False, refusal
+        assert report.virtual_display_refusal is refusal
+
+    # All ten pairwise unions per mode, each resolving to the earlier row.
+    for earlier in range(len(MIRROR_REFUSAL_ORDER)):
+        for later in range(earlier + 1, len(MIRROR_REFUSAL_ORDER)):
+            report = await evidence_probe(
+                broken=MIRROR_ROW_TOKENS[earlier] | MIRROR_ROW_TOKENS[later],
+            ).check()
+            assert report.mirror_refusal is MIRROR_REFUSAL_ORDER[earlier], (
+                earlier, later,
+            )
+    for earlier in range(len(VIRTUAL_REFUSAL_ORDER)):
+        for later in range(earlier + 1, len(VIRTUAL_REFUSAL_ORDER)):
+            report = await evidence_probe(
+                broken=VIRTUAL_ROW_TOKENS[earlier] | VIRTUAL_ROW_TOKENS[later],
+            ).check()
+            assert report.virtual_display_refusal is VIRTUAL_REFUSAL_ORDER[earlier], (
+                earlier, later,
+            )
+
+    # Backend probes: absent, failed, malformed raw, malformed ``Ok`` and no
+    # admission all resolve through ``mode_ready`` to ``admission``.
+    backend_failures = (
+        ("probe-absent", None),
+        (
+            "probe-error",
+            backend(Err(error=diagnostic(ErrorCode.dependency_incompatible))),
+        ),
+        ("malformed-raw-result", backend("doubletake looks fine")),
+        ("malformed-ok", backend(Ok(value={"profile": "doubletake-0.5"}))),
+        (
+            "no-admission",
+            backend(Ok(value=features(foreground_control=False, owner_handshake=False))),
+        ),
+        (
+            "missing-multi-target",
+            backend(Ok(value=features(multi_target=False))),
+        ),
+    )
+    for name, backend_probe in backend_failures:
+        report = await scenario(backend_probe=backend_probe).check()
+        assert report.mirror_refusal is ModeRefusal.admission, name
+        assert report.virtual_display_refusal is ModeRefusal.admission, name
+
+    # A source-only backend failure is ``backend``, never ``admission``.
+    for name, overrides, mirror_refusal, virtual_refusal in (
+        ("physical-source", {"physical_source": False}, ModeRefusal.backend, None),
+        ("virtual-source", {"virtual_source": False}, None, ModeRefusal.backend),
+    ):
+        report = await scenario(
+            backend_probe=backend(Ok(value=features(**overrides))),
+        ).check()
+        assert report.mirror_refusal is mirror_refusal, name
+        assert report.virtual_display_refusal is virtual_refusal, name
+
+    # Capture inventory: absent provider, error, malformed raw, malformed ``Ok``
+    # and an empty tuple all withhold Mirror; only the absent provider is
+    # ``dependency``.
+    for name, capture_port, expected in (
+        ("provider-absent", None, ModeRefusal.dependency),
+        (
+            "provider-error",
+            capture(Err(error=diagnostic(ErrorCode.portal_denied))),
+            ModeRefusal.inventory,
+        ),
+        ("malformed-raw-result", capture("one monitor"), ModeRefusal.inventory),
+        ("malformed-ok", capture(Ok(value="DP-1")), ModeRefusal.inventory),
+        ("empty-tuple", capture(Ok(value=())), ModeRefusal.inventory),
+    ):
+        report = await scenario(capture_port=capture_port).check()
+        assert report.mirror_refusal is expected, name
+        assert report.virtual_display_refusal is None, name
+
+    # A KScreen lookup that finds nothing, raises, or returns a malformed value
+    # is unproven in all three shapes and refuses Virtual display as dependency.
+    for name, command in (
+        ("command-absent", _Missing("kscreen-doctor")),
+        ("finder-raises", _RaisingFinder()),
+        ("malformed-result", _MalformedFinder()),
+        ("empty-result", _MalformedFinder("")),
+    ):
+        report = await scenario(command=command).check()
+        assert report.virtual_display_refusal is ModeRefusal.dependency, name
+        assert report.mirror_refusal is None, name
+
+    # Helper probe: absent, error, malformed raw and malformed ``Ok`` are
+    # ``helper``; a valid ``HelperFeatures`` proves the contract.
+    for name, helper_probe in (
+        ("helper-absent", None),
+        ("helper-error", helper(Err(error=diagnostic(ErrorCode.dependency_missing)))),
+        ("helper-malformed-raw", helper("24.08.2")),
+        ("helper-malformed-ok", helper(Ok(value={"distinct_outputs": True}))),
+    ):
+        report = await scenario(helper_probe=helper_probe).check()
+        assert report.virtual_display_refusal is ModeRefusal.helper, name
+        assert report.mirror_refusal is None, name
+
+    valid = await scenario(helper_probe=helper()).check()
+    assert valid.virtual_display_refusal is None
+    assert valid.virtual_display is True
+    assert valid.mirror_refusal is None
+
+    # No unreachable pair exists in either closed set.
+    assert set(MIRROR_REFUSAL_ORDER) == {
+        ModeRefusal.session,
+        ModeRefusal.dependency,
+        ModeRefusal.admission,
+        ModeRefusal.backend,
+        ModeRefusal.inventory,
+    }
+    assert set(VIRTUAL_REFUSAL_ORDER) == {
+        ModeRefusal.session,
+        ModeRefusal.dependency,
+        ModeRefusal.admission,
+        ModeRefusal.backend,
+        ModeRefusal.helper,
+    }
+
+
+class _HelperSource:
+    """The composition seam's helper shape: only ``.probe`` is consumed."""
+
+    def __init__(self, probe: Callable[[], object] | None) -> None:
+        self.probe = probe
+
+
+class _RawOkCapture:
+    """A capture provider whose ``Ok`` payload is not a monitor inventory."""
+
+    async def list_physical(self):
+        return Ok(value="DP-1")
+
+
+class _RawResultCapture:
+    """A capture provider that returns something that is not a ``Result``."""
+
+    async def list_physical(self):
+        return "one physical monitor"
+
+
+#: Backend evidence cases: absent probe, typed failure, malformed results, and
+#: every partial proof the refusal table distinguishes.
+BACKEND_CASE_FACTORIES: dict[str, Callable[[], object]] = {
+    "probe-absent": lambda: None,
+    "probe-error": lambda: backend(Err(error=diagnostic(ErrorCode.dependency_incompatible))),
+    "malformed-raw-result": lambda: backend("doubletake-0.5"),
+    "malformed-ok": lambda: backend(Ok(value=("doubletake-0.5", "0.5.0"))),
+    "no-admission": lambda: backend(
+        Ok(value=features(foreground_control=False, owner_handshake=False)),
+    ),
+    "no-multi-target": lambda: backend(Ok(value=features(multi_target=False))),
+    "no-physical-source": lambda: backend(Ok(value=features(physical_source=False))),
+    "no-virtual-source": lambda: backend(Ok(value=features(virtual_source=False))),
+    "all-mode-evidence": lambda: backend(Ok(value=features())),
+}
+
+#: Capture evidence cases, each a fresh provider so no script is consumed twice.
+CAPTURE_CASE_FACTORIES: dict[str, Callable[[], object]] = {
+    "provider-absent": lambda: None,
+    "provider-error": lambda: capture(Err(error=diagnostic(ErrorCode.portal_denied))),
+    "malformed-raw-result": lambda: _RawResultCapture(),
+    "malformed-ok": lambda: _RawOkCapture(),
+    "empty-inventory": lambda: capture(Ok(value=())),
+    "one-physical-monitor": lambda: capture(),
+}
+
+#: KScreen command outcomes, from the same ``_command`` evidence ``_probe`` uses.
+KSCREEN_CASE_FACTORIES: dict[str, Callable[[], object]] = {
+    "found": lambda: _Missing(),
+    "finder-raises": lambda: _RaisingFinder(),
+    "malformed-result": lambda: _MalformedFinder(),
+}
+
+#: Helper evidence cases, including a valid ``HelperFeatures`` contract.
+HELPER_CASE_FACTORIES: dict[str, Callable[[], object]] = {
+    "probe-absent": lambda: None,
+    "probe-error": lambda: helper(Err(error=diagnostic(ErrorCode.dependency_missing))),
+    "malformed-raw-result": lambda: helper("24.08.2"),
+    "malformed-ok": lambda: helper(Ok(value={"distinct_outputs": True})),
+    "valid-features": lambda: helper(),
+}
+
+
+async def test_probe_mode_refusals_are_total_over_the_evidence_matrix():
+    """Every environment/evidence combination yields one closed mode/refusal pair.
+
+    ``9 x 9 x 6 x 3 x 5`` reports are produced from injected probes only, so no
+    host command runs, no module is imported, and no D-Bus call is made.
+    ``EnvironmentProbe`` at this seam owns no process runner at all; the runner
+    the composition installs is exercised by the bootstrap test below.
+    """
+    reports = 0
+    for profile in sorted(PROFILE_ENVIRONMENTS):
+        for backend_name, make_backend in BACKEND_CASE_FACTORIES.items():
+            for capture_name, make_capture in CAPTURE_CASE_FACTORIES.items():
+                for kscreen_name, make_command in KSCREEN_CASE_FACTORIES.items():
+                    for helper_name, make_helper in HELPER_CASE_FACTORIES.items():
+                        builder = EnvironmentProbe(
+                            environment=PROFILE_ENVIRONMENTS[profile],
+                            command_finder=make_command(),  # type: ignore[arg-type]
+                            module_finder=_Modules(),
+                            backend_probe=make_backend(),  # type: ignore[arg-type]
+                            helper_probe=make_helper(),  # type: ignore[arg-type]
+                            capture=make_capture(),  # type: ignore[arg-type]
+                            audio_probe=audio(),
+                            keyring_probe=_Keyring(),
+                            dbus=_FixedDBus(frozenset()),
+                        )
+                        report = await builder.check()
+                        reports += 1
+                        case = (
+                            profile, backend_name, capture_name, kscreen_name,
+                            helper_name,
+                        )
+                        assert report.mirror is (report.mirror_refusal is None), case
+                        assert report.virtual_display is (
+                            report.virtual_display_refusal is None
+                        ), case
+                        if report.mirror_refusal is not None:
+                            assert report.mirror_refusal in set(
+                                MIRROR_REFUSAL_ORDER
+                            ), case
+                        if report.virtual_display_refusal is not None:
+                            assert report.virtual_display_refusal in set(
+                                VIRTUAL_REFUSAL_ORDER
+                            ), case
+
+    assert reports == 9 * 9 * 6 * 3 * 5 == 7290
+
+
+async def test_bootstrap_probe_without_capture_keeps_mirror_false_on_x11():
+    """``--check-environment`` composes no capture provider, so Mirror stays off.
+
+    It prints the human-readable session label and the physical-provider
+    limitation. Its ``mirror=False`` report is not a capture failure.
+    """
+    environment = PROFILE_ENVIRONMENTS["kde-plasma-6-x11"]
+    process = FakeProcess()
+    process.queue_result(
+        "run",
+        Err(error=diagnostic(ErrorCode.dependency_missing, command="doubletake")),
+    )
+    process.queue_result(
+        "run",
+        Err(error=diagnostic(
+            ErrorCode.dependency_missing, command="krfb-virtualmonitor",
+        )),
+    )
+    builder = EnvironmentProbe.from_environment(
+        process=process,
+        helper=VirtualHelper(process, FakeClock()),
+        environment=environment,
+        audio_probe=audio(),
+        keyring_probe=_Keyring(),
+    )
+
+    report = await builder.check()
+
+    assert classify_environment(environment) == "kde-plasma-6-x11"
+    assert report.environment == "KDE Plasma 6 X11"
+    assert report.mirror is False
+    assert report.mirror_refusal is ModeRefusal.dependency
+    assert "physical capture provider" in {
+        item.detail for item in report.diagnostics
+    }
+    assert [spec.argv[0] for spec, _ in process.runs] == [
+        "doubletake", "krfb-virtualmonitor",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("environment", "token", "mirror"),
+    [
+        ({**PLASMA, "XDG_SESSION_TYPE": "x11"}, "kde-plasma-6-x11", True),
+        ({**PLASMA, "XDG_CURRENT_DESKTOP": "GNOME"}, "gnome-wayland", False),
+        ({"XDG_SESSION_TYPE": "wayland"}, "unknown", False),
+        ({**PLASMA, "KDE_SESSION_VERSION": "5"}, "kde-plasma-5-wayland", False),
+        ({**PLASMA, "KDE_SESSION_VERSION": ""}, "kde-wayland-unverified", False),
+    ],
+)
+async def test_profile_labels_and_independent_mode_gates_across_supported_and_unsupported_profiles(
+    environment: dict[str, str], token: str, mirror: bool,
 ):
     report = await probe(environment=environment).check()
 
-    assert report.environment == token
-    assert report.mirror is False
+    assert classify_environment(environment) == token
+    assert report.environment == environment_label(token)
+    assert report.mirror is mirror
     assert report.virtual_display is False
     assert report.discovery is True
     assert ErrorCode.unsupported_operation in _codes(report)
@@ -953,7 +1758,8 @@ async def test_the_current_environment_without_krfb_keeps_shell_and_discovery_us
 
     report = await builder.check()
 
-    assert report.environment == KDE_PLASMA_6_WAYLAND
+    assert report.environment == environment_label(KDE_PLASMA_6_WAYLAND)
+    assert report.environment == "KDE Plasma 6 Wayland"
     assert report.discovery is True
     assert report.mirror is False
     assert report.virtual_display is False
