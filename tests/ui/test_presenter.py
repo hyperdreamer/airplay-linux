@@ -84,6 +84,7 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     IntentStage,
     Mode,
+    ModeRefusal,
     Ok,
     RecoveryAction,
     ResolutionDecision,
@@ -821,6 +822,7 @@ async def test_a_capability_retry_reprobes_instead_of_replaying_the_frozen_repor
     """The pane promises "retry after fixing it"; Retry must re-read the evidence."""
     rig.capabilities = capability_report(
         mirror=False,
+        mirror_refusal=ModeRefusal.backend,
         diagnostics=(
             replace(
                 diagnostic(ErrorCode.dependency_incompatible), detail="physical_source"
@@ -834,6 +836,10 @@ async def test_a_capability_retry_reprobes_instead_of_replaying_the_frozen_repor
     await prepared.settle()
     assert Action.start not in prepared.offered()
     assert Action.retry in prepared.offered()
+    stale_reason = "The installed backend does not provide monitor capture."
+    assert prepared.pane().mode_reason == stale_reason
+    assert prepared.window._mode_reason.text() == stale_reason
+    assert prepared.window._mode_reason.isVisibleTo(prepared.window)
 
     prepared.refreshed_capabilities = capability_report()
     prepared.click(Action.retry)
@@ -841,9 +847,12 @@ async def test_a_capability_retry_reprobes_instead_of_replaying_the_frozen_repor
 
     assert prepared.refresh_calls == 1
     # The gate is gone, so the same selection can start, and no session command
-    # was invented for a capability question.
+    # was invented for a capability question.  The stale reason is gone too.
     assert Action.start in prepared.offered()
     assert prepared.commands_of(Retry) == []
+    assert prepared.pane().mode_reason is None
+    assert prepared.window._mode_reason.text() == ""
+    assert not prepared.window._mode_reason.isVisibleTo(prepared.window)
 
 
 async def test_a_rejected_command_renders_a_catalog_diagnostic(

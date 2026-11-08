@@ -363,6 +363,13 @@ class MainWindow(QMainWindow):
         mode_row.addStretch(1)
         layout.addWidget(self._mode_selector)
 
+        self._mode_reason = QLabel("", pane)
+        self._mode_reason.setObjectName("modeReasonLabel")
+        self._mode_reason.setAccessibleName("Mode availability reason")
+        self._mode_reason.setWordWrap(True)
+        self._mode_reason.setStyleSheet("color: #5f6368;")
+        layout.addWidget(self._mode_reason)
+
         self._notice = QLabel("", pane)
         self._notice.setObjectName("noticeLabel")
         self._notice.setAccessibleName("Notice")
@@ -534,6 +541,7 @@ class MainWindow(QMainWindow):
         self._phase.setText(pane.phase_label)
         self._render_badges(pane.badges)
         self._render_mode(pane)
+        self._render_mode_reason(pane)
         self._render_notice(pane)
         self._render_error(pane)
         self._render_editor(pane)
@@ -707,6 +715,8 @@ class MainWindow(QMainWindow):
         self._resolution.setEnabled(False)
         self._empty.setVisible(True)
         self._render_badges(())
+        self._mode_reason.clear()
+        self._mode_reason.setVisible(False)
         self._notice.clear()
         self._notice.setVisible(False)
         self._error.clear()
@@ -761,6 +771,15 @@ class MainWindow(QMainWindow):
             (self._virtual if target is self._mirror else self._mirror).setChecked(False)
         self._mirror.setEnabled(pane.mode_enabled)
         self._virtual.setEnabled(pane.mode_enabled)
+
+    def _render_mode_reason(self, pane: PaneState) -> None:
+        """Show the withheld mode's sentence verbatim; hide it when available."""
+        if pane.mode_reason is None:
+            self._mode_reason.clear()
+            self._mode_reason.setVisible(False)
+            return
+        self._mode_reason.setText(pane.mode_reason)
+        self._mode_reason.setVisible(True)
 
     def _render_notice(self, pane: PaneState) -> None:
         if pane.notice:

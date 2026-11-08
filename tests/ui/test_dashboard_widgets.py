@@ -153,6 +153,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
     actions: frozenset[Action] = frozenset(),
     mode_enabled: bool = True,
     visible_mode: Mode = Mode.MIRROR,
+    mode_reason: str | None = None,
     primary_label: str = "Start",
     source_enabled: bool = False,
     resolution_enabled: bool = False,
@@ -180,6 +181,7 @@ def pane(  # noqa: PLR0913 - explicit projection fields keep each test self-docu
         actions=actions,
         mode_enabled=mode_enabled,
         visible_mode=visible_mode,
+        mode_reason=mode_reason,
         primary_label=primary_label,
         source_enabled=source_enabled,
         resolution_enabled=resolution_enabled,
@@ -1099,6 +1101,46 @@ def test_notice_and_error_labels_render_the_projection_and_hide_when_empty(qtbot
     assert notice.text() == "Retained output is still owned."
     assert error.isVisibleTo(window)
     assert error.text() == failure.message
+
+
+def test_mode_reason_label_renders_below_selector_and_hides_when_none(qtbot) -> None:
+    from PySide6.QtWidgets import QLabel, QWidget
+
+    from airplay_linux.ui.window import MainWindow
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    reason = window.findChild(QLabel, "modeReasonLabel")
+    assert reason is not None
+    assert reason.accessibleName() == "Mode availability reason"
+    assert reason.toolTip() == ""
+    assert not reason.isVisibleTo(window)
+    assert reason.text() == ""
+
+    # The reason line sits immediately under the selector, above the notice.
+    selected = window.findChild(QWidget, "selectedPane")
+    selector = window.findChild(QWidget, "modeSelector")
+    notice = window.findChild(QLabel, "noticeLabel")
+    layout = selected.layout()
+    assert layout.indexOf(reason) == layout.indexOf(selector) + 1
+    assert layout.indexOf(reason) == layout.indexOf(notice) - 1
+
+    sentence = "Virtual display needs KDE Plasma 6 on Wayland."
+    window.render_selected(
+        pane(mode_reason=sentence, visible_mode=Mode.VIRTUAL, mode_enabled=False)
+    )
+    assert reason.isVisibleTo(window)
+    assert reason.text() == sentence
+
+    window.render_selected(pane(mode_reason=None))
+    assert not reason.isVisibleTo(window)
+    assert reason.text() == ""
+
+    window.render_selected(pane(mode_reason=sentence))
+    assert reason.isVisibleTo(window)
+    window._render_no_selection()
+    assert not reason.isVisibleTo(window)
+    assert reason.text() == ""
 
 
 def test_summary_reports_counts_and_environment(qtbot) -> None:
