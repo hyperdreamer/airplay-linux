@@ -16,13 +16,16 @@ if TYPE_CHECKING:
         ChallengeView,
         DisplayHandle,
         InstanceId,
+        LeaseId,
         OperationContext,
         OperationId,
         OwnerId,
+        PairingResult,
         ProcessIdentity,
         SensitiveText,
         StreamHandle,
     )
+    from .relay import RelayLeaseView
     from .resources import Diagnostic, PhysicalMonitorSource, ResolutionDecision, Result, Size, StartRequest
 
 
@@ -228,9 +231,16 @@ class ChallengePayload:
     challenge: ChallengeView
 
 
+@dataclass(frozen=True, kw_only=True)
+class RelayPairingPayload:
+    """Secret-free relay update; ``pairing_required`` is not a new wire event."""
+
+    lease: RelayLeaseView
+
+
 TransportPayload: TypeAlias = (
     EmptyPayload | FailurePayload | ModePayload | MutePayload | VolumePayload | ChallengePayload
-    | SourceVerificationPayload
+    | SourceVerificationPayload | RelayPairingPayload
 )
 
 
@@ -247,6 +257,26 @@ class TransportEvent:
 
     def __post_init__(self) -> None:
         _validate_generation("endpoint_generation", self.endpoint_generation)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RelaySubmitCompletion:
+    """One actor-allocated relay submission result with its admitted identity."""
+
+    submission_id: OperationId
+    challenge_id: ChallengeId
+    receiver_id: ReceiverId
+    endpoint_generation: int
+    session_generation: int
+    owner_lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    generation: int
+    result: PairingResult
+
+    def __post_init__(self) -> None:
+        _validate_generation("endpoint_generation", self.endpoint_generation)
+        _validate_generation("session_generation", self.session_generation)
+        _validate_generation("generation", self.generation)
 
 
 @dataclass(frozen=True, kw_only=True)

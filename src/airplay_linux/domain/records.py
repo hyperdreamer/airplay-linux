@@ -33,6 +33,7 @@ if TYPE_CHECKING:
         ProcessIdentity,
         StreamHandle,
     )
+    from .relay import RelayLeaseView, RelayNotice
     from .resources import (
         Diagnostic,
         ErrorCode,
@@ -254,6 +255,8 @@ class SessionSnapshot:
     volume_state: str | None = None
     audio_close_pending: bool = False
     volume_save_failed: bool = False
+    relay: RelayLeaseView | None = None
+    relay_notice: RelayNotice | None = None
 
     def __post_init__(self) -> None:
         _validate_generation("session_generation", self.session_generation)
