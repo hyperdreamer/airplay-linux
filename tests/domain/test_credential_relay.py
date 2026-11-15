@@ -199,45 +199,139 @@ def test_relay_eligibility_requires_both_success_pending_and_input_retirement(el
 # --------------------------------------------------------------------- record shape
 
 
-RELAY_FIELDS = {
-    "RelayStartOptions": ("target_volume_proven", "audio", "initial_volume"),
-    "CredentialRequest": (
-        "receiver_id", "target", "credential_kind", "endpoint_generation",
-        "session_generation", "owner_lease", "daemon_instance_uuid", "generation",
-        "observed_at", "start_options",
+RELAY_RECORDS = {
+    "RelayStartOptions": (
+        ("target_volume_proven", "audio", "initial_volume"),
+        {
+            "target_volume_proven": "bool",
+            "audio": "AudioPolicy | None",
+            "initial_volume": "VolumeLevel | None",
+        },
     ),
-    "SuccessPending": ("generation", "attempt", "observed_at"),
+    "CredentialRequest": (
+        (
+            "receiver_id", "target", "credential_kind", "endpoint_generation",
+            "session_generation", "owner_lease", "daemon_instance_uuid", "generation",
+            "observed_at", "start_options",
+        ),
+        {
+            "receiver_id": "ReceiverId",
+            "target": "ReceiverTarget",
+            "credential_kind": "CredentialKind",
+            "endpoint_generation": "int",
+            "session_generation": "int",
+            "owner_lease": "LeaseId",
+            "daemon_instance_uuid": "InstanceId",
+            "generation": "int",
+            "observed_at": "float",
+            "start_options": "RelayStartOptions",
+        },
+    ),
+    "SuccessPending": (
+        ("generation", "attempt", "observed_at"),
+        {"generation": "int", "attempt": "int", "observed_at": "float"},
+    ),
     "RelayLeaseView": (
-        "receiver_id", "target", "endpoint_generation", "session_generation",
-        "owner_lease", "daemon_instance_uuid", "owner_live", "generation", "request",
-        "request_state", "request_waiting", "challenge", "submit_inflight",
-        "submit_fenced", "dispatch_state", "success_pending", "prepared_source",
-        "streaming", "consumed_submissions", "release_state", "phase", "expires_at",
-        "notice",
+        (
+            "receiver_id", "target", "endpoint_generation", "session_generation",
+            "owner_lease", "daemon_instance_uuid", "owner_live", "generation", "request",
+            "request_state", "request_waiting", "challenge", "submit_inflight",
+            "submit_fenced", "dispatch_state", "success_pending", "prepared_source",
+            "streaming", "consumed_submissions", "release_state", "phase", "expires_at",
+            "notice",
+        ),
+        {
+            "receiver_id": "ReceiverId",
+            "target": "ReceiverTarget",
+            "endpoint_generation": "int",
+            "session_generation": "int",
+            "owner_lease": "LeaseId",
+            "daemon_instance_uuid": "InstanceId",
+            "owner_live": "bool",
+            "generation": "int",
+            "request": "CredentialRequest | None",
+            "request_state": "RequestState",
+            "request_waiting": "bool",
+            "challenge": "ChallengeView | None",
+            "submit_inflight": "int | None",
+            "submit_fenced": "bool",
+            "dispatch_state": "DispatchState",
+            "success_pending": "SuccessPending | None",
+            "prepared_source": "bool",
+            "streaming": "bool",
+            "consumed_submissions": "int",
+            "release_state": "ReleaseState",
+            "phase": "RelayPhase",
+            "expires_at": "float | None",
+            "notice": "RelayNotice | None",
+        },
     ),
     "TerminationProof": (
-        "daemon_instance_uuid", "daemon", "runtime_directory", "launch_uuid",
-        "receipt_state", "cleanup_outcome", "cleanup_completed_at", "process_evidence",
-        "identity_verified_at", "observed_at",
+        (
+            "daemon_instance_uuid", "daemon", "runtime_directory", "launch_uuid",
+            "receipt_state", "cleanup_outcome", "cleanup_completed_at", "process_evidence",
+            "identity_verified_at", "observed_at",
+        ),
+        {
+            "daemon_instance_uuid": "InstanceId",
+            "daemon": "ProcessIdentity",
+            "runtime_directory": "str",
+            "launch_uuid": "UUID",
+            "receipt_state": "Literal['stopped', 'failed']",
+            "cleanup_outcome": "Literal['stopped'] | None",
+            "cleanup_completed_at": "float | None",
+            "process_evidence": "Literal['pid_absent', 'pidfd_exited']",
+            "identity_verified_at": "float",
+            "observed_at": "float",
+        },
     ),
     "ReleaseEvidence": (
-        "reason", "observed_at", "disconnect_ack", "status", "daemon_instance_uuid",
-        "endpoint_generation", "termination",
+        (
+            "reason", "observed_at", "disconnect_ack", "status", "daemon_instance_uuid",
+            "endpoint_generation", "termination",
+        ),
+        {
+            "reason": "ErrorCode | None",
+            "observed_at": "float",
+            "disconnect_ack": "AckReply | None",
+            "status": "StatusReply | None",
+            "daemon_instance_uuid": "InstanceId | None",
+            "endpoint_generation": "int | None",
+            "termination": "TerminationProof | None",
+        },
     ),
-    "RelayPairingPayload": ("lease",),
+    "RelayPairingPayload": (
+        ("lease",),
+        {"lease": "RelayLeaseView"},
+    ),
     "RelaySubmitCompletion": (
-        "submission_id", "challenge_id", "receiver_id", "endpoint_generation",
-        "session_generation", "owner_lease", "daemon_instance_uuid", "generation",
-        "result",
+        (
+            "submission_id", "challenge_id", "receiver_id", "endpoint_generation",
+            "session_generation", "owner_lease", "daemon_instance_uuid", "generation",
+            "result",
+        ),
+        {
+            "submission_id": "OperationId",
+            "challenge_id": "ChallengeId",
+            "receiver_id": "ReceiverId",
+            "endpoint_generation": "int",
+            "session_generation": "int",
+            "owner_lease": "LeaseId",
+            "daemon_instance_uuid": "InstanceId",
+            "generation": "int",
+            "result": "PairingResult",
+        },
     ),
 }
 
 
-@pytest.mark.parametrize(("name", "expected"), sorted(RELAY_FIELDS.items()))
+@pytest.mark.parametrize(("name", "expected"), sorted(RELAY_RECORDS.items()))
 def test_relay_record_field_inventory_is_complete(name, expected):
+    expected_fields, expected_annotations = expected
     owner = messages if name.startswith(("RelayPairing", "RelaySubmit")) else relay
     record = getattr(owner, name)
-    assert tuple(field.name for field in fields(record)) == expected
+    assert tuple(field.name for field in fields(record)) == expected_fields
+    assert record.__annotations__ == expected_annotations
     assert all(field.kw_only for field in fields(record))
     assert record.__dataclass_params__.frozen
 
@@ -299,10 +393,52 @@ def test_relay_request_generations_are_exact_nonnegative_integers(generation, ba
         request_for(**{generation: bad})
 
 
-@pytest.mark.parametrize("bad", [-1, True, False])
-def test_relay_lease_generation_is_an_exact_nonnegative_integer(eligible_view, bad):
+@pytest.mark.parametrize("bad", [-1, True, False, 1.0, "2", None])
+@pytest.mark.parametrize("generation", [
+    "endpoint_generation", "session_generation", "generation", "consumed_submissions",
+])
+def test_relay_lease_generation_is_an_exact_nonnegative_integer(eligible_view, generation, bad):
+    assert getattr(replace(eligible_view, **{generation: 0}), generation) == 0
     with pytest.raises((TypeError, ValueError)):
-        replace(eligible_view, generation=bad)
+        replace(eligible_view, **{generation: bad})
+
+
+def success_pending_for(**overrides: object) -> SuccessPending:
+    defaults: dict[str, object] = {"generation": 1, "attempt": 1, "observed_at": 100.0}
+    return SuccessPending(**(defaults | overrides))
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, 1.0, "2", None])
+@pytest.mark.parametrize("generation", ["generation", "attempt"])
+def test_success_pending_generations_are_exact_nonnegative_integers(generation, bad):
+    assert getattr(success_pending_for(**{generation: 0}), generation) == 0
+    with pytest.raises((TypeError, ValueError)):
+        success_pending_for(**{generation: bad})
+
+
+def completion_for(**overrides: object) -> messages.RelaySubmitCompletion:
+    defaults: dict[str, object] = {
+        "submission_id": SUBMISSION,
+        "challenge_id": CHALLENGE,
+        "receiver_id": TARGET.receiver_id,
+        "endpoint_generation": TARGET.endpoint_generation,
+        "session_generation": 1,
+        "owner_lease": OWNER_LEASE,
+        "daemon_instance_uuid": DAEMON,
+        "generation": 1,
+        "result": PairingResult(kind="Trusted", credential_ref=None, diagnostic=None),
+    }
+    return messages.RelaySubmitCompletion(**(defaults | overrides))
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, 1.0, "2", None])
+@pytest.mark.parametrize("generation", [
+    "endpoint_generation", "session_generation", "generation",
+])
+def test_relay_submit_completion_generations_are_exact_nonnegative_integers(generation, bad):
+    assert getattr(completion_for(**{generation: 0}), generation) == 0
+    with pytest.raises((TypeError, ValueError)):
+        completion_for(**{generation: bad})
 
 
 def test_release_evidence_endpoint_generation_is_a_generation():
@@ -382,10 +518,34 @@ def test_relay_credential_representable(value, proven, expected):
     assert relay_credential_representable(value, target_volume_proven=proven) is expected
 
 
+def _module_function(path: Path, name: str) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name
+    ]
+    assert len(definitions) == 1, name
+    return definitions[0]
+
+
 def test_relay_credential_representable_is_keyword_only_and_retains_nothing():
     assert relay_credential_representable("-1234", target_volume_proven=True) is False
     with pytest.raises(TypeError):
         relay_credential_representable("-1234", True)
+    # "Retains nothing" is executable structure, not merely an observable result:
+    # after the docstring the body must be exactly the specified return, so any
+    # inserted statement (for example retaining ``value`` in a global) fails here.
+    definition = _module_function(Path(relay.__file__), "relay_credential_representable")
+    statements = list(definition.body)
+    if (statements and isinstance(statements[0], ast.Expr)
+            and isinstance(statements[0].value, ast.Constant)
+            and isinstance(statements[0].value.value, str)):
+        statements.pop(0)
+    expected = ast.parse('return not (target_volume_proven and value.startswith("-"))').body[0]
+    assert len(statements) == 1, ast.dump(definition, include_attributes=False)
+    assert ast.dump(statements[0], include_attributes=False) == ast.dump(
+        expected, include_attributes=False
+    )
 
 
 # ------------------------------------------------------------------ snapshot fields
@@ -422,17 +582,53 @@ def test_no_persistent_codec_admits_relay_records_or_snapshot_fields(eligible_vi
         codecs.decode_session(document)
 
 
-def test_relay_module_is_pure_and_imports_no_transport_qt_process_or_storage():
-    source = Path(relay.__file__).read_text(encoding="utf-8")
-    modules: list[str] = []
-    for node in ast.parse(source).body:
-        if isinstance(node, ast.If):  # the TYPE_CHECKING annotation-only block
+def _is_type_checking_guard(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "TYPE_CHECKING"
+    )
+
+
+def _absolute_import_parts(node: ast.ImportFrom, package: str) -> list[str]:
+    if not node.level:
+        return node.module.split(".") if node.module else []
+    package_parts = package.split(".")
+    keep = len(package_parts) - (node.level - 1)
+    if keep <= 0:
+        return []
+    parts = package_parts[:keep]
+    if node.module:
+        parts.extend(node.module.split("."))
+    return parts
+
+
+def _relay_import_names(nodes: list[ast.stmt], package: str) -> list[str]:
+    names: list[str] = []
+    for node in nodes:
+        if _is_type_checking_guard(node):
+            # Exempt exactly the type-only body. The test expression and every
+            # other branch remain part of the executable, checked module.
+            names.extend(_relay_import_names(node.orelse, package))
             continue
         for child in ast.walk(node):
             if isinstance(child, ast.Import):
-                modules.extend(alias.name for alias in child.names)
+                names.extend(alias.name for alias in child.names)
             elif isinstance(child, ast.ImportFrom):
-                modules.append(child.module or "")
+                base = ".".join(_absolute_import_parts(child, package))
+                if base:
+                    names.append(base)
+                    names.extend(
+                        f"{base}.{alias.name}"
+                        for alias in child.names if alias.name != "*"
+                    )
+    return names
+
+
+def test_relay_module_is_pure_and_imports_no_transport_qt_process_or_storage():
+    source = Path(relay.__file__).read_text(encoding="utf-8")
+    package = relay.__package__ or "airplay_linux.domain"
+    modules = _relay_import_names(ast.parse(source).body, package)
     forbidden = (
         "asyncio", "PySide6", "qasync", "airplay_linux.transport",
         "airplay_linux.process", "airplay_linux.storage", "airplay_linux.backend",
@@ -477,6 +673,21 @@ def test_command_projection_redacts_only_declared_positions():
     assert "1234" not in repr({"spec": command})
     assert "1234" not in repr([command, command])
     assert command.secret_indices == (9,)
+
+
+def test_command_projection_redacts_every_declared_position_not_only_the_last():
+    argv = ("doubletake-ctl", "pair", "1111", "--audio", "on", "--pin", "2222", "tail")
+    command = CommandSpec(argv=argv, env={}, secret_indices=(2, 6))
+    assert command.argv == argv
+    assert command.secret_indices == (2, 6)
+    assert command.redacted_argv == (
+        "doubletake-ctl", "pair", "<redacted>", "--audio", "on", "--pin",
+        "<redacted>", "tail",
+    )
+    assert command.redacted_argv[-1] == "tail"
+    for observation in (repr(command), repr({"spec": command}), repr([command, command])):
+        assert "1111" not in observation
+        assert "2222" not in observation
 
 
 def test_command_without_declared_secrets_keeps_its_vector():
