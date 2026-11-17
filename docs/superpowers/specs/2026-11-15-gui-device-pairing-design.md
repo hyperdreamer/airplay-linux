@@ -665,9 +665,19 @@ stale view is refused there with `stale_target` (or `no_spawn` when nothing was 
 prompt closes on the next view, and the pane shows "That receiver changed; start again."
 
 **Consequence for staleness.** A stale view can only mislead the display for as long as the
-transport takes to refuse. It cannot cause a credential to reach any receiver: the transport
-binds the command to the named target and revalidates ownership immediately before the spawn,
-so a stale offer is an annoyance, never a delivery.
+transport takes to refuse. Targeting prevents the credential from reaching a *different*
+receiver, and the transport revalidates ownership immediately before the spawn.
+
+**What the guarantee does not cover (correction).** The receiver resolves a credential by
+target address. When the named target's waiting entry has vanished it starts a new
+connection to that same address with the credential, and it receives no owner lease,
+request generation, receiver identity or challenge token. The protocol therefore cannot
+distinguish the original device from a different device that has since taken the same
+address. The honest statement is: *the credential is delivered to the named target under
+an address-continuity assumption.* The application narrows the window (identity and
+fingerprint revalidation immediately before the spawn) and detects replacement when the
+receiver's reported identity changes, but it does not prove session continuity. This
+residual is recorded here and in `docs/operations.md`; it is not claimed as a guarantee.
 
 ### 12.3 What the dashboard still owns
 
@@ -730,3 +740,70 @@ refused — that is the accepted cost, and the refusal is the explanation.
 5. Release fences submissions before settling and spawns exactly one disconnect.
 6. A successful handle commits trust exactly once, before the start effect's blocked-trust
    check, and a later matching completion does not clear or discard the admitted handle.
+
+### 12.8 Corrigenda after review (D1-01 … D1-06)
+
+**Relay outcome carried with the handle (D1-01).** Trust is committed on the exact handle the
+start returns, and the decision must not depend on a challenge view that may be stale, cleared
+or arrive later. The transport therefore publishes one owner-bound record with the handle:
+
+```python
+@dataclass(frozen=True, kw_only=True)
+class RelayStartOutcome:
+    lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    endpoint_generation: int
+    session_generation: int
+    request_generation: int | None   # the challenge generation this start completed, if any
+    succeeded: bool
+```
+
+`complete_relay_start` commits `trust=Trusted` exactly once when `succeeded` is true, clears
+the provisional flags and admits the handle, before the start effect's blocked-trust check.
+When `succeeded` is false, the ordinary start path applies unchanged. Both arrival orders are
+covered: a handle first with a live challenge, and a provisional success first followed by the
+handle. The record is owner-bound, so a handle for a different lease or daemon cannot commit.
+
+**Bounded staleness (D1-03).** The actor owns a per-receiver publication order it assigns
+itself: every closing, refusing or terminal view it publishes advances a local
+`closing_epoch`. A later view that would reopen a prompt for a challenge the actor has already
+closed at or below that epoch is dropped before any state change. This uses the actor's own
+lifecycle, not dispatch state, so it is not a second authority — it only prevents the actor
+from undoing its own published closures.
+
+**Refusal taxonomy (D1-04).** Classification answers *what is known about the command*;
+effect answers *what the dashboard does*. They are separate columns and both are fixed:
+
+| Transport admission outcome | Typed result | Challenge effect | Attempt charged | Child may exist | Notice |
+| --- | --- | --- | --- | --- | --- |
+| unchanged owner and challenge still eligible | accepted | retained until completion | no | yes | none |
+| named target's waiting entry vanished before reservation | `stale_target`, `no_spawn` | closed | no | no | receiver changed |
+| another command unresolved for this lease | `stale_target`, `no_spawn` | retained | no | no | uncertainty |
+| release fence active | `stale_target`, `no_spawn` | closed | no | no | receiver changed |
+| client invalid input | `InvalidInput` | retained | no | no | inline validation |
+| receiver service shutting down | `daemon_failed`, `no_spawn` | closed | yes | no | service stopping |
+| decoded refusal | `receiver_rejected`, `acknowledged` | retained | yes | yes | PIN not accepted |
+| no decoded reply after reservation | `cleanup_timeout`, `uncertain` | retained | yes | unknown | uncertainty |
+
+A refusal closes only the challenge it names; an older challenge's refusal never closes a
+replacement.
+
+**Linearization point (D1-06).** The boundary is the *synchronous reservation* performed by the
+transport immediately before runner entry — after the final ownership revalidation and with no
+await or scheduling gap. Child creation inside the runner is asynchronous and is not evidence
+that a start occurred; the reservation stays unresolved until a positive `no_spawn`, a decoded
+reply plus the required status, exclusive progress, or exact-instance termination evidence.
+
+**Sections that must be rewritten (D1-05).** §§5.4 (shared-predicate and `submit_fenced`
+paragraphs), 5.5 (outcome-to-challenge table), 5.6 (actor routes and the late-completion fence),
+5.7 (fence-as-admission), 5.10 (cross-component atomicity), 5.11 (daemon reply to challenge
+effect) and 5.13 (projected action table as authority) are superseded by §12 and must be
+rewritten to transport admission, actor presentation, and the §12.8 taxonomy. The specification
+§§6, 13, 14 and 20 must be reconciled with the same rules, and the A1 `view_seq` requirements
+removed.
+
+**Plan re-derivation (D1-07).** The plan, execution graph, interface pins and lane projections
+describe the pre-pivot contract and must be re-derived from the amended design and the revised
+specification before any lane is dispatched. Reusable without change: the target-bound command
+construction (T-002), the historical termination proof (T-003) and the pure relay records
+(T-001), subject to whatever field changes the revised specification requires.
