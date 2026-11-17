@@ -272,17 +272,54 @@ class ActivitySink(Protocol):
     def emit(self, event: ActivityEvent) -> None: ...
 
 
-@dataclass(frozen=True, kw_only=True)
+_REDACTED_ARGUMENT = "<redacted>"
+
+
+def _validate_secret_indices(argv: tuple[str, ...], indices: tuple[int, ...]) -> None:
+    """Refuse malformed secret metadata with a fixed, argv-free message."""
+    if type(indices) is not tuple:
+        raise ValueError("invalid secret indices")
+    seen: set[int] = set()
+    for index in indices:
+        if type(index) is not int or not 0 <= index < len(argv) or index in seen:
+            raise ValueError("invalid secret indices")
+        seen.add(index)
+
+
+@dataclass(frozen=True, kw_only=True, repr=False)
 class CommandSpec:
-    """Process launch data; callers must never put sensitive input in argv."""
+    """Process launch data; declared secret indices are redacted for observation only.
+
+    ``argv`` is the actual execution vector. A caller that must carry a credential
+    declares its exact position in ``secret_indices``; observations use
+    ``redacted_argv``, and no observation, journal or record keeps the raw vector.
+    """
 
     argv: tuple[str, ...]
     env: Mapping[str, str]
     cwd: str | None = None
     pass_fds: tuple[int, ...] = ()
+    secret_indices: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "env", MappingProxyType(dict(self.env)))
+        _validate_secret_indices(self.argv, self.secret_indices)
+
+    @property
+    def redacted_argv(self) -> tuple[str, ...]:
+        """The observation projection; the execution vector is never rewritten."""
+        positions = set(self.secret_indices)
+        return tuple(
+            _REDACTED_ARGUMENT if position in positions else argument
+            for position, argument in enumerate(self.argv)
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(argv={self.redacted_argv!r}, env={dict(self.env)!r}, "
+            f"cwd={self.cwd!r}, pass_fds={self.pass_fds!r}, "
+            f"secret_indices={self.secret_indices!r})"
+        )
 
 
 @dataclass(frozen=True, kw_only=True)

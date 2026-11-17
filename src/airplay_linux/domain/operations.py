@@ -165,11 +165,13 @@ class ChallengeView:
     created_at: float
     expires_at: float
     credential_kind: Literal["pin", "password"]
+    presentation_revision: int = 0
 
     def __post_init__(self) -> None:
         _validate_generation("endpoint_generation", self.endpoint_generation)
         _validate_generation("session_generation", self.session_generation)
         _validate_generation("trust_generation", self.trust_generation)
+        _validate_generation("presentation_revision", self.presentation_revision)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -180,3 +182,4 @@ class PairingResult:
     ]
     credential_ref: OpaqueCredentialRef | None
     diagnostic: Diagnostic | None
+    waiting: bool = False
