@@ -448,6 +448,7 @@ class RelayLeaseView:
     phase: RelayPhase
     expires_at: float | None
     notice: RelayNotice | None
+    view_seq: int
 
 @dataclass(frozen=True, kw_only=True)
 class RelayPairingPayload:
@@ -1156,3 +1157,53 @@ The design's explicit no-revision rule for provisional success (§5.4) is the ap
 | F-07 | Single-unresolved-dispatch guard with controlled two-ID progress evidence, and inert forbidden-spawn/run interception controls assigned the guard-removal mutations: §§4, 8, 16, 18. |
 | F-08 | Persisted wall-clock cleanup_completed_at, monotonic transient times, forbidden cross-domain comparisons and clock-domain test: §§1–2, 4, 10, 16, 18. |
 | F-09 | Correct refusal locator doubletake.py:1042 inside _start, defined at :998: §§2, 19 (D-02). |
+
+## 20. Amendment A1 — single dispatch authority
+
+This amendment resolves a contract defect found by lane review: §§12–14 required the actor to
+correlate submission completions with dispatch settlement using captured views, while the
+authoritative dispatch identity (`command_id`, `unresolved_dispatch_ids`) is deliberately
+private to the transport and never appears in a public view. The actor was therefore
+re-deriving dispatch state in parallel, and five review rounds produced only divergence in
+that duplication.
+
+**Rule 1 — the transport is the sole dispatch authority.** The actor never caches, infers,
+latches or re-derives dispatch state, eligibility, uncertainty, progress or settlement. It
+projects the newest view it has been given and nothing else. Every actor-side barrier,
+monotonic latch and "preserved uncertainty" record added during implementation is removed.
+
+**Rule 2 — views are ordered.** `RelayLeaseView.view_seq` is a monotonically increasing
+integer owned by the transport, incremented on every state change of that lease. The actor
+records the highest applied `view_seq` per `(owner_lease, daemon_instance_uuid)` and **drops
+entirely** any view whose `view_seq` is less than or equal to that value: no trust change, no
+challenge change, no revision increment, no admission. This single rule replaces every
+per-field regression guard; a replayed or out-of-order view cannot resurrect a retired
+challenge, restore a waiting prompt, or clear a published fence.
+
+**Rule 3 — settlement is published, never inferred.** `dispatch_state="settled"` appears in a
+view only when the transport's exclusive-progress predicate (§8, "the exclusive-progress
+predicate is all of") holds for the sole retained `command_id`. The actor treats it as an
+opaque fact. A submission completion never changes dispatch state; it only feeds §12's
+completion deduplication and the trust/challenge/revision reduction.
+
+**Rule 4 — admission asks the newest view.** `can_submit` is evaluated against the newest
+applied view at presentation, at command admission and at the final spawn fence. Because the
+transport already excludes a second unresolved dispatch, and because a stale view cannot be
+applied at all, the delayed-C1/C2 sequence, kind replacement, replay and out-of-order
+delivery all reduce to the same case: the older view is dropped.
+
+**Rule 5 — completion and settlement are order-independent.** A completion may arrive before
+or after the settlement that concerns it. Neither order changes dispatch state, so neither
+order can create, clear or recreate uncertainty. Tests must cover both orders for the raised,
+malformed and normal cases.
+
+**Removed by this amendment:** the actor's `_relay_uncertainty_preserved`, the per-field
+monotonic latch, settlement fingerprinting/consumption, and any actor comparison of
+`consumed_submissions` across request generations. `RelayLease`'s private
+`unresolved_dispatch_ids` and `command_id` are unchanged; they remain transport-only.
+
+**Conformance tests added by this amendment:** a stale view is dropped before any state
+change (§2); replaying a waiting view after progress or terminal retirement is a no-op; a
+settled view carrying a release fence is applied even when its other content is unchanged; a
+completion delivered before its settlement and after it produce identical eligibility;
+cross-generation kind replacement never compares counters.
