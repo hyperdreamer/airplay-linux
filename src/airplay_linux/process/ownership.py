@@ -331,6 +331,9 @@ class EvidenceAuthority:
             return f.multi_target and f.target_volume
         if operation is BackendOperation.connect:
             return f.multi_target and (f.physical_source or f.virtual_source)
+        if operation is BackendOperation.submit_pairing:
+            return (f.credential_relay and f.owned_daemon_control and f.multi_target
+                    and f.physical_source)
         if operation is BackendOperation.shutdown:
             return True
         # This authority represents the public evidence contract. Unsupported

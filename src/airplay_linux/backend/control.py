@@ -29,7 +29,15 @@ from airplay_linux.domain.operations import (
     ProcessIdentity,
     SensitiveText,
 )
-from airplay_linux.domain.ports import CommandOutput, CommandSpec, Clock, Subscription
+from airplay_linux.domain.ports import (
+    CommandOutput,
+    CommandSpec,
+    Clock,
+    Subscription,
+    _REDACTED_ARGUMENT,
+    _validate_secret_indices,
+)
+from airplay_linux.domain.relay import relay_credential_representable
 from airplay_linux.domain.resources import (
     AudioPolicy,
     CaptureSource,
@@ -118,9 +126,49 @@ class ConnectPayload:
         return f"ConnectPayload(source={source}, credential={credential})"
 
 
+@dataclass(frozen=True, repr=False)
+class ProfileCommand:
+    """One profile's execution argv plus the exact positions to redact.
+
+    ``argv`` is what the runner executes.  Only a credential-bearing relay
+    submission declares an index; every other command carries an empty tuple.
+    Invalid metadata fails construction with one fixed, argv-free message.
+    """
+
+    argv: tuple[str, ...]
+    secret_indices: tuple[int, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.argv) is not tuple or not all(type(arg) is str for arg in self.argv):
+            raise ValueError("invalid profile command argv")
+        _validate_secret_indices(self.argv, self.secret_indices)
+
+    @property
+    def redacted_argv(self) -> tuple[str, ...]:
+        """The observation projection; the execution vector is never rewritten."""
+        positions = set(self.secret_indices)
+        return tuple(
+            _REDACTED_ARGUMENT if position in positions else argument
+            for position, argument in enumerate(self.argv)
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"ProfileCommand(argv={self.redacted_argv!r}, "
+            f"secret_indices={self.secret_indices!r})"
+        )
+
+
 @dataclass(frozen=True, kw_only=True, repr=False)
 class CredentialPayload:
+    """Transient relay input plus the original start's proved option snapshot.
+
+    Neither the value nor a stringified payload is ever printable.
+    """
+
     value: SensitiveText | str
+    audio: AudioPolicy | None = None
+    initial_volume: VolumeLevel | None = None
 
     def __repr__(self) -> str:
         return "CredentialPayload(value=<redacted>)"
@@ -412,7 +460,7 @@ class PublishedDoubletakeProfile:
         operation: BackendOperation | str,
         target: ReceiverTarget | None,
         payload: BackendPayload,
-    ) -> Result[tuple[str, ...]]:
+    ) -> Result[ProfileCommand]:
         op = self._operation(operation)
         if op is None:
             return _err(ErrorCode.unsupported_operation)
@@ -433,7 +481,9 @@ class PublishedDoubletakeProfile:
             if target is not None:
                 return _err(ErrorCode.invalid_input)
             command = op.value
-            return Ok(value=("doubletake-ctl", "-socket", self.socket_path, command))
+            return Ok(value=ProfileCommand(argv=(
+                "doubletake-ctl", "-socket", self.socket_path, command,
+            )))
 
         if op in {BackendOperation.disconnect, BackendOperation.mute, BackendOperation.unmute}:
             if target_text is None:
@@ -442,7 +492,9 @@ class PublishedDoubletakeProfile:
                 return _err(ErrorCode.invalid_input)
             if op is BackendOperation.disconnect and not isinstance(payload, EmptyPayload):
                 return _err(ErrorCode.invalid_input)
-            return Ok(value=("doubletake-ctl", "-socket", self.socket_path, op.value, target_text))
+            return Ok(value=ProfileCommand(argv=(
+                "doubletake-ctl", "-socket", self.socket_path, op.value, target_text,
+            )))
 
         if op in {BackendOperation.volume, BackendOperation.audio_off}:
             if target_text is None or not self.features.target_volume:
@@ -455,7 +507,9 @@ class PublishedDoubletakeProfile:
                 if type(payload) is not AudioGatePayload or payload.enabled is not False:
                     return _err(ErrorCode.invalid_input)
                 arguments = ("audio", "off", target_text)
-            return Ok(value=("doubletake-ctl", "-socket", self.socket_path, *arguments))
+            return Ok(value=ProfileCommand(argv=(
+                "doubletake-ctl", "-socket", self.socket_path, *arguments,
+            )))
 
         if op is BackendOperation.connect:
             if target_text is None:
@@ -483,8 +537,58 @@ class PublishedDoubletakeProfile:
                     arguments = () if payload.audio is None else ("--audio", "on" if payload.audio.enabled else "off")
                     if payload.initial_volume is not None:
                         arguments += ("--volume", str(payload.initial_volume.value))
-                    return Ok(value=("doubletake-ctl", "-socket", self.socket_path, "connect", target_text, *arguments))
-            return Ok(value=("doubletake-ctl", "-socket", self.socket_path, "connect", target_text))
+                    return Ok(value=ProfileCommand(argv=(
+                        "doubletake-ctl", "-socket", self.socket_path, "connect",
+                        target_text, *arguments,
+                    )))
+            return Ok(value=ProfileCommand(argv=(
+                "doubletake-ctl", "-socket", self.socket_path, "connect", target_text,
+            )))
+
+        if op is BackendOperation.submit_pairing:
+            # The one public credential-bearing mapping: a target-bound connect
+            # whose final token is the receiver tool's own credential.  The
+            # targetless ``pin`` form is never emitted.
+            if target_text is None or not self.features.credential_relay:
+                return _err(ErrorCode.unsupported_operation)
+            if type(payload) is not CredentialPayload:
+                return _err(ErrorCode.invalid_input)
+            if payload.audio is not None or payload.initial_volume is not None:
+                if not self.features.target_volume:
+                    return _err(ErrorCode.unsupported_operation)
+            if (
+                (payload.audio is not None and (
+                    type(payload.audio) is not AudioPolicy
+                    or type(payload.audio.enabled) is not bool
+                ))
+                or (
+                    payload.initial_volume is not None
+                    and type(payload.initial_volume) is not VolumeLevel
+                )
+                or (
+                    payload.initial_volume is not None
+                    and payload.audio is not None
+                    and not payload.audio.enabled
+                )
+            ):
+                return _err(ErrorCode.invalid_input)
+            credential = _secret_text(payload.value)
+            if not credential or not relay_credential_representable(
+                credential, target_volume_proven=self.features.target_volume,
+            ):
+                return _err(ErrorCode.invalid_input)
+            arguments = () if payload.audio is None else (
+                "--audio", "on" if payload.audio.enabled else "off",
+            )
+            if payload.initial_volume is not None:
+                arguments += ("--volume", str(payload.initial_volume.value))
+            completed = (
+                "doubletake-ctl", "-socket", self.socket_path, "connect",
+                target_text, *arguments, credential,
+            )
+            return Ok(value=ProfileCommand(
+                argv=completed, secret_indices=(len(completed) - 1,),
+            ))
 
         # No other operation has a published v0.5 command mapping.
         return _err(ErrorCode.unsupported_operation)
@@ -494,7 +598,7 @@ class PublishedDoubletakeProfile:
         operation: BackendOperation | str,
         target: ReceiverTarget | None,
         payload: BackendPayload,
-    ) -> tuple[str, ...]:
+    ) -> ProfileCommand:
         result = self.try_argv(operation, target, payload)
         if isinstance(result, Err):
             raise ValueError(result.error.code.value)
@@ -532,7 +636,7 @@ class ApplicationContractProfile(PublishedDoubletakeProfile):
         operation: BackendOperation | str,
         target: ReceiverTarget | None,
         payload: BackendPayload,
-    ) -> Result[tuple[str, ...]]:
+    ) -> Result[ProfileCommand]:
         op = self._operation(operation)
         if op is None:
             return _err(ErrorCode.unsupported_operation)
@@ -575,7 +679,9 @@ class ApplicationContractProfile(PublishedDoubletakeProfile):
         # Payload values, including credentials, are consumed by the fake
         # socket/process harness and are intentionally never placed in argv.
         argv = ("application-contract-v1", "-socket", self.socket_path, op.value)
-        return Ok(value=argv + ((target_text,) if target_text is not None else ()))
+        return Ok(value=ProfileCommand(
+            argv=argv + ((target_text,) if target_text is not None else ()),
+        ))
 
 
 class UnsupportedControl:
@@ -719,11 +825,54 @@ class PublishedDoubletakeControl:
         except (TypeError, ValueError):
             return None
 
-    async def _run(self, argv: tuple[str, ...]) -> Result[CommandOutput]:
+    def _relay_submission(self, operation: BackendOperation) -> bool:
+        """Whether this profile/operation is the proved public relay submission.
+
+        Derived from the actual operation and the recognized public profile with
+        proved ``credential_relay``; never from a caller flag or the payload.
+        """
+        features = self._profile.features
+        return (
+            operation is BackendOperation.submit_pairing
+            and features.profile in {"doubletake-0.5", "doubletake-0.5+source"}
+            and features.credential_relay
+        )
+
+    def _command_refusal(
+        self, command: ProfileCommand, operation: BackendOperation,
+    ) -> Err | None:
+        """Validate redaction metadata before any I/O, at the adapter boundary."""
+        if type(operation) is not BackendOperation or not isinstance(command, ProfileCommand):
+            return _err(ErrorCode.invalid_input)
+        try:
+            _validate_secret_indices(command.argv, command.secret_indices)
+        except ValueError:
+            return _err(ErrorCode.invalid_input)
+        if operation is BackendOperation.submit_pairing:
+            # A proved public relay command must declare exactly its final
+            # credential token; the application-contract fixture keeps the
+            # transactional empty tuple.  Every other operation carries none.
+            if self._relay_submission(operation):
+                if command.secret_indices != (len(command.argv) - 1,):
+                    return _err(ErrorCode.invalid_input)
+        elif command.secret_indices:
+            return _err(ErrorCode.invalid_input)
+        return None
+
+    async def _run(
+        self, command: ProfileCommand, *, operation: BackendOperation,
+    ) -> Result[CommandOutput]:
+        refused = self._command_refusal(command, operation)
+        if refused is not None:
+            return refused
+        executable = command.argv[0] if command.argv else None
         try:
             value = await asyncio.wait_for(
                 self._process.run(
-                    CommandSpec(argv=argv, env={}),
+                    CommandSpec(
+                        argv=command.argv, env={},
+                        secret_indices=command.secret_indices,
+                    ),
                     timeout=self._timeout,
                     stdin=None,
                 ),
@@ -732,15 +881,15 @@ class PublishedDoubletakeControl:
         except asyncio.TimeoutError:
             return _err(ErrorCode.daemon_failed)
         except FileNotFoundError:
-            return _err(ErrorCode.dependency_missing, command=argv[0])
+            return _err(ErrorCode.dependency_missing, command=executable)
         except OSError:
-            return _err(ErrorCode.dependency_missing, command=argv[0])
+            return _err(ErrorCode.dependency_missing, command=executable)
         except Exception:
             return _err(ErrorCode.dependency_incompatible)
         if isinstance(value, Err):
             code = getattr(value.error, "code", ErrorCode.dependency_incompatible)
             if code is ErrorCode.dependency_missing:
-                return _err(ErrorCode.dependency_missing, command=argv[0])
+                return _err(ErrorCode.dependency_missing, command=executable)
             if code in {ErrorCode.cleanup_timeout, ErrorCode.daemon_failed, ErrorCode.transport_failed}:
                 return _err(ErrorCode.daemon_failed)
             return _err(ErrorCode.dependency_incompatible)
@@ -839,7 +988,9 @@ class PublishedDoubletakeControl:
         )
         if isinstance(argv_result, Err):
             return argv_result
-        process_result = await self._run(argv_result.value)
+        process_result = await self._run(
+            argv_result.value, operation=BackendOperation.status,
+        )
         if isinstance(process_result, Err):
             return process_result
         output = process_result.value
@@ -948,7 +1099,7 @@ class PublishedDoubletakeControl:
                 if isinstance(fenced, Err):
                     return fenced
 
-        process_result = await self._run(argv_result.value)
+        process_result = await self._run(argv_result.value, operation=op)
         if self._public_authority():
             proof = ownership if self._is_mutation(op) else read_proof
             if proof is None:
@@ -1134,7 +1285,7 @@ class HandshakeAuthority:
         argv = profile.try_argv(BackendOperation.status, None, EmptyPayload())
         if isinstance(argv, Err):
             return argv
-        response = await control._run(argv.value)
+        response = await control._run(argv.value, operation=BackendOperation.status)
         if isinstance(response, Err):
             return response
         if response.value.exit_code != 0:
@@ -1313,6 +1464,7 @@ __all__ = [
     "OwnershipAuthority",
     "OwnershipProof",
     "PairingPayload",
+    "ProfileCommand",
     "PublishedDoubletakeControl",
     "PublishedDoubletakeProfile",
     "SourcePayload",
