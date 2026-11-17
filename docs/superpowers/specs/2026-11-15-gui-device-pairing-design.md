@@ -74,7 +74,7 @@ tool owns all of it.
 | `BackendFeatures.credential_relay` and its derivation | T-002 | Proves the target-bound credential command exists in the pinned surface |
 | `ProfileCommand` / `CommandSpec.secret_indices` and redacted projections | T-002, T-005 | The credential must never reach a journal, record or diagnostic |
 | `EvidenceAuthority.allows(submit_pairing)` | T-002 | One authorization branch, four transaction flags still false |
-| Observer redaction (`redact`, `FakeProcess`, `ProbeProcessRecorder`, acceptance recorder) | T-005 | Retained observations never contain the credential |
+| Observer redaction (`redact`, `FakeProcess`, `ProbeProcessRecorder`, acceptance recorder) | T-005 work, **not yet integrated** | Retained observations never contain the credential. This is the quarantined core lane's commit; the review of it found three retention paths and one leaky assertion. It must be finished and integrated as part of this delivery, not assumed present. |
 | `PairingDialog`, projection, presenter prompt plumbing | existing `ui/` | The dialog already exists, wipes secrets on exit and renders offered actions |
 
 ## 5. What is dropped
