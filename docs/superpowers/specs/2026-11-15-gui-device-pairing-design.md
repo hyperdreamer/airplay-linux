@@ -59,7 +59,7 @@ transport sends:  connect T [--audio on|off] [--volume N] <credential>
       ▼
 await the reply (bounded), then read status once
       │
-      ├── T no longer waiting      → report accepted, close the prompt
+      ├── T no longer waiting      → report what the receiver reports, then close the prompt
       ├── T still waiting          → report "that PIN was not accepted", keep the prompt
       └── no reply / ambiguous     → report "the receiver did not answer", close the prompt
 ```
@@ -120,10 +120,10 @@ After the reply, one status read decides the message:
 
 | Observation | Message | Prompt |
 | --- | --- | --- |
-| this target reaches `streaming` within the wait | "Connected to <TV>." | closed |
-| still waiting or merely `connecting` when the wait expires | "The mirror did not start - check the PIN." | closed |
-| this target absent from the status | "The mirror did not start - check the PIN." | closed |
-| no decoded reply to the command | "The receiver did not answer; start again." | closed |
+| this target is reported `streaming` within the wait | "Connected to <TV>." (the receiver reports a streaming session) | closed |
+| not `streaming` when the wait expires | "The mirror did not reach streaming in time." | closed |
+| this target absent from the status | "The mirror did not reach streaming in time." | closed |
+| no decoded reply to the command | "The receiver did not answer." | closed |
 | receiver service reports it is shutting down | "The receiver service is stopping; start again." | closed |
 
 **Why only these two outcomes.** The receiver acknowledges a credential before it authenticates
@@ -163,7 +163,8 @@ submits, not when the prompt opens.
 The credential crosses one process boundary in the argv of `doubletake-ctl`, readable by a
 same-UID process during that call. That matches the existing cooperative same-user boundary: any
 such process can drive the daemon socket directly. The application stores nothing, logs nothing,
-and retains nothing — enforced by the canary tests already written for T-005.
+and retains nothing — enforced by the canary tests that this delivery must finish and integrate - they exist in the
+quarantined core lane and are known to be incomplete.
 
 The address-continuity limit of §2 is the honest statement of what targeting can and cannot
 prove.
@@ -204,3 +205,82 @@ follow-up status read.
    a second command from elsewhere is the receiver's problem, not this application's.
 3. **Receiver lockout after repeated wrong PINs** — the operator can retype; the receiver decides.
    The dashboard does not retry by itself and never submits without an operator action.
+
+## 12. Route B integration contract
+
+This section fixes the boundaries the reviews kept finding unowned. Everything here is mechanism;
+no new promise is made.
+
+### 12.1 Publishing the request (transport)
+
+`_await_connecting_stream` currently fails with `dependency_incompatible` when it sees a prompt.
+It instead publishes a `CredentialRequest(target, kind)` for the entry **whose target matches the
+stream**, records it on the stream, and keeps waiting. Aggregate status fields never create a
+request; another target's prompt is ignored.
+
+The pending start remains the owner of the wait. The request does not create a second start, a
+lease or a reservation.
+
+### 12.2 Suspending and resuming the deadlines (F-08)
+
+While a request is live for this stream, the start's readiness budget is **suspended**: the
+transport stops counting it and records the offset. It resumes when the request leaves the live
+state (a submission was attempted, the entry changed, or the prompt was cancelled), and the
+remaining budget is shifted by the elapsed pause. A person typing is therefore never inside a
+start deadline.
+
+After a submission is attempted, a **bounded streaming wait** begins: `CONNECT_STREAMING_TIMEOUT`
+measured from the command's reply, polled with the existing status read. That wait is independent
+of the suspended start budget. On expiry the prompt closes and the pending start continues to its
+own resumed deadline; the operator may Stop.
+
+### 12.3 Submitting (session and transport)
+
+The session publishes the existing `ChallengeView` for a live request without touching the
+transactional coordinator. On submit it calls one transport operation:
+
+```
+submit_credential(target, value) -> Submitted | NoReply | ShuttingDown
+```
+
+which builds the T-002 profile command (`connect <target> [--audio on|off] [--volume N]
+<credential>`, credential index declared as a secret) and runs it once. It reports only which of
+three sanitized things happened; it does not interpret the receiver's error text and does not
+carry a credential in any result.
+
+The session then performs the bounded wait of §12.2 and derives the §6.4 message from the
+observed state. Cancellation closes the prompt and sends nothing.
+
+### 12.4 The fall-through is accepted (F-03)
+
+If the waiting entry disappears between the status read and the command, the receiver may start a
+new connection using the credential. That is the connection the operator asked for; the design
+accepts it and does not claim otherwise. The application still reports only what it observes
+afterwards, and §2 already states that a duplicate command cannot be prevented.
+
+### 12.5 Presentation (F-06, F-07)
+
+The prompt opens for the receiver whose start produced the request, regardless of which pane is
+selected; selection changes do not retarget an open prompt. The dialog disables its field while a
+submission is in flight and its Cancel dismisses the prompt (it is not a transactional pairing
+cancel). Prompt identity is the pair `(receiver, start operation)` plus the first observed
+credential kind; a repeated status cannot reopen it, and an old prompt is invalidated when the
+local start is replaced.
+
+**Documented limit:** the status exposes no request identifier, so two successive waits of the
+same kind for the same target are indistinguishable. The design does not promise to tell them
+apart.
+
+### 12.6 Input validation (F-12)
+
+A value is refused before dispatch when it is empty, contains a NUL, or would be parsed as an
+option by the profile in use (`connect` terminates the pinned CLI's flag parsing, so a leading
+dash is positional there; the extended volume grammar is different). Refusal is a fixed,
+secret-free invalid-input result and sends no command.
+
+### 12.7 Wording (F-10, F-13)
+
+"Connected" means exactly: *the receiver reports this target streaming*. It does not mean frames
+are visible, and it does not mean the credential was remembered. A failure says only that
+streaming was not reached in time; it names no cause, because the observations cannot establish
+one. A later status that reaches streaming after the prompt closed is not retro-reported.
