@@ -3,6 +3,10 @@
 **Status:** design under review (round 8)
 **Run:** `pm-run-20261115-031248-7c91beef`
 **Target branch:** `master` at `afc07b2`
+**Superseded in part by Amendment D1 (§12):** the relay ownership, settlement and
+presentation clauses of §§5.4–5.7 and 5.13 now read through §12, which removes the
+dashboard's dispatch authority entirely.
+
 **Supersedes:** SD-1 term (1) and the pairing-submission clause of owned-daemon control
 Amendment 1 §3
 
@@ -627,3 +631,102 @@ Mutation probes:
    intent, and tested with the original audio and volume options preserved.
 4. **Deferred virtual pairing** — a virtual start still refuses when a receiver asks; this
    is visible to the operator and stated in the delivery summary.
+
+## 12. Amendment D1 — the dashboard holds no dispatch authority
+
+### 12.1 Why the previous shape failed
+
+Sections 5.4–5.7 gave the dashboard actor a share of dispatch authority: it kept its own
+uncertainty barrier, its own monotonic latches over progress, and its own settlement
+attribution, synchronised with the transport by message. Six review rounds of the actor found
+only disagreements between those two copies — an older view applied late, a request kind
+replaced underneath a pending view, a completion delivered before its settlement, a release
+fence published with otherwise unchanged content. Ordering the messages (amendment A1) moved
+the problem rather than solving it: ordering what has *arrived* does not make it *current*, and
+a successful start handle carries no ordering at all.
+
+The seam is wrong, not the code. Two controllers arbitrating one question by message cannot be
+made correct by more message rules.
+
+### 12.2 The rule
+
+**The transport is the only authority on dispatch.** What is outstanding, whether input is
+eligible, when a command is settled, and when a lease is released are all decided by the
+transport and are never inferred, cached, latched or re-derived by the actor.
+
+**The dashboard renders.** The actor projects the newest `RelayLeaseView` it has been given and
+nothing else. It may *display* an offer of input; it never *authorises* one.
+
+**Admission is decided at submission.** The dashboard may refuse early for its own reasons
+(no live challenge, dialog not open, client-side input invalid), but its acceptance is never
+authority to spawn. Every relay submission is admitted or refused by the transport at the
+moment it is submitted, using its own current state. A submission the dashboard offered from a
+stale view is refused there with `stale_target` (or `no_spawn` when nothing was reserved), the
+prompt closes on the next view, and the pane shows "That receiver changed; start again."
+
+**Consequence for staleness.** A stale view can only mislead the display for as long as the
+transport takes to refuse. It cannot cause a credential to reach any receiver: the transport
+binds the command to the named target and revalidates ownership immediately before the spawn,
+so a stale offer is an annoyance, never a delivery.
+
+### 12.3 What the dashboard still owns
+
+Only facts that belong to the receiver actor and are not dispatch state:
+
+1. **Presentation revision** — monotonically increasing per receiver, keyed to
+   `(challenge_id, presentation_revision)`, so a repeated snapshot cannot open a second dialog
+   and two distinct invalid submissions each reopen once (§11 of the specification).
+2. **Submission identity and dedup** — a fresh `submission_id` allocated before client input
+   validation, registered pending, tombstoned on completion for the actor's lifetime, so a
+   duplicate cannot apply twice and two identical invalid submissions remain distinguishable.
+3. **Projection and notice** — rendering the view, the challenge, the pane actions and the
+   typed notice, including the terminal notice that survives ordered cleanup.
+
+These are actor-lifetime identity facts with no transport counterpart, so they cannot diverge
+from a transport copy.
+
+### 12.4 What this removes
+
+Removed from the actor and from the contract: the uncertainty barrier, the per-field monotonic
+latches, settlement fingerprinting and consumption, cross-generation attempt-counter
+comparison, `view_seq`, and the ordered-view rule of amendment A1. None of them is replaced by
+another actor-side mechanism.
+
+Removed from the transport's public view: nothing. `RelayLeaseView` keeps its existing fields;
+`command_id` and `unresolved_dispatch_ids` remain transport-private.
+
+### 12.5 Transport obligations this makes load-bearing
+
+Because the dashboard no longer pre-checks anything, the transport must be correct on its own,
+and the following are now the *only* barriers:
+
+1. **Reservation before spawn** — the fence, the final ownership revalidation and the
+   reservation happen in one uninterrupted sequence immediately before the child starts, with
+   no await and no scheduling gap between them (already required by §8).
+2. **Exclusive dispatch** — `can_submit` on the transport's current state refuses a second
+   command while one is unresolved, including after its caller returned.
+3. **Release before retirement** — a release fences further submissions before it settles
+   anything, and one disconnect at a time (already required by §9).
+4. **Typed refusal** — every refusal is one of `no_spawn`, `acknowledged` or `uncertain`, with
+   its fixed diagnostic, so the dashboard's closure is always explained.
+
+### 12.6 Presentation under refusal
+
+A refusal that closes the challenge publishes a view with the challenge cleared and the typed
+notice. A refusal that keeps the challenge (`Waiting`, retained `Rejected`) publishes a view
+that still names it. The dashboard does not decide which of those it is; it renders the view.
+If the view is stale by the time it is rendered, the user may type into a field that will be
+refused — that is the accepted cost, and the refusal is the explanation.
+
+### 12.7 Tests this amendment requires
+
+1. A submission offered from a stale view is refused by the transport and closes the prompt;
+   no child is spawned, and the pane shows the stale notice.
+2. Two identical invalid submissions produce two revisions and two dialogs (actor identity),
+   while neither reaches the transport.
+3. A duplicate completion applies once, with no revision and no dialog.
+4. The transport refuses a second command while one is unresolved, across request replacement
+   and after a caller timeout.
+5. Release fences submissions before settling and spawns exactly one disconnect.
+6. A successful handle commits trust exactly once, before the start effect's blocked-trust
+   check, and a later matching completion does not clear or discard the admitted handle.
