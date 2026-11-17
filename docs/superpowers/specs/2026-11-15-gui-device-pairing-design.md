@@ -13,7 +13,9 @@ Mirror mode only. When the receiver that the operator started is waiting for a P
 the dashboard shows a field, sends the credential to the receiver tool, and reports what the
 status says afterwards.
 
-Delivered: **answer the PIN, report the outcome.**
+Delivered: **answer the PIN, and report what the receiver actually did.** The only
+success claim is that the mirror reached `streaming`; the only failure claim is that it
+did not.
 
 ## 2. What this design does not promise
 
@@ -28,6 +30,8 @@ These are stated here because earlier drafts promised them and could not keep th
 - **Not a duplicate-submission guarantee.** The dashboard disables its own field while a
   submission is in flight, which prevents the ordinary double-click. It cannot prove that a
   second command never reaches the receiver.
+- **Not a diagnosis.** A failure is reported as "did not start"; the application does not claim
+  to know whether the credential was wrong, the receiver timed out, or the connection dropped.
 - **Not a release guarantee.** Stopping a mirror is the existing behaviour, unchanged.
 
 Each of these is recorded in `docs/operations.md` as an operator-visible limit.
@@ -116,11 +120,21 @@ After the reply, one status read decides the message:
 
 | Observation | Message | Prompt |
 | --- | --- | --- |
-| this target no longer waiting | "Paired with <TV>." | closed |
-| this target still waiting, same kind | "That PIN was not accepted." | kept, field cleared |
-| this target absent from the status | "That receiver did not answer; start again." | closed |
-| no decoded reply within the bounded wait | "The receiver did not answer; start again." | closed |
+| this target reaches `streaming` within the wait | "Connected to <TV>." | closed |
+| still waiting or merely `connecting` when the wait expires | "The mirror did not start - check the PIN." | closed |
+| this target absent from the status | "The mirror did not start - check the PIN." | closed |
+| no decoded reply to the command | "The receiver did not answer; start again." | closed |
 | receiver service reports it is shutting down | "The receiver service is stopping; start again." | closed |
+
+**Why only these two outcomes.** The receiver acknowledges a credential before it authenticates
+and removes the waiting stream when pairing fails, so "no longer waiting" is not proof of
+success and a rejection cannot be told apart from a timeout by the application. `streaming` is
+the one state the receiver only reports when a stream is actually carrying media, so it is the
+one success claim this design is entitled to make. Everything else is reported as "did not
+start", with no invented cause.
+
+**No same-prompt retry.** A refused credential does not leave the waiting request open, so the
+prompt closes and the operator starts again. The dashboard does not pretend a retry is possible.
 
 The dashboard reports; it does not adjudicate. There is no attempt counter beyond the
 receiver's own policy: the operator can retype, and the receiver decides whether to accept it.
@@ -128,8 +142,10 @@ The dialog's existing "Cancel" closes the prompt and leaves the receiver as it w
 
 ### 6.5 Bounded waits
 
-Two bounds, both pre-existing constants: the control command timeout for the submit, and the
-existing status read for the follow-up observation. No new timers.
+Two bounds, both pre-existing constants: the control command timeout for the submit, and
+`CONNECT_STREAMING_TIMEOUT` for the wait that follows it, polled with the existing status read.
+No new timers. A person typing is not subject to either bound: both start when the operator
+submits, not when the prompt opens.
 
 ## 7. Failure handling
 
@@ -138,7 +154,7 @@ existing status read for the follow-up observation. No new timers.
 | status cannot be read | existing transport failure path, unchanged |
 | the receiver asks but a newer status no longer shows it | prompt closes with "That receiver did not answer; start again." |
 | the operator cancels | prompt closes; no command is sent |
-| the credential is refused | message shown, prompt stays, field cleared |
+| the credential is refused (the receiver removes the stream) | "The mirror did not start - check the PIN.", prompt closed |
 | the receiver service is shutting down | message shown, prompt closes |
 | the app is closed mid-prompt | existing shutdown path; no credential retained anywhere |
 
