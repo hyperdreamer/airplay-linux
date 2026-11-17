@@ -132,6 +132,11 @@ class BackendFeatures:
     source_reporting_complete: bool = False
     target_volume: bool = False
 
+    #: The exact pinned control table proves the target-bound credential
+    #: ``connect`` form.  It is derived independently and grants nothing else:
+    #: ownership, source typing and the transactional pairing flags stay separate.
+    credential_relay: bool = False
+
     def __post_init__(self) -> None:
         if type(self.profile) is not str or type(self.version) is not str:
             raise TypeError("backend profile and version must be strings")
@@ -353,6 +358,29 @@ class AckReply:
 
 
 BackendReply: TypeAlias = StatusReply | DevicesReply | AckReply
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialDispatchFailure(Err):
+    """A relay credential command's sanitized refusal and proved classification.
+
+    ``error`` is inherited from :class:`Err` and carries only a catalog code.
+    ``dispatch_state`` records whether a child provably could not exist, produced
+    a decoded acknowledgement, or may have executed without a decoded reply.
+    ``refusal`` is the closed fixed-string classification for the few daemon
+    rejections the adapter can name; it is never daemon text.
+    """
+
+    dispatch_state: Literal["no_spawn", "acknowledged", "uncertain"]
+    refusal: Literal["shutdown", "ended", "stale", "rejected"] | None = None
+
+    def __post_init__(self) -> None:
+        if self.dispatch_state not in {"no_spawn", "acknowledged", "uncertain"}:
+            raise ValueError("invalid credential dispatch state")
+        if self.refusal is not None and self.refusal not in {
+            "shutdown", "ended", "stale", "rejected",
+        }:
+            raise ValueError("invalid credential dispatch refusal")
 
 
 def _exact_dict(value: object) -> dict[str, Any] | None:
@@ -843,6 +871,21 @@ def _target_scope_proven(command: _CtlCommand | None) -> bool:
     return re.search(r"\b(?:not|never|ignor\w*|unsupported|unavailable)\b", summary) is None
 
 
+def _credential_relay_proven(
+    *, verified: bool, signatures: dict[str, str] | None,
+) -> bool:
+    """Whether this exact verified control table proves the relay connect form.
+
+    Both recognized tables carry the target-bound ``connect``/``pin`` rows; a
+    missing row, an added row or a changed signature matches neither.  Nothing is
+    inferred from version text, keyring, a ``-pair`` flag or prose.
+    """
+    return verified and (
+        signatures == _PINNED_050_CTL_COMMANDS
+        or signatures == _VOLUME_CTL_COMMANDS
+    )
+
+
 def features_from_help(
     sender_help: str, ctl_help: str, *, advertised: frozenset[str] = frozenset(),
 ) -> BackendFeatures:
@@ -891,6 +934,9 @@ def features_from_help(
     if source_surface and not source_tokens:
         verified = False
     patched_surface = verified and source_surface
+    credential_relay = _credential_relay_proven(
+        verified=verified, signatures=signatures,
+    )
     source_complete = patched_surface and {
         _CAPABILITY_SCHEMA_TOKEN, _STATUS_SOURCE_TOKEN, _STATUS_SOURCE_COMPLETE_TOKEN,
     } <= set(advertised)
@@ -945,6 +991,7 @@ def features_from_help(
         source_reporting=patched_surface,
         source_reporting_complete=source_complete,
         target_volume=target_volume,
+        credential_relay=credential_relay,
     )
 
 
@@ -1071,6 +1118,7 @@ __all__ = [
     "BackendReply",
     "BackendSource",
     "BackendStream",
+    "CredentialDispatchFailure",
     "CredentialProofVerdict",
     "DevicesReply",
     "StatusReply",

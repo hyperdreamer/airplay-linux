@@ -15,7 +15,7 @@ from airplay_linux.capture.source import SourceRefusal, verify_reported_source
 from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.backend.control import (
     ApplicationContractProfile, BackendNotice, BackendNoticeKind, BackendOperation,
-    PublishedDoubletakeControl, PublishedDoubletakeProfile,
+    ProfileCommand, PublishedDoubletakeControl, PublishedDoubletakeProfile,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import MutePayload, SourceVerificationPayload, TransportEventKind
@@ -2744,8 +2744,10 @@ async def test_volume_connect_payload_is_capability_conditioned(volume_control, 
     argv = PublishedDoubletakeProfile(socket_path=h.registry.record.socket_path,
                                       features=h.transport._features).try_argv(
         BackendOperation.connect, h.a, payloads[0])
-    assert argv == Ok(value=("doubletake-ctl", "-socket", h.registry.record.socket_path,
-                             "connect", h.a.canonical_host, *want))
+    assert argv == Ok(value=ProfileCommand(
+        argv=("doubletake-ctl", "-socket", h.registry.record.socket_path,
+              "connect", h.a.canonical_host, *want),
+    ))
 
 
 @pytest.mark.asyncio
