@@ -12,6 +12,7 @@ import asyncio
 import errno
 import inspect
 import os
+import select
 import socket
 import stat
 import sys
@@ -38,6 +39,7 @@ from airplay_linux.domain.ports import (
 from airplay_linux.domain.records import (
     AuthorityOwner, DaemonCleanupIntent, DaemonRecord, LaunchReceipt, SupervisorReleaseIntent,
 )
+from airplay_linux.domain.relay import TerminationProof
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
 from airplay_linux.process.authority import AuthorityLease, SharedRootAuthority
 from airplay_linux.process.launcher import LaunchCapability
@@ -351,6 +353,107 @@ class DaemonRegistry:
                 return acquired
             return await self._reconcile_locked()
 
+    async def termination_proof(self, record: DaemonRecord) -> Result[TerminationProof]:
+        """Observe historical terminal evidence for one exact original instance.
+
+        This is a query, not lifecycle admission: it reads the receipt and
+        cleanup-intent repositories, joins the original identity, requires the
+        actual terminal vocabulary and then observes positive exit evidence for
+        the recorded process. It never launches, stops, signals, reconciles,
+        rewrites or releases anything, and it does not consult the old runtime
+        directory, socket, inode or current endpoint generation.
+        """
+        if record.daemon is None:
+            return _error(ErrorCode.stale_event)
+        async with self._lock:
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            intents = await self._cleanup_intents.all()
+            if isinstance(intents, Err):
+                return intents
+            matches = tuple(
+                receipt for receipt in history.value
+                if receipt.daemon_instance_uuid == record.instance_uuid
+            )
+            if len(matches) != 1:
+                return _error(ErrorCode.stale_event)
+            receipt = matches[0]
+            if (
+                receipt.daemon != record.daemon
+                or receipt.runtime_directory != record.runtime_directory
+                or str(Path(receipt.runtime_directory) / receipt.socket_name) != record.socket_path
+            ):
+                return _error(ErrorCode.stale_event)
+            intent: DaemonCleanupIntent | None = None
+            if receipt.state == 'failed':
+                selected = tuple(
+                    item for item in intents.value
+                    if item.launch_uuid == receipt.launch_uuid
+                )
+                if len(selected) != 1:
+                    return _error(ErrorCode.cleanup_timeout)
+                intent = selected[0]
+                if (
+                    intent.outcome != 'stopped'
+                    or intent.completed_at is None
+                    or intent.completed_at < intent.intent_at
+                ):
+                    return _error(ErrorCode.cleanup_timeout)
+            elif receipt.state != 'stopped':
+                return _error(ErrorCode.cleanup_timeout)
+            evidence = self._exit_evidence(record.daemon)
+            if isinstance(evidence, Err):
+                return evidence
+            process_evidence, identity_verified_at = evidence.value
+            return Ok(value=TerminationProof(
+                daemon_instance_uuid=record.instance_uuid,
+                daemon=record.daemon,
+                runtime_directory=record.runtime_directory,
+                launch_uuid=receipt.launch_uuid,
+                receipt_state=receipt.state,
+                cleanup_outcome=intent.outcome if intent is not None else None,
+                cleanup_completed_at=intent.completed_at if intent is not None else None,
+                process_evidence=process_evidence,
+                identity_verified_at=identity_verified_at,
+                observed_at=self._clock.now(),
+            ))
+
+    def _exit_evidence(self, daemon: ProcessIdentity) -> Result[tuple[str, float]]:
+        """The recorded process's authoritative absence or exact pidfd exit.
+
+        A cached ``alive`` flag, a missing socket, a finished client task or an
+        unreadable procfs entry is never evidence. The pidfd branch binds the
+        observed start time to the recorded identity twice around the open and
+        closes the descriptor on every path.
+        """
+        try:
+            observed = self._inspect(daemon.pid)
+        except (OSError, ValueError):
+            return _error(ErrorCode.cleanup_timeout)
+        if observed.state is IdentityState.absent:
+            return Ok(value=('pid_absent', self._clock.now()))
+        if observed.state is not IdentityState.present or observed.identity != daemon:
+            return _error(ErrorCode.cleanup_timeout)
+        pidfd = self._open_pidfd(daemon.pid)
+        if pidfd is None:
+            return _error(ErrorCode.cleanup_timeout)
+        try:
+            try:
+                revalidated = self._inspect(daemon.pid)
+            except (OSError, ValueError):
+                return _error(ErrorCode.cleanup_timeout)
+            if (
+                revalidated.identity != daemon
+                or revalidated.state not in {IdentityState.present, IdentityState.terminated}
+                or not self._pidfd_exited(pidfd)
+            ):
+                return _error(ErrorCode.cleanup_timeout)
+            verified_at = self._clock.now()
+        finally:
+            self._close_pidfd(pidfd)
+        return Ok(value=('pidfd_exited', verified_at))
+
     async def _pause(self) -> None:
         if self._scheduler is None:
             await asyncio.sleep(0.02)
@@ -418,6 +521,38 @@ class DaemonRegistry:
             )
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _open_pidfd(pid: int) -> int | None:
+        """Open one process descriptor, or report that the kernel cannot."""
+        opener = getattr(os, 'pidfd_open', None)
+        if opener is None:
+            return None
+        try:
+            return opener(pid, 0)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _pidfd_exited(pidfd: int) -> bool:
+        """Whether this descriptor reports the process's exit now.
+
+        A pidfd becomes readable on exit. A zero timeout keeps the historical
+        query non-blocking: a still-live process is not exit evidence.
+        """
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        try:
+            return any(events & select.POLLIN for _, events in poller.poll(0))
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _close_pidfd(pidfd: int) -> None:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
 
     def _exact_process(self, identity: ProcessIdentity | None, uid: int) -> bool:
         if identity is None:
