@@ -10,9 +10,9 @@ from __future__ import annotations
 import ast
 from dataclasses import MISSING, FrozenInstanceError, fields, replace
 from pathlib import Path
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from typing import get_args, get_type_hints
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -135,6 +135,38 @@ def test_each_relay_eligibility_gate(eligible_view, changes):
     assert not can_submit(replace(eligible_view, **changes))
 
 
+# The predicate admits exactly one request state and exactly two dispatch states; every
+# declared vocabulary member is exercised, so widening either set must fail by name.
+LIVE_REQUEST_STATES = frozenset({"live"})
+SUBMITTABLE_DISPATCH_STATES = frozenset({"none", "settled"})
+
+
+@pytest.mark.parametrize("state", get_args(relay.RequestState))
+def test_relay_eligibility_admits_exactly_the_live_request_state(eligible_view, state):
+    assert can_submit(replace(eligible_view, request_state=state)) is (
+        state in LIVE_REQUEST_STATES
+    )
+
+
+@pytest.mark.parametrize("state", get_args(relay.DispatchState))
+def test_relay_eligibility_admits_exactly_the_settled_dispatch_states(eligible_view, state):
+    assert can_submit(replace(eligible_view, dispatch_state=state)) is (
+        state in SUBMITTABLE_DISPATCH_STATES
+    )
+
+
+@pytest.mark.parametrize("kind", get_args(relay.CredentialKind))
+def test_relay_eligibility_accepts_each_matching_credential_kind(eligible_view, kind):
+    matching = _challenge(_request(eligible_view, credential_kind=kind), credential_kind=kind)
+    assert can_submit(matching) is True
+    # Either side alone refuses, so neither comparison may be pinned to one kind.
+    for other in get_args(relay.CredentialKind):
+        if other == kind:
+            continue
+        assert can_submit(_challenge(matching, credential_kind=other)) is False
+        assert can_submit(_request(matching, credential_kind=other)) is False
+
+
 def _request(view: RelayLeaseView, **changes: object) -> RelayLeaseView:
     return replace(view, request=replace(view.request, **changes))
 
@@ -165,6 +197,13 @@ IDENTITY_MISMATCHES = (
     ("request-credential-kind", lambda view: _request(view, credential_kind="password")),
     ("endpoint-fingerprint", lambda view: _challenge(view, endpoint_fingerprint="endpoint-b-v1")),
     ("target-fingerprint", lambda view: replace(view, target=replace(view.target, endpoint_fingerprint="other"))),
+    # A host-only disagreement leaves receiver, fingerprint and generations equal.
+    ("request-target-host", lambda view: _request(
+        view, target=replace(view.target, canonical_host="192.0.2.11"),
+    )),
+    ("lease-target-host", lambda view: replace(
+        view, target=replace(view.target, canonical_host="192.0.2.11"),
+    )),
 )
 
 
@@ -354,13 +393,17 @@ def test_relay_literal_vocabulary_is_exact(alias, values):
 def test_relay_defaulted_fields_keep_existing_contracts_compatible(eligible_view):
     options = RelayStartOptions(target_volume_proven=False, audio=None, initial_volume=None)
     assert (options.audio, options.initial_volume) == (None, None)
-    for record in (
+    # Every inventory record that must stay required is listed here explicitly.
+    required = (
         RelayStartOptions, CredentialRequest, SuccessPending, RelayLeaseView,
-        TerminationProof, messages.RelaySubmitCompletion,
-    ):
+        TerminationProof, messages.RelayPairingPayload, messages.RelaySubmitCompletion,
+    )
+    for record in required:
         assert all(field.default is MISSING and field.default_factory is MISSING
                    for field in fields(record)), record.__name__
-    # ReleaseEvidence alone carries the §4 defaults for its optional evidence.
+    # ReleaseEvidence alone is defaulted; the two inventories are otherwise the same,
+    # so no record may silently acquire a default by escaping this check.
+    assert {record.__name__ for record in required} | {"ReleaseEvidence"} == set(RELAY_RECORDS)
     defaults = {field.name: field.default for field in fields(ReleaseEvidence)}
     assert defaults.pop("reason") is MISSING and defaults.pop("observed_at") is MISSING
     assert defaults == {
@@ -481,6 +524,16 @@ def test_challenge_view_presentation_revision_validation():
     assert can_submit(replace(eligible_view_for_challenge(revisioned)))
 
 
+def test_challenge_view_presentation_revision_is_annotated_exactly_int():
+    # ``bool`` is an ``int`` subclass, so the annotation is pinned as a type identity,
+    # not merely as an accepted value shape.
+    hints = get_type_hints(ChallengeView, localns={"ReceiverId": ReceiverId})
+    assert hints["presentation_revision"] is int
+    view = challenge_for(request_for())
+    assert type(view.presentation_revision) is int
+    assert type(replace(view, presentation_revision=3).presentation_revision) is int
+
+
 def eligible_view_for_challenge(challenge: ChallengeView) -> RelayLeaseView:
     request = request_for()
     return RelayLeaseView(
@@ -528,6 +581,25 @@ def _module_function(path: Path, name: str) -> ast.FunctionDef | ast.AsyncFuncti
     return definitions[0]
 
 
+def _is_docstring(node: ast.stmt) -> bool:
+    return (
+        isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    )
+
+
+def _statements(definition: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.stmt]:
+    statements = list(definition.body)
+    if statements and _is_docstring(statements[0]):
+        statements.pop(0)
+    return statements
+
+
+def _dump(nodes: list[ast.stmt]) -> list[str]:
+    return [ast.dump(node, include_attributes=False) for node in nodes]
+
+
 def test_relay_credential_representable_is_keyword_only_and_retains_nothing():
     assert relay_credential_representable("-1234", target_volume_proven=True) is False
     with pytest.raises(TypeError):
@@ -536,15 +608,67 @@ def test_relay_credential_representable_is_keyword_only_and_retains_nothing():
     # after the docstring the body must be exactly the specified return, so any
     # inserted statement (for example retaining ``value`` in a global) fails here.
     definition = _module_function(Path(relay.__file__), "relay_credential_representable")
-    statements = list(definition.body)
-    if (statements and isinstance(statements[0], ast.Expr)
-            and isinstance(statements[0].value, ast.Constant)
-            and isinstance(statements[0].value.value, str)):
-        statements.pop(0)
+    # A decorator may retain the argument after the call returns: ``lru_cache`` keeps
+    # the credential text as a cache key. No wrapper is admissible at all.
+    assert definition.decorator_list == []
     expected = ast.parse('return not (target_volume_proven and value.startswith("-"))').body[0]
-    assert len(statements) == 1, ast.dump(definition, include_attributes=False)
-    assert ast.dump(statements[0], include_attributes=False) == ast.dump(
-        expected, include_attributes=False
+    assert _dump(_statements(definition)) == _dump([expected]), ast.dump(
+        definition, include_attributes=False
+    )
+    # The executable twin of the structural check: the module name must still bind a
+    # plain function with no memo, wrapper, closure or module-held argument.
+    sentinel = "-" + uuid4().hex
+    assert relay_credential_representable(sentinel, target_volume_proven=True) is False
+    retained = relay_credential_representable
+    assert type(retained) is FunctionType, type(retained)
+    assert retained.__closure__ is None and retained.__code__.co_freevars == ()
+    assert retained.__kwdefaults__ is None and retained.__dict__ == {}
+    assert not hasattr(retained, "cache_info") and not hasattr(retained, "__wrapped__")
+    assert sentinel not in repr(vars(relay))
+
+
+# ``can_submit`` is the one admission predicate shared by presentation, command
+# admission and the spawn fence. Its body is pinned statement for statement so no
+# decorator, global assignment or retained module state can be added unnoticed.
+CAN_SUBMIT_STATEMENTS = (
+    "r = lease.request",
+    "c = lease.challenge",
+    '''
+return (
+    r is not None
+    and c is not None
+    and lease.owner_live
+    and lease.request_state == "live"
+    and lease.request_waiting
+    and r.generation == lease.generation
+    and r.receiver_id == lease.receiver_id == c.receiver_id
+    and r.target == lease.target
+    and r.endpoint_generation == lease.endpoint_generation == c.endpoint_generation
+    and r.session_generation == lease.session_generation == c.session_generation
+    and r.owner_lease == lease.owner_lease
+    and r.daemon_instance_uuid == lease.daemon_instance_uuid
+    and c.credential_kind == r.credential_kind
+    and c.endpoint_fingerprint == lease.target.endpoint_fingerprint
+    and lease.submit_inflight is None
+    and not lease.submit_fenced
+    and lease.dispatch_state in {"none", "settled"}
+    and lease.success_pending is None
+    and not lease.prepared_source
+    and not lease.streaming
+)
+''',
+)
+
+
+def test_can_submit_is_a_state_free_pinned_predicate():
+    definition = _module_function(Path(relay.__file__), "can_submit")
+    assert definition.decorator_list == []
+    assert not any(
+        isinstance(node, (ast.Global, ast.Nonlocal)) for node in ast.walk(definition)
+    ), ast.dump(definition, include_attributes=False)
+    expected = [ast.parse(source).body[0] for source in CAN_SUBMIT_STATEMENTS]
+    assert _dump(_statements(definition)) == _dump(expected), ast.dump(
+        definition, include_attributes=False
     )
 
 
@@ -625,6 +749,60 @@ def _relay_import_names(nodes: list[ast.stmt], package: str) -> list[str]:
     return names
 
 
+def _type_checking_binding_findings(tree: ast.Module) -> tuple[bool, list[str]]:
+    """Report every rebinding of ``TYPE_CHECKING`` and prove the typing import.
+
+    Exempting the guarded import block is only sound while the guard name is the
+    ``typing.TYPE_CHECKING`` constant. A later ``TYPE_CHECKING = True`` would run the
+    block, so any rebinding is a finding rather than an exemption.
+    """
+    bound_from_typing = False
+    findings: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name != "TYPE_CHECKING" and alias.asname != "TYPE_CHECKING":
+                    continue
+                if (node.level == 0 and node.module == "typing"
+                        and alias.name == "TYPE_CHECKING" and alias.asname is None):
+                    bound_from_typing = True
+                else:
+                    findings.append(
+                        f"line {node.lineno}: TYPE_CHECKING from {node.module!r} "
+                        f"level {node.level} as {alias.asname!r}"
+                    )
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if (alias.name.split(".")[0] == "TYPE_CHECKING"
+                        or alias.asname == "TYPE_CHECKING"):
+                    findings.append(f"line {node.lineno}: import {alias.name!r}")
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and "TYPE_CHECKING" in node.names:
+            findings.append(f"line {node.lineno}: declared global TYPE_CHECKING")
+        elif (isinstance(node, ast.Name) and node.id == "TYPE_CHECKING"
+                and isinstance(node.ctx, ast.Store)):
+            findings.append(f"line {node.lineno}: TYPE_CHECKING assigned")
+        elif isinstance(node, ast.arg) and node.arg == "TYPE_CHECKING":
+            findings.append(f"line {node.lineno}: TYPE_CHECKING parameter")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) \
+                and node.name == "TYPE_CHECKING":
+            findings.append(f"line {node.lineno}: TYPE_CHECKING defined")
+    return bound_from_typing, findings
+
+
+def test_relay_type_checking_guard_is_the_typing_constant():
+    tree = ast.parse(Path(relay.__file__).read_text(encoding="utf-8"))
+    bound_from_typing, findings = _type_checking_binding_findings(tree)
+    assert bound_from_typing, "the type-only import exemption needs typing.TYPE_CHECKING"
+    assert findings == [], findings
+    # Executable twin: at runtime the guard must still be the false typing constant.
+    assert relay.TYPE_CHECKING is False
+    guarded = [node for node in ast.walk(tree) if _is_type_checking_guard(node)]
+    assert len(guarded) == 1, [ast.dump(node, include_attributes=False) for node in guarded]
+    for node in guarded:
+        assert not node.orelse
+        assert all(isinstance(child, (ast.Import, ast.ImportFrom)) for child in node.body)
+
+
 def test_relay_module_is_pure_and_imports_no_transport_qt_process_or_storage():
     source = Path(relay.__file__).read_text(encoding="utf-8")
     package = relay.__package__ or "airplay_linux.domain"
@@ -651,6 +829,19 @@ def test_command_secret_indices_are_exact(indices):
 def test_command_secret_indices_are_an_exact_integer_tuple(indices):
     with pytest.raises(ValueError, match="^invalid secret indices$"):
         CommandSpec(argv=("ctl", "value"), env={}, secret_indices=indices)
+
+
+@pytest.mark.parametrize(("argv", "secret_indices", "redacted"), [
+    (("1234", "--pin"), (0,), ("<redacted>", "--pin")),
+    (("1234", "visible", "tail"), (0, 2), ("<redacted>", "visible", "<redacted>")),
+])
+def test_command_secret_indices_accept_every_populated_position(argv, secret_indices, redacted):
+    # Index zero is a real position: the declared bound is ``0 <= index < len(argv)``.
+    command = CommandSpec(argv=argv, env={}, secret_indices=secret_indices)
+    assert command.argv == argv
+    assert command.secret_indices == secret_indices
+    assert command.redacted_argv == redacted
+    assert "1234" not in repr(command)
 
 
 def test_command_projection_preserves_execution_arguments():
