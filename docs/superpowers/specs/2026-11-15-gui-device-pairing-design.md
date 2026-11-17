@@ -21,8 +21,9 @@ did not.
 
 These are stated here because earlier drafts promised them and could not keep the promise:
 
-- **Not exactly-once trust.** The application records no trust. The receiver tool stores the
-  credential; the dashboard reports what it observes.
+- **Not exactly-once trust.** The application records no trust. The receiver tool attempts to
+  store the credential and is best effort about it — a save failure is only logged — so the
+  dashboard reports what it observes and never claims the credential was remembered.
 - **Not session continuity.** The receiver routes a credential by the target's address. If the
   device at that address has been replaced since the start, the receiver cannot tell, and
   neither can this application. The design therefore promises *target-addressed delivery under
@@ -116,7 +117,8 @@ with the credential's index declared as a secret position.
 
 ### 6.4 Reporting
 
-After the reply, one status read decides the message:
+After the reply, status is polled until this target reports `streaming` or the bound expires;
+the first of those two decides the message:
 
 | Observation | Message | Prompt |
 | --- | --- | --- |
@@ -137,7 +139,8 @@ start", with no invented cause.
 prompt closes and the operator starts again. The dashboard does not pretend a retry is possible.
 
 The dashboard reports; it does not adjudicate. There is no attempt counter beyond the
-receiver's own policy: the operator can retype, and the receiver decides whether to accept it.
+receiver's own policy. A new attempt requires a new Start; the receiver does not keep the
+request open for a retry.
 The dialog's existing "Cancel" closes the prompt and leaves the receiver as it was.
 
 ### 6.5 Bounded waits
@@ -154,7 +157,7 @@ submits, not when the prompt opens.
 | status cannot be read | existing transport failure path, unchanged |
 | the receiver asks but a newer status no longer shows it | prompt closes with "That receiver did not answer; start again." |
 | the operator cancels | prompt closes; no command is sent |
-| the credential is refused (the receiver removes the stream) | "The mirror did not start - check the PIN.", prompt closed |
+| the credential is refused (the receiver removes the stream) | "The mirror did not reach streaming in time.", prompt closed |
 | the receiver service is shutting down | message shown, prompt closes |
 | the app is closed mid-prompt | existing shutdown path; no credential retained anywhere |
 
@@ -203,7 +206,8 @@ follow-up status read.
    narrows the window; it cannot close it.
 2. **Duplicate submission** — the dashboard disables its field while a submission is in flight;
    a second command from elsewhere is the receiver's problem, not this application's.
-3. **Receiver lockout after repeated wrong PINs** — the operator can retype; the receiver decides.
+3. **Receiver lockout after repeated wrong PINs** — a wrong value ends that attempt; the operator
+   starts again.
    The dashboard does not retry by itself and never submits without an operator action.
 
 ## 12. Route B integration contract
@@ -273,9 +277,10 @@ apart.
 
 ### 12.6 Input validation (F-12)
 
-A value is refused before dispatch when it is empty, contains a NUL, or would be parsed as an
-option by the profile in use (`connect` terminates the pinned CLI's flag parsing, so a leading
-dash is positional there; the extended volume grammar is different). Refusal is a fixed,
+A value is refused before dispatch when it is empty, contains a NUL or any character the
+platform cannot encode as an argv element, or begins with `-`. The leading-dash rejection is
+unconditional on this profile: the extended parser rejects an unrecognized dash-prefixed
+argument after dispatch, so rejecting it first is safer and honest. Refusal is a fixed,
 secret-free invalid-input result and sends no command.
 
 ### 12.7 Wording (F-10, F-13)
@@ -284,3 +289,20 @@ secret-free invalid-input result and sends no command.
 are visible, and it does not mean the credential was remembered. A failure says only that
 streaming was not reached in time; it names no cause, because the observations cannot establish
 one. A later status that reaches streaming after the prompt closed is not retro-reported.
+
+### 12.8 Deferred to the specification (F-05, F-08, F-09)
+
+Three findings are specification-level surface, not design decisions. They are recorded so
+Step 4 defines them explicitly instead of leaving them to an implementer:
+
+1. **A transport event carrying the request.** `TransportPort` has no event that carries a
+   `CredentialRequest`, and the existing pairing event enters the transactional coordinator. The
+   specification must add one event type, name it, and route it to the non-transactional path.
+2. **A session-facing status read and a submission operation.** `TransportPort` exposes neither.
+   The specification must add `submit_credential(target, value) -> Submitted | NoReply |
+   ShuttingDown` and a status read the session can poll during the bounded wait, and must
+   enumerate which existing transport deadline each starts, suspends or leaves alone.
+3. **The source of the `ShuttingDown` classification.** The receiver reports shutdown in free-form
+   error text that the typed acknowledgement path discards. The specification must either name a
+   field the adapter can read without interpreting text, or drop `ShuttingDown` and report that
+   case as "did not reach streaming". Copying receiver text into a diagnostic is not acceptable.
