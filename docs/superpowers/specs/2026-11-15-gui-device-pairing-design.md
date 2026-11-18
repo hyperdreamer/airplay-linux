@@ -33,7 +33,13 @@ These are stated here because earlier drafts promised them and could not keep th
   second command never reaches the receiver.
 - **Not a diagnosis.** A failure is reported as "did not start"; the application does not claim
   to know whether the credential was wrong, the receiver timed out, or the connection dropped.
-- **Not a release guarantee.** Stopping a mirror is the existing behaviour, unchanged.
+- **Stop and an in-flight PIN command.** Stop keeps its existing cleanup behavior for a stream
+  it has disconnected, but the receiver cannot atomically cancel a credential command already
+  in flight. If that command is handled after Stop disconnects the waiting stream, the receiver
+  can start another connection to the same target. The application will observe and disconnect
+  that stream, so Stop may take effect after one command and cleanup cycle; this is not fully
+  equivalent to the existing Stop guarantee. If the command never settles, its outcome is
+  unknown. This limitation is stated in `docs/operations.md`.
 
 Each of these is recorded in `docs/operations.md` as an operator-visible limit.
 
@@ -58,11 +64,13 @@ client checks the value is representable as a command argument
 transport sends:  connect T [--audio on|off] [--volume N] <credential>
       │
       ▼
-await the reply (bounded), then read status once
+await the reply (bounded), then poll status until streaming or the bound expires
       │
-      ├── T no longer waiting      → report what the receiver reports, then close the prompt
-      ├── T still waiting          → report "that PIN was not accepted", keep the prompt
-      └── no reply / ambiguous     → report "the receiver did not answer", close the prompt
+      ├── T reaches streaming      → report what the receiver reports, then close the prompt
+      ├── no decoded command reply → report "No complete command reply was received; the
+      │                               outcome is unknown.", close the prompt
+      └── wait expires or T absent → report "The mirror did not reach streaming in time.",
+                                      close the prompt
 ```
 
 There is no lease, no reservation, no settlement state and no release transition. The receiver
@@ -125,15 +133,14 @@ the first of those two decides the message:
 | this target is reported `streaming` within the wait | "Connected to <TV>." (the receiver reports a streaming session) | closed |
 | not `streaming` when the wait expires | "The mirror did not reach streaming in time." | closed |
 | this target absent from the status | "The mirror did not reach streaming in time." | closed |
-| no decoded reply to the command | "The receiver did not answer." | closed |
-| receiver service reports it is shutting down | "The receiver service is stopping; start again." | closed |
+| no complete decoded command reply, including a service shutdown | "No complete command reply was received; the outcome is unknown." | closed |
 
 **Why only these two outcomes.** The receiver acknowledges a credential before it authenticates
 and removes the waiting stream when pairing fails, so "no longer waiting" is not proof of
 success and a rejection cannot be told apart from a timeout by the application. `streaming` is
-the one state the receiver only reports when a stream is actually carrying media, so it is the
-one success claim this design is entitled to make. Everything else is reported as "did not
-start", with no invented cause.
+the one success claim this design is entitled to make: the receiver reports the named target in
+its `streaming` state. This does not prove that any frame was sent, received or displayed.
+Everything else is reported as "did not start", with no invented cause.
 
 **No same-prompt retry.** A refused credential does not leave the waiting request open, so the
 prompt closes and the operator starts again. The dashboard does not pretend a retry is possible.
@@ -155,10 +162,10 @@ submits, not when the prompt opens.
 | Condition | Behaviour |
 | --- | --- |
 | status cannot be read | existing transport failure path, unchanged |
-| the receiver asks but a newer status no longer shows it | prompt closes with "That receiver did not answer; start again." |
+| the receiver asks but a newer status no longer shows it | prompt closes with "The mirror did not reach streaming in time." |
 | the operator cancels | prompt closes; no command is sent |
 | the credential is refused (the receiver removes the stream) | "The mirror did not reach streaming in time.", prompt closed |
-| the receiver service is shutting down | message shown, prompt closes |
+| no complete command reply is decoded, including a service shutdown | "No complete command reply was received; the outcome is unknown." |
 | the app is closed mid-prompt | existing shutdown path; no credential retained anywhere |
 
 ## 8. Security
@@ -302,7 +309,9 @@ Step 4 defines them explicitly instead of leaving them to an implementer:
    The specification must add `submit_credential(target, value) -> Submitted | NoReply |
    ShuttingDown` and a status read the session can poll during the bounded wait, and must
    enumerate which existing transport deadline each starts, suspends or leaves alone.
-3. **The source of the `ShuttingDown` classification.** The receiver reports shutdown in free-form
-   error text that the typed acknowledgement path discards. The specification must either name a
-   field the adapter can read without interpreting text, or drop `ShuttingDown` and report that
-   case as "did not reach streaming". Copying receiver text into a diagnostic is not acceptable.
+3. **Shutdown is `NoReply`.** The typed acknowledgement path discards the receiver's free-form
+   shutdown text, so Route B does not add a `ShuttingDown` outcome or parse that text. A shutdown
+   that yields no complete command reply is `NoReply` and is reported as "No complete command
+   reply was received; the outcome is unknown." A complete negative command reply remains
+   `Submitted` and is followed by the bounded status observation. Copying receiver text into a
+   diagnostic is not acceptable.
