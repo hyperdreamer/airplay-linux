@@ -14,8 +14,9 @@ the dashboard shows a field, sends the credential to the receiver tool, and repo
 status says afterwards.
 
 Delivered: **answer the PIN, and report what the receiver actually did.** The only
-success claim is that the mirror reached `streaming`; the only failure claim is that it
-did not.
+success claim is that the receiver reports the named target in `streaming`; a terminal
+non-streaming observation says the mirror did not reach `streaming`. If no complete command
+reply is decoded, the outcome is unknown.
 
 ## 2. What this design does not promise
 
@@ -31,15 +32,19 @@ These are stated here because earlier drafts promised them and could not keep th
 - **Not a duplicate-submission guarantee.** The dashboard disables its own field while a
   submission is in flight, which prevents the ordinary double-click. It cannot prove that a
   second command never reaches the receiver.
-- **Not a diagnosis.** A failure is reported as "did not start"; the application does not claim
-  to know whether the credential was wrong, the receiver timed out, or the connection dropped.
-- **Stop and an in-flight PIN command.** Stop keeps its existing cleanup behavior for a stream
-  it has disconnected, but the receiver cannot atomically cancel a credential command already
-  in flight. If that command is handled after Stop disconnects the waiting stream, the receiver
-  can start another connection to the same target. The application will observe and disconnect
-  that stream, so Stop may take effect after one command and cleanup cycle; this is not fully
-  equivalent to the existing Stop guarantee. If the command never settles, its outcome is
-  unknown. This limitation is stated in `docs/operations.md`.
+- **Not a diagnosis.** A terminal non-streaming observation is reported as "did not reach
+  streaming"; a missing complete command reply is reported as "outcome unknown". Neither tells
+  whether the credential was wrong, the receiver timed out, or the connection dropped.
+- **Stop and an in-flight PIN command.** The receiver cannot atomically cancel a credential
+  command already in flight. Stop first waits up to the existing `CONTROL_TIMEOUT` for that
+  command's local result, then reads status and disconnects a newly observed stream for the same
+  target using the existing cleanup path. If the command has no complete reply, the application
+  continues the existing bounded `CONNECT_STREAMING_TIMEOUT` status observation and disconnects
+  a stream if it appears within that window. It does not claim to prevent a command already
+  delivered to the daemon from taking effect later: if no stream is observed by the end of that
+  bound, the outcome is unknown and the operator may need to press Stop again. Stop may therefore
+  take effect after the in-flight command and follow-up cleanup; it is not atomic cancellation.
+  This limitation is stated in `docs/operations.md`.
 
 Each of these is recorded in `docs/operations.md` as an operator-visible limit.
 
@@ -53,6 +58,8 @@ transport reads status ──► T's own stream entry says pin_required (kind: p
       │
       ▼
 dashboard opens the prompt for T          (existing dialog, existing projection)
+      │
+      ├── before submit, request ends ──► close prompt; Start remains pending; no PIN result
       │
       ▼
 operator types the credential ──► submit
@@ -69,8 +76,8 @@ await the reply (bounded), then poll status until streaming or the bound expires
       ├── T reaches streaming      → report what the receiver reports, then close the prompt
       ├── no decoded command reply → report "No complete command reply was received; the
       │                               outcome is unknown.", close the prompt
-      └── wait expires or T absent → report "The mirror did not reach streaming in time.",
-                                      close the prompt
+      ├── after submit, T leaves pin_required but is still present → keep polling; no result yet
+      └── wait expires or T absent → report "The mirror did not reach streaming in time.", close
 ```
 
 There is no lease, no reservation, no settlement state and no release transition. The receiver
@@ -130,9 +137,10 @@ the first of those two decides the message:
 
 | Observation | Message | Prompt |
 | --- | --- | --- |
+| Before submit, the matching request row ends | No PIN result | Close prompt; resume Start |
+| After submit, this target leaves `pin_required` but remains present | No result yet | Keep polling; keep prompt read-only |
 | this target is reported `streaming` within the wait | "Connected to <TV>." (the receiver reports a streaming session) | closed |
-| not `streaming` when the wait expires | "The mirror did not reach streaming in time." | closed |
-| this target absent from the status | "The mirror did not reach streaming in time." | closed |
+| this target is absent after submission, or is not `streaming` when the wait expires | "The mirror did not reach streaming in time." | closed |
 | no complete decoded command reply, including a service shutdown | "No complete command reply was received; the outcome is unknown." | closed |
 
 **Why only these two outcomes.** The receiver acknowledges a credential before it authenticates
@@ -162,7 +170,8 @@ submits, not when the prompt opens.
 | Condition | Behaviour |
 | --- | --- |
 | status cannot be read | existing transport failure path, unchanged |
-| the receiver asks but a newer status no longer shows it | prompt closes with "The mirror did not reach streaming in time." |
+| before submit, a newer status no longer shows the matching request | prompt closes; Start resumes; no PIN result is reported |
+| after submit, the matching row changes from `pin_required` to another present state | keep polling until `streaming`, target absence, or deadline |
 | the operator cancels | prompt closes; no command is sent |
 | the credential is refused (the receiver removes the stream) | "The mirror did not reach streaming in time.", prompt closed |
 | no complete command reply is decoded, including a service shutdown | "No complete command reply was received; the outcome is unknown." |
@@ -251,7 +260,7 @@ The session publishes the existing `ChallengeView` for a live request without to
 transactional coordinator. On submit it calls one transport operation:
 
 ```
-submit_credential(target, value) -> Submitted | NoReply | ShuttingDown
+submit_credential(target, value) -> Result[Submitted | NoReply]
 ```
 
 which builds the T-002 profile command (`connect <target> [--audio on|off] [--volume N]
@@ -306,12 +315,13 @@ Step 4 defines them explicitly instead of leaving them to an implementer:
    `CredentialRequest`, and the existing pairing event enters the transactional coordinator. The
    specification must add one event type, name it, and route it to the non-transactional path.
 2. **A session-facing status read and a submission operation.** `TransportPort` exposes neither.
-   The specification must add `submit_credential(target, value) -> Submitted | NoReply |
-   ShuttingDown` and a status read the session can poll during the bounded wait, and must
+   The specification must add `submit_credential(target, value) -> Result[Submitted | NoReply]`
+   (local errors are `Err`; only receiver observations are `Submitted` or `NoReply`) and a
+   status read the session can poll during the bounded wait, and must
    enumerate which existing transport deadline each starts, suspends or leaves alone.
-3. **Shutdown is `NoReply`.** The typed acknowledgement path discards the receiver's free-form
-   shutdown text, so Route B does not add a `ShuttingDown` outcome or parse that text. A shutdown
-   that yields no complete command reply is `NoReply` and is reported as "No complete command
-   reply was received; the outcome is unknown." A complete negative command reply remains
-   `Submitted` and is followed by the bounded status observation. Copying receiver text into a
-   diagnostic is not acceptable.
+3. **Shutdown classification.** The typed acknowledgement path discards the receiver's free-form
+   shutdown text, so Route B does not add a `ShuttingDown` outcome or parse that text. If shutdown
+   yields no complete command reply it is `NoReply` and is reported as "No complete command reply
+   was received; the outcome is unknown." A complete negative command reply remains `Submitted`
+   and is followed by the bounded status observation. Copying receiver text into a diagnostic is
+   not acceptable.
