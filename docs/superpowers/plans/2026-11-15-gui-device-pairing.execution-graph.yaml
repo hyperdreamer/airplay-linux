@@ -2,787 +2,232 @@ schema: 1
 topic: gui-device-pairing
 source_plan:
   path: docs/superpowers/plans/2026-11-15-gui-device-pairing.md
-  sha256: 9d55d2c926285cc568876bdf6702eb16759ea4a1c40860962d89a515fcfe7c03
-  digest: 9d55d2c926285cc568876bdf6702eb16759ea4a1c40860962d89a515fcfe7c03
-  task_count: 13
+  sha256: ab806b598eb61cedad02d3f76c05b79b91dc534b8d9680b8cf0e21bcc3bf2663
+  digest: ab806b598eb61cedad02d3f76c05b79b91dc534b8d9680b8cf0e21bcc3bf2663
+  task_count: 4
 lanes:
-  - id: backend
+  - id: acceptance-docs
     task_ids:
-      - T-002
       - T-004
-      - T-007
-      - T-008
-      - T-009
-  - id: core
+  - id: redaction
     task_ids:
       - T-001
-      - T-003
-      - T-005
-      - T-012
-  - id: dashboard
+  - id: session-ui
     task_ids:
-      - T-006
-      - T-010
-      - T-011
-      - T-013
+      - T-003
+  - id: transport
+    task_ids:
+      - T-002
 tasks:
   - id: T-001
     plan_task: 1
-    lane: core
+    lane: redaction
     depends_on: []
-    title: "Establish pure relay records, shared predicates and command metadata"
-    tier: Advanced
+    title: "Close Observer Retention Paths"
+    tier: advanced
     sequence: 1
     ownership:
-      - src/airplay_linux/domain/relay.py
-      - src/airplay_linux/domain/operations.py
-      - src/airplay_linux/domain/records.py
-      - src/airplay_linux/domain/messages.py
-      - src/airplay_linux/domain/ports.py
-      - tests/domain/test_credential_relay.py
+      - "src/airplay_linux/testing/adapters.py"
+      - "tests/testing/test_fakes.py"
+      - "tests/process/test_credential_probe.py"
+      - "tests/acceptance/test_no_production_spawn.py"
+      - "tests/fixtures/processes/fake_doubletake.py"
+      - "tests/adapter_contracts/test_keyring_contract.py"
     exclusive_resources:
-      - pytest-relay-core
+      - "/tmp/ap-relay-redaction"
     interfaces:
-      produces:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: relay_credential_representable
-          signature: "relay_credential_representable(value: str, *, target_volume_proven: bool) -> bool"
-          digest: "sha256:48123ec961a2bf2ef41f89622f724d60df3386de72d2f083e32f3420a5535533"
-        - name: RelayStartOptions
-          signature: "RelayStartOptions (frozen): audio, initial_volume"
-          digest: "sha256:601a31fe9b54dd091cc0042c8d8ab4cde520c067ce8a5d87f6c1318b076cef37"
-        - name: CredentialRequest
-          signature: "CredentialRequest (frozen): receiver_id, target, credential_kind, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, observed_at"
-          digest: "sha256:73b85027ace42b30dd03040da0b78a332264e8dd962cec5ee81e8b805b16c84a"
-        - name: SuccessPending
-          signature: "SuccessPending (frozen): generation, attempt, observed_at"
-          digest: "sha256:c1cb5a3f2f9173a75f7faa32b92e9be6f5f9edc419aba59783e3f353f2658665"
-        - name: RelayLeaseView
-          signature: "RelayLeaseView (frozen): lease, receiver_id, target, challenge, request, request_state, request_waiting, owner_live, generation, endpoint_generation, session_generation, daemon_instance_uuid, dispatch_state, submit_fenced, success_pending, presentation_revision"
-          digest: "sha256:8de7613e861b815f21a5b407b9cc475e80c7a02cd82e1dc980481631d9739684"
-        - name: TerminationProof
-          signature: "TerminationProof (frozen): daemon_instance_uuid, daemon, runtime_directory, launch_uuid, receipt_state, cleanup_outcome, cleanup_completed_at, process_evidence, identity_verified_at, observed_at"
-          digest: "sha256:d022028611dfcf44aec2ef09f138d62f741343fec1aee9902911ba5520ed692b"
-        - name: ReleaseEvidence
-          signature: "ReleaseEvidence (frozen): reason, observed_at, disconnect_ack, status, daemon_instance_uuid, endpoint_generation, termination"
-          digest: "sha256:2b41a5253a28020d96049730dc3feb1757ad2b49c72cfdcae20e27e5d30ec9d3"
-        - name: ChallengeView
-          signature: "ChallengeView(..., presentation_revision: int = 0)"
-          digest: "sha256:65559623bb16f5c9aa689e60ce8c913b16d02badcbf1eee14fec2450b55f1afd"
-        - name: PairingResult
-          signature: "PairingResult(kind, credential_ref, diagnostic, waiting: bool = False)"
-          digest: "sha256:cf792e0cb792a6808d8ebb165fec2364b6d55fe6cd2d5d2548c0ba9d52740d9d"
-        - name: SessionSnapshot
-          signature: "SessionSnapshot(..., relay: RelayLeaseView | None = None, relay_notice: RelayNotice | None = None)"
-          digest: "sha256:378de49ee00f809ab8407f0de2222cd0663368dc6166fd832b5ae5a5f0283c8f"
-        - name: RelayPairingPayload
-          signature: "RelayPairingPayload(*, lease: RelayLeaseView)"
-          digest: "sha256:c2a040e0341a5c9129438d011f34d38c0e985832c232b2bd01c48dc0d1049bde"
-        - name: RelaySubmitCompletion
-          signature: "RelaySubmitCompletion(*, submission_id, challenge_id, receiver_id, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, result)"
-          digest: "sha256:06098d574cd82adac3674218d5301bdd4af5c7a987718f14249bbb810e2cba1d"
-        - name: CommandSpec
-          signature: "CommandSpec(*, argv: tuple[str, ...], env: Mapping[str, str], cwd: str | None = None, pass_fds: tuple[int, ...] = (), secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:34ade8563457f5724618cf189b461f0b3cd6dce93c8ad9e241064c35676621e2"
+      produces: []
       consumes: []
     validation:
       argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/domain
-        - tests/storage/test_reservation_codecs.py
-        - "--basetemp=/tmp/ap-relay-core"
+        - "`/data/home/guest/Development/airplay-linux/.venv/bin/python"
+        - "-m"
+        - "pytest"
+        - "-q"
+        - "tests/testing/test_fakes.py"
+        - "tests/process/test_credential_probe.py"
+        - "tests/acceptance/test_no_production_spawn.py"
+        - "tests/adapter_contracts/test_keyring_contract.py"
+        - "--basetemp=/tmp/ap-relay-redaction`"
   - id: T-002
     plan_task: 2
-    lane: backend
-    depends_on:
-      - T-001
-    title: Prove relay capability and construct typed target-bound commands
-    tier: Advanced
+    lane: transport
+    depends_on: []
+    title: "Implement Route-B Transport Contracts and Readiness Waits"
+    tier: capable
     sequence: 1
     ownership:
-      - src/airplay_linux/backend/contract.py
-      - src/airplay_linux/backend/control.py
-      - src/airplay_linux/process/ownership.py
-      - tests/backend/test_credential_relay.py
-      - tests/backend/test_control.py
-      - tests/backend/test_contract.py
-      - tests/transport/test_doubletake.py
+      - "src/airplay_linux/backend/contract.py"
+      - "src/airplay_linux/backend/control.py"
+      - "src/airplay_linux/domain/messages.py"
+      - "src/airplay_linux/domain/operations.py"
+      - "src/airplay_linux/domain/ports.py"
+      - "src/airplay_linux/process/ownership.py"
+      - "src/airplay_linux/runtime.py"
+      - "src/airplay_linux/transport/doubletake.py"
+      - "tests/backend/test_credential_relay.py"
+      - "tests/backend/test_control.py"
+      - "tests/backend/test_contract.py"
+      - "tests/transport/test_doubletake.py"
+      - "tests/adapter_contracts/test_transport_contract.py"
+      - "tests/runtime/test_capability_report.py"
+      - "tests/runtime/test_owned_probe.py"
+      - "tests/app/test_composition.py"
     exclusive_resources:
-      - pytest-relay-backend
+      - "/tmp/ap-relay-transport"
     interfaces:
       produces:
-        - name: BackendFeatures
-          signature: "BackendFeatures(..., credential_relay: bool = False)"
-          digest: "sha256:c2756b7945ba2ee539a404737e1aed15c151b076ee3a87bf2fbfb7d8c565feac"
-        - name: _credential_relay_proven
-          signature: "_credential_relay_proven(*, verified: bool, signatures: dict[str, str] | None) -> bool"
-          digest: "sha256:a9f3c7c1a64e9f65bc23eeab06ee3bade622a1b25797ee68f6f1fe26958d8599"
-        - name: features_from_help
-          signature: "features_from_help(sender_help: str, ctl_help: str, *, advertised: frozenset[str] = frozenset()) -> BackendFeatures"
-          digest: "sha256:041d90756d3e157fc3b9a068b313e2f8b873f8bdc5e2cd7dc82b7ff60ed42c85"
-        - name: CredentialDispatchFailure
-          signature: "CredentialDispatchFailure(*, error: Diagnostic, dispatch_state: Literal['no_spawn','acknowledged','uncertain'], refusal: Literal['shutdown','ended','stale','rejected'] | None)"
-          digest: "sha256:805a4248fb2b0cc994245065b1f5fc44f73a11b4f222ea180cd75038ec964523"
-        - name: ProfileCommand
-          signature: "ProfileCommand(argv: tuple[str, ...], secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:43381fe6f6e45d791ee25a93b3e47900f7056d0ab81912bd494b9e00b239bee9"
-        - name: CredentialPayload
-          signature: "CredentialPayload(*, value, audio: AudioPolicy | None = None, initial_volume: VolumeLevel | None = None)"
-          digest: "sha256:4230657eba67365784b431ee35e7081868ca75c30b218724422f0382b153ac38"
-        - name: EvidenceAuthority.allows
-          signature: "EvidenceAuthority.allows(submit_pairing) requires relay and owned daemon, multi-target and physical source"
-          digest: "sha256:45c4eb9f7ce665b9bc4226c8d58e7a9082ebccb12e4a25603544b447a5e22170"
-        - name: _run
-          signature: "_run(self, command: ProfileCommand, *, operation: BackendOperation) -> Result[CommandOutput]"
-          digest: "sha256:3a984c225358cf35fefbf107809cae6d819f4b2786a2652e062f4761179f120c"
-      consumes:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: relay_credential_representable
-          signature: "relay_credential_representable(value: str, *, target_volume_proven: bool) -> bool"
-          digest: "sha256:48123ec961a2bf2ef41f89622f724d60df3386de72d2f083e32f3420a5535533"
-        - name: CommandSpec
-          signature: "CommandSpec(*, argv: tuple[str, ...], env: Mapping[str, str], cwd: str | None = None, pass_fds: tuple[int, ...] = (), secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:34ade8563457f5724618cf189b461f0b3cd6dce93c8ad9e241064c35676621e2"
-        - name: RelayLeaseView
-          signature: "RelayLeaseView (frozen): lease, receiver_id, target, challenge, request, request_state, request_waiting, owner_live, generation, endpoint_generation, session_generation, daemon_instance_uuid, dispatch_state, submit_fenced, success_pending, presentation_revision"
-          digest: "sha256:8de7613e861b815f21a5b407b9cc475e80c7a02cd82e1dc980481631d9739684"
+        - name: "src/airplay_linux/domain/messages.py"
+          signature: "src/airplay_linux/domain/messages.py"
+          digest: sha256:e2798fcaa3d3596f811e7119ae821cd2224520e6aeed26ed9f62e1388fb0f541
+        - name: "CredentialKind = Literal["pin", "password"]"
+          signature: "CredentialKind = Literal["pin", "password"]"
+          digest: sha256:12fb9527b0abc0c4088e8eeb8a2706817d2d4229b16b13771fe4c6d77dfecdcf
+        - name: "CredentialRequest(target: ReceiverTarget, kind: CredentialKind)"
+          signature: "CredentialRequest(target: ReceiverTarget, kind: CredentialKind)"
+          digest: sha256:dbbf7331e92a736f45b2d6d88ef35973fe06ddf470841113755e8c22e164f637
+        - name: "CredentialRequestEnded(target: ReceiverTarget, kind: CredentialKind)"
+          signature: "CredentialRequestEnded(target: ReceiverTarget, kind: CredentialKind)"
+          digest: sha256:44a826612c238ee0125d6d32a3ee9572aec495ef61254937d29484f47a2d0cf9
+        - name: "src/airplay_linux/domain/operations.py"
+          signature: "src/airplay_linux/domain/operations.py"
+          digest: sha256:ead0dcb2d300071d3a00776d234f1da2a76387de7b721ccf4b3aa5d559571b93
+        - name: "CredentialOutcome = Submitted(reply_at: float) | NoReply()"
+          signature: "CredentialOutcome = Submitted(reply_at: float) | NoReply()"
+          digest: sha256:0cc485c2f683e857252ecd92bbb2b60a00e019a800e8d32352e60983c7d61db0
+        - name: "TransportPort.submit_credential(target: ReceiverTarget, value: SensitiveText) -> Result[CredentialOutcome]"
+          signature: "TransportPort.submit_credential(target: ReceiverTarget, value: SensitiveText) -> Result[CredentialOutcome]"
+          digest: sha256:3f35b3e9391a4ba7b87dcbd61198bd6705d745f397e28d1e91d1d6028e82c5fb
+        - name: "TransportPort.read_status(target: ReceiverTarget, context: OperationContext) -> Result[StatusReply]"
+          signature: "TransportPort.read_status(target: ReceiverTarget, context: OperationContext) -> Result[StatusReply]"
+          digest: sha256:279caf447895d74a74ab7fc04e0556be6093aa4e04efb354d3c6a1e159fea4cc
+        - name: "TransportPort.dismiss_credential_request(target: ReceiverTarget, context: OperationContext) -> None"
+          signature: "TransportPort.dismiss_credential_request(target: ReceiverTarget, context: OperationContext) -> None"
+          digest: sha256:d7e93f6d91739b2ba7db105e9b7bb347c05f4ade15a488d1f62bb956f4b87294
+        - name: "TransportEvent"
+          signature: "TransportEvent"
+          digest: sha256:fca28ca760869478b0d991d8892321420f5f77a947e4fa3dafcb30d19bce73dc
+      consumes: []
     validation:
       argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/backend
-        - tests/transport/test_doubletake.py
-        - "--basetemp=/tmp/ap-relay-backend"
+        - "`/data/home/guest/Development/airplay-linux/.venv/bin/python"
+        - "-m"
+        - "pytest"
+        - "-q"
+        - "tests/backend/test_credential_relay.py"
+        - "tests/backend/test_control.py"
+        - "tests/backend/test_contract.py"
+        - "tests/transport/test_doubletake.py"
+        - "tests/adapter_contracts/test_transport_contract.py"
+        - "tests/runtime/test_capability_report.py"
+        - "tests/runtime/test_owned_probe.py"
+        - "tests/app/test_composition.py"
+        - "--basetemp=/tmp/ap-relay-transport`"
   - id: T-003
     plan_task: 3
-    lane: core
-    depends_on:
-      - T-001
-    title: Query historical exact-instance termination evidence without control effects
-    tier: Advanced
-    sequence: 2
-    ownership:
-      - src/airplay_linux/process/daemon_registry.py
-      - tests/process/test_relay_termination.py
-    exclusive_resources:
-      - pytest-relay-core
-    interfaces:
-      produces:
-        - name: DaemonRegistry.termination_proof
-          signature: "DaemonRegistry.termination_proof(self, record: DaemonRecord) -> Result[TerminationProof]"
-          digest: "sha256:106d03d755884da797fcc9cb314b76b230db37832e15fbc7294551b5a2ae2845"
-      consumes:
-        - name: TerminationProof
-          signature: "TerminationProof (frozen): daemon_instance_uuid, daemon, runtime_directory, launch_uuid, receipt_state, cleanup_outcome, cleanup_completed_at, process_evidence, identity_verified_at, observed_at"
-          digest: "sha256:d022028611dfcf44aec2ef09f138d62f741343fec1aee9902911ba5520ed692b"
-        - name: CredentialRequest
-          signature: "CredentialRequest (frozen): receiver_id, target, credential_kind, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, observed_at"
-          digest: "sha256:73b85027ace42b30dd03040da0b78a332264e8dd962cec5ee81e8b805b16c84a"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/process/test_relay_termination.py
-        - tests/process/test_daemon_registry.py
-        - tests/process/test_procfs.py
-        - "--basetemp=/tmp/ap-relay-core"
-  - id: T-004
-    plan_task: 4
-    lane: backend
+    lane: session-ui
     depends_on:
       - T-002
-    title: "Enforce relay-only preflight, final reservation and typed dispatch classification"
-    tier: Advanced
-    sequence: 2
-    ownership:
-      - src/airplay_linux/backend/control.py
-      - src/airplay_linux/process/ownership.py
-      - tests/backend/test_credential_relay.py
-    exclusive_resources:
-      - pytest-relay-backend
-    interfaces:
-      produces:
-        - name: DispatchStarted
-          signature: "DispatchStarted = Callable[[], Result[None]]"
-          digest: "sha256:e1e3058a12585833927f5e5164e6c236e4b7864aa172cc1a3e7c0104cb1765bf"
-        - name: DispatchStatus
-          signature: "DispatchStatus = Callable[[StatusReply], Result[None]]"
-          digest: "sha256:641624f8942324196e14b764b83361b373052f4daf58b45f9cb41c81a8222d46"
-        - name: requires_dispatch_fence
-          signature: "requires_dispatch_fence(operation: BackendOperation, *, relay_submission: bool = False) -> bool"
-          digest: "sha256:637d04fd463c47e25ac586aa100d1a4af6135880a378386ed7f79e8ab5f3b832"
-        - name: BackendControl.request
-          signature: "BackendControl.request(self, operation, target, payload, context, *, dispatch_fence=None, ownership_proof=None, dispatch_started=None, dispatch_status=None) -> Result[BackendReply]"
-          digest: "sha256:1cd57a55dc96eb97855e09d47ee284a571465a480df50889438ea09ad070a881"
-        - name: _credential_rejection
-          signature: "_credential_rejection(error: object, target: ReceiverTarget) -> CredentialDispatchFailure"
-          digest: "sha256:c0df910a7e8ded78732088a71d4eb56feae46b1779f240dfd2af633ff468bbed"
-      consumes:
-        - name: ProfileCommand
-          signature: "ProfileCommand(argv: tuple[str, ...], secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:43381fe6f6e45d791ee25a93b3e47900f7056d0ab81912bd494b9e00b239bee9"
-        - name: CredentialDispatchFailure
-          signature: "CredentialDispatchFailure(*, error: Diagnostic, dispatch_state: Literal['no_spawn','acknowledged','uncertain'], refusal: Literal['shutdown','ended','stale','rejected'] | None)"
-          digest: "sha256:805a4248fb2b0cc994245065b1f5fc44f73a11b4f222ea180cd75038ec964523"
-        - name: _run
-          signature: "_run(self, command: ProfileCommand, *, operation: BackendOperation) -> Result[CommandOutput]"
-          digest: "sha256:3a984c225358cf35fefbf107809cae6d819f4b2786a2652e062f4761179f120c"
-        - name: CommandSpec
-          signature: "CommandSpec(*, argv: tuple[str, ...], env: Mapping[str, str], cwd: str | None = None, pass_fds: tuple[int, ...] = (), secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:34ade8563457f5724618cf189b461f0b3cd6dce93c8ad9e241064c35676621e2"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/backend/test_credential_relay.py
-        - tests/backend/test_control.py
-        - tests/process/test_ownership.py
-        - "--basetemp=/tmp/ap-relay-backend"
-  - id: T-005
-    plan_task: 5
-    lane: core
-    depends_on:
-      - T-002
-      - T-003
-    title: Project secrets before observation and provide private relay fixtures
-    tier: Advanced
-    sequence: 3
-    ownership:
-      - src/airplay_linux/testing/adapters.py
-      - tests/relay_support.py
-      - tests/fixtures/processes/fake_doubletake.py
-      - tests/acceptance/test_no_production_spawn.py
-      - tests/testing/test_fakes.py
-    exclusive_resources:
-      - pytest-relay-core
-    interfaces:
-      produces:
-        - name: redact
-          signature: "redact(value: Any) -> Any"
-          digest: "sha256:e6cf80f3829c5a34f844cabe61edd365c2a6469964f12d0cd5af105cb267e62a"
-        - name: FakeProcess.run
-          signature: "FakeProcess.run(self, spec: CommandSpec, timeout: float, stdin: bytes | None = None) -> Result[CommandOutput]"
-          digest: "sha256:d0980dcc1630ea6652fbea95e8275eceeafa0200e9c3da7d5f48d5d1f0e9604b"
-        - name: ProbeProcessRecorder
-          signature: "ProbeProcessRecorder.observe_invocation(self, method: str, spec: CommandSpec) -> None"
-          digest: "sha256:f1bcad38a84fcc15469be3344f567aab5e5f85e12968f4aa780601e32c68e523"
-        - name: RelayGate
-          signature: "RelayGate(entered: asyncio.Event, result: Deferred[object], wait, release)"
-          digest: "sha256:1e7fa52be20410c1dd3e91b1cf028f780d2afdc6f85292ee5463f8fcfa82e8cf"
-        - name: RelayDaemon
-          signature: "RelayDaemon(FakeProcess): set_entry, remove_entry, gate, credential_children, disconnect_children, streams, journal"
-          digest: "sha256:aa077c6020e530dc2ed8d63c72e3ff407b64eba6c3a34e2e1664fe88272b3473"
-        - name: relay_fixtures
-          signature: "relay_daemon, relay_dispatch_barriers, relay_store_spy, relay_clock, relay_scheduler"
-          digest: "sha256:c31b7382582e6d502e60c4cd955d8d174c3aa255f97d69bfb7dc993b4aa35a4c"
-      consumes:
-        - name: CommandSpec
-          signature: "CommandSpec(*, argv: tuple[str, ...], env: Mapping[str, str], cwd: str | None = None, pass_fds: tuple[int, ...] = (), secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:34ade8563457f5724618cf189b461f0b3cd6dce93c8ad9e241064c35676621e2"
-        - name: ProfileCommand
-          signature: "ProfileCommand(argv: tuple[str, ...], secret_indices: tuple[int, ...] = ())"
-          digest: "sha256:43381fe6f6e45d791ee25a93b3e47900f7056d0ab81912bd494b9e00b239bee9"
-        - name: CredentialRequest
-          signature: "CredentialRequest (frozen): receiver_id, target, credential_kind, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, observed_at"
-          digest: "sha256:73b85027ace42b30dd03040da0b78a332264e8dd962cec5ee81e8b805b16c84a"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/testing/test_fakes.py
-        - tests/acceptance/test_no_production_spawn.py
-        - tests/adapter_contracts/test_private_processes.py
-        - "--basetemp=/tmp/ap-relay-core"
-  - id: T-006
-    plan_task: 6
-    lane: dashboard
-    depends_on:
-      - T-001
-    title: Publish owned relay challenges and deduplicate actor submission completions
-    tier: Advanced
+    title: "Integrate Prompt Identity, Session Lifecycle, and UI Reporting"
+    tier: capable
     sequence: 1
     ownership:
-      - src/airplay_linux/session/engine.py
-      - src/airplay_linux/session/pairing.py
-      - src/airplay_linux/session/virtual.py
-      - tests/session/test_credential_relay.py
+      - "src/airplay_linux/domain/messages.py"
+      - "src/airplay_linux/domain/records.py"
+      - "src/airplay_linux/domain/relay.py"
+      - "src/airplay_linux/session/cleanup.py"
+      - "src/airplay_linux/session/engine.py"
+      - "src/airplay_linux/session/mirror.py"
+      - "src/airplay_linux/session/pairing.py"
+      - "src/airplay_linux/session/reconnect.py"
+      - "src/airplay_linux/ui/state.py"
+      - "src/airplay_linux/ui/presenter.py"
+      - "src/airplay_linux/ui/dialogs.py"
+      - "src/airplay_linux/runtime.py"
+      - "tests/domain/test_credential_relay.py"
+      - "tests/session/test_pairing_integration.py"
+      - "tests/session/test_engine.py"
+      - "tests/session/test_reconnect.py"
+      - "tests/session/test_stop_matrix.py"
+      - "tests/session/test_shutdown.py"
+      - "tests/session/test_shutdown_drain.py"
+      - "tests/session/test_lifecycle_regressions.py"
+      - "tests/session/test_fencing.py"
+      - "tests/session/test_mirror_and_trust.py"
+      - "tests/ui/test_state_projection.py"
+      - "tests/ui/test_presenter.py"
+      - "tests/ui/test_dashboard_widgets.py"
+      - "tests/trust/test_pairing_transactions.py"
     exclusive_resources:
-      - pytest-relay-dashboard
+      - "/tmp/ap-relay-session-ui"
     interfaces:
       produces:
-        - name: PairingFlow.observe_relay
-          signature: "PairingFlow.observe_relay(self, ctx, event: TransportEvent) -> bool"
-          digest: "sha256:08ed8b17db7656dadf17898efc85e3be9e828786a030fa3772291b7d5b5eb98c"
-        - name: PairingFlow._submit_result
-          signature: "PairingFlow._submit_result(self, message, context, *, relay=None, submission_id=None) -> Result[object]"
-          digest: "sha256:7c9803c32c68ebf0b8a0d0698c0b2d8dc6639eab394534eaba2e59facdc7f62e"
-        - name: PairingFlow._submit_effect
-          signature: "PairingFlow._submit_effect(self, ctx, message: EffectEvent) -> bool"
-          digest: "sha256:6343d4d5a2e63e217234692f81d625cf39248a07ffd64fd8385047dc971458e7"
-      consumes:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: relay_credential_representable
-          signature: "relay_credential_representable(value: str, *, target_volume_proven: bool) -> bool"
-          digest: "sha256:48123ec961a2bf2ef41f89622f724d60df3386de72d2f083e32f3420a5535533"
-        - name: RelayPairingPayload
-          signature: "RelayPairingPayload(*, lease: RelayLeaseView)"
-          digest: "sha256:c2a040e0341a5c9129438d011f34d38c0e985832c232b2bd01c48dc0d1049bde"
-        - name: RelaySubmitCompletion
-          signature: "RelaySubmitCompletion(*, submission_id, challenge_id, receiver_id, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, result)"
-          digest: "sha256:06098d574cd82adac3674218d5301bdd4af5c7a987718f14249bbb810e2cba1d"
-        - name: ChallengeView
-          signature: "ChallengeView(..., presentation_revision: int = 0)"
-          digest: "sha256:65559623bb16f5c9aa689e60ce8c913b16d02badcbf1eee14fec2450b55f1afd"
-        - name: PairingResult
-          signature: "PairingResult(kind, credential_ref, diagnostic, waiting: bool = False)"
-          digest: "sha256:cf792e0cb792a6808d8ebb165fec2364b6d55fe6cd2d5d2548c0ba9d52740d9d"
+        - name: "DismissRouteBPrompt(receiver_id: ReceiverId, start_operation: OperationId, prompt_key: ChallengeId)"
+          signature: "DismissRouteBPrompt(receiver_id: ReceiverId, start_operation: OperationId, prompt_key: ChallengeId)"
+          digest: sha256:e31775740849f296a8baa9897755d9e467a56e8dd7b41ac269ad0edd41688133
+        - name: "Command"
+          signature: "Command"
+          digest: sha256:713166971d730f81fcf8b757f2ea239d1a0360d9f74e8f5afe60fba97105879c
+        - name: "SessionSnapshot.route_b_request: CredentialRequest | None"
+          signature: "SessionSnapshot.route_b_request: CredentialRequest | None"
+          digest: sha256:67f6cfe344f5d61a610e5644c2bf230cd5bce503acbf5c9c11267239295f787d
+        - name: "SessionSnapshot.route_b_submission_pending: bool"
+          signature: "SessionSnapshot.route_b_submission_pending: bool"
+          digest: sha256:b65140e3cb225714e0a063110925f69a2218b2b59f13e51c10d9dd9c28dd5953
+        - name: "PaneState.route_b_prompt: bool"
+          signature: "PaneState.route_b_prompt: bool"
+          digest: sha256:6f5308a9d871e37f0eab5b487f23b1e5f627770601e20b851a336c09b7eb273a
+        - name: "PaneState.route_b_submission_pending: bool"
+          signature: "PaneState.route_b_submission_pending: bool"
+          digest: sha256:68d417d08987c14dc3b19f5fe771687a15d992e0bb3b2627279be58af7090f8e
+      consumes: []
     validation:
       argv:
-        - env
-        - "QT_QPA_PLATFORM=offscreen"
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/session/test_credential_relay.py
-        - tests/session/test_pairing_integration.py
-        - tests/session/test_actor_fences.py
-        - "--basetemp=/tmp/ap-relay-dashboard"
-  - id: T-007
-    plan_task: 7
-    lane: backend
+        - "`/data/home/guest/Development/airplay-linux/.venv/bin/python"
+        - "-m"
+        - "pytest"
+        - "-q"
+        - "tests/domain/test_credential_relay.py"
+        - "tests/session/test_pairing_integration.py"
+        - "tests/session/test_engine.py"
+        - "tests/session/test_reconnect.py"
+        - "tests/session/test_stop_matrix.py"
+        - "tests/session/test_shutdown.py"
+        - "tests/session/test_shutdown_drain.py"
+        - "tests/session/test_lifecycle_regressions.py"
+        - "tests/session/test_fencing.py"
+        - "tests/ui/test_state_projection.py"
+        - "tests/ui/test_presenter.py"
+        - "tests/ui/test_dashboard_widgets.py"
+        - "tests/trust/test_pairing_transactions.py"
+        - "--basetemp=/tmp/ap-relay-session-ui`"
+  - id: T-004
+    plan_task: 4
+    lane: acceptance-docs
     depends_on:
-      - T-004
-      - T-005
-    title: Implement the transport-only relay lease and single phase controller
-    tier: Advanced
-    sequence: 3
-    ownership:
-      - src/airplay_linux/transport/relay.py
-      - tests/transport/test_credential_relay.py
-    exclusive_resources:
-      - pytest-relay-backend
-    interfaces:
-      produces:
-        - name: CredentialDispatch
-          signature: "CredentialDispatch(*, command_id, generation, attempt, admitted_at, state, request_task, reply_decoded, status_resolved, charged, spawn_admitted, pre_spawn_retired)"
-          digest: "sha256:fe0eee24090f26bc3bd4bc6b006d9e639315c72bf6f88d2b207cc2fba3d10679"
-        - name: RelayLease
-          signature: "RelayLease (mutable): RelayLeaseView inventory + dispatch, unresolved_dispatch_ids, phase_controller, release_task, release_attempt, disconnect_task, disconnect_outstanding"
-          digest: "sha256:649644b91740f86a51184ed65ef3ae25dda13883870c4b15178c3495a3ceb987"
-        - name: RelayPhaseController
-          signature: "RelayPhaseController(clock, scheduler, expire): connect_acknowledged, request_live, observe_progress, status_decoded, deadline, check, close"
-          digest: "sha256:a4ab059f62e584cb5d0331475814feec2379728e9ffe2a53e8ffbd52d6b48ec9"
-      consumes:
-        - name: CredentialRequest
-          signature: "CredentialRequest (frozen): receiver_id, target, credential_kind, endpoint_generation, session_generation, owner_lease, daemon_instance_uuid, generation, observed_at"
-          digest: "sha256:73b85027ace42b30dd03040da0b78a332264e8dd962cec5ee81e8b805b16c84a"
-        - name: RelayLeaseView
-          signature: "RelayLeaseView (frozen): lease, receiver_id, target, challenge, request, request_state, request_waiting, owner_live, generation, endpoint_generation, session_generation, daemon_instance_uuid, dispatch_state, submit_fenced, success_pending, presentation_revision"
-          digest: "sha256:8de7613e861b815f21a5b407b9cc475e80c7a02cd82e1dc980481631d9739684"
-        - name: RelayStartOptions
-          signature: "RelayStartOptions (frozen): audio, initial_volume"
-          digest: "sha256:601a31fe9b54dd091cc0042c8d8ab4cde520c067ce8a5d87f6c1318b076cef37"
-        - name: ReleaseEvidence
-          signature: "ReleaseEvidence (frozen): reason, observed_at, disconnect_ack, status, daemon_instance_uuid, endpoint_generation, termination"
-          digest: "sha256:2b41a5253a28020d96049730dc3feb1757ad2b49c72cfdcae20e27e5d30ec9d3"
-        - name: TerminationProof
-          signature: "TerminationProof (frozen): daemon_instance_uuid, daemon, runtime_directory, launch_uuid, receipt_state, cleanup_outcome, cleanup_completed_at, process_evidence, identity_verified_at, observed_at"
-          digest: "sha256:d022028611dfcf44aec2ef09f138d62f741343fec1aee9902911ba5520ed692b"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - "tests/transport/test_credential_relay.py::test_relay_phases"
-        - "--basetemp=/tmp/ap-relay-backend"
-  - id: T-008
-    plan_task: 8
-    lane: backend
-    depends_on:
+      - T-001
+      - T-002
       - T-003
-      - T-007
-    title: "Implement one fenced, shared and retryable relay release transition"
-    tier: Capable
-    sequence: 4
+    title: "Prove Acceptance, Canary Coverage, Mutations, and Documentation"
+    tier: advanced
+    sequence: 1
     ownership:
-      - src/airplay_linux/transport/doubletake.py
-      - tests/transport/test_credential_relay.py
+      - "tests/acceptance/test_credential_relay.py"
+      - "tests/ui_acceptance/test_multireceiver_flow.py"
+      - "README.md"
+      - "docs/backend-compatibility.md"
+      - "docs/operations.md"
     exclusive_resources:
-      - pytest-relay-backend
-    interfaces:
-      produces:
-        - name: DoubleTakeTransport.release
-          signature: "DoubleTakeTransport.release(self, lease: LeaseId, evidence: ReleaseEvidence) -> Result[None]"
-          digest: "sha256:e6f43cf2525a2a31307ce30d61dab62e3cec95172b103fa9f7c4618cb9f749fe"
-        - name: DoubleTakeTransport._relay_view
-          signature: "DoubleTakeTransport._relay_view(self, stream: _Stream) -> RelayLeaseView"
-          digest: "sha256:d4d737c792ae503f1e5ce2e9cf7477f35d9ab75fb2912e29acac996a0a063aa8"
-        - name: DoubleTakeTransport._stop_owned
-          signature: "DoubleTakeTransport._stop_owned(self, stream: _Stream, context: OperationContext) -> Result[None]"
-          digest: "sha256:7efa44d0607e2545ccf5c1a23a0bf82a52e3fd7744ec1dee8864c4b68448fafb"
-      consumes:
-        - name: DaemonRegistry.termination_proof
-          signature: "DaemonRegistry.termination_proof(self, record: DaemonRecord) -> Result[TerminationProof]"
-          digest: "sha256:106d03d755884da797fcc9cb314b76b230db37832e15fbc7294551b5a2ae2845"
-        - name: RelayLease
-          signature: "RelayLease (mutable): RelayLeaseView inventory + dispatch, unresolved_dispatch_ids, phase_controller, release_task, release_attempt, disconnect_task, disconnect_outstanding"
-          digest: "sha256:649644b91740f86a51184ed65ef3ae25dda13883870c4b15178c3495a3ceb987"
-        - name: CredentialDispatch
-          signature: "CredentialDispatch(*, command_id, generation, attempt, admitted_at, state, request_task, reply_decoded, status_resolved, charged, spawn_admitted, pre_spawn_retired)"
-          digest: "sha256:fe0eee24090f26bc3bd4bc6b006d9e639315c72bf6f88d2b207cc2fba3d10679"
-        - name: RelayPhaseController
-          signature: "RelayPhaseController(clock, scheduler, expire): connect_acknowledged, request_live, observe_progress, status_decoded, deadline, check, close"
-          digest: "sha256:a4ab059f62e584cb5d0331475814feec2379728e9ffe2a53e8ffbd52d6b48ec9"
-        - name: ReleaseEvidence
-          signature: "ReleaseEvidence (frozen): reason, observed_at, disconnect_ack, status, daemon_instance_uuid, endpoint_generation, termination"
-          digest: "sha256:2b41a5253a28020d96049730dc3feb1757ad2b49c72cfdcae20e27e5d30ec9d3"
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: BackendControl.request
-          signature: "BackendControl.request(self, operation, target, payload, context, *, dispatch_fence=None, ownership_proof=None, dispatch_started=None, dispatch_status=None) -> Result[BackendReply]"
-          digest: "sha256:1cd57a55dc96eb97855e09d47ee284a571465a480df50889438ea09ad070a881"
-        - name: CredentialDispatchFailure
-          signature: "CredentialDispatchFailure(*, error: Diagnostic, dispatch_state: Literal['no_spawn','acknowledged','uncertain'], refusal: Literal['shutdown','ended','stale','rejected'] | None)"
-          digest: "sha256:805a4248fb2b0cc994245065b1f5fc44f73a11b4f222ea180cd75038ec964523"
-        - name: RelayGate
-          signature: "RelayGate(entered: asyncio.Event, result: Deferred[object], wait, release)"
-          digest: "sha256:1e7fa52be20410c1dd3e91b1cf028f780d2afdc6f85292ee5463f8fcfa82e8cf"
-        - name: RelayDaemon
-          signature: "RelayDaemon(FakeProcess): set_entry, remove_entry, gate, credential_children, disconnect_children, streams, journal"
-          digest: "sha256:aa077c6020e530dc2ed8d63c72e3ff407b64eba6c3a34e2e1664fe88272b3473"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/transport/test_credential_relay.py
-        - tests/transport/test_doubletake.py
-        - "--basetemp=/tmp/ap-relay-backend"
-  - id: T-009
-    plan_task: 9
-    lane: backend
-    depends_on:
-      - T-008
-    title: Relay target-specific requests through dispatch settlement and original mirror readiness
-    tier: Capable
-    sequence: 5
-    ownership:
-      - src/airplay_linux/transport/doubletake.py
-      - tests/transport/test_credential_relay.py
-      - tests/backend/test_credential_relay.py
-    exclusive_resources:
-      - pytest-relay-backend
-    interfaces:
-      produces:
-        - name: DoubleTakeTransport.submit_pairing
-          signature: "DoubleTakeTransport.submit_pairing(self, challenge_id, value, context) -> PairingResult"
-          digest: "sha256:28524cbe4d948fb2e149b07045616516731eb39fec968693b311fc5d5100b6ea"
-        - name: DoubleTakeTransport.cancel_pairing
-          signature: "DoubleTakeTransport.cancel_pairing(self, receiver_id, challenge_id, context) -> Result[None]"
-          digest: "sha256:571c54f97aeb4f7d71e258a35352cd4a2d326b88e8cb1482deefa8f139281334"
-        - name: DoubleTakeTransport._observe_credential_request
-          signature: "DoubleTakeTransport._observe_credential_request(self, stream, status, observed_at) -> CredentialRequest | None"
-          digest: "sha256:62d7f214cd1c5b97a68d8a4506934632fd7a18a4fe8d8416b134c342406babe3"
-        - name: DoubleTakeTransport._await_connecting_stream
-          signature: "DoubleTakeTransport._await_connecting_stream(self, stream) -> Result[None]"
-          digest: "sha256:e5f4e7065d7227cb0f4045eeccb3f207e82c0aa81b7a8a673570cb2f2841ea43"
-      consumes:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: relay_credential_representable
-          signature: "relay_credential_representable(value: str, *, target_volume_proven: bool) -> bool"
-          digest: "sha256:48123ec961a2bf2ef41f89622f724d60df3386de72d2f083e32f3420a5535533"
-        - name: RelayPairingPayload
-          signature: "RelayPairingPayload(*, lease: RelayLeaseView)"
-          digest: "sha256:c2a040e0341a5c9129438d011f34d38c0e985832c232b2bd01c48dc0d1049bde"
-        - name: PairingResult
-          signature: "PairingResult(kind, credential_ref, diagnostic, waiting: bool = False)"
-          digest: "sha256:cf792e0cb792a6808d8ebb165fec2364b6d55fe6cd2d5d2548c0ba9d52740d9d"
-        - name: CredentialPayload
-          signature: "CredentialPayload(*, value, audio: AudioPolicy | None = None, initial_volume: VolumeLevel | None = None)"
-          digest: "sha256:4230657eba67365784b431ee35e7081868ca75c30b218724422f0382b153ac38"
-        - name: DispatchStarted
-          signature: "DispatchStarted = Callable[[], Result[None]]"
-          digest: "sha256:e1e3058a12585833927f5e5164e6c236e4b7864aa172cc1a3e7c0104cb1765bf"
-        - name: DispatchStatus
-          signature: "DispatchStatus = Callable[[StatusReply], Result[None]]"
-          digest: "sha256:641624f8942324196e14b764b83361b373052f4daf58b45f9cb41c81a8222d46"
-        - name: BackendControl.request
-          signature: "BackendControl.request(self, operation, target, payload, context, *, dispatch_fence=None, ownership_proof=None, dispatch_started=None, dispatch_status=None) -> Result[BackendReply]"
-          digest: "sha256:1cd57a55dc96eb97855e09d47ee284a571465a480df50889438ea09ad070a881"
-        - name: RelayPhaseController
-          signature: "RelayPhaseController(clock, scheduler, expire): connect_acknowledged, request_live, observe_progress, status_decoded, deadline, check, close"
-          digest: "sha256:a4ab059f62e584cb5d0331475814feec2379728e9ffe2a53e8ffbd52d6b48ec9"
-        - name: DoubleTakeTransport.release
-          signature: "DoubleTakeTransport.release(self, lease: LeaseId, evidence: ReleaseEvidence) -> Result[None]"
-          digest: "sha256:e6f43cf2525a2a31307ce30d61dab62e3cec95172b103fa9f7c4618cb9f749fe"
-        - name: DoubleTakeTransport._relay_view
-          signature: "DoubleTakeTransport._relay_view(self, stream: _Stream) -> RelayLeaseView"
-          digest: "sha256:d4d737c792ae503f1e5ce2e9cf7477f35d9ab75fb2912e29acac996a0a063aa8"
-        - name: RelayDaemon
-          signature: "RelayDaemon(FakeProcess): set_entry, remove_entry, gate, credential_children, disconnect_children, streams, journal"
-          digest: "sha256:aa077c6020e530dc2ed8d63c72e3ff407b64eba6c3a34e2e1664fe88272b3473"
-        - name: RelayGate
-          signature: "RelayGate(entered: asyncio.Event, result: Deferred[object], wait, release)"
-          digest: "sha256:1e7fa52be20410c1dd3e91b1cf028f780d2afdc6f85292ee5463f8fcfa82e8cf"
-    validation:
-      argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/transport
-        - tests/backend/test_credential_relay.py
-        - tests/backend/test_control.py
-        - tests/trust/test_pairing_transactions.py
-        - "--basetemp=/tmp/ap-relay-backend"
-  - id: T-010
-    plan_task: 10
-    lane: dashboard
-    depends_on:
-      - T-006
-    title: Project relay actions and serialize prompts by receiver revision
-    tier: Advanced
-    sequence: 2
-    ownership:
-      - src/airplay_linux/ui/state.py
-      - src/airplay_linux/ui/presenter.py
-      - tests/ui/test_credential_relay.py
-    exclusive_resources:
-      - pytest-relay-dashboard
-    interfaces:
-      produces:
-        - name: project
-          signature: "project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState"
-          digest: "sha256:61259ac25be18106b23b97b6ef88ed4bdb6878bfdf38f4f4e92cb760ec31f9ec"
-        - name: Presenter._maybe_open_pairing
-          signature: "Presenter._maybe_open_pairing(self, receiver_id, pane) -> None"
-          digest: "sha256:4140a805096c98eb132d8e6aa1de8fb73f96f3c3264f85ffb501be8c3433f1f7"
-      consumes:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: ChallengeView
-          signature: "ChallengeView(..., presentation_revision: int = 0)"
-          digest: "sha256:65559623bb16f5c9aa689e60ce8c913b16d02badcbf1eee14fec2450b55f1afd"
-        - name: SessionSnapshot
-          signature: "SessionSnapshot(..., relay: RelayLeaseView | None = None, relay_notice: RelayNotice | None = None)"
-          digest: "sha256:378de49ee00f809ab8407f0de2222cd0663368dc6166fd832b5ae5a5f0283c8f"
-        - name: RelayLeaseView
-          signature: "RelayLeaseView (frozen): lease, receiver_id, target, challenge, request, request_state, request_waiting, owner_live, generation, endpoint_generation, session_generation, daemon_instance_uuid, dispatch_state, submit_fenced, success_pending, presentation_revision"
-          digest: "sha256:8de7613e861b815f21a5b407b9cc475e80c7a02cd82e1dc980481631d9739684"
-    validation:
-      argv:
-        - env
-        - "QT_QPA_PLATFORM=offscreen"
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/ui/test_credential_relay.py
-        - tests/ui/test_presenter.py
-        - tests/ui/test_state_projection.py
-        - tests/ui/test_dashboard_widgets.py
-        - "--basetemp=/tmp/ap-relay-dashboard"
-  - id: T-011
-    plan_task: 11
-    lane: dashboard
-    depends_on:
-      - T-009
-      - T-010
-    title: Commit trust on the original handle and join terminal relay cleanup
-    tier: Capable
-    sequence: 3
-    ownership:
-      - src/airplay_linux/session/pairing.py
-      - src/airplay_linux/session/mirror.py
-      - src/airplay_linux/session/reconnect.py
-      - src/airplay_linux/session/virtual.py
-      - src/airplay_linux/session/cleanup.py
-      - src/airplay_linux/session/phase.py
-      - tests/session/test_credential_relay.py
-    exclusive_resources:
-      - pytest-relay-dashboard
-    interfaces:
-      produces:
-        - name: PairingFlow.complete_relay_start
-          signature: "PairingFlow.complete_relay_start(self, ctx, handle: StreamHandle) -> bool"
-          digest: "sha256:1695816c017dbec677a67f82aace34bd216a552acd0e8bf8b582cd8d90a2c236"
-        - name: PairingFlow.fail_relay
-          signature: "PairingFlow.fail_relay(self, ctx, error: Diagnostic) -> None"
-          digest: "sha256:0a665033ae28214e67ef28ef34c3d5a6ecd3421e76886f32cd674295b25abfb3"
-        - name: derive_phase
-          signature: "derive_phase(state: SessionSnapshot) -> SessionPhase"
-          digest: "sha256:6883b8c30fae5d51d2a4901270bbb05e0a8ffa02d2d68b8b5a1b2593d66515a8"
-      consumes:
-        - name: PairingFlow.observe_relay
-          signature: "PairingFlow.observe_relay(self, ctx, event: TransportEvent) -> bool"
-          digest: "sha256:08ed8b17db7656dadf17898efc85e3be9e828786a030fa3772291b7d5b5eb98c"
-        - name: PairingFlow._submit_result
-          signature: "PairingFlow._submit_result(self, message, context, *, relay=None, submission_id=None) -> Result[object]"
-          digest: "sha256:7c9803c32c68ebf0b8a0d0698c0b2d8dc6639eab394534eaba2e59facdc7f62e"
-        - name: PairingFlow._submit_effect
-          signature: "PairingFlow._submit_effect(self, ctx, message: EffectEvent) -> bool"
-          digest: "sha256:6343d4d5a2e63e217234692f81d625cf39248a07ffd64fd8385047dc971458e7"
-        - name: DoubleTakeTransport.submit_pairing
-          signature: "DoubleTakeTransport.submit_pairing(self, challenge_id, value, context) -> PairingResult"
-          digest: "sha256:28524cbe4d948fb2e149b07045616516731eb39fec968693b311fc5d5100b6ea"
-        - name: DoubleTakeTransport.cancel_pairing
-          signature: "DoubleTakeTransport.cancel_pairing(self, receiver_id, challenge_id, context) -> Result[None]"
-          digest: "sha256:571c54f97aeb4f7d71e258a35352cd4a2d326b88e8cb1482deefa8f139281334"
-        - name: DoubleTakeTransport.release
-          signature: "DoubleTakeTransport.release(self, lease: LeaseId, evidence: ReleaseEvidence) -> Result[None]"
-          digest: "sha256:e6f43cf2525a2a31307ce30d61dab62e3cec95172b103fa9f7c4618cb9f749fe"
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: RelayLeaseView
-          signature: "RelayLeaseView (frozen): lease, receiver_id, target, challenge, request, request_state, request_waiting, owner_live, generation, endpoint_generation, session_generation, daemon_instance_uuid, dispatch_state, submit_fenced, success_pending, presentation_revision"
-          digest: "sha256:8de7613e861b815f21a5b407b9cc475e80c7a02cd82e1dc980481631d9739684"
-    validation:
-      argv:
-        - env
-        - "QT_QPA_PLATFORM=offscreen"
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/session
-        - tests/integration
-        - tests/ui/test_credential_relay.py
-        - "--basetemp=/tmp/ap-relay-dashboard"
-  - id: T-012
-    plan_task: 12
-    lane: core
-    depends_on:
-      - T-005
-      - T-009
-    title: Verify termination proofs against held active and retired relay obligations
-    tier: Advanced
-    sequence: 4
-    ownership:
-      - tests/process/test_relay_termination.py
-    exclusive_resources:
-      - pytest-relay-core
+      - "/tmp/ap-relay-acceptance"
     interfaces:
       produces: []
-      consumes:
-        - name: DaemonRegistry.termination_proof
-          signature: "DaemonRegistry.termination_proof(self, record: DaemonRecord) -> Result[TerminationProof]"
-          digest: "sha256:106d03d755884da797fcc9cb314b76b230db37832e15fbc7294551b5a2ae2845"
-        - name: DoubleTakeTransport.release
-          signature: "DoubleTakeTransport.release(self, lease: LeaseId, evidence: ReleaseEvidence) -> Result[None]"
-          digest: "sha256:e6f43cf2525a2a31307ce30d61dab62e3cec95172b103fa9f7c4618cb9f749fe"
-        - name: ReleaseEvidence
-          signature: "ReleaseEvidence (frozen): reason, observed_at, disconnect_ack, status, daemon_instance_uuid, endpoint_generation, termination"
-          digest: "sha256:2b41a5253a28020d96049730dc3feb1757ad2b49c72cfdcae20e27e5d30ec9d3"
-        - name: RelayLease
-          signature: "RelayLease (mutable): RelayLeaseView inventory + dispatch, unresolved_dispatch_ids, phase_controller, release_task, release_attempt, disconnect_task, disconnect_outstanding"
-          digest: "sha256:649644b91740f86a51184ed65ef3ae25dda13883870c4b15178c3495a3ceb987"
-        - name: CredentialDispatch
-          signature: "CredentialDispatch(*, command_id, generation, attempt, admitted_at, state, request_task, reply_decoded, status_resolved, charged, spawn_admitted, pre_spawn_retired)"
-          digest: "sha256:fe0eee24090f26bc3bd4bc6b006d9e639315c72bf6f88d2b207cc2fba3d10679"
-        - name: RelayDaemon
-          signature: "RelayDaemon(FakeProcess): set_entry, remove_entry, gate, credential_children, disconnect_children, streams, journal"
-          digest: "sha256:aa077c6020e530dc2ed8d63c72e3ff407b64eba6c3a34e2e1664fe88272b3473"
-        - name: RelayGate
-          signature: "RelayGate(entered: asyncio.Event, result: Deferred[object], wait, release)"
-          digest: "sha256:1e7fa52be20410c1dd3e91b1cf028f780d2afdc6f85292ee5463f8fcfa82e8cf"
-        - name: relay_fixtures
-          signature: "relay_daemon, relay_dispatch_barriers, relay_store_spy, relay_clock, relay_scheduler"
-          digest: "sha256:c31b7382582e6d502e60c4cd955d8d174c3aa255f97d69bfb7dc993b4aa35a4c"
+      consumes: []
     validation:
       argv:
-        - python
-        - -m
-        - pytest
-        - -q
-        - tests/process/test_relay_termination.py
-        - tests/transport/test_credential_relay.py
-        - "--basetemp=/tmp/ap-relay-core"
-  - id: T-013
-    plan_task: 13
-    lane: dashboard
-    depends_on:
-      - T-011
-      - T-012
-    title: "Deliver offline runtime acceptance, canary coverage, documentation and mutation evidence"
-    tier: Capable
-    sequence: 4
-    ownership:
-      - tests/acceptance/test_credential_relay.py
-      - tests/storage/test_relay_secrets.py
-      - tests/relay_mutations.py
-      - README.md
-      - docs/backend-compatibility.md
-      - docs/operations.md
-    exclusive_resources:
-      - pytest-relay-dashboard
-      - relay-mutation-workspace
-    interfaces:
-      produces: []
-      consumes:
-        - name: can_submit
-          signature: "can_submit(lease: RelayLeaseView) -> bool"
-          digest: "sha256:ff9f2e5d21858f01371d25ad59c6dfce77b6491876da0c659c75c4e0d637eaff"
-        - name: DoubleTakeTransport.submit_pairing
-          signature: "DoubleTakeTransport.submit_pairing(self, challenge_id, value, context) -> PairingResult"
-          digest: "sha256:28524cbe4d948fb2e149b07045616516731eb39fec968693b311fc5d5100b6ea"
-        - name: DoubleTakeTransport.release
-          signature: "DoubleTakeTransport.release(self, lease: LeaseId, evidence: ReleaseEvidence) -> Result[None]"
-          digest: "sha256:e6f43cf2525a2a31307ce30d61dab62e3cec95172b103fa9f7c4618cb9f749fe"
-        - name: DaemonRegistry.termination_proof
-          signature: "DaemonRegistry.termination_proof(self, record: DaemonRecord) -> Result[TerminationProof]"
-          digest: "sha256:106d03d755884da797fcc9cb314b76b230db37832e15fbc7294551b5a2ae2845"
-        - name: PairingFlow.observe_relay
-          signature: "PairingFlow.observe_relay(self, ctx, event: TransportEvent) -> bool"
-          digest: "sha256:08ed8b17db7656dadf17898efc85e3be9e828786a030fa3772291b7d5b5eb98c"
-        - name: PairingFlow.complete_relay_start
-          signature: "PairingFlow.complete_relay_start(self, ctx, handle: StreamHandle) -> bool"
-          digest: "sha256:1695816c017dbec677a67f82aace34bd216a552acd0e8bf8b582cd8d90a2c236"
-        - name: project
-          signature: "project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState"
-          digest: "sha256:61259ac25be18106b23b97b6ef88ed4bdb6878bfdf38f4f4e92cb760ec31f9ec"
-        - name: Presenter._maybe_open_pairing
-          signature: "Presenter._maybe_open_pairing(self, receiver_id, pane) -> None"
-          digest: "sha256:4140a805096c98eb132d8e6aa1de8fb73f96f3c3264f85ffb501be8c3433f1f7"
-        - name: RelayDaemon
-          signature: "RelayDaemon(FakeProcess): set_entry, remove_entry, gate, credential_children, disconnect_children, streams, journal"
-          digest: "sha256:aa077c6020e530dc2ed8d63c72e3ff407b64eba6c3a34e2e1664fe88272b3473"
-        - name: RelayGate
-          signature: "RelayGate(entered: asyncio.Event, result: Deferred[object], wait, release)"
-          digest: "sha256:1e7fa52be20410c1dd3e91b1cf028f780d2afdc6f85292ee5463f8fcfa82e8cf"
-        - name: redact
-          signature: "redact(value: Any) -> Any"
-          digest: "sha256:e6cf80f3829c5a34f844cabe61edd365c2a6469964f12d0cd5af105cb267e62a"
-    validation:
-      argv:
-        - env
-        - "QT_QPA_PLATFORM=offscreen"
-        - python
-        - -m
-        - pytest
-        - -q
-        - "--basetemp=/tmp/ap-relay-full"
+        - "`/data/home/guest/Development/airplay-linux/.venv/bin/python"
+        - "-m"
+        - "pytest"
+        - "-q"
+        - "tests/acceptance"
+        - "tests/ui_acceptance"
+        - "--basetemp=/tmp/ap-relay-acceptance`"
