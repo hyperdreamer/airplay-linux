@@ -480,7 +480,22 @@ class FakeTransport(_Scripted, _EventSource):
     ) -> None:
         self._record("dismiss_credential_prompt", target=target, context=context)
 
-    async def stop_pending_start(self, owner: Any, stop_context: OperationContext) -> Result[Any]:
+    async def record_credential_marker_generation(
+        self, target: ReceiverTarget, context: OperationContext, *,
+        submission_id: OperationId, expected_generation: int, previous_generation: int,
+    ) -> Result[Any]:
+        self._record(
+            "record_credential_marker_generation", target=target, context=context,
+            submission_id=submission_id, expected_generation=expected_generation,
+            previous_generation=previous_generation,
+        )
+        scripted = await self._take("record_credential_marker_generation")
+        if scripted is not _UNSET:
+            return scripted
+        return _failure(ErrorCode.dependency_incompatible, "Marker generation is not scripted")
+
+    async def stop_pending_start(
+        self, owner: Any, stop_context: OperationContext) -> Result[Any]:
         self._record("stop_pending_start", owner=owner, stop_context=stop_context)
         scripted = await self._take("stop_pending_start")
         if scripted is not _UNSET:

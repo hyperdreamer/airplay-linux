@@ -999,6 +999,47 @@ def marker_for_receipt(receipt, *, target="192.0.2.41"):
     )
 
 
+async def test_authenticate_exact_identity_resolves_fresh_registry_record(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+
+    result = await c.registry.authenticate_exact_identity(marker.original_daemon)
+
+    assert result == Ok(value=replace(c.record, lifecycle="running"))
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("field", [
+    "launch_uuid", "instance_uuid", "endpoint_generation", "pid", "start_ticks",
+    "runtime_directory", "socket_path",
+])
+async def test_authenticate_exact_identity_rejects_each_mismatched_field(
+    application_daemon_identity_cases, field,
+):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    identity = marker_for_receipt(await c.current()).original_daemon
+    changed = {
+        "launch_uuid": UUID(int=801), "instance_uuid": InstanceId(UUID(int=802)),
+        "endpoint_generation": identity.endpoint_generation + 1,
+        "runtime_directory": identity.runtime_directory + "-other",
+        "socket_path": identity.runtime_directory + "/other.sock",
+    }
+    if field in {"pid", "start_ticks"}:
+        process = replace(identity.daemon_process, **{field: getattr(identity.daemon_process, field) + 1})
+        identity = replace(identity, daemon_process=process)
+    else:
+        identity = replace(identity, **{field: changed[field]})
+    c.reopen()
+
+    result = await c.registry.authenticate_exact_identity(identity)
+
+    assert isinstance(result, Err)
+    assert c.process.terminated == []
+
+
 async def test_recovery_exemption_retains_authenticated_original_as_current(application_daemon_identity_cases):
     # Breaks when reconciliation stops a marker-owned daemon or fails to adopt it.
     c = application_daemon_identity_cases

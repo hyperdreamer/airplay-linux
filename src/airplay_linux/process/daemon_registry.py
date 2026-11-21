@@ -38,7 +38,7 @@ from airplay_linux.domain.ports import (
 )
 from airplay_linux.domain.records import (
     AuthorityOwner, CredentialRecoveryMarker, DaemonCleanupIntent, DaemonRecord,
-    LaunchReceipt, SupervisorReleaseIntent,
+    LaunchReceipt, OriginalDaemonIdentity, SupervisorReleaseIntent,
 )
 from airplay_linux.domain.relay import TerminationProof
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
@@ -418,6 +418,106 @@ class DaemonRegistry:
             )
             self._issued_recovery_exemptions[marker.target] = exemption
             return Ok(value=exemption)
+
+    async def authenticate_exact_identity(
+        self, identity: OriginalDaemonIdentity,
+    ) -> Result[DaemonRecord]:
+        """Resolve and authenticate one marker-bound daemon identity.
+
+        Recovery status reads must not reuse an in-memory record or call
+        ``ensure`` because either can point at a replacement endpoint. This
+        query joins the launch receipt, daemon record, ownership channels,
+        process identities and endpoint proof before authenticating the exact
+        record, then repeats the durable join after that awaited work.
+        """
+        if (
+            type(identity) is not OriginalDaemonIdentity
+            or identity.daemon_process is None
+            or identity.endpoint_generation <= 0
+        ):
+            return _error(ErrorCode.stale_event)
+        if not self._public_lifecycle():
+            return _error(ErrorCode.dependency_incompatible)
+
+        def select(
+            history: tuple[LaunchReceipt, ...],
+            records: tuple[DaemonRecord, ...],
+            channels: dict[str, SupervisorReleaseIntent | None],
+        ) -> tuple[LaunchReceipt, DaemonRecord] | None:
+            receipts = tuple(item for item in history if item.launch_uuid == identity.launch_uuid)
+            matches = tuple(item for item in records if item.instance_uuid == identity.instance_uuid)
+            if len(receipts) != 1 or len(matches) != 1:
+                return None
+            receipt, record = receipts[0], matches[0]
+            if not recovery_identity_matches(identity, receipt, record):
+                return None
+            endpoint = tuple(
+                item for item in history
+                if item.runtime_directory == identity.runtime_directory
+                and str(Path(item.runtime_directory) / item.socket_name) == identity.socket_path
+            )
+            if (
+                not endpoint
+                or max(item.endpoint_generation for item in endpoint) != identity.endpoint_generation
+                or sum(item.state not in {"failed", "stopped"} for item in endpoint) != 1
+                or channels.get(identity.runtime_directory) is not None
+            ):
+                return None
+            try:
+                if (
+                    not self._exact_process(record.supervisor, receipt.owner_uid)
+                    or not self._exact_process(record.daemon, receipt.owner_uid)
+                    or self._inspect(record.daemon.pid).parent != record.supervisor.pid
+                ):
+                    return None
+                verified = verify_owned_endpoint(
+                    receipt, current_generation=identity.endpoint_generation,
+                )
+            except (OSError, ValueError):
+                return None
+            return (receipt, record) if isinstance(verified, Ok) else None
+
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return obligations
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            channels = await self._owned_runtime_channels(
+                self._receipt_history, records.value,
+            )
+            if isinstance(channels, Err):
+                return channels
+            selected = select(self._receipt_history, records.value, channels.value)
+            if selected is None:
+                return _error(ErrorCode.stale_event)
+            authenticated = await self._authenticate(selected[1])
+            if isinstance(authenticated, Err):
+                return authenticated
+
+            history = await self._receipts.all()
+            records = await self._store.all()
+            intents = await self._cleanup_intents.all()
+            if (
+                isinstance(history, Err)
+                or isinstance(records, Err)
+                or isinstance(intents, Err)
+            ):
+                return _error(ErrorCode.persistence_failed)
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return channels
+            current = select(history.value, records.value, channels.value)
+            if current is None or current != selected:
+                return _error(ErrorCode.stale_event)
+            if any(
+                intent.launch_uuid == identity.launch_uuid for intent in intents.value
+            ):
+                return _error(ErrorCode.stale_event)
+            return Ok(value=current[1])
 
     async def _validate_recovery_exemptions(
         self, exemptions: tuple[DaemonRecoveryExemption, ...], history: tuple[LaunchReceipt, ...],

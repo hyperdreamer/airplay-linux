@@ -198,6 +198,7 @@ class _Daemon:
     record: DaemonRecord
     control: BackendControl
     ownership_proof: OwnershipProof | None = None
+    recovery_launch_uuid: object | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     authenticated: bool = False
     alive: bool = True
@@ -803,13 +804,35 @@ class DoubleTakeTransport:
             return _failure(ErrorCode.stale_event)
         deadline = self._clock.now() + SOURCE_TIMEOUT
         polling = self._spawn(self._poll_reported_source(stream, deadline))
+        if not self._features.credential_relay:
+            try:
+                return await self._wait(polling, ErrorCode.unsupported_source, timeout=SOURCE_TIMEOUT)
+            finally:
+                if not polling.done():
+                    polling.cancel()
+        bounded = self._spawn(
+            self._wait(polling, ErrorCode.unsupported_source, timeout=SOURCE_TIMEOUT),
+        )
+        stop_wait = asyncio.create_task(stream.readiness_stop.wait())
         try:
-            return await self._wait(polling, ErrorCode.unsupported_source, timeout=SOURCE_TIMEOUT)
+            done, _ = await asyncio.wait(
+                (bounded, stop_wait), return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_wait in done:
+                if not bounded.done():
+                    bounded.cancel()
+                if not polling.done():
+                    polling.cancel()
+                await asyncio.gather(bounded, polling, return_exceptions=True)
+                stream.handoff_requested = True
+                return _failure(ErrorCode.stale_event)
+            return bounded.result()
         finally:
-            # Status and inventory reads confer no acquisition authority. Retire
-            # the poll on expiry so a late reply cannot publish or start a poll.
+            stop_wait.cancel()
+            await asyncio.gather(stop_wait, return_exceptions=True)
             if not polling.done():
                 polling.cancel()
+            await asyncio.gather(polling, return_exceptions=True)
 
     def _resume_credential_readiness(self, stream: _Stream) -> None:
         if stream.readiness_paused_at is not None:
@@ -1027,8 +1050,12 @@ class DoubleTakeTransport:
         checked = self._current(stream.target, stream.context)
         if isinstance(source_checked, Err):
             return source_checked
+        if stream.readiness_stop.is_set() or stream.handoff_requested:
+            return _failure(ErrorCode.stale_event)
         if isinstance(checked, Err):
             return checked
+        if stream.readiness_stop.is_set() or stream.handoff_requested:
+            return _failure(ErrorCode.stale_event)
         if stream.abandoned or not stream.daemon.alive:
             return _failure(ErrorCode.stale_event)
         stream.ready = True
@@ -1165,7 +1192,23 @@ class DoubleTakeTransport:
                     # Preserve the virtual acquisition contract: the caller owns
                     # this handle while waiting for a separate readiness event.
                     return Ok(value=stream.handle)
-                if result.value.state in ("connecting", "pin_required") and not isinstance(
+                if (
+                    self._features.credential_relay
+                    and result.value.state in ("connecting", "pin_required", "streaming")
+                    and not isinstance(stream.source, VirtualOutputSource)
+                ):
+                    # The aggregate acknowledgement is progress even when it
+                    # says streaming. Route B readiness requires one exact
+                    # target-row observation before it can publish ready.
+                    waited = await self._await_connecting_stream(stream)
+                    claimed = (
+                        waited if isinstance(waited, Err)
+                        else await self._claim_streaming_readiness(stream)
+                    )
+                    if not isinstance(claimed, Err) and not stream.handoff_requested:
+                        return Ok(value=stream.handle)
+                    failure = claimed if isinstance(claimed, Err) else _failure(ErrorCode.stale_event)
+                elif result.value.state in ("connecting", "pin_required") and not isinstance(
                     stream.source, VirtualOutputSource
                 ):
                     # The backend accepts ``connect`` before its handshake and
@@ -1318,13 +1361,15 @@ class DoubleTakeTransport:
             return False
         record = daemon.record
         return (
+            daemon.recovery_launch_uuid is None or daemon.recovery_launch_uuid == owner.launch_uuid
+        ) and (
             record.instance_uuid == owner.instance_uuid
             and record.socket_path == owner.socket_path
             and record.runtime_directory == owner.runtime_directory
             and record.daemon == owner.daemon_process
         )
 
-    def _daemon_for_recovery(
+    async def _daemon_for_recovery(
         self, target: ReceiverTarget, context: OperationContext,
     ) -> Result[_Daemon]:
         owner = context.owner_daemon
@@ -1334,13 +1379,79 @@ class DoubleTakeTransport:
             or owner.endpoint_generation != target.endpoint_generation
         ):
             return _failure(ErrorCode.stale_event)
-        daemon = self._daemons.get(owner.instance_uuid)
+        checked = self._current(target, context)
+        if isinstance(checked, Err):
+            return checked
+        resolver = getattr(self._registry, "authenticate_exact_identity", None)
+        if not callable(resolver):
+            return _failure(ErrorCode.stale_event)
+        resolved = await _safe(resolver(owner), ErrorCode.stale_event)
+        if isinstance(resolved, Err) or not isinstance(resolved.value, DaemonRecord):
+            return resolved if isinstance(resolved, Err) else _failure(ErrorCode.stale_event)
+        record = resolved.value
         if (
-            not self._marker_daemon_matches(daemon, owner)
-            or not daemon.alive
-            or not daemon.authenticated
+            record.instance_uuid != owner.instance_uuid
+            or record.socket_path != owner.socket_path
+            or record.runtime_directory != owner.runtime_directory
+            or record.daemon != owner.daemon_process
         ):
             return _failure(ErrorCode.stale_event)
+        daemon = self._daemons.get(record.instance_uuid)
+        if daemon is None:
+            try:
+                daemon = _Daemon(
+                    record=record, control=self._control_factory(record),
+                    recovery_launch_uuid=owner.launch_uuid,
+                )
+            except Exception:
+                return _failure(ErrorCode.stale_event)
+        elif (
+            daemon.record != record
+            or not self._marker_daemon_matches(daemon, owner)
+            or (
+                daemon.recovery_launch_uuid is not None
+                and daemon.recovery_launch_uuid != owner.launch_uuid
+            )
+        ):
+            return _failure(ErrorCode.stale_event)
+        async with daemon.lock:
+            if not daemon.alive:
+                return _failure(ErrorCode.stale_event)
+            if not daemon.authenticated:
+                proof = await _safe(
+                    daemon.control.handshake(record.owner_token, record.instance_uuid),
+                    ErrorCode.ownership_mismatch,
+                )
+                if isinstance(proof, Err):
+                    return proof
+                value = proof.value
+                if isinstance(value, OwnershipProof):
+                    if value.kind != "evidence" or value.daemon != record.daemon:
+                        return _failure(ErrorCode.ownership_mismatch)
+                    daemon.ownership_proof = value
+                else:
+                    handshake = value
+                    owner_token = (
+                        handshake.owner_token.reveal_for_backend()
+                        if isinstance(handshake, Handshake)
+                        and isinstance(handshake.owner_token, SensitiveText)
+                        else getattr(handshake, "owner_token", None)
+                    )
+                    if not isinstance(handshake, Handshake) or (
+                        handshake.instance_uuid != record.instance_uuid
+                        or owner_token != record.owner_token
+                        or handshake.daemon != record.daemon
+                        or handshake.protocol_version != record.protocol_version
+                    ):
+                        return _failure(ErrorCode.ownership_mismatch)
+                daemon.authenticated = True
+            daemon.recovery_launch_uuid = owner.launch_uuid
+        checked = self._current(target, context)
+        if isinstance(checked, Err):
+            return checked
+        if not daemon.alive or not daemon.authenticated:
+            return _failure(ErrorCode.stale_event)
+        self._daemons[record.instance_uuid] = daemon
         return Ok(value=daemon)
 
     def dismiss_credential_prompt(
@@ -1366,6 +1477,49 @@ class DoubleTakeTransport:
             return
         self._resume_credential_readiness(stream)
 
+    async def record_credential_marker_generation(
+        self,
+        target: ReceiverTarget,
+        context: OperationContext,
+        *,
+        submission_id: OperationId,
+        expected_generation: int,
+        previous_generation: int,
+    ) -> Result[None]:
+        if (
+            type(target) is not ReceiverTarget
+            or type(context) is not OperationContext
+            or type(submission_id) is not type(context.operation_id)
+            or context.operation_id != submission_id
+            or type(expected_generation) is not int
+            or type(previous_generation) is not int
+            or expected_generation <= previous_generation
+            or previous_generation <= 0
+        ):
+            return _failure(ErrorCode.stale_event)
+        stream = self._streams.get(context.transport_lease_id) if context.transport_lease_id else None
+        if (
+            stream is None
+            or stream.released
+            or stream.target != target
+            or stream.context.session_generation != context.session_generation
+            or stream.context.endpoint_generation != context.endpoint_generation
+            or stream.context.trust_generation != context.trust_generation
+            or stream.credential_submission_id != submission_id
+            or stream.credential_marker_generation != previous_generation
+            or context.marker_generation != previous_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        if context.owner_daemon is not None and not self._marker_daemon_matches(
+            stream.daemon, context.owner_daemon,
+        ):
+            return _failure(ErrorCode.stale_event)
+        checked = self._current(target, context)
+        if isinstance(checked, Err):
+            return checked
+        stream.credential_marker_generation = expected_generation
+        return Ok(value=None)
+
     async def read_credential_status(
         self, target: ReceiverTarget, context: OperationContext,
     ) -> Result[StatusReply]:
@@ -1383,7 +1537,7 @@ class DoubleTakeTransport:
             return _failure(ErrorCode.stale_event)
         daemon = stream.daemon if stream is not None else None
         if stream is None:
-            recovered = self._daemon_for_recovery(target, context)
+            recovered = await self._daemon_for_recovery(target, context)
             if isinstance(recovered, Err):
                 return recovered
             daemon = recovered.value
@@ -1399,8 +1553,8 @@ class DoubleTakeTransport:
             or context.marker_generation != stream.credential_marker_generation
         ):
             return _failure(ErrorCode.stale_event)
-        if context.owner_daemon is not None:
-            recovered = self._daemon_for_recovery(target, context)
+        if context.owner_daemon is not None and stream is None:
+            recovered = await self._daemon_for_recovery(target, context)
             if isinstance(recovered, Err) or recovered.value is not daemon:
                 return _failure(ErrorCode.stale_event)
         if daemon is None or not daemon.alive or not daemon.authenticated:
@@ -1518,7 +1672,7 @@ class DoubleTakeTransport:
             negative_disconnect = isinstance(result, Err) and result.error.code is ErrorCode.receiver_rejected
             if not (disconnect_ack or negative_disconnect) or not stream.daemon.alive:
                 return _failure(ErrorCode.cleanup_timeout)
-            if stream.credential_request is None:
+            if not stream.ready and stream.credential_request is None:
                 if not disconnect_ack or result.value.state in ("streaming", "connecting", "pin_required"):
                     return _failure(ErrorCode.cleanup_timeout)
             else:

@@ -144,6 +144,16 @@ class TransportPort(Protocol):
         self, target: ReceiverTarget, context: OperationContext,
     ) -> Result[StatusReply]: ...
 
+    async def record_credential_marker_generation(
+        self,
+        target: ReceiverTarget,
+        context: OperationContext,
+        *,
+        submission_id: OperationId,
+        expected_generation: int,
+        previous_generation: int,
+    ) -> Result[None]: ...
+
     def dismiss_credential_prompt(
         self, target: ReceiverTarget, context: OperationContext,
     ) -> None: ...
