@@ -910,6 +910,9 @@ class PublishedDoubletakeControl:
         if isinstance(ownership, Err):
             return _credential_no_spawn(ownership.error.code)
         proof = ownership.value
+        fenced = self._evaluate_dispatch_fence(dispatch_fence)
+        if isinstance(fenced, Err):
+            return _credential_no_spawn(fenced.error.code)
         try:
             process_result = await self._process.run_credential(
                 CommandSpec(
@@ -935,7 +938,10 @@ class PublishedDoubletakeControl:
             return _credential_uncertain("malformed_reply")
         if output.exit_code not in {0, 1}:
             return _credential_uncertain("incomplete_reply")
-        response = self._response_object(output)
+        try:
+            response = self._response_object(output)
+        except Exception:
+            return _credential_uncertain("malformed_reply")
         if not isinstance(response, dict) or type(response.get("ok")) is not bool:
             return _credential_uncertain("malformed_reply")
         reply_at = self._now()
@@ -1049,6 +1055,18 @@ class PublishedDoubletakeControl:
             if status.protocol_version != self._profile.protocol_version:
                 return _err(ErrorCode.dependency_incompatible)
         return Ok(value=None)
+
+    @staticmethod
+    def _evaluate_dispatch_fence(fence: DispatchFence) -> Result[None]:
+        try:
+            checked = fence()
+        except Exception:
+            return _err(ErrorCode.dependency_incompatible)
+        if isinstance(checked, Err):
+            return checked
+        if isinstance(checked, Ok) and checked.value is None:
+            return checked
+        return _err(ErrorCode.dependency_incompatible)
 
     @staticmethod
     def _response_object(output: CommandOutput) -> object:

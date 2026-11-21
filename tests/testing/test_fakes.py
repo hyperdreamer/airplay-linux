@@ -1466,10 +1466,36 @@ def test_fake_process_credential_run_applies_fence_and_redacts_secret_metadata()
     assert isinstance(result, ports.CredentialProcessCompleted)
     assert calls == ["fence"]
     assert process.credential_runs[0][0].redacted_argv == command.redacted_argv
+    assert process.credential_runs[0][0].argv[-1] == "<redacted>"
     assert process.credential_runs[0][0].secret_indices == command.secret_indices
     assert canary not in repr(process.credential_runs)
     assert command.redacted_argv[-1] == "<redacted>"
     assert canary not in repr(process.journal.entries)
+
+
+def test_fake_process_credential_run_enforces_timeout_for_unresolved_deferred_result():
+    async def scenario():
+        process = FakeProcess()
+        canary = "fake-credential-timeout-canary-21b7"
+        command = ports.CommandSpec(
+            argv=("doubletake-ctl", "connect", "192.0.2.10", canary),
+            env={}, secret_indices=(3,),
+        )
+        deferred = Deferred()
+        process.queue_result("run_credential", deferred)
+
+        result = await asyncio.wait_for(
+            process.run_credential(command, 0.01, lambda: Ok(value=None)),
+            timeout=0.5,
+        )
+
+        assert isinstance(result, ports.CredentialProcessUncertain)
+        assert result.reason == "command_timeout"
+        assert deferred.resolved is False
+        assert canary not in repr(process.credential_runs)
+        assert canary not in repr(process.journal.entries)
+
+    run(scenario())
 
 
 def test_fake_process_credential_run_returns_not_spawned_for_fence_refusal():

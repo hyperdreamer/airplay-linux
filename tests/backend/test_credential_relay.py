@@ -33,8 +33,9 @@ from airplay_linux.backend.control import (
     OwnershipProof,
 )
 from airplay_linux.domain.operations import ProcessIdentity, SensitiveText
-from airplay_linux.domain.ports import CommandOutput, CredentialProcessUncertain
+from airplay_linux.domain.ports import CommandOutput, CommandSpec, CredentialProcessUncertain
 from airplay_linux.domain.resources import AudioPolicy, Diagnostic, Err, ErrorCode, Ok, VolumeLevel
+from airplay_linux.testing.adapters import Deferred
 from airplay_linux.testing.builders import target
 
 
@@ -216,6 +217,49 @@ def _authority(**overrides):
         evidence_factory=TerminationEvidence,
         features=_relay_features(**overrides),
     )
+
+
+@pytest.mark.parametrize("table", ["legacy", "extended"])
+def test_relay_rejects_contradictory_connect_scope_wording(relay_help_tables, table):
+    if table == "legacy":
+        sender, ctl, advertised = (
+            relay_help_tables.sender,
+            relay_help_tables.legacy_ctl,
+            frozenset(),
+        )
+    else:
+        sender, ctl, advertised = (
+            relay_help_tables.source_sender,
+            relay_help_tables.extended_ctl,
+            relay_help_tables.extended_tokens,
+        )
+    contradictory = ctl.replace(
+        "Start mirroring (to target IP, or first free device)",
+        "Start mirroring while ignoring the target and using any receiver",
+    )
+    features = features_from_help(sender, contradictory, advertised=advertised)
+
+    assert features.credential_relay is False
+    assert features.multi_target is False
+    assert features.profile == "doubletake-unknown"
+    profile = PublishedDoubletakeProfile(
+        socket_path="/run/user/1000/airplay-linux/doubletake.sock",
+        features=features,
+    )
+    process = _CredentialRecordingProcess(CommandOutput(
+        exit_code=0, stdout=b'{"ok": true}', stderr=b"",
+    ))
+    control = PublishedDoubletakeControl(process, profile)
+    result = asyncio.run(control.submit_credential(
+        target(),
+        CredentialPayload(value=SensitiveText(f"{table}-scope-canary")),
+        SimpleNamespace(),
+        dispatch_fence=lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, CredentialDispatchFailure)
+    assert result.dispatch_state == "no_spawn"
+    assert process.credential_calls == []
 
 
 def test_relay_authorization():
@@ -401,12 +445,21 @@ class _CredentialRecordingProcess(_RecordingProcess):
         self.credential_calls = []
 
     async def run_credential(self, spec, timeout, dispatch_fence):
-        self.credential_calls.append(spec)
+        observed = CommandSpec(
+            argv=spec.redacted_argv,
+            env=spec.env,
+            cwd=spec.cwd,
+            pass_fds=spec.pass_fds,
+            secret_indices=spec.secret_indices,
+        )
+        self.credential_calls.append(observed)
         checked = dispatch_fence()
         from airplay_linux.domain.ports import CredentialProcessCompleted, CredentialProcessNotSpawned
         if isinstance(checked, Err):
             return CredentialProcessNotSpawned(diagnostic=checked.error)
         if self.process_result is not None:
+            if isinstance(self.process_result, Deferred):
+                return await self.process_result.wait()
             return self.process_result
         return CredentialProcessCompleted(output=self.output)
 
@@ -434,9 +487,12 @@ def test_submit_credential_uses_the_fenced_process_boundary(relay_help_tables):
     assert isinstance(result, CredentialSubmissionReply)
     assert result.accepted is True
     assert authority.fence_calls == 1
-    assert len(fence_calls) == 2
+    assert len(fence_calls) == 3
     assert process.credential_calls[0].redacted_argv[-1] == "<redacted>"
-    assert "relay-submit-canary" not in repr(process.credential_calls[0])
+    assert process.credential_calls[0].argv[-1] == "<redacted>"
+    assert "relay-submit-canary" not in repr(process.credential_calls[0].argv)
+    assert "relay-submit-canary" not in repr(process.credential_calls[0].env)
+    assert "relay-submit-canary" not in repr(process.credential_calls)
 
 
 @pytest.mark.parametrize(("exit_code", "stdout", "expected_state", "expected_accepted", "reason"), [
@@ -474,6 +530,28 @@ def test_submit_credential_classifies_complete_envelopes_and_discards_text(
             assert result.refusal == "rejected"
     assert "receiver-private-error" not in repr(result)
     assert "relay-classification-canary" not in repr(result)
+
+
+def test_submit_credential_contains_decoder_integer_limit_errors(relay_help_tables):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _CredentialRecordingProcess(CommandOutput(
+        exit_code=0,
+        stdout=b'{"ok": true, "unexpected": ' + b"9" * 5000 + b"}",
+        stderr=b"",
+    ))
+    control = PublishedDoubletakeControl(
+        process, profile, record=object(), authority=_RelayAuthority(),
+    )
+
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("decoder-exception-canary")),
+        SimpleNamespace(), dispatch_fence=lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, CredentialDispatchFailure)
+    assert result.dispatch_state == "uncertain"
+    assert result.reason == "malformed_reply"
+    assert "decoder-exception-canary" not in repr(result)
 
 
 def test_submit_credential_preserves_process_uncertainty(relay_help_tables):
@@ -570,6 +648,103 @@ def test_relay_authorization_rechecks_replaced_generation_after_await(relay_help
         assert result.error.code is ErrorCode.stale_target
         assert process.credential_calls == []
         assert "relay-barrier-canary" not in repr(result)
+
+    asyncio.run(scenario())
+
+
+def test_relay_fence_is_rechecked_after_final_ownership_proof(relay_help_tables):
+    async def scenario():
+        profile = _relay_profile(relay_help_tables, "legacy")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        generation = {"value": 1}
+
+        class FinalProofBarrierAuthority(_RelayAuthority):
+            async def prove(self, record):
+                entered.set()
+                await release.wait()
+                return Ok(value=self.proof)
+
+        process = _CredentialRecordingProcess(CommandOutput(
+            exit_code=0, stdout=b'{"ok": true}', stderr=b"",
+        ))
+        control = PublishedDoubletakeControl(
+            process, profile, record=object(), authority=FinalProofBarrierAuthority(),
+        )
+
+        def fence():
+            if generation["value"] != 1:
+                return Err(error=Diagnostic(
+                    code=ErrorCode.stale_target,
+                    message="fixed stale target",
+                    recovery=(),
+                ))
+            return Ok(value=None)
+
+        submission = asyncio.create_task(control.submit_credential(
+            target(), CredentialPayload(value=SensitiveText("final-proof-canary")),
+            SimpleNamespace(), dispatch_fence=fence,
+        ))
+        await entered.wait()
+        generation["value"] = 2
+        release.set()
+        result = await submission
+
+        assert isinstance(result, CredentialDispatchFailure)
+        assert result.dispatch_state == "no_spawn"
+        assert result.error.code is ErrorCode.stale_target
+        assert process.credential_calls == []
+        assert "final-proof-canary" not in repr(result)
+
+    asyncio.run(scenario())
+
+
+def test_credential_test_process_retains_only_redacted_stale_and_deferred_specs():
+    from airplay_linux.domain.ports import (
+        CommandSpec,
+        CredentialProcessCompleted,
+        CredentialProcessNotSpawned,
+    )
+
+    async def scenario():
+        stale_canary = "stale-recorder-canary-9f34"
+        stale_process = _CredentialRecordingProcess()
+        stale_result = await stale_process.run_credential(
+            CommandSpec(
+                argv=("doubletake-ctl", "connect", "192.0.2.10", stale_canary),
+                env={}, secret_indices=(3,),
+            ),
+            1.0,
+            lambda: Err(error=Diagnostic(
+                code=ErrorCode.stale_target, message="fixed", recovery=(),
+            )),
+        )
+        assert isinstance(stale_result, CredentialProcessNotSpawned)
+        assert stale_process.credential_calls[0].argv[-1] == "<redacted>"
+        assert stale_canary not in repr(stale_process.credential_calls[0].argv)
+        assert stale_canary not in repr(stale_process.credential_calls[0].env)
+
+        deferred_canary = "deferred-recorder-canary-71aa"
+        deferred = Deferred()
+        deferred_process = _CredentialRecordingProcess(process_result=deferred)
+        submission = asyncio.create_task(deferred_process.run_credential(
+            CommandSpec(
+                argv=("doubletake-ctl", "connect", "192.0.2.10", deferred_canary),
+                env={}, secret_indices=(3,),
+            ),
+            1.0,
+            lambda: Ok(value=None),
+        ))
+        await asyncio.sleep(0)
+        retained = deferred_process.credential_calls[0]
+        assert retained.argv[-1] == "<redacted>"
+        assert deferred_canary not in repr(retained.argv)
+        assert deferred_canary not in repr(retained.env)
+        deferred.resolve(CredentialProcessCompleted(output=CommandOutput(
+            exit_code=0, stdout=b'{"ok": true}', stderr=b"",
+        )))
+        assert isinstance(await submission, CredentialProcessCompleted)
+        assert deferred_canary not in repr(deferred_process.credential_calls)
 
     asyncio.run(scenario())
 

@@ -1166,8 +1166,11 @@ class FakeProcess(_Scripted, _EventSource):
                 ),
             )
         observed = ports.CommandSpec(
-            argv=spec.redacted_argv, env=spec.env, cwd=spec.cwd,
-            pass_fds=spec.pass_fds, secret_indices=spec.secret_indices,
+            argv=spec.redacted_argv,
+            env=spec.env,
+            cwd=spec.cwd,
+            pass_fds=spec.pass_fds,
+            secret_indices=spec.secret_indices,
         )
         self.credential_runs.append((observed, timeout))
         self._record("run_credential", spec=observed, timeout=timeout)
@@ -1178,7 +1181,12 @@ class FakeProcess(_Scripted, _EventSource):
             )
 
         try:
-            scripted = await self._take("run_credential")
+            scripted = await asyncio.wait_for(
+                self._take("run_credential"),
+                timeout=max(0.0, float(timeout)),
+            )
+        except TimeoutError:
+            return ports.CredentialProcessUncertain(reason="command_timeout")
         except asyncio.CancelledError:
             return ports.CredentialProcessUncertain(reason="dispatch_cancelled")
         except Exception:

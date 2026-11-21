@@ -365,9 +365,14 @@ class LinuxProcessRunner:
             launch_identity = self._launch_identity(process.pid)
             stdout = bytearray()
             stderr = bytearray()
+            stream_issues: list[bool] = [False]
             streams = [
-                asyncio.ensure_future(self._drain(process.stdout, stdout)),
-                asyncio.ensure_future(self._drain(process.stderr, stderr)),
+                asyncio.ensure_future(self._drain(
+                    process.stdout, stdout, issues=stream_issues,
+                )),
+                asyncio.ensure_future(self._drain(
+                    process.stderr, stderr, issues=stream_issues,
+                )),
             ]
             try:
                 await asyncio.wait_for(process.wait(), max(0.0, float(timeout)))
@@ -393,6 +398,15 @@ class LinuxProcessRunner:
                 await self._finish(streams, _DRAIN_GRACE)
                 return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
             await self._finish(streams, _DRAIN_GRACE)
+            if stream_issues[0] or any(
+                not stream.done() or stream.cancelled() for stream in streams
+            ):
+                return ports.CredentialProcessUncertain(reason="incomplete_reply")
+            try:
+                for stream in streams:
+                    stream.result()
+            except Exception:
+                return ports.CredentialProcessUncertain(reason="incomplete_reply")
             return ports.CredentialProcessCompleted(
                 output=ports.CommandOutput(
                     exit_code=process.returncode if process.returncode is not None else -1,
@@ -690,24 +704,31 @@ class LinuxProcessRunner:
     # -- streams ------------------------------------------------------------
 
     @staticmethod
-    async def _drain(stream: asyncio.StreamReader | None, sink: bytearray) -> None:
-        """Read ``stream`` to EOF, keeping at most :data:`OUTPUT_LIMIT` bytes.
-
-        Reading never stops at the cap: the child keeps writing, and a pipe
-        nobody reads is a pipe that blocks the child forever.
-        """
+    async def _drain(
+        stream: asyncio.StreamReader | None,
+        sink: bytearray,
+        *,
+        issues: list[bool] | None = None,
+    ) -> None:
+        """Read a stream to EOF, recording truncation and read failures when requested."""
         if stream is None:
             return
         while True:
             try:
                 chunk = await stream.read(_READ_CHUNK)
-            except (ConnectionResetError, ValueError):
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if issues is not None:
+                    issues[0] = True
                 return
             if not chunk:
                 return
             room = OUTPUT_LIMIT - len(sink)
             if room > 0:
                 sink.extend(chunk[:room])
+            if issues is not None and len(chunk) > max(0, room):
+                issues[0] = True
 
     @staticmethod
     def _observe_task_exception(task: asyncio.Future[object]) -> None:

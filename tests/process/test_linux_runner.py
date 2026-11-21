@@ -241,6 +241,28 @@ def test_run_credential_reports_ambiguous_creation_as_uncertain(monkeypatch):
     assert canary not in repr(result)
 
 
+def test_run_credential_returns_uncertain_when_output_is_truncated():
+    runner = LinuxProcessRunner()
+    prefix = b'{"ok":true}'
+    script = (
+        "import sys; "
+        f"sys.stdout.buffer.write({prefix!r} + b' ' * ({OUTPUT_LIMIT} - len({prefix!r})) + b'!')"
+    )
+    argv = python("-c", script)
+    result = run(runner.run_credential(
+        ports.CommandSpec(
+            argv=argv,
+            env={},
+            secret_indices=(len(argv) - 1,),
+        ),
+        10.0,
+        lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, ports.CredentialProcessUncertain)
+    assert result.reason == "incomplete_reply"
+
+
 def test_run_credential_classifies_timeout_after_admission_as_uncertain():
     runner = LinuxProcessRunner()
     argv = python("-c", "import time; time.sleep(60)")
