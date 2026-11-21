@@ -2347,6 +2347,8 @@ tasks:
       - tests/session/test_daemon_recovery.py
       - tests/session/test_startup_recovery.py
       - tests/storage/test_launch_receipts.py
+      - src/airplay_linux/domain/records.py
+      - src/airplay_linux/storage/repositories.py
     ownership:
       - src/airplay_linux/process/daemon_registry.py
       - src/airplay_linux/process/ownership.py
@@ -2358,6 +2360,8 @@ tasks:
       - tests/session/test_daemon_recovery.py
       - tests/session/test_startup_recovery.py
       - tests/storage/test_launch_receipts.py
+      - src/airplay_linux/domain/records.py
+      - src/airplay_linux/storage/repositories.py
     exclusive_resources: [/tmp/ap-relay-release-pass]
     produces:
       - id: DaemonRegistry.restart_with_new_endpoint
