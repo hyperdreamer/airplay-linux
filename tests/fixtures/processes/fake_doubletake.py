@@ -745,15 +745,18 @@ def _ctl(argv: list[str]) -> int:
                 operation, target = None, None
         else:
             return 64
+        recorded_argv = list(argv)
+        if operation == "connect" and len(rest) > 2:
+            recorded_argv[index + 4:] = ["<redacted>"] * (len(rest) - 2)
         _append(journal_path, {
             "process": "ctl", "outcome": "start", "operation": operation,
-            "request_id": request_id, "argv": argv, "env_keys": sorted(os.environ),
+            "request_id": request_id, "argv": recorded_argv, "env_keys": sorted(os.environ),
         })
         _capture_record(
             os.environ.get(CTL_CAPTURE_ENV, ""), "ctl-argv-env.jsonl",
             {
                 "process": "ctl", "operation": operation,
-                "request_id": request_id, "argv": argv,
+                "request_id": request_id, "argv": recorded_argv,
                 "env": dict(os.environ),
             },
         )

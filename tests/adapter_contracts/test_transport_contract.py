@@ -103,6 +103,65 @@ if str(PROCESS_FIXTURES) not in sys.path:
 import fake_doubletake  # noqa: E402
 
 
+def test_fake_control_redacts_credential_in_failed_capture(tmp_path, monkeypatch, capsys):
+    canary = "fake-control-credential-f7-canary"
+    capture = tmp_path / "capture"
+    monkeypatch.setenv(fake_doubletake.CTL_MODE_ENV, "malformed")
+    monkeypatch.setenv(fake_doubletake.CTL_CAPTURE_ENV, str(capture))
+    result = fake_doubletake._ctl([
+        "-socket", str(tmp_path / "daemon.sock"), "connect", "192.0.2.1",
+        "--audio", "on", "--volume", "20", canary,
+    ])
+    assert result == 0
+    retained = fake_doubletake.daemon_journal_path(tmp_path).read_text()
+    retained += (capture / "ctl-argv-env.jsonl").read_text()
+    captured = capsys.readouterr()
+    if canary in retained or canary in captured.out + captured.err:
+        import pytest
+        pytest.fail("fake control retained a credential", pytrace=False)
+
+
+
+def test_fake_control_redacts_credential_in_successful_capture(tmp_path, monkeypatch, capsys):
+    canary = "fake-control-credential-f7-success-canary"
+    capture = tmp_path / "capture"
+    monkeypatch.setenv(fake_doubletake.CTL_MODE_ENV, "normal")
+    monkeypatch.setenv(fake_doubletake.CTL_CAPTURE_ENV, str(capture))
+    (tmp_path / fake_doubletake.TOKEN_NAME).write_text("owner")
+    (tmp_path / fake_doubletake.INSTANCE_NAME).write_text("instance")
+
+    class Socket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, body):
+            self.request_id = json.loads(body)["request_id"]
+
+        def recv(self, size):
+            return (json.dumps({"request_id": self.request_id, "body": {"ok": True}}) + "\n").encode()
+
+    monkeypatch.setattr(fake_doubletake.socket, "socket", lambda *args: Socket())
+    result = fake_doubletake._ctl([
+        "-socket", str(tmp_path / "daemon.sock"), "connect", "192.0.2.1", canary,
+    ])
+    assert result == 0
+    retained = fake_doubletake.daemon_journal_path(tmp_path).read_text()
+    retained += "".join(path.read_text() for path in capture.iterdir())
+    captured = capsys.readouterr()
+    if canary in retained or canary in captured.out + captured.err:
+        import pytest
+        pytest.fail("fake control retained a credential", pytrace=False)
+
+
 class _Clock:
     now = staticmethod(time.monotonic)
 

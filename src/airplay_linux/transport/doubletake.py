@@ -244,7 +244,10 @@ class _Stream:
     handoff_claimed: bool = False
     credential_request: CredentialRequest | None = None
     credential_request_ended: bool = False
+    credential_kinds_seen: set[str] = field(default_factory=set)
     credential_submission_id: OperationId | None = None
+    readiness_paused_at: float | None = None
+    readiness_pause_total: float = 0.0
     abandoned: bool = False
     released: bool = False
 
@@ -807,6 +810,11 @@ class DoubleTakeTransport:
             if not polling.done():
                 polling.cancel()
 
+    def _resume_credential_readiness(self, stream: _Stream) -> None:
+        if stream.readiness_paused_at is not None:
+            stream.readiness_pause_total += self._clock.now() - stream.readiness_paused_at
+            stream.readiness_paused_at = None
+
     def _observe_credential_request(self, stream: _Stream, status: StatusReply) -> bool:
         """Publish the first exact target-row credential request, if any."""
         matches = tuple(
@@ -819,8 +827,25 @@ class DoubleTakeTransport:
             and matches[0].credential_kind in {"pin", "password"}
             else None
         )
+        request = stream.credential_request
+        if (
+            request is not None
+            and stream.credential_submission_id is None
+            and not stream.credential_request_ended
+            and (matching is None or matching.credential_kind != request.credential_kind)
+        ):
+            stream.credential_request_ended = True
+            self._resume_credential_readiness(stream)
+            self._emit(
+                stream, TransportEventKind.credential_request,
+                CredentialRequestPayload(request=request, lifecycle="ended", reason="row_ended"),
+            )
         if matching is not None:
-            if stream.credential_request is None and not stream.credential_request_ended:
+            if (
+                stream.credential_submission_id is None
+                and matching.credential_kind not in stream.credential_kinds_seen
+                and (request is None or stream.credential_request_ended)
+            ):
                 options = RelayStartOptions(
                     target_volume_proven=self._features.target_volume is True,
                     audio=stream.audio_policy,
@@ -837,29 +862,19 @@ class DoubleTakeTransport:
                     session_generation=stream.context.session_generation,
                     owner_lease=stream.lease,
                     daemon_instance_uuid=stream.daemon.record.instance_uuid,
-                    generation=1,
+                    generation=1 if request is None else request.generation + 1,
                     observed_at=self._clock.now(),
                     start_options=options,
                 )
                 stream.credential_request = request
+                stream.credential_request_ended = False
+                stream.credential_kinds_seen.add(matching.credential_kind)
+                stream.readiness_paused_at = self._clock.now()
                 self._emit(
                     stream, TransportEventKind.credential_request,
                     CredentialRequestPayload(request=request, lifecycle="live", reason=None),
                 )
             return True
-        if (
-            stream.credential_request is not None
-            and stream.credential_submission_id is None
-            and not stream.credential_request_ended
-            and not matches
-        ):
-            stream.credential_request_ended = True
-            self._emit(
-                stream, TransportEventKind.credential_request,
-                CredentialRequestPayload(
-                    request=stream.credential_request, lifecycle="ended", reason="row_ended",
-                ),
-            )
         return False
 
     async def _read_status(self, daemon: _Daemon, *, code: ErrorCode) -> Result[StatusReply]:
@@ -884,6 +899,7 @@ class DoubleTakeTransport:
         accepted = self._clock.now() + CONNECT_STREAMING_TIMEOUT
         permission = self._clock.now() + PERMISSION_WAIT_TIMEOUT
         handshake: float | None = None
+        applied_pause = 0.0
         seen = False
         failures = 0
         loop = asyncio.get_running_loop()
@@ -940,22 +956,33 @@ class DoubleTakeTransport:
             # source: that is the desktop's permission prompt, and a human may
             # take minutes to answer it. Once the stream carries a source, only
             # the handshake is left, which is bounded.
+            now = self._clock.now()
+            paused = stream.readiness_pause_total
+            if stream.readiness_paused_at is not None:
+                paused += now - stream.readiness_paused_at
+            pause_delta = paused - applied_pause
+            permission += pause_delta
+            if handshake is not None:
+                handshake += pause_delta
+            applied_pause = paused
             prepared = examined and len(matches) == 1 and matches[0].source is not None
-            if prepared:
+            if stream.readiness_paused_at is not None:
+                pass
+            elif prepared:
                 if handshake is None:
-                    handshake = self._clock.now() + CONNECT_STREAMING_TIMEOUT
-                if self._clock.now() >= handshake:
+                    handshake = now + CONNECT_STREAMING_TIMEOUT
+                if now >= handshake:
                     return _failure(ErrorCode.unsupported_source)
             else:
                 handshake = None
                 if examined and seen and not matches and not stream.credential_request_ended:
                     # The stream this target had is gone: the backend dropped it.
                     return _failure(ErrorCode.unsupported_source)
-                if not seen and self._clock.now() >= accepted:
+                if not seen and now >= accepted:
                     # No stream for this target ever appeared: the backend never
                     # accepted the capture, so no prompt is pending.
                     return _failure(ErrorCode.unsupported_source)
-            if self._clock.now() >= permission:
+            if stream.readiness_paused_at is None and now >= permission:
                 return _failure(ErrorCode.unsupported_source)
             wake = loop.create_future()
 
@@ -1041,17 +1068,7 @@ class DoubleTakeTransport:
                     item for item in status.value.streams
                     if item.target == stream.target.canonical_host
                 )
-                if (
-                    status.value.target == stream.target.canonical_host
-                    and (
-                        status.value.state == "pin_required"
-                        or status.value.needs_credential
-                        or status.value.credential_kind is not None
-                    )
-                ) or any(
-                    item.state == "pin_required" or item.credential_kind is not None
-                    for item in matches
-                ):
+                if len(matches) == 1 and matches[0].state == "pin_required":
                     return _failure(ErrorCode.dependency_incompatible)
                 if len(matches) == 1:
                     requested = (
@@ -1145,7 +1162,7 @@ class DoubleTakeTransport:
                     # Preserve the virtual acquisition contract: the caller owns
                     # this handle while waiting for a separate readiness event.
                     return Ok(value=stream.handle)
-                if result.value.state == "connecting" and not isinstance(
+                if result.value.state in ("connecting", "pin_required") and not isinstance(
                     stream.source, VirtualOutputSource
                 ):
                     # The backend accepts ``connect`` before its handshake and
@@ -1240,6 +1257,7 @@ class DoubleTakeTransport:
         if submitter is None:
             return _failure(ErrorCode.dependency_incompatible)
         stream.credential_submission_id = context.operation_id
+        self._resume_credential_readiness(stream)
         payload = CredentialPayload(
             value=value,
             audio=stream.audio_policy,
@@ -1254,7 +1272,7 @@ class DoubleTakeTransport:
         except asyncio.CancelledError:
             raise
         except Exception:
-            return _failure(ErrorCode.transport_failed)
+            return Ok(value=NoReply(reason="incomplete_reply"))
         if isinstance(result, CredentialSubmissionReply):
             return Ok(value=Submitted(
                 reply_at=result.reply_at, accepted=result.accepted,
@@ -1274,7 +1292,7 @@ class DoubleTakeTransport:
                     ),
                 ))
             return Ok(value=NoReply(reason=result.reason))
-        return _failure(ErrorCode.dependency_incompatible)
+        return Ok(value=NoReply(reason="incomplete_reply"))
 
     async def read_credential_status(
         self, target: ReceiverTarget, context: OperationContext,
@@ -1292,11 +1310,8 @@ class DoubleTakeTransport:
         ):
             return _failure(ErrorCode.stale_event)
         daemon = stream.daemon if stream is not None else None
-        if daemon is None:
-            admitted = await self._admit(target, context)
-            if isinstance(admitted, Err):
-                return admitted
-            daemon = admitted.value
+        if daemon is None or not daemon.alive or not daemon.authenticated:
+            return _failure(ErrorCode.stale_event)
         result = await self._read_status(daemon, code=ErrorCode.transport_failed)
         if isinstance(result, Err):
             return result
@@ -1311,9 +1326,10 @@ class DoubleTakeTransport:
         stream = self._streams.get(owner.owner_lease)
         if stream is None or stream.handle is None or stream.daemon is None or stream.released:
             return _failure(ErrorCode.stale_event)
-        current = self._current(stream.target, stream.context)
+        current = self._current(stream.target, stop_context)
         if isinstance(current, Err):
             return current
+        fence = self._fences.get(stream.target.receiver_id)
         handle = stream.handle
         if (
             stream.target.receiver_id != owner.receiver_id
@@ -1328,8 +1344,13 @@ class DoubleTakeTransport:
             or stream.credential_submission_id != owner.credential_submission_id
             or stop_context.operation_id != owner.stop_operation_id
             or stop_context.endpoint_generation != owner.endpoint_generation
-            or stop_context.session_generation != owner.session_generation
-            or stop_context.trust_generation != owner.trust_generation
+            or stop_context.session_generation != owner.session_generation + 1
+            or stop_context.trust_generation != owner.trust_generation + 1
+            or fence is None
+            or fence.session_generation != stop_context.session_generation
+            or fence.trust_generation != stop_context.trust_generation
+            or fence.endpoint_generation != owner.endpoint_generation
+            or fence.endpoint_fingerprint != owner.endpoint_fingerprint
             or (
                 stop_context.transport_lease_id is not None
                 and stop_context.transport_lease_id != owner.owner_lease
@@ -1383,7 +1404,10 @@ class DoubleTakeTransport:
             negative_disconnect = isinstance(result, Err) and result.error.code is ErrorCode.receiver_rejected
             if not (disconnect_ack or negative_disconnect) or not stream.daemon.alive:
                 return _failure(ErrorCode.cleanup_timeout)
-            if stream.credential_request is not None:
+            if stream.credential_request is None:
+                if not disconnect_ack or result.value.state in ("streaming", "connecting", "pin_required"):
+                    return _failure(ErrorCode.cleanup_timeout)
+            else:
                 status = await self._read_status(stream.daemon, code=ErrorCode.cleanup_timeout)
                 if isinstance(status, Err):
                     return status

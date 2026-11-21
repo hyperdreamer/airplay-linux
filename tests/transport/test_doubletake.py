@@ -698,6 +698,9 @@ async def test_unconfirmed_start_disconnect_takes_cleanup_timeout_precedence(tmp
         gate = h.control.gates[(BackendOperation.disconnect, h.a.receiver_id)] = Gate()
     pending = asyncio.create_task(h.start())
     await _drain_transport()
+    if failure == "ack_challenge":
+        h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
+        await _drain_transport()
     if cleanup == "timeout":
         assert gate.entered.is_set() and not pending.done()
         h.scheduler.advance(5.0)
@@ -1469,7 +1472,7 @@ async def test_connect_acceptance_without_streaming_does_not_claim_video_readine
 
     pending = asyncio.create_task(h.start(source=source))
     if cleanup == "timeout":
-        if state == "connecting" and isinstance(source, PhysicalMonitorSource):
+        if state in ("connecting", "pin_required") and isinstance(source, PhysicalMonitorSource):
             # The streaming budget must expire before refusal and cleanup.
             await _drain_transport()
             h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
@@ -1478,9 +1481,8 @@ async def test_connect_acceptance_without_streaming_does_not_claim_video_readine
         h.scheduler.advance(5.0)
         await _drain_transport()
         assert pending.done()
-    elif state == "connecting" and isinstance(source, PhysicalMonitorSource):
-        # ``connecting`` is progress, not acceptance: the bounded wait must
-        # expire without streaming evidence instead of claiming readiness.
+    elif state in ("connecting", "pin_required") and isinstance(source, PhysicalMonitorSource):
+        # Progress must expire without streaming evidence instead of claiming readiness.
         await _drain_transport()
         assert not pending.done()
         h.scheduler.advance(CONNECT_STREAMING_TIMEOUT)
@@ -2982,7 +2984,28 @@ async def test_stop_pending_start_transfers_one_exact_handle_without_canceling_s
             break
     request = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
     stream = h.transport._streams[request.context.transport_lease_id]
-    stop_context = context(operation_id=OperationId(UUID(int=88)))
+    from airplay_linux.domain.messages import Stop
+    from airplay_linux.session.engine import Route
+    from airplay_linux.session.testing import SessionRig
+
+    stop_contexts = []
+
+    def handlers(_deps):
+        def cleanup(ctx, message):
+            ctx.apply(
+                online=True, target=h.a,
+                session_generation=stream.context.session_generation,
+                trust_generation=stream.context.trust_generation or 0,
+            )
+            stop_contexts.append(ctx.supersede("stop"))
+            return True
+        return {Route.cleanup: cleanup}
+
+    rig = SessionRig(handlers)
+    rig.discovery.add_target(h.a)
+    await rig.manager.dispatch(Stop(receiver_id=h.a.receiver_id))
+    stop_context = stop_contexts[0]
+    h.fences.set(rig.fences.get(h.a.receiver_id))
     owner = PendingStartCleanupOwner(
         receiver_id=h.a.receiver_id, target=h.a,
         start_operation_id=stream.context.operation_id,
@@ -2997,6 +3020,7 @@ async def test_stop_pending_start_transfers_one_exact_handle_without_canceling_s
     )
 
     transferred = await h.transport.stop_pending_start(owner, stop_context)
+    assert isinstance(transferred, Ok), transferred
     duplicate = await h.transport.stop_pending_start(owner, stop_context)
     if status_gate is not None:
         status_gate.release()
@@ -3009,3 +3033,333 @@ async def test_stop_pending_start_transfers_one_exact_handle_without_canceling_s
     assert isinstance(start_result, Err)
     assert start_result.error.code is ErrorCode.stale_event
     assert not h.control.calls(BackendOperation.submit_pairing)
+
+
+@pytest.mark.asyncio
+async def test_pin_ack_polls_exact_row_instead_of_refusing_start(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="pin_required",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    pending = asyncio.create_task(h.start())
+    try:
+        await _drain_transport()
+        assert any(event.kind is TransportEventKind.credential_request for event in h.events)
+        assert not pending.done()
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_source_verification_ignores_aggregate_credential_state(tmp_path):
+    verifier = SourceVerifier()
+    h = Harness(tmp_path, source_verifier=verifier, source_reporting_complete=True)
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    status = _source_status(h.a, source).value
+    h.control.results[BackendOperation.status].append(Ok(value=replace(
+        status, state="pin_required", needs_credential=True, credential_kind="pin",
+    )))
+    result = await h.start()
+    assert isinstance(result, Ok), result
+    assert len(verifier.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_request_suspends_permission_and_source_handshake_deadlines(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    status = _pin_required_status(h.a).value
+    source = BackendSource(type=1, width=1920, height=1080, x=0, y=0)
+    status = replace(status, streams=(replace(status.streams[0], source=source),))
+    h.control.results[BackendOperation.status].extend([Ok(value=status)] * 5)
+    pending = asyncio.create_task(h.start())
+    try:
+        await _drain_transport()
+        assert any(event.kind is TransportEventKind.credential_request for event in h.events)
+        h.scheduler.advance(PERMISSION_WAIT_TIMEOUT + 1)
+        await _drain_transport()
+        assert not pending.done()
+        assert not h.control.calls(BackendOperation.disconnect)
+    finally:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_permission_budget_resumes_with_original_remaining_time_after_row_ends(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    h.control.results[BackendOperation.status].extend([_source_status(h.a, None, "connecting")] * 3)
+    h.control.results[BackendOperation.status].append(Ok(value=replace(
+        _pin_required_status(h.a).value, streams=(),
+    )))
+    pending = asyncio.create_task(h.start())
+    try:
+        await _drain_transport()
+        h.scheduler.advance(PERMISSION_WAIT_TIMEOUT + 10)
+        await _drain_transport()
+        requests = [event for event in h.events if event.kind is TransportEventKind.credential_request]
+        assert [event.payload.lifecycle for event in requests] == ["live", "ended"]
+        assert not pending.done()
+        h.scheduler.advance(PERMISSION_WAIT_TIMEOUT - 0.1)
+        await _drain_transport()
+        assert not pending.done()
+        h.scheduler.advance(0.1)
+        await _drain_transport()
+        assert_error(await pending, ErrorCode.unsupported_source)
+    finally:
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", ["connecting", "different_kind", "duplicate"])
+async def test_pre_submit_request_ends_when_matching_typed_row_changes(tmp_path, replacement):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    stream = h.transport._streams[handle.lease_id]
+    status = _pin_required_status(h.a).value
+    h.transport._observe_credential_request(stream, status)
+    row = status.streams[0]
+    if replacement == "connecting":
+        rows = (replace(row, state="connecting", credential_kind=None),)
+    elif replacement == "different_kind":
+        rows = (replace(row, credential_kind="password"),)
+    else:
+        rows = (row, row)
+    h.transport._observe_credential_request(stream, replace(status, streams=rows))
+    events = [event for event in h.events if event.kind is TransportEventKind.credential_request]
+    assert [event.payload.lifecycle for event in events[:2]] == ["live", "ended"]
+    assert events[1].payload.reason == "row_ended"
+    if replacement == "different_kind":
+        assert [event.payload.lifecycle for event in events] == ["live", "ended", "live"]
+        assert events[-1].payload.request.credential_kind == "password"
+    else:
+        assert len(events) == 2
+
+
+@pytest.mark.asyncio
+async def test_recovery_status_does_not_admit_replacement_daemon_after_handle_retirement(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    h.transport._drop(h.transport._streams[handle.lease_id])
+    h.registry.record = daemon(10)
+    replacement = h.factory(h.registry.record)
+    replacement.results[BackendOperation.status].append(_source_status(h.a, None))
+    operation = replace(context(), transport_lease_id=handle.lease_id)
+    result = await h.transport.read_credential_status(h.a, operation)
+    assert isinstance(result, Err)
+    assert not replacement.calls(BackendOperation.status)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_disconnect_does_not_release_active_target(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    h.control.results[BackendOperation.disconnect].append(Ok(value=AckReply(
+        operation="disconnect", target=h.a.canonical_host, state="streaming",
+    )))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, None))
+    result = await h.transport.stop_stream(handle, context())
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    assert handle.lease_id in h.transport._streams
+
+
+@pytest.mark.asyncio
+async def test_dispatched_handoff_preserves_command_status_and_exact_target_cleanup(tmp_path):
+    from airplay_linux.transport.doubletake import CONTROL_TIMEOUT
+
+    h = Harness(tmp_path, credential_relay=True)
+    h.control.connected.add(h.b.receiver_id)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    readiness_gate = Gate()
+    h.transport.subscribe(lambda event: h.control.gates.__setitem__(
+        (BackendOperation.status, None), readiness_gate,
+    ) if event.kind is TransportEventKind.credential_request else None)
+    start = asyncio.create_task(h.start())
+    submission = None
+    status_read = None
+    try:
+        await _drain_transport()
+        event = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
+        stream = h.transport._streams[event.context.transport_lease_id]
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await _drain_transport()
+        assert readiness_gate.entered.is_set()
+        status_gate = Gate()
+        command_entered = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        command_deadline = loop.create_future()
+
+        async def submit(target, payload, operation, *, dispatch_fence):
+            command_entered.set()
+            scheduled = h.scheduler.call_at(
+                h.clock.now() + CONTROL_TIMEOUT,
+                lambda: command_deadline.set_result(None),
+            )
+            try:
+                await command_deadline
+                return CredentialSubmissionReply(reply_at=h.clock.now(), accepted=True)
+            finally:
+                scheduled.cancel()
+
+        h.control.submit_credential = submit
+        submission_context = replace(stream.context, operation_id=OperationId(UUID(int=94)))
+        submission = asyncio.create_task(h.transport.submit_credential(
+            h.a, SensitiveText("dispatched-handoff-f10-canary"), submission_context,
+            dispatch_fence=lambda: Ok(value=None),
+        ))
+        await command_entered.wait()
+        h.control.gates[(BackendOperation.status, None)] = status_gate
+        status_read = asyncio.create_task(h.transport.read_credential_status(h.a, submission_context))
+        await status_gate.entered.wait()
+        h.scheduler.advance(2.0)
+        stop_context = replace(
+            context(operation_id=OperationId(UUID(int=95))),
+            session_generation=stream.context.session_generation + 1,
+            trust_generation=(stream.context.trust_generation or 0) + 1,
+        )
+        h.fences.set(replace(
+            h.fences.get(h.a.receiver_id),
+            session_generation=stop_context.session_generation,
+            trust_generation=stop_context.trust_generation,
+        ))
+        owner = PendingStartCleanupOwner(
+            receiver_id=h.a.receiver_id, target=h.a,
+            start_operation_id=stream.context.operation_id,
+            endpoint_fingerprint=h.a.endpoint_fingerprint,
+            endpoint_generation=h.a.endpoint_generation,
+            session_generation=stream.context.session_generation,
+            trust_generation=stream.context.trust_generation or 0,
+            owner_lease=stream.lease, daemon_instance_uuid=stream.daemon.record.instance_uuid,
+            stop_operation_id=stop_context.operation_id,
+            credential_submission_id=submission_context.operation_id, marker_generation=1,
+        )
+        transferred = await asyncio.wait_for(
+            h.transport.stop_pending_start(owner, stop_context), timeout=1.0,
+        )
+        assert isinstance(transferred, Ok)
+        assert not stream.lock.locked()
+        assert isinstance(await h.transport.stop_pending_start(owner, stop_context), Err)
+        assert isinstance(await start, Err)
+        assert not submission.done() and not status_read.done()
+        h.scheduler.advance(CONTROL_TIMEOUT - 2.0)
+        await _drain_transport()
+        assert isinstance(await submission, Ok)
+        assert not status_read.done()
+        connecting = _source_status(h.a, None, "connecting")
+        status_gate.release(connecting)
+        assert await status_read == connecting
+        h.control.results[BackendOperation.status].append(_pin_required_status(h.b))
+        assert isinstance(await h.transport.stop_stream(transferred.value, stop_context), Ok)
+        assert h.control.connected == {h.b.receiver_id}
+        disconnects = h.control.calls(BackendOperation.disconnect)
+        assert len(disconnects) == 1
+        assert disconnects[0]["target"]["canonical_host"] == h.a.canonical_host
+        assert "dispatched-handoff-f10-canary" not in repr((h.events, h.control.journal.entries))
+    finally:
+        for task in (start, submission, status_read):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(*(task for task in (start, submission, status_read) if task is not None), return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_handoff_rejects_stale_marker_generation_before_signalling(tmp_path):
+    h = Harness(tmp_path, credential_relay=True)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    h.transport.subscribe(lambda event: h.control.gates.__setitem__(
+        (BackendOperation.status, None), Gate(),
+    ) if event.kind is TransportEventKind.credential_request else None)
+    pending = asyncio.create_task(h.start())
+    submit_gate = Gate()
+
+    async def submit(target, payload, operation, *, dispatch_fence):
+        await submit_gate.wait()
+        return CredentialSubmissionReply(reply_at=1.0, accepted=True)
+
+    h.control.submit_credential = submit
+    submission = None
+    try:
+        await _drain_transport()
+        event = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
+        stream = h.transport._streams[event.context.transport_lease_id]
+        submit_context = replace(stream.context, operation_id=OperationId(UUID(int=92)))
+        submission = asyncio.create_task(h.transport.submit_credential(
+            h.a, SensitiveText("stale-marker-generation-f4-canary"), submit_context,
+            dispatch_fence=lambda: Ok(value=None),
+        ))
+        await submit_gate.entered.wait()
+        stop_context = replace(
+            context(operation_id=OperationId(UUID(int=93))),
+            session_generation=stream.context.session_generation + 1,
+            trust_generation=(stream.context.trust_generation or 0) + 1,
+        )
+        h.fences.set(replace(
+            h.fences.get(h.a.receiver_id),
+            session_generation=stop_context.session_generation,
+            trust_generation=stop_context.trust_generation,
+        ))
+        owner = PendingStartCleanupOwner(
+            receiver_id=h.a.receiver_id, target=h.a,
+            start_operation_id=stream.context.operation_id,
+            endpoint_fingerprint=h.a.endpoint_fingerprint,
+            endpoint_generation=h.a.endpoint_generation,
+            session_generation=stream.context.session_generation,
+            trust_generation=stream.context.trust_generation or 0,
+            owner_lease=stream.lease, daemon_instance_uuid=stream.daemon.record.instance_uuid,
+            stop_operation_id=stop_context.operation_id,
+            credential_submission_id=submit_context.operation_id, marker_generation=999,
+        )
+        result = await h.transport.stop_pending_start(owner, stop_context)
+        assert isinstance(result, Err)
+        assert not stream.readiness_stop.is_set()
+    finally:
+        submit_gate.release()
+        if submission is not None:
+            await asyncio.gather(submission, return_exceptions=True)
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_unclassified_submit_exception_keeps_unknown_outcome(tmp_path):
+    from airplay_linux.domain.relay import NoReply
+
+    h = Harness(tmp_path, credential_relay=True)
+    handle = await h.handle()
+    dispatched = []
+
+    async def submit(target, payload, operation, *, dispatch_fence):
+        dispatched.append(True)
+        raise RuntimeError("credential-unknown-outcome-canary")
+
+    h.control.submit_credential = submit
+    operation = replace(context(operation_id=OperationId(UUID(int=91))), transport_lease_id=handle.lease_id)
+    result = await h.transport.submit_credential(
+        h.a, SensitiveText("credential-unknown-outcome-canary"), operation,
+        dispatch_fence=lambda: Ok(value=None),
+    )
+    assert dispatched == [True]
+    assert isinstance(result, Ok) and isinstance(result.value, NoReply)
+    assert "credential-unknown-outcome-canary" not in repr(result)
