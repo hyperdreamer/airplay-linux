@@ -297,6 +297,124 @@ class LinuxProcessRunner:
             ),
         )
 
+    async def run_credential(
+        self,
+        spec: ports.CommandSpec,
+        timeout: float,
+        dispatch_fence: Callable[[], ports.Result[None]],
+    ) -> ports.CredentialProcessResult:
+        """Run one credential command with a synchronous final admission fence.
+
+        A command that has passed the fence is treated as potentially effective
+        until its ordinary child exit is observed.  Timeout, cancellation, and
+        cleanup failures therefore remain uncertain even when cleanup later
+        reaps the child.
+        """
+        try:
+            argv = _validated_argv(spec.argv)
+        except Exception:
+            argv = None
+        if argv is None or type(spec) is not ports.CommandSpec:
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=diagnostic(ErrorCode.invalid_input),
+            )
+        try:
+            ports._validate_secret_indices(spec.argv, spec.secret_indices)
+            if spec.secret_indices != (len(argv) - 1,):
+                raise ValueError("invalid secret indices")
+        except (AttributeError, TypeError, ValueError):
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=diagnostic(ErrorCode.invalid_input),
+            )
+        try:
+            fenced = dispatch_fence()
+        except Exception:
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=diagnostic(ErrorCode.dependency_incompatible),
+            )
+        if isinstance(fenced, Err):
+            return ports.CredentialProcessNotSpawned(diagnostic=fenced.error)
+        if not isinstance(fenced, Ok) or fenced.value is not None:
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=diagnostic(ErrorCode.dependency_incompatible),
+            )
+
+        # Keep this await immediately after the final synchronous predicate.  The
+        # process helper performs no work before create_subprocess_exec, so the
+        # fence and child admission are one uninterrupted boundary.
+        try:
+            process = await self._exec(
+                argv, spec, stdin=_DEVNULL, stdout=_PIPE, stderr=_PIPE,
+            )
+        except asyncio.CancelledError:
+            return ports.CredentialProcessUncertain(reason="dispatch_cancelled")
+        except (FileNotFoundError, PermissionError, NotADirectoryError, ValueError):
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=_missing_command(argv).error,
+            )
+        except OSError:
+            return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+        except Exception:
+            return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+
+        pidfd: int | None = None
+        launch_identity: ProcessIdentity | None = None
+        streams: list[asyncio.Future[None]] = []
+        try:
+            pidfd = self._open_pidfd(process.pid)
+            launch_identity = self._launch_identity(process.pid)
+            stdout = bytearray()
+            stderr = bytearray()
+            streams = [
+                asyncio.ensure_future(self._drain(process.stdout, stdout)),
+                asyncio.ensure_future(self._drain(process.stderr, stderr)),
+            ]
+            try:
+                await asyncio.wait_for(process.wait(), max(0.0, float(timeout)))
+            except TimeoutError:
+                try:
+                    await self._kill_direct_child(process, pidfd, launch_identity)
+                except Exception:
+                    return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+                await self._finish(streams, _DRAIN_GRACE)
+                return ports.CredentialProcessUncertain(reason="command_timeout")
+            except asyncio.CancelledError:
+                try:
+                    await self._kill_direct_child(process, pidfd, launch_identity)
+                except Exception:
+                    return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+                await self._finish(streams, _DRAIN_GRACE)
+                return ports.CredentialProcessUncertain(reason="dispatch_cancelled")
+            except Exception:
+                try:
+                    await self._kill_direct_child(process, pidfd, launch_identity)
+                except Exception:
+                    return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+                await self._finish(streams, _DRAIN_GRACE)
+                return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+            await self._finish(streams, _DRAIN_GRACE)
+            return ports.CredentialProcessCompleted(
+                output=ports.CommandOutput(
+                    exit_code=process.returncode if process.returncode is not None else -1,
+                    stdout=bytes(stdout),
+                    stderr=bytes(stderr),
+                ),
+            )
+        except asyncio.CancelledError:
+            try:
+                await self._kill_direct_child(process, pidfd, launch_identity)
+            except Exception:
+                pass
+            return ports.CredentialProcessUncertain(reason="dispatch_cancelled")
+        except Exception:
+            try:
+                await self._kill_direct_child(process, pidfd, launch_identity)
+            except Exception:
+                pass
+            return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+        finally:
+            self._close_pidfd(pidfd)
+
     async def spawn(self, spec: ports.CommandSpec) -> Result[ProcessIdentity]:
         argv = _validated_argv(spec.argv)
         if argv is None:

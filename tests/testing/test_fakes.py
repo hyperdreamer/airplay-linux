@@ -1448,6 +1448,47 @@ def test_process_stdin_is_redacted_in_the_journal_and_its_representation():
     assert process.journal.calls("process.run")[-1]["stdin"] is None
 
 
+def test_fake_process_credential_run_applies_fence_and_redacts_secret_metadata():
+    process = FakeProcess()
+    canary = "fake-credential-canary-2d1e"
+    command = ports.CommandSpec(
+        argv=("doubletake-ctl", "connect", "192.0.2.10", canary),
+        env={}, secret_indices=(3,),
+    )
+    calls = []
+
+    def fence():
+        calls.append("fence")
+        return Ok(value=None)
+
+    result = run(process.run_credential(command, 5.0, fence))
+
+    assert isinstance(result, ports.CredentialProcessCompleted)
+    assert calls == ["fence"]
+    assert process.credential_runs[0][0].redacted_argv == command.redacted_argv
+    assert process.credential_runs[0][0].secret_indices == command.secret_indices
+    assert canary not in repr(process.credential_runs)
+    assert command.redacted_argv[-1] == "<redacted>"
+    assert canary not in repr(process.journal.entries)
+
+
+def test_fake_process_credential_run_returns_not_spawned_for_fence_refusal():
+    process = FakeProcess()
+    command = ports.CommandSpec(
+        argv=("doubletake-ctl", "connect", "192.0.2.10", "credential-canary"),
+        env={}, secret_indices=(3,),
+    )
+    result = run(process.run_credential(
+        command,
+        5.0,
+        lambda: failure(ErrorCode.stale_target, "stale target"),
+    ))
+
+    assert isinstance(result, ports.CredentialProcessNotSpawned)
+    assert result.diagnostic.code is ErrorCode.stale_target
+    assert process.credential_runs == []
+
+
 # ------------------------------------------------------------------ F-4
 def test_display_reconcile_is_a_deferred_async_operation():
     async def scenario():

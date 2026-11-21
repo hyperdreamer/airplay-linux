@@ -16,7 +16,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from airplay_linux.backend.contract import BackendFeatures, features_from_help
+from airplay_linux.backend.contract import (
+    BackendFeatures,
+    CredentialDispatchFailure,
+    CredentialSubmissionReply,
+    features_from_help,
+)
 from airplay_linux.backend.control import (
     ApplicationContractProfile,
     BackendOperation,
@@ -25,10 +30,11 @@ from airplay_linux.backend.control import (
     ProfileCommand,
     PublishedDoubletakeControl,
     PublishedDoubletakeProfile,
+    OwnershipProof,
 )
-from airplay_linux.domain.operations import SensitiveText
-from airplay_linux.domain.ports import CommandOutput
-from airplay_linux.domain.resources import AudioPolicy, Err, ErrorCode, Ok, VolumeLevel
+from airplay_linux.domain.operations import ProcessIdentity, SensitiveText
+from airplay_linux.domain.ports import CommandOutput, CredentialProcessUncertain
+from airplay_linux.domain.resources import AudioPolicy, Diagnostic, Err, ErrorCode, Ok, VolumeLevel
 from airplay_linux.testing.builders import target
 
 
@@ -312,19 +318,40 @@ def test_relay_command(relay_help_tables, table, proven, audio, level, expected_
         )
         assert isinstance(disabled, Err) and disabled.error.code is ErrorCode.invalid_input
 
-    # The extended parser has no end-of-options escape, so an option-shaped
-    # credential is unrepresentable there; the legacy positional form is unchanged.
+    # Option-shaped values are rejected before command construction for both
+    # recognized profiles.
     for value in ("-secret", "--audio", "--volume", "--"):
         shaped = profile.try_argv(
             BackendOperation.submit_pairing, receiver,
             CredentialPayload(value=SensitiveText(value)),
         )
-        if proven:
-            assert isinstance(shaped, Err), value
-            assert shaped.error.code is ErrorCode.invalid_input
-        else:
-            assert isinstance(shaped, Ok), value
-            assert shaped.value.argv[-1] == value
+        assert isinstance(shaped, Err), value
+        assert shaped.error.code is ErrorCode.invalid_input
+
+
+def test_relay_command_rejects_unrepresentable_values_before_building_argv(relay_help_tables):
+    for table in ("legacy", "extended"):
+        profile = _relay_profile(relay_help_tables, table)
+        for value in ("", "contains\x00nul", "-leading-option", "unencodable-\ud800"):
+            result = profile.try_argv(
+                BackendOperation.submit_pairing,
+                target(),
+                CredentialPayload(value=SensitiveText(value)),
+            )
+            assert isinstance(result, Err)
+            assert result.error.code is ErrorCode.invalid_input
+            if value:
+                assert value not in repr(result)
+
+    # Credential shape and ordinary Unicode remain profile independent.
+    legacy = _relay_profile(relay_help_tables, "legacy")
+    ordinary = legacy.try_argv(
+        BackendOperation.submit_pairing,
+        target(),
+        CredentialPayload(value=SensitiveText("letters and symbols ! 雪")),
+    )
+    assert isinstance(ordinary, Ok)
+    assert ordinary.value.argv[-1] == "letters and symbols ! 雪"
 
 
 class _RecordingProcess:
@@ -339,6 +366,244 @@ class _RecordingProcess:
             exit_code=0, stdout=json.dumps({"ok": True, "state": "idle"}).encode(),
             stderr=b"",
         ))
+
+
+class _RelayAuthority:
+    def __init__(self):
+        self.proof = OwnershipProof(
+            kind="evidence", daemon=ProcessIdentity(pid=71, start_ticks=9),
+            socket_entry=(1, 2), generation=1, handshake=None,
+        )
+        self.fence_calls = 0
+
+    def allows(self, operation):
+        return operation is BackendOperation.submit_pairing
+
+    async def authorize(self, record, operation, target, fence):
+        self.fence_calls += 1
+        checked = fence()
+        if isinstance(checked, Err):
+            return checked
+        return Ok(value=self.proof)
+
+    async def prove(self, record):
+        return Ok(value=self.proof)
+
+    async def confirm(self, record, proof):
+        return getattr(self, "confirmation", Ok(value=None))
+
+
+class _CredentialRecordingProcess(_RecordingProcess):
+    def __init__(self, output=None, process_result=None):
+        super().__init__()
+        self.output = output
+        self.process_result = process_result
+        self.credential_calls = []
+
+    async def run_credential(self, spec, timeout, dispatch_fence):
+        self.credential_calls.append(spec)
+        checked = dispatch_fence()
+        from airplay_linux.domain.ports import CredentialProcessCompleted, CredentialProcessNotSpawned
+        if isinstance(checked, Err):
+            return CredentialProcessNotSpawned(diagnostic=checked.error)
+        if self.process_result is not None:
+            return self.process_result
+        return CredentialProcessCompleted(output=self.output)
+
+
+def test_submit_credential_uses_the_fenced_process_boundary(relay_help_tables):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _CredentialRecordingProcess(CommandOutput(
+        exit_code=0, stdout=b'{"ok": true, "error": "discard-me"}', stderr=b"",
+    ))
+    authority = _RelayAuthority()
+    control = PublishedDoubletakeControl(
+        process, profile, record=object(), authority=authority,
+    )
+    fence_calls = []
+
+    def fence():
+        fence_calls.append("fence")
+        return Ok(value=None)
+
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("relay-submit-canary")),
+        SimpleNamespace(), dispatch_fence=fence,
+    ))
+
+    assert isinstance(result, CredentialSubmissionReply)
+    assert result.accepted is True
+    assert authority.fence_calls == 1
+    assert len(fence_calls) == 2
+    assert process.credential_calls[0].redacted_argv[-1] == "<redacted>"
+    assert "relay-submit-canary" not in repr(process.credential_calls[0])
+
+
+@pytest.mark.parametrize(("exit_code", "stdout", "expected_state", "expected_accepted", "reason"), [
+    (0, b'{"ok": true, "error": "receiver-private-error"}', "reply", True, None),
+    (0, b'{"ok": false, "error": "receiver-private-error"}', "acknowledged", False, None),
+    (1, b'{"ok": false, "error": "receiver-private-error"}', "acknowledged", False, None),
+    (2, b'{"ok": true}', "uncertain", None, "incomplete_reply"),
+    (0, b'{"ok": 1}', "uncertain", None, "malformed_reply"),
+    (0, b'{broken', "uncertain", None, "malformed_reply"),
+])
+def test_submit_credential_classifies_complete_envelopes_and_discards_text(
+    relay_help_tables, exit_code, stdout, expected_state, expected_accepted, reason,
+):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _CredentialRecordingProcess(CommandOutput(
+        exit_code=exit_code, stdout=stdout, stderr=b"",
+    ))
+    control = PublishedDoubletakeControl(
+        process, profile, record=object(), authority=_RelayAuthority(),
+    )
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("relay-classification-canary")),
+        SimpleNamespace(), dispatch_fence=lambda: Ok(value=None),
+    ))
+
+    if expected_state == "reply":
+        assert isinstance(result, CredentialSubmissionReply)
+        assert result.accepted is expected_accepted
+    else:
+        assert isinstance(result, CredentialDispatchFailure)
+        assert result.dispatch_state == expected_state
+        assert result.reason == reason
+        assert result.reply_accepted is expected_accepted
+        if expected_state == "acknowledged":
+            assert result.refusal == "rejected"
+    assert "receiver-private-error" not in repr(result)
+    assert "relay-classification-canary" not in repr(result)
+
+
+def test_submit_credential_preserves_process_uncertainty(relay_help_tables):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _CredentialRecordingProcess(
+        process_result=CredentialProcessUncertain(reason="child_cleanup_uncertain"),
+    )
+    control = PublishedDoubletakeControl(
+        process, profile, record=object(), authority=_RelayAuthority(),
+    )
+
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("relay-uncertain-canary")),
+        SimpleNamespace(), dispatch_fence=lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, CredentialDispatchFailure)
+    assert result.dispatch_state == "uncertain"
+    assert result.reason == "child_cleanup_uncertain"
+    assert result.reply_at is None and result.reply_accepted is None
+    assert "relay-uncertain-canary" not in repr(result)
+
+
+def test_submit_credential_reports_acknowledged_when_post_reply_ownership_fails(relay_help_tables):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _CredentialRecordingProcess(CommandOutput(
+        exit_code=0, stdout=b'{"ok": true}', stderr=b"",
+    ))
+    authority = _RelayAuthority()
+    authority.confirmation = Err(error=Diagnostic(
+        code=ErrorCode.ownership_mismatch,
+        message="fixed ownership refusal",
+        recovery=(),
+    ))
+    control = PublishedDoubletakeControl(
+        process, profile, record=object(), authority=authority,
+    )
+
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("relay-post-reply-canary")),
+        SimpleNamespace(), dispatch_fence=lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, CredentialDispatchFailure)
+    assert result.dispatch_state == "acknowledged"
+    assert result.reply_accepted is True
+    assert result.refusal == "stale"
+    assert "relay-post-reply-canary" not in repr(result)
+
+
+def test_relay_authorization_rechecks_replaced_generation_after_await(relay_help_tables):
+    async def scenario():
+        profile = _relay_profile(relay_help_tables, "legacy")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        generation = {"value": 1}
+
+        class BarrierAuthority(_RelayAuthority):
+            async def authorize(self, record, operation, receiver, fence):
+                entered.set()
+                await release.wait()
+                checked = fence()
+                if isinstance(checked, Err):
+                    return checked
+                return Ok(value=self.proof)
+
+        process = _CredentialRecordingProcess(CommandOutput(
+            exit_code=0, stdout=b'{"ok": true}', stderr=b"",
+        ))
+        control = PublishedDoubletakeControl(
+            process, profile, record=object(), authority=BarrierAuthority(),
+        )
+
+        def fence():
+            if generation["value"] != 1:
+                return Err(error=Diagnostic(
+                    code=ErrorCode.stale_target,
+                    message="fixed stale target",
+                    recovery=(),
+                ))
+            return Ok(value=None)
+
+        submission = asyncio.create_task(control.submit_credential(
+            target(), CredentialPayload(value=SensitiveText("relay-barrier-canary")),
+            SimpleNamespace(), dispatch_fence=fence,
+        ))
+        await entered.wait()
+        generation["value"] = 2
+        release.set()
+        result = await submission
+
+        assert isinstance(result, CredentialDispatchFailure)
+        assert result.dispatch_state == "no_spawn"
+        assert result.error.code is ErrorCode.stale_target
+        assert process.credential_calls == []
+        assert "relay-barrier-canary" not in repr(result)
+
+    asyncio.run(scenario())
+
+
+def test_credential_dispatch_failure_and_reply_are_typed_and_secret_free():
+    reply = CredentialSubmissionReply(reply_at=1.25, accepted=False)
+    assert reply.accepted is False
+    failure = CredentialDispatchFailure(
+        error=Err(error=Diagnostic(
+            code=ErrorCode.dependency_incompatible,
+            message="fixed",
+            recovery=(),
+        )).error,
+        dispatch_state="uncertain",
+        reason="malformed_reply",
+    )
+    assert failure.reply_at is None
+    assert failure.reply_accepted is None
+    assert "malformed_reply" in repr(failure)
+
+
+def test_submit_credential_requires_fence_and_never_uses_generic_process_run(relay_help_tables):
+    profile = _relay_profile(relay_help_tables, "legacy")
+    process = _RecordingProcess()
+    control = PublishedDoubletakeControl(process, profile)
+    result = asyncio.run(control.submit_credential(
+        target(), CredentialPayload(value=SensitiveText("relay-submit-canary")),
+        SimpleNamespace(),
+        dispatch_fence=lambda: Ok(value=None),
+    ))
+    assert isinstance(result, CredentialDispatchFailure)
+    assert result.dispatch_state == "no_spawn"
+    assert process.calls == []
+    assert "relay-submit-canary" not in repr(result)
 
 
 def test_relay_metadata_refusals(relay_help_tables):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -16,6 +17,8 @@ from airplay_linux.backend.contract import (
     BackendFeatures,
     BackendReply,
     BackendStream,
+    CredentialDispatchFailure,
+    CredentialSubmissionReply,
     DevicesReply,
     StatusReply,
     decode_devices,
@@ -33,6 +36,9 @@ from airplay_linux.domain.ports import (
     CommandOutput,
     CommandSpec,
     Clock,
+    CredentialProcessCompleted,
+    CredentialProcessNotSpawned,
+    CredentialProcessUncertain,
     Subscription,
     _REDACTED_ARGUMENT,
     _validate_secret_indices,
@@ -47,6 +53,7 @@ from airplay_linux.domain.resources import (
     Ok,
     Result,
     VolumeLevel,
+    NoReplyReason,
 )
 
 
@@ -347,6 +354,17 @@ class _Subscription:
         self._close_action()
 
 
+class CredentialRelayControl(Protocol):
+    async def submit_credential(
+        self,
+        target: ReceiverTarget,
+        payload: CredentialPayload,
+        context: OperationContext,
+        *,
+        dispatch_fence: DispatchFence,
+    ) -> CredentialSubmissionReply | CredentialDispatchFailure: ...
+
+
 @runtime_checkable
 class BackendControl(Protocol):
     async def request(
@@ -573,9 +591,7 @@ class PublishedDoubletakeProfile:
             ):
                 return _err(ErrorCode.invalid_input)
             credential = _secret_text(payload.value)
-            if not credential or not relay_credential_representable(
-                credential, target_volume_proven=self.features.target_volume,
-            ):
+            if not _relay_value_representable(credential):
                 return _err(ErrorCode.invalid_input)
             arguments = () if payload.audio is None else (
                 "--audio", "on" if payload.audio.enabled else "off",
@@ -858,6 +874,106 @@ class PublishedDoubletakeControl:
         elif command.secret_indices:
             return _err(ErrorCode.invalid_input)
         return None
+
+    async def submit_credential(
+        self,
+        target: ReceiverTarget,
+        payload: CredentialPayload,
+        context: OperationContext,
+        *,
+        dispatch_fence: DispatchFence,
+    ) -> CredentialSubmissionReply | CredentialDispatchFailure:
+        """Dispatch the target-bound relay command through the credential runner."""
+        operation = BackendOperation.submit_pairing
+        if dispatch_fence is None:
+            return _credential_no_spawn(ErrorCode.dependency_incompatible)
+        if self._closed:
+            return _credential_no_spawn(ErrorCode.daemon_failed)
+        if not isinstance(target, ReceiverTarget) or not isinstance(payload, CredentialPayload):
+            return _credential_no_spawn(ErrorCode.invalid_input)
+        command = self._profile.try_argv(operation, target, payload)
+        if isinstance(command, Err):
+            return _credential_no_spawn(command.error.code)
+        refusal = self._command_refusal(command.value, operation)
+        if refusal is not None:
+            return _credential_no_spawn(refusal.error.code)
+        if not self._available(operation) or not self._public_authority():
+            return _credential_no_spawn(ErrorCode.dependency_incompatible)
+        try:
+            ownership = await self._revalidate_ownership(
+                operation, target, dispatch_fence,
+            )
+        except asyncio.CancelledError:
+            return _credential_no_spawn(ErrorCode.stale_event)
+        except Exception:
+            return _credential_no_spawn(ErrorCode.ownership_mismatch)
+        if isinstance(ownership, Err):
+            return _credential_no_spawn(ownership.error.code)
+        proof = ownership.value
+        try:
+            process_result = await self._process.run_credential(
+                CommandSpec(
+                    argv=command.value.argv,
+                    env={},
+                    secret_indices=command.value.secret_indices,
+                ),
+                timeout=self._timeout,
+                dispatch_fence=dispatch_fence,
+            )
+        except asyncio.CancelledError:
+            return _credential_uncertain("dispatch_cancelled")
+        except Exception:
+            return _credential_uncertain("child_cleanup_uncertain")
+        if isinstance(process_result, CredentialProcessNotSpawned):
+            return _credential_no_spawn(process_result.diagnostic.code)
+        if isinstance(process_result, CredentialProcessUncertain):
+            return _credential_uncertain(process_result.reason)
+        if not isinstance(process_result, CredentialProcessCompleted):
+            return _credential_uncertain("malformed_reply")
+        output = process_result.output
+        if not isinstance(output, CommandOutput):
+            return _credential_uncertain("malformed_reply")
+        if output.exit_code not in {0, 1}:
+            return _credential_uncertain("incomplete_reply")
+        response = self._response_object(output)
+        if not isinstance(response, dict) or type(response.get("ok")) is not bool:
+            return _credential_uncertain("malformed_reply")
+        reply_at = self._now()
+        accepted = response["ok"]
+        try:
+            confirmation = await self._authority.confirm(self._record, proof)
+        except asyncio.CancelledError:
+            confirmation = _err(ErrorCode.stale_event)
+        except Exception:
+            confirmation = _err(ErrorCode.ownership_mismatch)
+        if not isinstance(confirmation, Ok):
+            failure = confirmation if isinstance(confirmation, Err) else _err(ErrorCode.ownership_mismatch)
+            return CredentialDispatchFailure(
+                error=failure.error,
+                dispatch_state="acknowledged",
+                refusal="stale",
+                reply_at=reply_at,
+                reply_accepted=accepted,
+            )
+        if accepted:
+            return CredentialSubmissionReply(reply_at=reply_at, accepted=True)
+        return CredentialDispatchFailure(
+            error=_diag(ErrorCode.receiver_rejected),
+            dispatch_state="acknowledged",
+            refusal="rejected",
+            reply_at=reply_at,
+            reply_accepted=False,
+        )
+
+    def _now(self) -> float:
+        try:
+            if self._clock is not None:
+                value = self._clock.now()
+                if type(value) is float:
+                    return value
+        except Exception:
+            pass
+        return asyncio.get_running_loop().time()
 
     async def _run(
         self, command: ProfileCommand, *, operation: BackendOperation,
@@ -1370,6 +1486,32 @@ class HandshakeAuthority:
         return await self._release(record)
 
 
+def _relay_value_representable(value: str | None) -> bool:
+    if type(value) is not str or not value or "\0" in value:
+        return False
+    if not relay_credential_representable(value):
+        return False
+    try:
+        os.fsencode(value)
+    except (UnicodeEncodeError, ValueError):
+        return False
+    return True
+
+
+def _credential_no_spawn(code: ErrorCode) -> CredentialDispatchFailure:
+    return CredentialDispatchFailure(
+        error=_diag(code), dispatch_state="no_spawn",
+    )
+
+
+def _credential_uncertain(reason: NoReplyReason) -> CredentialDispatchFailure:
+    return CredentialDispatchFailure(
+        error=_diag(ErrorCode.cleanup_timeout),
+        dispatch_state="uncertain",
+        reason=reason,
+    )
+
+
 def _secret_text(value: SensitiveText | str | None) -> str | None:
     if isinstance(value, SensitiveText):
         try:
@@ -1453,6 +1595,9 @@ __all__ = [
     "BackendReply",
     "BackendStream",
     "ConnectPayload",
+    "CredentialDispatchFailure",
+    "CredentialRelayControl",
+    "CredentialSubmissionReply",
     "CredentialPayload",
     "DevicesReply",
     "DispatchFence",

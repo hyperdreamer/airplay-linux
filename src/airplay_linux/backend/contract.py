@@ -23,6 +23,7 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     Ok,
     Result,
+    NoReplyReason,
 )
 
 
@@ -361,6 +362,20 @@ BackendReply: TypeAlias = StatusReply | DevicesReply | AckReply
 
 
 @dataclass(frozen=True, kw_only=True)
+class CredentialSubmissionReply:
+    """A complete relay envelope with only its typed acceptance bit."""
+
+    reply_at: float
+    accepted: bool
+
+    def __post_init__(self) -> None:
+        if type(self.reply_at) is not float:
+            raise TypeError("reply_at must be a float")
+        if type(self.accepted) is not bool:
+            raise TypeError("accepted must be a boolean")
+
+
+@dataclass(frozen=True, kw_only=True)
 class CredentialDispatchFailure(Err):
     """A relay credential command's sanitized refusal and proved classification.
 
@@ -373,14 +388,40 @@ class CredentialDispatchFailure(Err):
 
     dispatch_state: Literal["no_spawn", "acknowledged", "uncertain"]
     refusal: Literal["shutdown", "ended", "stale", "rejected"] | None = None
+    reply_at: float | None = None
+    reply_accepted: bool | None = None
+    reason: NoReplyReason | None = None
 
     def __post_init__(self) -> None:
-        if self.dispatch_state not in {"no_spawn", "acknowledged", "uncertain"}:
-            raise ValueError("invalid credential dispatch state")
-        if self.refusal is not None and self.refusal not in {
-            "shutdown", "ended", "stale", "rejected",
+        if type(self.dispatch_state) is not str or self.dispatch_state not in {
+            "no_spawn", "acknowledged", "uncertain",
         }:
+            raise ValueError("invalid credential dispatch state")
+        if self.refusal is not None and (
+            type(self.refusal) is not str or self.refusal not in {
+                "shutdown", "ended", "stale", "rejected",
+            }
+        ):
             raise ValueError("invalid credential dispatch refusal")
+        if self.reply_at is not None and type(self.reply_at) is not float:
+            raise TypeError("reply_at must be a float or None")
+        if self.reply_accepted is not None and type(self.reply_accepted) is not bool:
+            raise TypeError("reply_accepted must be a boolean or None")
+        if self.reason is not None and (
+            type(self.reason) is not str or self.reason not in {
+                "command_timeout", "service_shutdown", "child_cleanup_uncertain",
+                "incomplete_reply", "malformed_reply", "dispatch_cancelled",
+            }
+        ):
+            raise ValueError("invalid credential dispatch reason")
+        if self.dispatch_state == "no_spawn":
+            if self.reply_at is not None or self.reply_accepted is not None or self.reason is not None:
+                raise ValueError("no-spawn credential failure cannot carry a reply")
+        elif self.dispatch_state == "acknowledged":
+            if self.reply_at is None or self.reply_accepted is None or self.reason is not None:
+                raise ValueError("acknowledged credential failure requires a reply")
+        elif self.reply_at is not None or self.reply_accepted is not None or self.reason is None:
+            raise ValueError("uncertain credential failure requires a reason")
 
 
 def _exact_dict(value: object) -> dict[str, Any] | None:
@@ -1120,6 +1161,7 @@ __all__ = [
     "BackendStream",
     "CredentialDispatchFailure",
     "CredentialProofVerdict",
+    "CredentialSubmissionReply",
     "DevicesReply",
     "StatusReply",
     "decode_devices",

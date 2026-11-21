@@ -448,6 +448,40 @@ class FakeTransport(_Scripted, _EventSource):
             return scripted
         return Ok(value=None)
 
+    async def submit_credential(
+        self, target: ReceiverTarget, value: SensitiveText,
+        context: OperationContext, *, dispatch_fence,
+    ) -> Result[Any]:
+        self._record(
+            "submit_credential", target=target, value=value,
+            context=context, dispatch_fence=dispatch_fence is not None,
+        )
+        if dispatch_fence is None:
+            return _failure(ErrorCode.dependency_incompatible, "Missing dispatch fence")
+        checked = dispatch_fence()
+        if isinstance(checked, Err):
+            return checked
+        scripted = await self._take("submit_credential")
+        if scripted is not _UNSET:
+            return scripted
+        return _failure(ErrorCode.dependency_incompatible, "Credential relay is not scripted")
+
+    async def read_credential_status(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> Result[Any]:
+        self._record("read_credential_status", target=target, context=context)
+        scripted = await self._take("read_credential_status")
+        if scripted is not _UNSET:
+            return scripted
+        return _failure(ErrorCode.dependency_incompatible, "Credential status is not scripted")
+
+    async def stop_pending_start(self, owner: Any, stop_context: OperationContext) -> Result[Any]:
+        self._record("stop_pending_start", owner=owner, stop_context=stop_context)
+        scripted = await self._take("stop_pending_start")
+        if scripted is not _UNSET:
+            return scripted
+        return _failure(ErrorCode.dependency_incompatible, "Pending start is not scripted")
+
     async def start_stream(
         self, target: ReceiverTarget, source: resources.CaptureSource | None,
         audio_policy: AudioPolicy, context: OperationContext, *, initial_volume: VolumeLevel | None = None,
@@ -1052,6 +1086,7 @@ class FakeProcess(_Scripted, _EventSource):
         _EventSource.__init__(self)
         self.spawned: list[ports.CommandSpec] = []
         self.runs: list[tuple[ports.CommandSpec, float]] = []
+        self.credential_runs: list[tuple[ports.CommandSpec, float]] = []
         self.terminated: list[ProcessIdentity] = []
         self.strict_terminations: list[TerminationEvidence] = []
         self._identities: dict[int, ProcessIdentity] = {}
@@ -1084,6 +1119,79 @@ class FakeProcess(_Scripted, _EventSource):
         return await self._call(
             "run", default, spec=spec, timeout=timeout, stdin=_redact_stdin(stdin),
         )
+
+    async def run_credential(
+        self,
+        spec: ports.CommandSpec,
+        timeout: float,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> ports.CredentialProcessResult:
+        try:
+            if type(spec) is not ports.CommandSpec or type(spec.argv) is not tuple:
+                raise ValueError("invalid credential command")
+            if not spec.argv or not all(
+                type(argument) is str and argument and "\0" not in argument
+                for argument in spec.argv
+            ):
+                raise ValueError("invalid credential command")
+            ports._validate_secret_indices(spec.argv, spec.secret_indices)
+            if spec.secret_indices != (len(spec.argv) - 1,):
+                raise ValueError("invalid secret indices")
+        except (AttributeError, TypeError, ValueError):
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=Diagnostic(
+                    code=ErrorCode.invalid_input,
+                    message="Invalid credential command",
+                    recovery=(RecoveryAction.retry,),
+                ),
+            )
+        try:
+            checked = dispatch_fence()
+        except Exception:
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=Diagnostic(
+                    code=ErrorCode.dependency_incompatible,
+                    message="Credential dispatch fence failed",
+                    recovery=(RecoveryAction.retry,),
+                ),
+            )
+        if isinstance(checked, Err):
+            return ports.CredentialProcessNotSpawned(diagnostic=checked.error)
+        if not isinstance(checked, Ok) or checked.value is not None:
+            return ports.CredentialProcessNotSpawned(
+                diagnostic=Diagnostic(
+                    code=ErrorCode.dependency_incompatible,
+                    message="Credential dispatch fence returned invalid evidence",
+                    recovery=(RecoveryAction.retry,),
+                ),
+            )
+        observed = ports.CommandSpec(
+            argv=spec.redacted_argv, env=spec.env, cwd=spec.cwd,
+            pass_fds=spec.pass_fds, secret_indices=spec.secret_indices,
+        )
+        self.credential_runs.append((observed, timeout))
+        self._record("run_credential", spec=observed, timeout=timeout)
+
+        async def default() -> ports.CredentialProcessCompleted:
+            return ports.CredentialProcessCompleted(
+                output=ports.CommandOutput(exit_code=0, stdout=b"{}", stderr=b"")
+            )
+
+        try:
+            scripted = await self._take("run_credential")
+        except asyncio.CancelledError:
+            return ports.CredentialProcessUncertain(reason="dispatch_cancelled")
+        except Exception:
+            return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
+        if scripted is _UNSET:
+            return await default()
+        if isinstance(scripted, (
+            ports.CredentialProcessNotSpawned,
+            ports.CredentialProcessCompleted,
+            ports.CredentialProcessUncertain,
+        )):
+            return scripted
+        return ports.CredentialProcessUncertain(reason="child_cleanup_uncertain")
 
     async def spawn(self, spec: ports.CommandSpec) -> Result[ProcessIdentity]:
         async def default() -> Result[ProcessIdentity]:

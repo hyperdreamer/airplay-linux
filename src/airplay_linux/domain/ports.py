@@ -423,6 +423,13 @@ class CredentialProcessCompleted:
 class CredentialProcessUncertain:
     reason: NoReplyReason
 
+    def __post_init__(self) -> None:
+        if type(self.reason) is not str or self.reason not in {
+            "command_timeout", "service_shutdown", "child_cleanup_uncertain",
+            "incomplete_reply", "malformed_reply", "dispatch_cancelled",
+        }:
+            raise ValueError("invalid credential process uncertainty reason")
+
 
 CredentialProcessResult: TypeAlias = (
     CredentialProcessNotSpawned | CredentialProcessCompleted | CredentialProcessUncertain
