@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 from uuid import UUID
 
 if TYPE_CHECKING:
-    # Postponed foundation-lane signature; no import of the unfinished implementation.
+    from airplay_linux.backend.contract import StatusReply
     from airplay_linux.process.procfs import TerminationEvidence
 
     from .identity import ReceiverId, ReceiverTarget, ReceiverView
@@ -49,14 +49,17 @@ if TYPE_CHECKING:
         SavedReceiver,
         SessionSnapshot,
     )
+    from .relay import NoReply, PendingStartCleanupOwner, Submitted
     from .resources import (
         AudioPolicy,
         CaptureSource,
+        Diagnostic,
         PhysicalMonitorSource,
         ReceiverCapabilities,
         Result,
         Size,
         VolumeLevel,
+        NoReplyReason,
     )
 
 
@@ -120,6 +123,23 @@ class TransportPort(Protocol):
         self, target: ReceiverTarget, source: CaptureSource | None,
         audio_policy: AudioPolicy, context: OperationContext, *,
         initial_volume: VolumeLevel | None = None,
+    ) -> Result[StreamHandle]: ...
+
+    async def submit_credential(
+        self,
+        target: ReceiverTarget,
+        value: SensitiveText,
+        context: OperationContext,
+        *,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> Result[Submitted | NoReply]: ...
+
+    async def read_credential_status(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> Result[StatusReply]: ...
+
+    async def stop_pending_start(
+        self, owner: PendingStartCleanupOwner, stop_context: OperationContext,
     ) -> Result[StreamHandle]: ...
 
     async def stop_stream(self, handle: StreamHandle, context: OperationContext) -> Result[None]: ...
@@ -330,6 +350,40 @@ class CommandOutput:
 
 
 @dataclass(frozen=True, kw_only=True)
+class CredentialProcessNotSpawned:
+    diagnostic: Diagnostic
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialProcessCompleted:
+    """Completed child output, which must remain transient at process boundaries."""
+
+    output: CommandOutput = field(repr=False)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(output=<transient>)"
+
+    def __getstate__(self) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+    def __reduce__(self) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialProcessUncertain:
+    reason: NoReplyReason
+
+
+CredentialProcessResult: TypeAlias = (
+    CredentialProcessNotSpawned | CredentialProcessCompleted | CredentialProcessUncertain
+)
+
+
+@dataclass(frozen=True, kw_only=True)
 class ProcessExit:
     identity: ProcessIdentity
     exit_code: int
@@ -339,6 +393,13 @@ class ProcessPort(Protocol):
     async def run(
         self, spec: CommandSpec, timeout: float, stdin: bytes | None = None,
     ) -> Result[CommandOutput]: ...
+
+    async def run_credential(
+        self,
+        spec: CommandSpec,
+        timeout: float,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> CredentialProcessResult: ...
 
     async def spawn(self, spec: CommandSpec) -> Result[ProcessIdentity]: ...
 
