@@ -1,12 +1,42 @@
-digraph gui_device_pairing {
+digraph execution {
   rankdir=LR;
-  node [shape=box, style="rounded,filled", fillcolor="#eef2f7"];
-  T_001 [label="T-001\nClose Observer Retention Paths\nredaction #1"];
-  T_002 [label="T-002\nImplement Route-B Transport Contracts and Readiness Waits\ntransport #1"];
-  T_003 [label="T-003\nIntegrate Prompt Identity, Session Lifecycle, and UI Reporting\nsession-ui #1"];
-  T_004 [label="T-004\nProve Acceptance, Canary Coverage, Mutations, and Documentation\nacceptance-docs #1"];
-  T_002 -> T_003;
-  T_001 -> T_004;
-  T_002 -> T_004;
-  T_003 -> T_004;
+  subgraph cluster_credential_relay {
+    label="credential-relay";
+    "T-001" [label="Task 1: Establish secret-free relay domain contracts and observer boundaries\nAdvanced"];
+    "T-002" [label="Task 2: Implement the durable recovery marker store and target reservation\nCapable"];
+    "T-003" [label="Task 3: Add startup recovery coordination and registry exemptions\nCapable"];
+    "T-004" [label="Task 4: Add fenced credential process and backend dispatch\nAdvanced"];
+    "T-005" [label="Task 5: Implement exact-row transport detection and pending-Start handoff\nCapable"];
+    "T-006" [label="Task 6: Add actor settlement, effect fencing, and ordered cleanup\nCapable"];
+    "T-007" [label="Task 7: Add transient prompt and recovery projections\nAdvanced"];
+    "T-008" [label="Task 8: Implement endpoint-changing daemon release and recovery attempts\nCapable"];
+    "T-009" [label="Task 9: Activate the assembled runtime, acceptance suite, and delivery documentation\nCapable"];
+  }
+  "T-001" -> "T-002";
+  "T-001" -> "T-003";
+  "T-002" -> "T-003";
+  "T-001" -> "T-004";
+  "T-003" -> "T-004";
+  "T-001" -> "T-005";
+  "T-004" -> "T-005";
+  "T-001" -> "T-006";
+  "T-002" -> "T-006";
+  "T-003" -> "T-006";
+  "T-005" -> "T-006";
+  "T-001" -> "T-007";
+  "T-003" -> "T-007";
+  "T-006" -> "T-007";
+  "T-001" -> "T-008";
+  "T-002" -> "T-008";
+  "T-003" -> "T-008";
+  "T-006" -> "T-008";
+  "T-007" -> "T-008";
+  "T-001" -> "T-009";
+  "T-002" -> "T-009";
+  "T-003" -> "T-009";
+  "T-004" -> "T-009";
+  "T-005" -> "T-009";
+  "T-006" -> "T-009";
+  "T-007" -> "T-009";
+  "T-008" -> "T-009";
 }
