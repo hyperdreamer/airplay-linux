@@ -400,12 +400,14 @@ class DoubleTakeTransport:
         receivers: ReceiverStore, fences: TrustFenceRegistry, features: BackendFeatures,
         clock: Clock, scheduler: Scheduler, ids: IdFactory,
         *, source_verifier: ReportedSourceVerifier | None = None,
+        recovery_guard: Callable[[ReceiverTarget, OperationId], Result[None]] | None = None,
     ) -> None:
         self._control_factory = control_factory
         self._registry, self._capture = registry, capture
         self._fences, self._features = fences, features
         self._clock, self._scheduler, self._ids = clock, scheduler, ids
         self._source_verifier = source_verifier
+        self._recovery_guard = recovery_guard
         self._targets = TargetRegistry()
         self._daemons: dict[InstanceId, _Daemon] = {}
         self._unusable: set[InstanceId] = set()
@@ -639,6 +641,7 @@ class DoubleTakeTransport:
 
     def _dispatch_fence(
         self, target: ReceiverTarget, context: OperationContext, *, cleanup: bool,
+        start_operation_id: OperationId | None = None,
     ) -> Callable[[], Result[None]]:
         """Bind the exact target/cleanup ownership the adapter rechecks at dispatch.
 
@@ -647,8 +650,21 @@ class DoubleTakeTransport:
         during that window therefore cannot receive the old stream's command.
         """
 
+        recovery_fence = None
+        if self._recovery_guard is not None and start_operation_id is not None:
+            current = self._targets.require_cleanup(target) if cleanup else self._current(target, context)
+            if isinstance(current, Ok):
+                candidate = self._recovery_guard(target, start_operation_id)
+                if callable(candidate):
+                    recovery_fence = candidate
+
         def check() -> Result[None]:
-            return self._targets.require_cleanup(target) if cleanup else self._current(target, context)
+            checked = self._targets.require_cleanup(target) if cleanup else self._current(target, context)
+            if isinstance(checked, Err) or self._recovery_guard is None or start_operation_id is None:
+                return checked
+            if recovery_fence is not None:
+                return recovery_fence()
+            return self._recovery_guard(target, start_operation_id)
 
         return check
 
@@ -661,7 +677,10 @@ class DoubleTakeTransport:
             return checked
         if not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.cleanup_timeout if cleanup else ErrorCode.stale_event)
-        fence = self._dispatch_fence(target, context, cleanup=cleanup)
+        fence = self._dispatch_fence(
+            target, context, cleanup=cleanup,
+            start_operation_id=context.operation_id if operation is BackendOperation.connect else None,
+        )
         if operation in (BackendOperation.volume, BackendOperation.audio_off):
             original = self._streams.get(context.transport_lease_id)
             def fence():

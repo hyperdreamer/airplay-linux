@@ -5,15 +5,17 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from airplay_linux.domain.messages import (
+    CredentialRequestPayload,
     DisplayEvent,
     EffectEvent,
     ResourceEvent,
     TransportEvent,
     TransportEventKind,
 )
-from airplay_linux.domain.operations import ChallengeView, DisplayHandle, StreamHandle
+from airplay_linux.domain.operations import ChallengeView, DisplayHandle, OperationContext, StreamHandle
 from airplay_linux.domain.records import SessionSnapshot
-from airplay_linux.domain.resources import PhysicalMonitorSource
+from airplay_linux.domain.relay import CredentialPromptState, CredentialRequest
+from airplay_linux.domain.resources import IntentStage, Mode, PhysicalMonitorSource, TransportState
 
 
 def _same_receiver(state: SessionSnapshot, receiver_id) -> bool:
@@ -70,6 +72,85 @@ def _display_progress_matches(left: DisplayHandle, event: DisplayEvent) -> bool:
     if event.helper is not None and event.helper != left.helper:
         return False
     return True
+
+
+def accept_credential_request(
+    state: SessionSnapshot, event: TransportEvent, previous: CredentialRequest | None = None,
+) -> bool:
+    if (
+        event.kind is not TransportEventKind.credential_request
+        or type(event.payload) is not CredentialRequestPayload
+        or state.mode is not Mode.MIRROR or not state.intent_active or state.cleanup_pending
+    ):
+        return False
+    request = event.payload.request
+    stream = event.stream
+    target = state.target
+    operation = event.context
+    if target is None or stream is None or type(request) is not CredentialRequest:
+        return False
+    if not (
+        request.receiver_id == event.receiver_id == state.receiver_id == target.receiver_id == stream.receiver_id
+        and request.target == target
+        and request.start_operation_id == operation.operation_id == state.operation_id == stream.start_operation_id
+        and request.endpoint_generation == target.endpoint_generation == event.endpoint_generation
+        == operation.endpoint_generation == stream.endpoint_generation
+        and request.target.endpoint_fingerprint == event.endpoint_fingerprint == stream.endpoint_fingerprint
+        and request.session_generation == operation.session_generation == state.session_generation
+        and operation.trust_generation == state.trust_generation
+        and request.owner_lease == operation.transport_lease_id == state.transport_lease_id == stream.lease_id
+        and request.daemon_instance_uuid == event.daemon_instance_uuid == stream.daemon_instance_uuid
+        and request.credential_kind in ("pin", "password") and request.generation > 0
+    ):
+        return False
+    if previous is not None and previous.start_operation_id == request.start_operation_id:
+        if (
+            previous.target != request.target or previous.owner_lease != request.owner_lease
+            or previous.daemon_instance_uuid != request.daemon_instance_uuid
+            or request.generation < previous.generation
+            or (request.generation == previous.generation and request != previous)
+        ):
+            return False
+    return True
+
+
+def accept_pending_credential_request(
+    state: SessionSnapshot, event: TransportEvent, start_context: OperationContext | None,
+    previous: CredentialRequest | None = None,
+) -> bool:
+    return (
+        state.stream is None
+        and state.intent_stage is IntentStage.starting
+        and state.transport is TransportState.Connecting
+        and start_context is not None
+        and event.context == start_context
+        and accept_credential_request(state, event, previous)
+    )
+
+
+def accept_credential_prompt(state: SessionSnapshot, prompt: CredentialPromptState) -> bool:
+    request, challenge = prompt.request, prompt.challenge
+    stream = state.stream
+    return (
+        state.mode is Mode.MIRROR and state.intent_active and not state.cleanup_pending
+        and state.target == request.target
+        and state.receiver_id == request.receiver_id == challenge.receiver_id
+        and state.operation_id == request.start_operation_id == challenge.operation_id
+        and state.session_generation == request.session_generation == challenge.session_generation
+        and state.trust_generation == challenge.trust_generation
+        and state.transport_lease_id == request.owner_lease
+        and challenge.endpoint_fingerprint == request.target.endpoint_fingerprint
+        and challenge.endpoint_generation == request.endpoint_generation == request.target.endpoint_generation
+        and challenge.credential_kind == request.credential_kind
+        and prompt.report is None
+        and (stream is None or (
+            stream.start_operation_id == request.start_operation_id
+            and stream.lease_id == request.owner_lease
+            and stream.daemon_instance_uuid == request.daemon_instance_uuid
+            and stream.endpoint_generation == request.endpoint_generation
+            and stream.endpoint_fingerprint == request.target.endpoint_fingerprint
+        ))
+    )
 
 
 def accept_transport(state: SessionSnapshot, event: TransportEvent) -> bool:
@@ -189,4 +270,7 @@ def accept_challenge(state: SessionSnapshot, challenge: ChallengeView) -> bool:
     )
 
 
-__all__ = ["accept_challenge", "accept_cleanup", "accept_display", "accept_transport"]
+__all__ = [
+    "accept_challenge", "accept_cleanup", "accept_display", "accept_transport",
+    "accept_credential_prompt", "accept_credential_request", "accept_pending_credential_request",
+]

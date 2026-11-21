@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
@@ -20,6 +20,13 @@ from airplay_linux.domain.messages import (
     CommandReceipt,
     ConfirmOrphanRemoval,
     ConfirmSwitch,
+    CredentialStatusCompletion,
+    CredentialSubmissionCompletion,
+    DismissCredentialPrompt,
+    DismissCredentialRecovery,
+    RestartReceiverToRelease,
+    StopCredentialRecovery,
+    SubmitCredential,
     DiscoveryEvent,
     DisplayEvent,
     EffectEvent,
@@ -69,6 +76,9 @@ from airplay_linux.domain.ports import (
     TransportPort,
 )
 from airplay_linux.domain.records import DaemonRecord, SessionSnapshot
+from airplay_linux.domain.relay import (
+    CredentialEffectOwner, CredentialRequest, CredentialSubmissionSettlement,
+)
 from airplay_linux.domain.resources import (
     AudioState,
     CapabilityReport,
@@ -87,7 +97,10 @@ from airplay_linux.domain.resources import (
 from airplay_linux.storage.repositories import ReceiverPreferenceWriter
 from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 
-from .fencing import accept_challenge, accept_cleanup, accept_display, accept_transport
+from .fencing import (
+    accept_challenge, accept_cleanup, accept_credential_prompt, accept_credential_request,
+    accept_display, accept_pending_credential_request, accept_transport,
+)
 from .phase import derive_phase
 
 if TYPE_CHECKING:
@@ -144,6 +157,8 @@ class _Effect:
     endpoint_fingerprint: str | None
     ownership_uuid: OwnerId | None
     daemon_instance_uuid: InstanceId | None
+    credential_owner: CredentialEffectOwner | None = None
+    credential_stop_operation_id: OperationId | None = None
     task: asyncio.Task[object] | None = None
 
 
@@ -164,6 +179,10 @@ class SessionContext:
         self.deps = manager.deps
         self._timers: list[object] = []
         self._audio_operation_id: OperationId | None = state.audio_operation_id
+        self.credential_request: CredentialRequest | None = None
+        self.credential_request_ended = False
+        self.dismissed_credential_prompt_id = None
+        self.credential_settlements: dict[OperationId, CredentialSubmissionSettlement] = {}
 
     @property
     def state(self) -> SessionSnapshot:
@@ -194,11 +213,17 @@ class SessionContext:
     def operation(self) -> OperationContext:
         return self._context(self._new_operation_id())
 
-    def supersede(self, reason: Literal["start", "cancel", "stop", "switch", "reconfigure", "shutdown"]) -> OperationContext:
+    def supersede(
+        self, reason: Literal["start", "cancel", "stop", "switch", "reconfigure", "shutdown"],
+        *, operation_id: OperationId | None = None,
+    ) -> OperationContext:
         self._require_dispatch()
         del reason
+        self.credential_request = None
+        self.credential_request_ended = False
+        self.dismissed_credential_prompt_id = None
         context = replace(
-            self._context(self._new_operation_id(), generation=self.state.session_generation + 1),
+            self._context(operation_id or self._new_operation_id(), generation=self.state.session_generation + 1),
             transport_lease_id=None,
             audio_operation_id=None,
         )
@@ -207,6 +232,7 @@ class SessionContext:
             session_generation=context.session_generation,
             transport_lease_id=None,
             audio_operation_id=None,
+            credential_prompt=None,
         )
         self.cancel_timers()
         self.invalidate_trust()
@@ -260,6 +286,7 @@ class SessionContext:
         work: Callable[[], Awaitable[Result[object]]],
         acquisition: bool = False,
         resource: StreamHandle | DisplayHandle | PhysicalMonitorSource | None = None,
+        *, credential_owner: CredentialEffectOwner | None = None,
     ) -> None:
         self._require_dispatch()
         effect = _Effect(
@@ -271,6 +298,7 @@ class SessionContext:
             work=work,
             resource=resource,
             acquisition=acquisition,
+            credential_owner=credential_owner,
             context=context,
             endpoint_fingerprint=self.state.target.endpoint_fingerprint if self.state.target else None,
             ownership_uuid=self.state.ownership_uuid,
@@ -538,6 +566,24 @@ class SessionManager:
             if resource is not None
         )
         if isinstance(message, TransportEvent):
+            if message.kind is TransportEventKind.credential_request:
+                if (context.credential_request_ended and message.payload.lifecycle == "live"
+                        and message.payload.request == context.credential_request):
+                    return None
+                if state.stream is None:
+                    start = next((
+                        effect for effect in (*self._effects.values(), *self._completed_effects.values())
+                        if effect.receiver_id == state.receiver_id and effect.name == "transport_start"
+                        and effect.operation_id == state.operation_id and effect.acquisition
+                    ), None)
+                    accepted = accept_pending_credential_request(
+                        state, message, start.context if start is not None else None, context.credential_request,
+                    )
+                else:
+                    accepted = accept_transport(state, message) and accept_credential_request(
+                        state, message, context.credential_request,
+                    )
+                return (route, message) if accepted else None
             if not accept_transport(state, message):
                 if message.kind is TransportEventKind.stopped and accept_cleanup(owned, message):
                     return Route.cleanup, message
@@ -546,6 +592,20 @@ class SessionManager:
             if not accept_display(state, message):
                 if message.kind == "removed" and accept_cleanup(owned, message):
                     return Route.cleanup, message
+                return None
+        elif isinstance(message, (SubmitCredential, DismissCredentialPrompt)):
+            prompt = state.credential_prompt
+            if (
+                prompt is None or message.receiver_id != state.receiver_id
+                or message.challenge_id != prompt.challenge.challenge_id
+                or not accept_credential_prompt(state, prompt)
+                or (isinstance(message, SubmitCredential) and prompt.state != "editing")
+            ):
+                return None
+            coordinator = self.deps.credential_recovery
+            if coordinator is not None and isinstance(coordinator.require_start_allowed(
+                prompt.request.target, prompt.request.start_operation_id,
+            ), Err):
                 return None
         elif isinstance(message, SubmitPairing):
             challenge = state.challenge
@@ -570,6 +630,18 @@ class SessionManager:
         elif isinstance(message, EffectEvent):
             key = (message.receiver_id, message.operation_id, message.kind)
             effect = self._completed_effects.get(key)
+            if route is Route.mirror and message.kind in {
+                "mirror:credential_prepare", "mirror:credential_submit", "mirror:credential_status",
+                "mirror:credential_transition", "mirror:credential_retire", "mirror:credential_generation",
+            }:
+                if effect is None or not self._effect_current(state, effect):
+                    return None
+                if message.session_generation != effect.session_generation:
+                    return None
+                if effect.name in {"credential_submit", "credential_status"}:
+                    if not self._credential_completion_current(context, effect, message):
+                        return None
+                return route, message
             # Trust results must reach the authority that owns compensation.
             if route is Route.trust:
                 return route, message
@@ -606,7 +678,82 @@ class SessionManager:
             and (not check_operation or state.operation_id in (None, operation.operation_id))
         )
 
+    def _credential_owner_current(
+        self, state: SessionSnapshot, owner: CredentialEffectOwner, stop_operation_id: OperationId | None,
+    ) -> bool:
+        if stop_operation_id is not None:
+            from .cleanup import runtime_for
+            runtime = runtime_for(self._contexts[state.receiver_id])
+            return (
+                runtime.active and runtime.context is not None
+                and runtime.context.operation_id == stop_operation_id == state.operation_id
+                and runtime.superseded_operation_id == owner.start_operation_id
+            )
+        stream = state.stream
+        return (
+            state.receiver_id == owner.receiver_id and state.intent_active and not state.cleanup_pending
+            and state.operation_id == owner.start_operation_id
+            and state.target == owner.target
+            and state.session_generation == owner.session_generation
+            and state.trust_generation == owner.trust_generation
+            and state.transport_lease_id == owner.owner_lease
+            and (stream is None or (
+                stream.lease_id == owner.owner_lease
+                and stream.start_operation_id == owner.start_operation_id
+                and stream.endpoint_fingerprint == owner.endpoint_fingerprint
+                and stream.endpoint_generation == owner.endpoint_generation
+                and stream.daemon_instance_uuid == owner.daemon_instance_uuid
+            ))
+        )
+
+    def _credential_completion_current(self, context, effect, event) -> bool:
+        if not isinstance(event.result, Ok) or effect.credential_owner is None:
+            return False
+        completion = event.result.value
+        owner = effect.credential_owner
+        settlement = next((
+            item for item in context.credential_settlements.values()
+            if (effect.name == "credential_submit" and item.submission_id == event.operation_id
+                and item.phase == "awaiting_reply")
+            or (effect.name == "credential_status" and item.read_id == event.operation_id
+                and item.phase == "observing")
+        ), None)
+        expected_type = CredentialSubmissionCompletion if effect.name == "credential_submit" else CredentialStatusCompletion
+        if settlement is None or type(completion) is not expected_type:
+            return False
+        operation_id = completion.submission_id if effect.name == "credential_submit" else completion.read_id
+        if operation_id != event.operation_id:
+            return False
+        return all(getattr(completion, item.name) == getattr(owner, item.name) for item in fields(CredentialEffectOwner))
+
     def _effect_current(self, state: SessionSnapshot, effect: _Effect) -> bool:
+        owner = effect.credential_owner
+        if owner is not None:
+            context = self._contexts[state.receiver_id]
+            if effect.name == "credential_prepare":
+                return self._credential_owner_current(state, owner, effect.credential_stop_operation_id)
+            settlement = next((
+                item for item in context.credential_settlements.values()
+                if item.owner.challenge_id == owner.challenge_id
+                and replace(item.owner, marker_generation=item.marker_generation) == owner
+            ), None)
+            if settlement is None or not self._credential_owner_current(state, owner, settlement.stop_operation_id):
+                return False
+            coordinator = self.deps.credential_recovery
+            marker = next((
+                marker for marker in coordinator.markers
+                if marker.target == owner.target.canonical_host
+            ), None) if coordinator is not None else None
+            # Transition effects have already confirmed a durable next generation.
+            generations = (owner.marker_generation, owner.marker_generation + 1) if effect.name in {
+                "credential_transition", "credential_retire",
+            } else (owner.marker_generation,)
+            return (
+                marker is not None and marker.receiver_id == owner.receiver_id
+                and marker.start_operation_id == owner.start_operation_id
+                and marker.marker_generation in generations
+                and marker.original_daemon == effect.context.owner_daemon
+            )
         target = state.target
         current = state.stream
         return (
@@ -795,6 +942,10 @@ class SessionManager:
             return Route.cleanup
         if isinstance(message, (Retry, StartVideoOnly)):
             return Route.reconnect
+        if isinstance(message, (SubmitCredential, DismissCredentialPrompt)):
+            return Route.mirror
+        if isinstance(message, (StopCredentialRecovery, DismissCredentialRecovery, RestartReceiverToRelease)):
+            return Route.recovery
         if isinstance(message, (Pair, Forget, SubmitPairing, RetryRevocation)):
             return Route.trust
         if isinstance(message, (ChooseResolution, ChangeResolution, RecreateAccepted)):

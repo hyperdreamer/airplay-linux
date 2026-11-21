@@ -33,7 +33,8 @@ from airplay_linux.domain.operations import (
     OwnerId,
     StreamHandle,
 )
-from airplay_linux.domain.records import SessionSnapshot
+from airplay_linux.domain.records import NoSpawnRetirement, SessionSnapshot
+from airplay_linux.domain.relay import PendingStartCleanupOwner
 from airplay_linux.domain.resources import (
     AudioState,
     DisplayState,
@@ -97,6 +98,10 @@ class CleanupRuntime:
     trust_pending: bool = False
     queued_start: StartRequest | None = None
     finishing: bool = False
+    pending_start_owner: PendingStartCleanupOwner | None = None
+    handoff_inflight: bool = False
+    handoff_done: bool = False
+    handed_stream: StreamHandle | None = None
 
 
 def runtime_for(ctx: SessionContext) -> CleanupRuntime:
@@ -294,6 +299,44 @@ class OrderedCleanup:
 
         old_operation = state.operation_id
         old_challenge = state.challenge
+        stop_operation_id = ctx.operation().operation_id
+        settlement = next((
+            item for item in ctx.credential_settlements.values()
+            if item.owner.start_operation_id == old_operation
+        ), None)
+        # The old owner remains admissible only for this exact cleanup operation.
+        if settlement is not None:
+            ctx.credential_settlements[settlement.submission_id] = replace(
+                settlement, stop_operation_id=stop_operation_id, report_suppressed=True,
+            )
+        for effect in (*ctx._manager._effects.values(), *ctx._manager._completed_effects.values()):
+            if (
+                effect.receiver_id == state.receiver_id and effect.name == "credential_prepare"
+                and effect.credential_owner is not None
+                and effect.credential_owner.start_operation_id == old_operation
+            ):
+                effect.credential_stop_operation_id = stop_operation_id
+        request = ctx.credential_request if not ctx.credential_request_ended else None
+        run = getattr(ctx, "_credential_runs", {}).get(settlement.submission_id) if settlement is not None else None
+        dispatched = settlement is not None and not (run is not None and isinstance(run.terminal, NoSpawnRetirement))
+        runtime.pending_start_owner = None
+        runtime.handed_stream = None
+        runtime.handoff_inflight = False
+        runtime.handoff_done = False
+        if request is not None and state.stream is None and ctx.outstanding_acquisitions(
+            names=frozenset({"transport_start"}),
+        ):
+            runtime.pending_start_owner = PendingStartCleanupOwner(
+                receiver_id=state.receiver_id, target=request.target,
+                start_operation_id=request.start_operation_id,
+                endpoint_fingerprint=request.target.endpoint_fingerprint,
+                endpoint_generation=request.endpoint_generation,
+                session_generation=request.session_generation, trust_generation=state.trust_generation,
+                owner_lease=request.owner_lease, daemon_instance_uuid=request.daemon_instance_uuid,
+                stop_operation_id=stop_operation_id,
+                credential_submission_id=settlement.submission_id if dispatched else None,
+                marker_generation=settlement.marker_generation if dispatched else None,
+            )
         # A context owns one ephemeral cleanup transaction at a time.  A later
         # Stop after a completed start/stop cycle must not inherit the prior
         # stage completion flags or old display-owner acknowledgements.  Keep
@@ -314,7 +357,7 @@ class OrderedCleanup:
         runtime.removed.clear()
         runtime.display_inflight.clear()
         runtime.finishing = False
-        context = ctx.supersede("stop")
+        context = ctx.supersede("stop", operation_id=stop_operation_id)
         runtime.active = True
         runtime.context = context
         runtime.superseded_operation_id = old_operation
@@ -346,7 +389,22 @@ class OrderedCleanup:
                 context,
             )
 
+        if runtime.pending_start_owner is not None:
+            self._launch_pending_handoff(ctx)
         self._launch_prepare(ctx)
+
+    def _launch_pending_handoff(self, ctx: SessionContext) -> None:
+        runtime = runtime_for(ctx)
+        if runtime.handoff_inflight or runtime.handoff_done or runtime.context is None:
+            return
+        owner = runtime.pending_start_owner
+        if owner is None:
+            return
+        runtime.handoff_inflight = True
+        ctx.launch(
+            Route.cleanup, "credential_handoff", runtime.context,
+            lambda: self.deps.transport.stop_pending_start(owner, runtime.context),
+        )
 
     def _launch_prepare(self, ctx: SessionContext) -> None:
         runtime = runtime_for(ctx)
@@ -398,6 +456,21 @@ class OrderedCleanup:
             return
         if runtime.context is None:
             return
+        if runtime.pending_start_owner is not None and not runtime.handoff_done:
+            if not runtime.handoff_inflight:
+                self._launch_pending_handoff(ctx)
+            return
+        preparing = any(
+            effect.receiver_id == ctx.state.receiver_id and effect.name == "credential_prepare"
+            and effect.credential_stop_operation_id == runtime.context.operation_id
+            for effect in (*ctx._manager._effects.values(), *ctx._manager._completed_effects.values())
+        )
+        if preparing or any(
+            settlement.stop_operation_id == runtime.context.operation_id
+            and (settlement.phase != "cleanup" or getattr(ctx, "_credential_runs", {})[settlement.submission_id].transition_pending)
+            for settlement in ctx.credential_settlements.values()
+        ):
+            return
         if not runtime.prepared:
             if not runtime.prepare_inflight:
                 self._launch_prepare(ctx)
@@ -428,7 +501,9 @@ class OrderedCleanup:
         context = runtime.context
         if context is None:
             return
-        stream = ctx.state.stream
+        stream = ctx.state.stream or runtime.handed_stream
+        if runtime.pending_start_owner is not None and ctx.outstanding_acquisitions(names=frozenset({"transport_start"})):
+            return
         if stream is None:
             late_streams = tuple(
                 resource for resource in runtime.late_resources
@@ -584,6 +659,25 @@ class OrderedCleanup:
                 return False
 
         runtime = runtime_for(ctx)
+        if kind == "credential_handoff":
+            runtime.handoff_inflight = False
+            stream = message.result.value if isinstance(message.result, Ok) else None
+            owner = runtime.pending_start_owner
+            if not isinstance(stream, StreamHandle) or owner is None or not (
+                stream.receiver_id == owner.receiver_id
+                and stream.start_operation_id == owner.start_operation_id
+                and stream.lease_id == owner.owner_lease
+                and stream.endpoint_generation == owner.endpoint_generation
+                and stream.endpoint_fingerprint == owner.endpoint_fingerprint
+                and stream.daemon_instance_uuid == owner.daemon_instance_uuid
+            ):
+                ctx.apply(cleanup_pending=True, intent_stage=IntentStage.cleanup,
+                          last_error=_result_error(message.result))
+                return True
+            runtime.handoff_done = True
+            runtime.handed_stream = stream
+            self._enqueue_recheck(ctx)
+            return True
         if kind == "recheck":
             self._continue(ctx)
             self._finish_if_possible(ctx)
@@ -632,6 +726,7 @@ class OrderedCleanup:
                 )
                 return True
             runtime.transport_done = False
+            runtime.handed_stream = None
             stream = runtime.stopped_stream
             if stream is None or ctx.state.stream == stream:
                 ctx.apply(
@@ -816,6 +911,9 @@ class OrderedCleanup:
                 or ctx.outstanding_acquisitions()
             ):
                 return
+        credential_settled = getattr(ctx, "_credential_cleanup_settled", None)
+        if credential_settled is not None and not credential_settled(ctx):
+            return
         runtime.finishing = True
         ctx.apply(
             cleanup_pending=False,

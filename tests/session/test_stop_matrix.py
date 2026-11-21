@@ -5,6 +5,8 @@ from uuid import UUID
 
 import pytest
 
+from virtual_scenarios import settle as settle_resources
+
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     ConfirmSwitch,
@@ -246,3 +248,56 @@ async def test_repeated_stop_uses_a_fresh_ordered_cleanup_transaction() -> None:
     assert state.phase.value == "Available"
     assert rig.transport.journal.names().count("transport.stop_stream") == 2
     assert rig.capture.journal.names().count("capture.release") == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatched", [False, True], ids=["pre-submit", "submitted"])
+async def test_pending_credential_stop_waits_for_handoff_reply_status_and_disconnect(tmp_path, dispatched):
+    from test_lifecycle_regressions import (
+        credential_rig, credential_status, handoff_pending, submit_credential,
+    )
+    from airplay_linux.domain.relay import Submitted
+    h = await credential_rig(tmp_path)
+    reply, status, disconnect, handoff = Deferred(), Deferred(), Deferred(), Deferred()
+    owners = []
+
+    async def transfer(owner, stop_context):
+        owners.append(owner)
+        await handoff.wait()
+        return await handoff_pending(h, owner, stop_context)
+
+    h.rig.transport.stop_pending_start = transfer
+    h.rig.transport.queue_result("read_credential_status", status)
+    h.rig.transport.queue_result("stop_stream", disconnect)
+    if dispatched:
+        await submit_credential(h, reply)
+    await h.rig.manager.dispatch(Stop(receiver_id=h.destination.receiver_id))
+    await h.rig.manager.dispatch(Stop(receiver_id=h.destination.receiver_id))
+    await settle_resources(h.rig)
+    assert len(owners) == 1
+    assert (owners[0].credential_submission_id is not None) is dispatched
+    assert (owners[0].marker_generation is not None) is dispatched
+    assert h.rig.manager.snapshot(h.destination.receiver_id).cleanup_pending
+    assert not h.rig.transport.journal.calls("transport.stop_stream")
+    handoff.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    if dispatched:
+        assert not h.rig.transport.journal.calls("transport.stop_stream")
+        reply.resolve(Ok(value=Submitted(reply_at=0.0, accepted=True, post_dispatch_error=None)))
+        await settle_resources(h.rig)
+        assert len(h.rig.transport.journal.calls("transport.read_credential_status")) == 1
+        assert not h.rig.transport.journal.calls("transport.stop_stream")
+        status.resolve(credential_status(h))
+        await settle_resources(h.rig)
+        assert h.coordinator.markers[0].state == "watching"
+    assert len(h.rig.transport.journal.calls("transport.stop_stream")) == 1
+    assert h.rig.manager.snapshot(h.destination.receiver_id).cleanup_pending
+    assert h.rig.manager.snapshot(h.destination.receiver_id).stream is None
+    disconnect.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    assert not h.rig.manager.snapshot(h.destination.receiver_id).cleanup_pending
+    if dispatched:
+        assert h.coordinator.markers[0].retirement.reply.stop_cleanup_settled
+    else:
+        assert h.coordinator.markers == ()
+        assert not h.rig.transport.journal.calls("transport.submit_credential")

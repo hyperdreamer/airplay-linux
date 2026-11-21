@@ -583,3 +583,30 @@ async def test_shutdown_closes_subscriptions_and_rejects_new_commands() -> None:
     ))
     assert not receipt.accepted
     subscription.close()
+
+
+@pytest.mark.parametrize(("name", "route"), [
+    ("SubmitCredential", Route.mirror), ("DismissCredentialPrompt", Route.mirror),
+    ("StopCredentialRecovery", Route.recovery), ("DismissCredentialRecovery", Route.recovery),
+    ("RestartReceiverToRelease", Route.recovery),
+])
+async def test_credential_commands_reach_their_closed_actor_route(name, route):
+    from airplay_linux.domain import messages
+    from airplay_linux.domain.operations import ChallengeId, SensitiveText
+    seen = []
+    rig = SessionRig(lambda _deps: {route: lambda _ctx, command: seen.append(command) or True})
+    fields = {"receiver_id": rig.receiver_id}
+    if name in ("SubmitCredential", "DismissCredentialPrompt"):
+        fields["challenge_id"] = ChallengeId(UUID(int=999))
+    else:
+        fields["marker_generation"] = 1
+    if name == "SubmitCredential":
+        fields["value"] = SensitiveText("route-canary-" + name)
+    command = getattr(messages, name)(**fields)
+    assert rig.manager._route(command) is route
+    receipt = await rig.manager.dispatch(command)
+    assert receipt.accepted
+    if route is Route.recovery:
+        assert seen == [command]
+    else:
+        assert seen == [], "a route alone must not admit a missing prompt"

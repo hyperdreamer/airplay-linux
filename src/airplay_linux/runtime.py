@@ -595,6 +595,9 @@ async def _compose_production(
     )
 
     fences = TrustFenceRegistry()
+    credential_recovery = CredentialRecoveryCoordinator(
+        JsonCredentialRecoveryMarkerStore(files), registry, fences=fences,
+    )
     credentials = BackendKeyringStore(UnsupportedControl(), features)
     transport_ref: dict[str, DoubleTakeTransport] = {}
 
@@ -657,6 +660,7 @@ async def _compose_production(
         scheduler,
         ids,
         source_verifier=source_verifier,
+        recovery_guard=credential_recovery.start_dispatch_fence,
     )
     # DoubleTakeTransport owns the only control that is bound to a concrete
     # receiver/daemon lease. Rebind the real store to that control immediately;
@@ -727,9 +731,7 @@ async def _compose_production(
         activity=activity,
         capabilities=capabilities,
         restart_daemon=registry.restart,
-        credential_recovery=CredentialRecoveryCoordinator(
-            JsonCredentialRecoveryMarkerStore(files), registry, fences=fences,
-        ),
+        credential_recovery=credential_recovery,
     )
 
     manager = compose_manager(deps)

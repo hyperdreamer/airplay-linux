@@ -6,17 +6,20 @@ from uuid import UUID
 
 import pytest
 
+from virtual_scenarios import settle as settle_resources
+
+from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     DisplayEvent, EffectEvent, EmptyPayload, Retry, RetryAudio, SetMuted, Start,
     Stop, SubmitPairing, TimerEvent, TransportEvent, TransportEventKind,
 )
 from airplay_linux.domain.operations import (
-    ChallengeId, ChallengeView, InstanceId, OpaqueCredentialRef, OperationId,
+    ChallengeId, ChallengeView, InstanceId, LeaseId, OpaqueCredentialRef, OperationId,
     SensitiveText, StreamHandle,
 )
 from airplay_linux.domain.records import SessionSnapshot
 from airplay_linux.domain.resources import (
-    DisplayState, IntentStage, Mode, Ok, StartRequest, TransportState,
+    DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, StartRequest, TransportState,
 )
 from airplay_linux.session.engine import Route
 from airplay_linux.session.testing import SessionRig
@@ -689,3 +692,144 @@ async def test_session_rig_defaults_to_trusted_available_audio_and_unknown_modes
     modes = await rig.transport.query_modes(target(), context())
     assert isinstance(modes, Ok)
     assert modes.value is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", [
+    "challenge_id", "receiver_id", "target", "start_operation_id", "endpoint_fingerprint",
+    "endpoint_generation", "session_generation", "trust_generation", "owner_lease",
+    "daemon_instance_uuid", "relay_generation", "marker_generation", "submission_id",
+])
+async def test_credential_submission_completion_requires_every_captured_owner_field(tmp_path, field):
+    from test_lifecycle_regressions import credential_rig, submit_credential
+    from airplay_linux.domain.relay import Submitted
+    from airplay_linux.domain.operations import LeaseId
+    h = await credential_rig(tmp_path, installed=True)
+    reply = Deferred()
+    await submit_credential(h, reply)
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    manager._draining.add(receiver_id)
+    reply.resolve(Ok(value=Submitted(reply_at=0.0, accepted=True, post_dispatch_error=None)))
+    for _ in range(6):
+        await asyncio.sleep(0)
+    event = manager._queues[receiver_id].pop()
+    completion = event.result.value
+    replacements = {
+        "challenge_id": ChallengeId(UUID(int=999)), "receiver_id": target("other").receiver_id,
+        "target": target(endpoint_generation=2), "start_operation_id": OperationId(UUID(int=999)),
+        "endpoint_fingerprint": "obsolete", "endpoint_generation": 2, "session_generation": 99,
+        "trust_generation": 99, "owner_lease": LeaseId(UUID(int=999)),
+        "daemon_instance_uuid": InstanceId(UUID(int=999)), "relay_generation": 99,
+        "marker_generation": 99, "submission_id": OperationId(UUID(int=999)),
+    }
+    manager._queues[receiver_id].append(replace(
+        event, result=Ok(value=replace(completion, **{field: replacements[field]})),
+    ))
+    manager._draining.remove(receiver_id)
+    await settle_resources(h.rig)
+    assert not h.rig.transport.journal.calls("transport.read_credential_status")
+    assert h.coordinator.markers[0].state == "watching"
+    assert manager.snapshot(receiver_id).credential_prompt.report is None
+
+
+@pytest.mark.asyncio
+async def test_stale_credential_challenge_is_rejected_before_marker_and_dispatch(tmp_path):
+    from test_lifecycle_regressions import credential_rig
+    from airplay_linux.domain.messages import SubmitCredential
+    h = await credential_rig(tmp_path)
+    await h.rig.manager.dispatch(SubmitCredential(
+        receiver_id=h.destination.receiver_id, challenge_id=ChallengeId(UUID(int=999)),
+        value=SensitiveText("stale-challenge-canary"),
+    ))
+    await settle_resources(h.rig)
+    assert h.coordinator.markers == ()
+    assert not h.rig.transport.journal.calls("transport.submit_credential")
+    h.pending.resolve(Ok(value=h.handle))
+    await settle_resources(h.rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["operation_id", "session_generation", "trust_generation", "target", "transport_lease_id"])
+async def test_replaced_start_refuses_credential_before_marker_creation(tmp_path, changed):
+    from test_lifecycle_regressions import credential_rig
+    from airplay_linux.domain.messages import SubmitCredential
+    h = await credential_rig(tmp_path)
+    prompt = h.rig.manager.snapshot(h.destination.receiver_id).credential_prompt
+    assert prompt is not None
+    def replace_owner(ctx, _message):
+        values = {
+            "operation_id": OperationId(UUID(int=996)), "session_generation": 99,
+            "trust_generation": 99, "target": target(endpoint_generation=2),
+            "transport_lease_id": LeaseId(UUID(int=996)),
+        }
+        ctx.apply(**{changed: values[changed]})
+        return True
+    h.rig.manager.handlers[Route.audio] = replace_owner
+    await h.rig.manager.dispatch(RetryAudio(receiver_id=h.destination.receiver_id))
+    await h.rig.manager.dispatch(SubmitCredential(
+        receiver_id=h.destination.receiver_id, challenge_id=prompt.challenge.challenge_id,
+        value=SensitiveText("replaced-start-canary-" + changed),
+    ))
+    await settle_resources(h.rig)
+    assert h.coordinator.markers == ()
+    assert not h.rig.transport.journal.calls("transport.submit_credential")
+    h.pending.resolve(Err(error=diagnostic(ErrorCode.stale_event)))
+    await settle_resources(h.rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["operation", "session", "trust", "lease", "endpoint", "relay"])
+async def test_pending_credential_request_rejects_replaced_start_evidence(tmp_path, changed):
+    from test_lifecycle_regressions import credential_rig
+    from airplay_linux.session.fencing import accept_pending_credential_request
+    h = await credential_rig(tmp_path)
+    state, event = h.rig.manager.snapshot(h.destination.receiver_id), h.event
+    assert accept_pending_credential_request(state, event, event.context)
+    states = {
+        "operation": replace(state, operation_id=OperationId(UUID(int=999))),
+        "session": replace(state, session_generation=99),
+        "trust": replace(state, trust_generation=99),
+        "lease": replace(state, transport_lease_id=LeaseId(UUID(int=999))),
+        "endpoint": replace(state, target=target(endpoint_generation=2)),
+        "relay": state,
+    }
+    if changed == "relay":
+        event = replace(event, payload=replace(event.payload, request=replace(event.payload.request, generation=0)))
+    assert not accept_pending_credential_request(states[changed], event, event.context)
+    assert state.stream is None
+    h.pending.resolve(Ok(value=h.handle))
+    await settle_resources(h.rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stopped", [False, True])
+async def test_credential_status_completion_rejects_stale_owner_and_wraps_error_after_stop(tmp_path, stopped):
+    from test_lifecycle_regressions import credential_rig, submit_credential, handoff_pending
+    from airplay_linux.domain.relay import Submitted
+    h = await credential_rig(tmp_path)
+    h.rig.transport.stop_pending_start = lambda owner, operation: handoff_pending(h, owner, operation)
+    status = Deferred()
+    h.rig.transport.queue_result("read_credential_status", status)
+    await submit_credential(h, Ok(value=Submitted(reply_at=0.0, accepted=True, post_dispatch_error=None)))
+    if stopped:
+        await h.rig.manager.dispatch(Stop(receiver_id=h.destination.receiver_id))
+        await settle_resources(h.rig)
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    manager._draining.add(receiver_id)
+    status.resolve(Err(error=diagnostic(ErrorCode.transport_failed)))
+    for _ in range(12):
+        await asyncio.sleep(0)
+    event = manager._queues[receiver_id].pop()
+    assert isinstance(event.result, Ok)
+    completion = event.result.value
+    assert isinstance(completion.result, Err)
+    manager._queues[receiver_id].append(replace(event, result=Ok(value=replace(completion, trust_generation=99))))
+    manager._draining.remove(receiver_id)
+    await settle_resources(h.rig)
+    assert h.coordinator.markers[0].state == "watching"
+    assert not h.rig.transport.journal.calls("transport.stop_stream")
+    if not stopped:
+        h.pending.resolve(Ok(value=h.handle))
+        await settle_resources(h.rig)

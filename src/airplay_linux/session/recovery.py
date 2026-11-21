@@ -11,6 +11,7 @@ import inspect
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from airplay_linux.backend.control import DispatchFence
 
@@ -22,7 +23,10 @@ from airplay_linux.domain.messages import (
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.operations import OpaqueCredentialRef, OperationId
 from airplay_linux.domain.ports import CredentialRecoveryMarkerStore
-from airplay_linux.domain.records import CredentialRecoveryMarker, RecoveryItem, SessionSnapshot
+from airplay_linux.domain.records import (
+    CredentialRecoveryMarker, DaemonRecord, LaunchReceipt, NoSpawnRetirement,
+    OriginalDaemonIdentity, RecoveryItem, SessionSnapshot, TerminalReplyRetirement,
+)
 from airplay_linux.domain.resources import (
     Diagnostic, DisplayState, Err, ErrorCode, IntentStage, Mode, Ok, RecoveryAction, Result, TrustState,
 )
@@ -55,6 +59,8 @@ class CredentialRecoveryCoordinator:
     ) -> None:
         self._store, self._registry, self._fences = store, registry, fences
         self._markers: dict[str, CredentialRecoveryMarker] = {}
+        self._lock = asyncio.Lock()
+        self._factory_reservations: dict[str, OperationId] = {}
         self._reservations: dict[str, CredentialRecoveryMarker] = {}
         self._inflight: set[str] = set()
         self._failed_targets: set[str] = set()
@@ -134,6 +140,9 @@ class CredentialRecoveryCoordinator:
         if self._startup_pending:
             return _recovery_refusal(ErrorCode.ownership_mismatch)
         canonical = target.canonical_host if isinstance(target, ReceiverTarget) else target
+        reserved_start = self._factory_reservations.get(canonical)
+        if reserved_start is not None and reserved_start != start_operation_id:
+            return _recovery_refusal(ErrorCode.ownership_mismatch)
         reserved = self._reservations.get(canonical)
         marker = reserved if reserved is not None else self._markers.get(canonical)
         if marker is not None and marker.state != "retired" and (
@@ -162,7 +171,79 @@ class CredentialRecoveryCoordinator:
 
         return check
 
+    async def begin_submission_for(
+        self, receiver_id: ReceiverId, target: ReceiverTarget, start_operation_id: OperationId,
+    ) -> Result[tuple[CredentialRecoveryMarker, OriginalDaemonIdentity]]:
+        if type(target) is not ReceiverTarget or target.receiver_id != receiver_id:
+            return _recovery_refusal(ErrorCode.ownership_mismatch)
+        canonical = target.canonical_host
+        if canonical in self._factory_reservations:
+            return _recovery_refusal(ErrorCode.ownership_mismatch)
+        allowed = self.require_start_allowed(target, start_operation_id)
+        current = self._markers.get(canonical)
+        if isinstance(allowed, Err):
+            return allowed
+        if current is not None and current.state != "retired":
+            return _recovery_refusal(ErrorCode.ownership_mismatch)
+        fence = self.start_dispatch_fence(target, start_operation_id)
+        self._factory_reservations[canonical] = start_operation_id
+        try:
+            async with self._lock:
+                # The registry's durable receipt supplies launch and endpoint
+                # identity. Authentication then repeats its full durable join.
+                record = getattr(self._registry, "_record", None)
+                if type(record) is not DaemonRecord or not getattr(self._registry, "_ready", False):
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+                receipt_result = await self._registry._receipt_for(record)
+                if not isinstance(receipt_result, Ok) or type(receipt_result.value) is not LaunchReceipt:
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+                receipt = receipt_result.value
+                if (
+                    receipt.state != "ready" or record.lifecycle != "running"
+                    or record.daemon is None or receipt.daemon != record.daemon
+                    or receipt.daemon_instance_uuid != record.instance_uuid
+                    or receipt.runtime_directory != record.runtime_directory
+                    or str(Path(receipt.runtime_directory) / receipt.socket_name) != record.socket_path
+                ):
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+                identity = OriginalDaemonIdentity(
+                    launch_uuid=receipt.launch_uuid, instance_uuid=record.instance_uuid,
+                    endpoint_generation=receipt.endpoint_generation,
+                    daemon_process=record.daemon, runtime_directory=record.runtime_directory,
+                    socket_path=record.socket_path,
+                )
+                authenticated = await self._registry.authenticate_exact_identity(identity)
+                if (
+                    not isinstance(authenticated, Ok) or authenticated.value != record
+                    or self._registry._record != record or not self._registry._ready
+                ):
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+                allowed = fence()
+                if isinstance(allowed, Err):
+                    return allowed
+                marker = CredentialRecoveryMarker(
+                    schema_version=1, target=canonical, receiver_id=receiver_id,
+                    start_operation_id=start_operation_id, original_daemon=identity,
+                    marker_generation=1 if current is None else current.marker_generation + 1,
+                    state="watching", automatic_status_checks=True,
+                    release_attempt=None, retirement=None,
+                )
+                created = await self._begin_submission_locked(marker)
+                if isinstance(created, Err):
+                    return created
+                return Ok(value=(created.value, identity))
+        except Exception:
+            return _recovery_refusal()
+        finally:
+            self._factory_reservations.pop(canonical, None)
+            if canonical in self._failed_targets:
+                self._reservations.pop(canonical, None)
+
     async def begin_submission(self, marker: CredentialRecoveryMarker) -> Result[CredentialRecoveryMarker]:
+        async with self._lock:
+            return await self._begin_submission_locked(marker)
+
+    async def _begin_submission_locked(self, marker: CredentialRecoveryMarker) -> Result[CredentialRecoveryMarker]:
         try:
             encode_credential_recovery_marker(marker)
         except Exception:
@@ -205,6 +286,54 @@ class CredentialRecoveryCoordinator:
             return _recovery_refusal()
         finally:
             self._inflight.discard(marker.target)
+
+    async def _transition_for(
+        self, identity, expected_generation: int, method, *evidence,
+    ) -> Result[CredentialRecoveryMarker]:
+        async with self._lock:
+            if type(identity) is not CredentialRecoveryMarker or type(expected_generation) is not int:
+                return _recovery_refusal(ErrorCode.ownership_mismatch)
+            current = self._markers.get(identity.target)
+            if (
+                current is None or _marker_identity(current) != _marker_identity(identity)
+                or current.marker_generation != expected_generation
+                or identity.target in self._reservations
+                or identity.target in self._factory_reservations
+            ):
+                return _recovery_refusal(ErrorCode.ownership_mismatch)
+            try:
+                result = await method(identity, expected_generation, *evidence)
+                if not isinstance(result, Ok):
+                    return _recovery_refusal(
+                        result.error.code if isinstance(result, Err) else ErrorCode.persistence_failed,
+                    )
+                updated = result.value
+                encode_credential_recovery_marker(updated)
+                if (
+                    _marker_identity(updated) != _marker_identity(current)
+                    or updated.marker_generation != expected_generation + 1
+                ):
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+            except Exception:
+                return _recovery_refusal()
+            self._markers[identity.target] = updated
+            return Ok(value=updated)
+
+    async def mark_release_pending_for(self, identity, expected_generation: int) -> Result[CredentialRecoveryMarker]:
+        return await self._transition_for(identity, expected_generation, self._store.mark_release_pending)
+
+    async def dismiss_for(self, identity, expected_generation: int) -> Result[CredentialRecoveryMarker]:
+        return await self._transition_for(identity, expected_generation, self._store.dismiss)
+
+    async def retire_no_spawn_for(
+        self, identity, expected_generation: int, evidence: NoSpawnRetirement,
+    ) -> Result[CredentialRecoveryMarker]:
+        return await self._transition_for(identity, expected_generation, self._store.retire_no_spawn, evidence)
+
+    async def retire_after_reply_for(
+        self, identity, expected_generation: int, evidence: TerminalReplyRetirement,
+    ) -> Result[CredentialRecoveryMarker]:
+        return await self._transition_for(identity, expected_generation, self._store.retire_after_reply, evidence)
 
     def credential_dispatch_fence(
         self, marker_identity: CredentialRecoveryMarker, marker_generation: int,
