@@ -901,7 +901,6 @@ class MainWindow(QMainWindow):
         receiver_id = self._model.receiver_id(current)
         if receiver_id is None or receiver_id == self._selected:
             return
-        self._dismiss_tracked_prompt()
         self._selected = receiver_id
         self.receiver_selected.emit(str(receiver_id))
 

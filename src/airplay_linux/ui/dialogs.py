@@ -214,6 +214,8 @@ class PairingDialog(_DecisionDialog):
     """
 
     retry_requested = Signal()
+    relay_submitted = Signal()
+    relay_cancelled = Signal()
 
     def __init__(
         self,
@@ -281,7 +283,12 @@ class PairingDialog(_DecisionDialog):
     def take_input(self) -> SensitiveText | None:
         """Hand the secret to the caller exactly once, then forget it."""
         value, self._input = self._input, None
-        if value is None and self._field.isEnabled() and not self._field.isReadOnly():
+        if (
+            self._relay
+            and value is None
+            and self._field.isEnabled()
+            and not self._field.isReadOnly()
+        ):
             text = self._field.text()
             error = self._validate_raw(text)
             if error is None:
@@ -302,11 +309,20 @@ class PairingDialog(_DecisionDialog):
     def confirm_input(self) -> None:
         """Accept the typed secret if there is one; blank input is not submitted."""
         text = self._field.text()
-        error = self._validate_raw(text)
-        if error is not None:
-            self._show_validation(error)
+        if self._relay:
+            error = self._validate_raw(text)
+            if error is not None:
+                self._show_validation(error)
+                return
+            self._action = Action.submit_credential
+            self._input = SensitiveText(text)
+            self._clear_field()
+            self.set_submitting()
+            self.relay_submitted.emit()
             return
-        self._action = Action.submit_credential if self._relay else Action.submit_pairing
+        if not text.strip():
+            return
+        self._action = Action.submit_pairing
         self._input = SensitiveText(text)
         self._clear_field()
         self.accept()
@@ -398,6 +414,8 @@ class PairingDialog(_DecisionDialog):
     def _cancel(self) -> None:
         """Preserve an explicit Cancel for the presenter after closing."""
         self._action = Action.cancel
+        if self._relay:
+            self.relay_cancelled.emit()
         self.reject()
 
     def _retry(self) -> None:
@@ -434,7 +452,11 @@ class PairingDialog(_DecisionDialog):
 
     def _sync_submit(self, text: str) -> None:
         if self._submit is not None:
-            self._submit.setEnabled(bool(text.strip()) and self._field.isEnabled() and not self._field.isReadOnly())
+            self._submit.setEnabled(
+                bool(text.strip())
+                and self._field.isEnabled()
+                and not self._field.isReadOnly()
+            )
 
     def set_submitting(self) -> None:
         self._field.setEnabled(False)

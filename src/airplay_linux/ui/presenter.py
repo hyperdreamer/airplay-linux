@@ -387,6 +387,7 @@ class Presenter:
         # -- prompt tracking (no secret is ever stored) --------------------
         self._pairing_pending: dict[ReceiverId, ChallengeView] = {}
         self._pairing_seen: dict[ReceiverId, ChallengeView] = {}
+        self._relay_prompt_pending: dict[ReceiverId, ChallengeView] = {}
         self._relay_prompt_key: tuple[ReceiverId, Any, str] | None = None
         self._relay_prompt_seen: dict[ReceiverId, tuple[ReceiverId, Any, str]] = {}
         self._switch_pending: set[ReceiverId] = set()
@@ -667,13 +668,18 @@ class Presenter:
             return None, False
         blocked = bool(getattr(coordinator, "_store_blocked", False))
         snapshot = self._snapshot(receiver_id)
-        target = snapshot.target if snapshot.online else None
+        target = snapshot.target
+        if target is None and not snapshot.online:
+            saved = self._saved.get(receiver_id)
+            target = saved.last_endpoint if saved is not None else None
         if target is None:
             return None, blocked
         marker = next(
             (
                 item for item in getattr(coordinator, "markers", ())
-                if item.target == target.canonical_host and item.state != "retired"
+                if item.receiver_id == receiver_id
+                and item.target == target.canonical_host
+                and item.state != "retired"
             ),
             None,
         )
@@ -1010,9 +1016,22 @@ class Presenter:
         self._saved_publication += 1
         self._start_saved_load()
         relay_prompt = snapshot.credential_prompt
-        if relay_prompt is None:
+        pane_prompt = self._pane(snapshot.receiver_id).credential_prompt
+        previous_relay_prompt = self._relay_prompt_pending.get(snapshot.receiver_id)
+        if previous_relay_prompt is not None and previous_relay_prompt != pane_prompt:
+            self._relay_prompt_pending.pop(snapshot.receiver_id, None)
             self._relay_prompt_seen.pop(snapshot.receiver_id, None)
-        else:
+            old_key = (
+                snapshot.receiver_id,
+                previous_relay_prompt.operation_id,
+                previous_relay_prompt.credential_kind,
+            )
+            if self._relay_prompt_key == old_key:
+                self._relay_prompt_key = None
+            self._invalidate_pairing(previous_relay_prompt)
+        if pane_prompt is None:
+            self._relay_prompt_seen.pop(snapshot.receiver_id, None)
+        elif relay_prompt is not None:
             current_key = (
                 snapshot.receiver_id,
                 relay_prompt.request.start_operation_id,
@@ -1020,8 +1039,22 @@ class Presenter:
             )
             if self._relay_prompt_seen.get(snapshot.receiver_id) != current_key:
                 self._relay_prompt_seen.pop(snapshot.receiver_id, None)
-        if relay_prompt is not None and self._pane(snapshot.receiver_id).credential_prompt == relay_prompt.challenge:
-            self._open_relay_prompt(snapshot.receiver_id, relay_prompt)
+            if relay_prompt.report is not None:
+                current_key = (
+                    snapshot.receiver_id,
+                    relay_prompt.request.start_operation_id,
+                    relay_prompt.challenge.credential_kind,
+                )
+                if self._relay_prompt_key == current_key:
+                    self._relay_prompt_key = None
+                self._relay_prompt_pending.pop(snapshot.receiver_id, None)
+                self._invalidate_pairing(pane_prompt)
+            else:
+                self._set_relay_prompt_state(
+                    pane_prompt, relay_prompt.state,
+                )
+                self._relay_prompt_pending[snapshot.receiver_id] = pane_prompt
+                self._open_relay_prompt(snapshot.receiver_id, relay_prompt)
         pairing = self._pairing_pending.get(snapshot.receiver_id)
         if pairing is not None and self._pane(snapshot.receiver_id).challenge != pairing:
             # Snapshot publication is authoritative even when this receiver is
@@ -1345,8 +1378,40 @@ class Presenter:
         """Route each live relay prompt to its producing receiver."""
         for receiver_id in tuple(self._snapshots):
             prompt = self._snapshot(receiver_id).credential_prompt
-            if prompt is not None and self._pane(receiver_id).credential_prompt == prompt.challenge:
-                self._open_relay_prompt(receiver_id, prompt)
+            pane_prompt = self._pane(receiver_id).credential_prompt
+            if prompt is None or pane_prompt is None or prompt.report is not None:
+                continue
+            self._relay_prompt_pending[receiver_id] = pane_prompt
+            self._set_relay_prompt_state(pane_prompt, prompt.state)
+            self._open_relay_prompt(receiver_id, prompt)
+
+    def _set_relay_prompt_state(self, challenge: ChallengeView, state: str) -> None:
+        setter = getattr(self._dialogs, "set_relay_state", None)
+        if callable(setter):
+            try:
+                setter(challenge, state)
+            except Exception:  # noqa: BLE001 - a stale prompt is already safe
+                pass
+
+    def _set_relay_cancel_handler(
+        self, receiver_id: ReceiverId, challenge: ChallengeView,
+    ) -> None:
+        setter = getattr(self._dialogs, "set_relay_cancel_handler", None)
+        if not callable(setter):
+            return
+
+        def dismiss() -> None:
+            current = self._snapshot(receiver_id).credential_prompt
+            if current is None or current.challenge != challenge:
+                return
+            self._schedule(self._dispatch(DismissCredentialPrompt(
+                receiver_id=receiver_id, challenge_id=challenge.challenge_id,
+            )), receiver_id=receiver_id)
+
+        try:
+            setter(challenge, dismiss)
+        except Exception:  # noqa: BLE001 - a stale prompt is already safe
+            pass
 
     def _open_relay_prompt(self, receiver_id: ReceiverId, prompt: CredentialPromptState) -> None:
         key = (receiver_id, prompt.request.start_operation_id, prompt.challenge.credential_kind)
@@ -1354,9 +1419,12 @@ class Presenter:
             return
         self._relay_prompt_key = key
         self._relay_prompt_seen[receiver_id] = key
+        self._relay_prompt_pending[receiver_id] = prompt.challenge
         self._schedule(self._relay_prompt(receiver_id, prompt), receiver_id=receiver_id)
 
     async def _relay_prompt(self, receiver_id: ReceiverId, prompt: CredentialPromptState) -> None:
+        if self._pane(receiver_id).credential_prompt != prompt.challenge:
+            return
         try:
             answer = await self._dialogs.pairing(
                 prompt.challenge,
@@ -1376,6 +1444,7 @@ class Presenter:
         if current.credential_prompt != prompt.challenge:
             return
         if answer.action is Action.submit_credential and isinstance(answer.value, SensitiveText):
+            self._set_relay_cancel_handler(receiver_id, prompt.challenge)
             await self._dispatch(SubmitCredential(
                 receiver_id=receiver_id,
                 challenge_id=prompt.challenge.challenge_id,
@@ -1860,6 +1929,7 @@ class QtDialogFactory:
     def __init__(self, window: QWidget | None = None) -> None:
         self._window = window
         self._pairing_prompts: dict[ChallengeView, PairingDialog] = {}
+        self._relay_cancel_handlers: dict[ChallengeView, Callable[[], None]] = {}
 
     async def pairing(
         self,
@@ -1879,15 +1949,78 @@ class QtDialogFactory:
             dialog_kwargs["relay"] = True
         dialog = self._pairing_dialog(challenge, **dialog_kwargs)
         self._pairing_prompts[challenge] = dialog
-        try:
-            return await _resolve_dialog(dialog, dialog.take_result, None)
-        finally:
+        if not relay:
+            try:
+                return await _resolve_dialog(dialog, dialog.take_result, None)
+            finally:
+                if self._pairing_prompts.get(challenge) is dialog:
+                    del self._pairing_prompts[challenge]
+
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[PairingAnswer | None] = loop.create_future()
+
+        def finish(*_args: object) -> None:
+            if future.done():
+                return
+            try:
+                answer = dialog.take_result()
+            except Exception:  # noqa: BLE001 - a destroyed prompt answers nothing
+                answer = None
+            future.set_result(answer)
+
+        def retire(*_args: object) -> None:
+            self._relay_cancel_handlers.pop(challenge, None)
             if self._pairing_prompts.get(challenge) is dialog:
                 del self._pairing_prompts[challenge]
 
+        dialog.finished.connect(finish)
+        dialog.destroyed.connect(finish)
+        dialog.finished.connect(retire)
+        dialog.destroyed.connect(retire)
+        dialog.relay_submitted.connect(finish)
+        answer: PairingAnswer | None = None
+        try:
+            dialog.open()
+            answer = await future
+            return answer
+        finally:
+            # A submitted relay keeps its visible, cancelable reporting surface.
+            # Cancellation, invalidation and ordinary dismissal retire it through
+            # the dialog's lifecycle signals and this cleanup path.
+            if not (
+                isinstance(answer, PairingAnswer)
+                and answer.action is Action.submit_credential
+            ):
+                try:
+                    dialog.close()
+                except RuntimeError:  # pragma: no cover - already destroyed
+                    pass
+                retire()
+
+    def set_relay_cancel_handler(
+        self, challenge: ChallengeView, handler: Callable[[], None],
+    ) -> None:
+        if not callable(handler):
+            raise TypeError("relay cancel handler must be callable")
+        dialog = self._pairing_prompts.get(challenge)
+        if dialog is None:
+            return
+        self._relay_cancel_handlers[challenge] = handler
+        dialog.relay_cancelled.connect(handler)
+
+    def set_relay_state(self, challenge: ChallengeView, state: str) -> None:
+        dialog = self._pairing_prompts.get(challenge)
+        if dialog is None:
+            return
+        if state == "submitting":
+            dialog.set_submitting()
+        elif state == "observing":
+            dialog.set_observing()
+
     def invalidate_pairing(self, challenge: ChallengeView) -> None:
         """Close the exact live prompt for an invalidated challenge."""
-        dialog = self._pairing_prompts.get(challenge)
+        dialog = self._pairing_prompts.pop(challenge, None)
+        self._relay_cancel_handlers.pop(challenge, None)
         if dialog is None:
             return
         try:

@@ -2214,6 +2214,7 @@ def test_relay_dialog_offers_only_submit_and_cancel_and_validates_before_wrappin
     qtbot.addWidget(dialogue)
     field = dialogue.findChild(QLineEdit, "secretField")
     submit = dialogue.findChild(QPushButton, "pairingSubmitButton")
+    assert dialogue.findChild(QPushButton, "pairingRetryButton") is None
 
     field.setText("-leading-dash")
     dialogue.confirm_input()

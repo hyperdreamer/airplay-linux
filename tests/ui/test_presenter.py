@@ -23,11 +23,12 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QApplication, QLineEdit, QPushButton, QWidget
 
 from airplay_linux.diagnostics import ActivityLog, diagnostic, safe_activity
@@ -54,6 +55,7 @@ from airplay_linux.domain.messages import (
     Start,
     StartVideoOnly,
     Stop,
+    SubmitCredential,
     SubmitPairing,
 )
 from airplay_linux.domain.operations import (
@@ -2458,6 +2460,107 @@ async def test_relay_prompt_opens_for_its_owner_and_is_not_retargeted_by_selecti
     rig.snapshot("a", operation_id=start_operation, session_generation=1, credential_prompt=prompt)
     await rig.settle()
     assert rig.dialogs.pairing_calls == [prompt.challenge]
+
+
+async def test_relay_submit_after_table_selection_stays_bound_to_owner(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    gate = rig.dialogs.gate("pairing")
+    start_operation = OperationId(UUID(int=888))
+    request = CredentialRequest(
+        receiver_id=RECEIVER_A,
+        target=target("a"),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=889)),
+        daemon_instance_uuid=InstanceId(UUID(int=890)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(
+            challenge(RECEIVER_A, challenge_id=891),
+            endpoint_fingerprint="endpoint-a-v1",
+            operation_id=start_operation,
+            session_generation=1,
+        ),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+    rig.snapshot(
+        "a",
+        operation_id=start_operation,
+        session_generation=1,
+        credential_prompt=prompt,
+    )
+    rig.discover("b")
+    rig.snapshot("b")
+    await rig.settle()
+
+    index = rig.window._model.index_of(RECEIVER_B)
+    rig.window._table.selectionModel().setCurrentIndex(
+        index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    await rig.settle()
+    gate.set_result(
+        PairingAnswer(
+            action=Action.submit_credential,
+            value=SensitiveText("selection-owner-canary"),
+        )
+    )
+    await rig.settle()
+
+    commands = rig.commands_of(SubmitCredential)
+    assert len(commands) == 1
+    assert commands[0].receiver_id == RECEIVER_A
+    assert rig.commands_of(SubmitPairing) == []
+
+
+async def test_recovery_action_matrix_is_state_and_marker_bound(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    marker = SimpleNamespace(
+        receiver_id=RECEIVER_A,
+        target=target("a").canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=1,
+    )
+    coordinator = SimpleNamespace(_store_blocked=False, markers=(marker,))
+    rig.presenter._credential_recovery = coordinator
+    rig.snapshot("a")
+    await rig.settle()
+
+    assert Action.stop_credential_recovery in rig.offered()
+    assert Action.dismiss_credential_recovery in rig.offered()
+    assert Action.restart_receiver_to_release not in rig.offered()
+
+    coordinator.markers = (
+        SimpleNamespace(
+            receiver_id=RECEIVER_A,
+            target=target("a").canonical_host,
+            state="release_pending",
+            automatic_status_checks=False,
+            marker_generation=2,
+        ),
+    )
+    rig.snapshot("a")
+    await rig.settle()
+
+    assert Action.stop_credential_recovery in rig.offered()
+    assert Action.restart_receiver_to_release in rig.offered()
+    assert Action.dismiss_credential_recovery not in rig.offered()
 
 
 async def test_retry_does_not_clear_the_remembered_screen(screen_rig: Any) -> None:

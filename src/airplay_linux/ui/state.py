@@ -31,7 +31,6 @@ from typing import Final
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverView
 from airplay_linux.domain.operations import ChallengeView
-from airplay_linux.domain.relay import CredentialPromptState
 from airplay_linux.domain.records import (
     OwnershipRecord,
     RecoveryItem,
@@ -413,22 +412,25 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
     ownership = _ownership_for(snapshot, inputs)
     orphans = _orphans_for(snapshot, inputs)
     decision = _decide(snapshot, inputs, ownership, orphans)
-    recovery = _matching_recovery(snapshot, inputs.credential_recovery)
-    credential_prompt = _credential_prompt(snapshot, inputs, recovery)
+    recovery = _matching_recovery(snapshot, inputs, inputs.credential_recovery)
+    credential_prompt = _credential_prompt(snapshot, recovery)
     volume_enabled, volume_reason = _volume_control(snapshot, inputs)
     actions = decision.actions
     primary = decision.primary
     notice = decision.notice
     phase_label = _phase_label(snapshot)
     if recovery is not None:
-        actions = recovery.actions
+        actions = set(recovery.actions)
+        if _credential_prompt_matches(snapshot):
+            actions.add(Action.stop)
+        actions = frozenset(actions)
         primary = _recovery_primary(recovery)
         phase_label = recovery.title
         notice = recovery.warning
     elif inputs.recovery_store_blocked:
         actions = actions - {Action.start}
         notice = _NOTICE_RECOVERY_STORE_BLOCKED
-    report = snapshot.credential_prompt.report if credential_prompt is not None and snapshot.credential_prompt is not None else None
+    report = _credential_report(snapshot)
     if report == "connected":
         notice = f"Connected to {_title(snapshot, inputs)}."
     elif report == "not_observed_streaming":
@@ -1059,29 +1061,30 @@ def _actionable_challenge(state: SessionSnapshot) -> ChallengeView | None:
 
 
 def _matching_recovery(
-    state: SessionSnapshot, recovery: CredentialRecoveryView | None,
+    state: SessionSnapshot, inputs: ViewInputs, recovery: CredentialRecoveryView | None,
 ) -> CredentialRecoveryView | None:
-    """Keep recovery evidence bound to the exact current canonical target."""
-    if recovery is None or state.target is None:
+    """Keep recovery evidence bound to exact live or saved target evidence."""
+    if recovery is None:
         return None
-    if recovery.target != state.target.canonical_host:
+    target = state.target
+    if target is None and not state.online:
+        saved = _saved_for(state, inputs)
+        target = saved.last_endpoint if saved is not None else None
+    if target is None:
+        return None
+    if recovery.target != target.canonical_host:
         return None
     if recovery.state == "retired":
         return None
     return recovery
 
 
-def _credential_prompt(
-    state: SessionSnapshot,
-    inputs: ViewInputs,
-    recovery: CredentialRecoveryView | None,
-) -> CredentialPromptState | None:
-    """Expose only a live relay prompt owned by this Start and endpoint."""
+def _credential_prompt_matches(state: SessionSnapshot) -> bool:
+    """Validate the relay prompt against its current Start and endpoint."""
     prompt = state.credential_prompt
     target = state.target
     if (
         prompt is None
-        or recovery is not None
         or target is None
         or state.challenge is not None
         or state.cleanup_pending
@@ -1098,8 +1101,26 @@ def _credential_prompt(
         or prompt.challenge.endpoint_generation != target.endpoint_generation
         or prompt.challenge.session_generation != state.session_generation
     ):
+        return False
+    return True
+
+
+def _credential_report(state: SessionSnapshot) -> str | None:
+    """Expose a terminal relay report even while recovery hides the editor."""
+    prompt = state.credential_prompt
+    if prompt is None or prompt.report is None or not _credential_prompt_matches(state):
         return None
-    return prompt.challenge
+    return prompt.report
+
+
+def _credential_prompt(
+    state: SessionSnapshot,
+    recovery: CredentialRecoveryView | None,
+) -> ChallengeView | None:
+    """Expose only a live relay prompt owned by this Start and endpoint."""
+    if recovery is not None or not _credential_prompt_matches(state):
+        return None
+    return state.credential_prompt.challenge
 
 
 def _recovery_primary(recovery: CredentialRecoveryView) -> str:
@@ -1108,8 +1129,6 @@ def _recovery_primary(recovery: CredentialRecoveryView) -> str:
     if Action.stop_credential_recovery in recovery.actions:
         return "Stop"
     return recovery.title
-
-
 
 
 def _require(snapshot: object, inputs: object) -> None:
