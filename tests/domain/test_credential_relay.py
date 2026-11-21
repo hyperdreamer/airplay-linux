@@ -3,20 +3,35 @@
 from __future__ import annotations
 
 import ast
+import gc
 import inspect
+import os
 import pickle
+import subprocess
+import sys
+import weakref
 from dataclasses import FrozenInstanceError, fields, replace
-from types import MappingProxyType
+from types import FunctionType, MappingProxyType
 from pathlib import Path
-from typing import get_args
+from typing import get_args, get_type_hints
 from uuid import UUID
 
 import pytest
 
 from airplay_linux.domain import messages, ports, records, relay, resources
 from airplay_linux.domain.identity import ReceiverId
-from airplay_linux.domain.operations import ChallengeId, ChallengeView, InstanceId, LeaseId, OperationContext, OperationId, SensitiveText
-from airplay_linux.domain.resources import AudioPolicy, Err, Ok, VolumeLevel
+from airplay_linux.domain.operations import (
+    ChallengeId,
+    ChallengeView,
+    InstanceId,
+    LeaseId,
+    OpaqueCredentialRef,
+    OperationContext,
+    OperationId,
+    PairingResult,
+    SensitiveText,
+)
+from airplay_linux.domain.resources import AudioPolicy, Diagnostic, Err, Ok, VolumeLevel
 from airplay_linux.testing.builders import target
 
 TARGET = target("a")
@@ -56,19 +71,22 @@ def request_for(**changes):
     return relay.CredentialRequest(**values)
 
 
-def challenge_for(request):
-    return ChallengeView(
-        challenge_id=CHALLENGE,
-        receiver_id=request.receiver_id,
-        endpoint_fingerprint=request.target.endpoint_fingerprint,
-        endpoint_generation=request.endpoint_generation,
-        operation_id=request.start_operation_id,
-        session_generation=request.session_generation,
-        trust_generation=9,
-        created_at=request.observed_at,
-        expires_at=request.observed_at + 60.0,
-        credential_kind=request.credential_kind,
-    )
+def challenge_for(request, **changes):
+    values = {
+        "challenge_id": CHALLENGE,
+        "receiver_id": request.receiver_id,
+        "endpoint_fingerprint": request.target.endpoint_fingerprint,
+        "endpoint_generation": request.endpoint_generation,
+        "operation_id": request.start_operation_id,
+        "session_generation": request.session_generation,
+        "trust_generation": 9,
+        "created_at": request.observed_at,
+        "expires_at": request.observed_at + 60.0,
+        "credential_kind": request.credential_kind,
+    }
+    values.update(changes)
+    return ChallengeView(**values)
+
 
 
 def owner_for(request):
@@ -100,9 +118,22 @@ def test_representability_is_the_exact_profile_independent_ast_predicate():
     assert tuple(inspect.signature(predicate).parameters) == ("value",)
     tree = ast.parse(Path(relay.__file__).read_text(encoding="utf-8"))
     definition = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "relay_credential_representable")
+    assert definition.decorator_list == []
     body = definition.body[1:] if ast.get_docstring(definition) else definition.body
     expected = ast.parse('return not value.startswith("-")').body
     assert [ast.dump(node, include_attributes=False) for node in body] == [ast.dump(node, include_attributes=False) for node in expected]
+    assert type(predicate) is FunctionType
+    assert predicate.__closure__ is None and predicate.__code__.co_freevars == ()
+    assert predicate.__kwdefaults__ is None and predicate.__dict__ == {}
+    assert not hasattr(predicate, "cache_info") and not hasattr(predicate, "__wrapped__")
+    class CredentialString(str):
+        pass
+    retained_value = CredentialString("-" + "relay-retention-" + CANARY)
+    retained_ref = weakref.ref(retained_value)
+    assert predicate(retained_value) is False
+    del retained_value
+    gc.collect()
+    assert retained_ref() is None
     assert [predicate(value) for value in ("-secret", "--audio", "--volume", "-")] == [False] * 4
     assert predicate("ordinary") is True
 
@@ -282,13 +313,119 @@ def test_prompt_is_removed_from_safe_snapshot_and_codec():
     assert "credential_prompt" not in {name for name, _codec in _SESSION_FIELDS}
 
 
-def test_transactional_pairing_contract_remains_unchanged():
-    command = messages.SubmitPairing(
-        receiver_id=TARGET.receiver_id, challenge_id=CHALLENGE, value=SensitiveText(CANARY),
+def test_completed_credential_results_do_not_compare_transient_output(tmp_path):
+    script = tmp_path / "test_transient_equality.py"
+    script.write_text(
+        "from airplay_linux.domain import ports\n"
+        "\n"
+        "CANARY = 'relay-equality-canary-9f31'\n"
+        "left = ports.CredentialProcessCompleted(\n"
+        "    output=ports.CommandOutput(exit_code=0, stdout=CANARY.encode(), stderr=b''),\n"
+        ")\n"
+        "right = ports.CredentialProcessCompleted(\n"
+        "    output=ports.CommandOutput(exit_code=0, stdout=b'other', stderr=b''),\n"
+        ")\n\n"
+        "def test_differing_transient_outputs_compare_equal():\n"
+        "    assert left == right\n\n"
+        "def test_differing_transient_outputs_do_not_leak_on_assertion_failure():\n"
+        "    assert left == right and False\n",
+
+
+
+
+        encoding="utf-8",
     )
+    source_root = Path(ports.__file__).parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(script), "-vv", "--tb=long", "--showlocals"],
+        cwd=source_root.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    output = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "relay-equality-canary-9f31" not in output
+
+
+
+
+def test_transactional_pairing_completion_identity_and_validation_are_preserved():
+    result = PairingResult(kind="InvalidInput", credential_ref=None, diagnostic=None, waiting=True)
+    completion = messages.RelaySubmitCompletion(
+        submission_id=SUBMISSION, challenge_id=CHALLENGE,
+        receiver_id=TARGET.receiver_id, endpoint_generation=TARGET.endpoint_generation,
+        session_generation=1, owner_lease=OWNER_LEASE, daemon_instance_uuid=DAEMON,
+        generation=1, result=result,
+    )
+    assert completion.submission_id == SUBMISSION
+    assert completion.result is result
+    assert completion.owner_lease == OWNER_LEASE
+    assert completion.daemon_instance_uuid == DAEMON
+    assert completion != replace(completion, generation=2)
+    assert completion != replace(completion, submission_id=OperationId(UUID(int=6)))
     assert messages.SubmitPairing in get_args(messages.Command)
     assert messages.RelaySubmitCompletion.__annotations__["result"] == "PairingResult"
-    assert CANARY not in repr(command)
+    assert CANARY not in repr(messages.SubmitPairing(
+        receiver_id=TARGET.receiver_id, challenge_id=CHALLENGE, value=SensitiveText(CANARY),
+    ))
+    with pytest.raises(FrozenInstanceError):
+        completion.generation = 2
+
+
+@pytest.mark.parametrize("bad", [-1, True, False, 1.0, "2", None])
+@pytest.mark.parametrize("generation", ["endpoint_generation", "session_generation", "generation"])
+def test_relay_submit_completion_generations_are_exact_nonnegative_integers(generation, bad):
+    values = {
+        "submission_id": SUBMISSION,
+        "challenge_id": CHALLENGE,
+        "receiver_id": TARGET.receiver_id,
+        "endpoint_generation": TARGET.endpoint_generation,
+        "session_generation": 1,
+        "owner_lease": OWNER_LEASE,
+        "daemon_instance_uuid": DAEMON,
+        "generation": 1,
+        "result": PairingResult(kind="Trusted", credential_ref=None, diagnostic=None),
+    }
+    values[generation] = bad
+    with pytest.raises((TypeError, ValueError)):
+        messages.RelaySubmitCompletion(**values)
+
+
+def test_pairing_result_waiting_defaults_false_and_keeps_its_kind_vocabulary():
+    result = PairingResult(kind="Trusted", credential_ref=None, diagnostic=None)
+    assert result.waiting is False
+    assert replace(result, waiting=True).waiting is True
+    declared = {field.name: field for field in fields(PairingResult)}
+    assert declared["waiting"].default is False
+    hints = get_type_hints(
+        PairingResult,
+        localns={"Diagnostic": Diagnostic, "OpaqueCredentialRef": OpaqueCredentialRef},
+    )
+    assert hints["waiting"] is bool
+    assert get_args(hints["kind"]) == (
+        "Trusted", "InvalidInput", "ReceiverRejected", "Cancelled",
+        "CredentialUnavailable", "TrustCleanupRequired", "TransportFailure",
+    )
+
+
+def test_challenge_view_presentation_revision_contract_is_preserved():
+    request = request_for()
+    assert challenge_for(request).presentation_revision == 0
+    assert replace(challenge_for(request), presentation_revision=7).presentation_revision == 7
+    for bad in (True, False, 1.0, "1", None, ()):
+        with pytest.raises(TypeError, match="^presentation_revision must be an integer$"):
+            challenge_for(request, presentation_revision=bad)
+    with pytest.raises(ValueError, match="^presentation_revision must be nonnegative$"):
+        challenge_for(request, presentation_revision=-1)
+    hints = get_type_hints(ChallengeView, localns={"ReceiverId": ReceiverId})
+    assert hints["presentation_revision"] is int
+    view = challenge_for(request)
+    assert type(view.presentation_revision) is int
+    assert type(replace(view, presentation_revision=3).presentation_revision) is int
 
 
 

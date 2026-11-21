@@ -358,7 +358,7 @@ class CredentialProcessNotSpawned:
 class CredentialProcessCompleted:
     """Completed child output, which must remain transient at process boundaries."""
 
-    output: CommandOutput = field(repr=False)
+    output: CommandOutput = field(repr=False, compare=False)
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(output=<transient>)"
