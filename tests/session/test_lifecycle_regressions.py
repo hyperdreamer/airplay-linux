@@ -1347,25 +1347,151 @@ async def test_credential_final_fence_refuses_dispatch_at_absolute_deadline_with
 
 
 @pytest.mark.asyncio
-async def test_credential_expiry_before_submit_effect_retires_proven_no_spawn(tmp_path):
+@pytest.mark.parametrize("expiry_stage", ["before-effect", "between-checks", "within-budget-control"])
+async def test_credential_expiry_before_submit_effect_retires_proven_no_spawn(tmp_path, monkeypatch, expiry_stage):
     h = await credential_rig(tmp_path, installed=True)
     launch = h.rig.manager._launch
+    now = h.rig.clock.now
     delayed = []
+    reads = []
+
+    def ticking_now():
+        value = now()
+        if delayed:
+            reads.append(value)
+            if expiry_stage == "between-checks":
+                h.rig.clock.advance(0.000002)
+        return value
 
     def expire_before_launch(effect):
         if effect.name == "credential_submit":
             delayed.append(effect.operation_id)
-            h.rig.clock.advance(5.0)
+            h.rig.clock.advance(5.0 if expiry_stage == "before-effect" else 4.999999)
         launch(effect)
 
-    h.rig.manager._launch = expire_before_launch
+    monkeypatch.setattr(h.rig.clock, "now", ticking_now)
+    monkeypatch.setattr(h.rig.manager, "_launch", expire_before_launch)
     secret = await submit_credential(h, Ok(value=NoReply(reason="incomplete_reply")))
     assert len(delayed) == 1
-    assert not h.rig.transport.journal.calls("transport.submit_credential")
+    assert_credential_private(h, secret)
+    calls = h.rig.transport.journal.calls("transport.submit_credential")
     marker = h.coordinator.markers[0]
+    if expiry_stage == "within-budget-control":
+        assert reads[0] == reads[1] == 4.999999
+        assert len(calls) == 1
+        assert marker.state == "release_pending"
+        return
+    if expiry_stage == "between-checks":
+        assert reads[0] < 5.0 < reads[1]
+    assert not calls
     assert marker.state == "retired"
     assert marker.retirement.kind == "no_spawn"
     assert marker.retirement.no_spawn.failure is ErrorCode.cleanup_timeout
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_after_reply", [False, True], ids=["before-reply", "after-reply"])
+@pytest.mark.parametrize("dismissed", [False, True], ids=["visible", "dismissed"])
+async def test_replacement_credential_submission_keeps_stop_owner(tmp_path, stop_after_reply, dismissed):
+    from airplay_linux.session.cleanup import runtime_for
+
+    h = await real_credential_rig(tmp_path)
+    h.store = h.coordinator._store
+    h.control.registry.gate = Deferred()
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    old_prompt = manager.snapshot(receiver_id).credential_prompt
+    old_secret = "replacement-stop-old-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=old_prompt.challenge.challenge_id,
+        value=SensitiveText(old_secret),
+    ))
+    await settle_resources(h.rig)
+    assert h.control.submission_context is None
+    stream = h.rig.transport._streams[old_prompt.request.owner_lease]
+    h.rig.transport._observe_credential_request(stream, StatusReply(
+        state="pin_required", device=None, target=None, has_audio=False, audio_muted=False,
+        needs_credential=True, credential_kind="password",
+        streams=(BackendStream(
+            device="Receiver", target=h.destination.canonical_host, state="pin_required",
+            credential_kind="password", has_audio=False, audio_muted=False,
+        ),),
+    ))
+    await settle_resources(h.rig)
+    replacement = manager.snapshot(receiver_id).credential_prompt
+    assert replacement.challenge.challenge_id != old_prompt.challenge.challenge_id
+    assert replacement.request.generation == 2
+    assert replacement.request.credential_kind == "password"
+    h.control.registry.gate.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    historical_marker = h.coordinator.markers[0]
+    assert historical_marker.state == "retired"
+    assert historical_marker.retirement.kind == "no_spawn"
+    assert historical_marker.marker_generation == 2
+    assert manager.snapshot(receiver_id).credential_prompt == replacement
+    assert h.control.submission_context is None
+
+    secret = "replacement-stop-current-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=replacement.challenge.challenge_id,
+        value=SensitiveText(secret),
+    ))
+    await settle_resources(h.rig)
+    assert h.control.submission_context is not None
+    submission_id = h.control.submission_context.operation_id
+    ctx = manager.context(receiver_id)
+    assert len(ctx.credential_settlements) == 2
+    assert h.coordinator.markers[0].state == "watching"
+    assert h.coordinator.markers[0].marker_generation == 3
+    if stop_after_reply:
+        h.control.reply.resolve(Ok(value=None))
+        await settle_resources(h.rig)
+        assert ctx.credential_settlements[submission_id].phase == "observing"
+    if dismissed:
+        await manager.dispatch(DismissCredentialPrompt(
+            receiver_id=receiver_id, challenge_id=replacement.challenge.challenge_id,
+        ))
+        await settle_resources(h.rig)
+        assert manager.snapshot(receiver_id).credential_prompt is None
+
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    await settle_resources(h.rig)
+    stop_id = manager.snapshot(receiver_id).operation_id
+    settlement = ctx.credential_settlements[submission_id]
+    assert settlement.stop_operation_id == stop_id
+    assert settlement.report_suppressed
+    owner = runtime_for(ctx).pending_start_owner
+    assert owner.credential_submission_id == submission_id
+    assert owner.marker_generation == 3
+    assert stream.handoff_claimed
+    assert manager.snapshot(receiver_id).cleanup_pending
+    assert h.control.disconnects == []
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    await settle_resources(h.rig)
+    assert manager.snapshot(receiver_id).operation_id == stop_id
+    if not stop_after_reply:
+        h.control.reply.resolve(Ok(value=None))
+        await settle_resources(h.rig)
+    assert ctx.credential_settlements[submission_id].phase == "observing"
+    assert h.control.disconnects == []
+    h.rig.scheduler.advance(20.0)
+    await settle_resources(h.rig)
+    stopped = manager.snapshot(receiver_id)
+    assert not stopped.cleanup_pending
+    assert stopped.stream is None
+    assert stopped.credential_prompt is None
+    assert h.control.disconnects == [h.destination.canonical_host]
+    marker = h.coordinator.markers[0]
+    assert marker.marker_generation == 4
+    assert marker.retirement.kind == "terminal_reply"
+    assert marker.retirement.reply.stop_cleanup_settled
+    assert len(ctx.credential_settlements) == 2
+    assert any(run.marker == historical_marker for run in ctx._credential_runs.values())
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    await settle_resources(h.rig)
+    assert manager.snapshot(receiver_id) == stopped
+    assert h.control.disconnects == [h.destination.canonical_host]
+    assert_credential_private(h, old_secret)
     assert_credential_private(h, secret)
 
 

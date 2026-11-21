@@ -99,6 +99,10 @@ def _start_gate(deps: ManagerDeps, mode: Mode, trust: TrustState) -> Result[None
     return can_start(deps.capabilities(), mode, trust)
 
 
+class _CredentialCallNotStarted(TimeoutError):
+    """The deadline expired before the bounded work was invoked."""
+
+
 @dataclass(frozen=True)
 class _PreparedCredential:
     marker: Result[tuple[CredentialRecoveryMarker, OriginalDaemonIdentity]]
@@ -643,7 +647,7 @@ class MirrorLifecycle:
         """Use the operator-submit deadline through each awaited command stage."""
         remaining = deadline - self.deps.clock.now()
         if remaining <= 0:
-            raise TimeoutError
+            raise _CredentialCallNotStarted
         loop = asyncio.get_running_loop()
         task = asyncio.current_task()
         expired = False
@@ -748,6 +752,8 @@ class MirrorLifecycle:
                         outcome = result.value
                     else:
                         outcome = NoReply(reason="incomplete_reply")
+                except _CredentialCallNotStarted:
+                    outcome = Err(error=diagnostic(ErrorCode.cleanup_timeout, owner.receiver_id))
                 except TimeoutError:
                     outcome = NoReply(reason="command_timeout")
                 except asyncio.CancelledError:

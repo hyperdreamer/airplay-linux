@@ -300,14 +300,16 @@ class OrderedCleanup:
         old_operation = state.operation_id
         old_challenge = state.challenge
         stop_operation_id = ctx.operation().operation_id
-        settlement = next((
+        settlements = tuple(
             item for item in ctx.credential_settlements.values()
             if item.owner.start_operation_id == old_operation
-        ), None)
-        # The old owner remains admissible only for this exact cleanup operation.
-        if settlement is not None:
-            ctx.credential_settlements[settlement.submission_id] = replace(
-                settlement, stop_operation_id=stop_operation_id, report_suppressed=True,
+        )
+        # The latest submission owns the handoff, including after prompt dismissal.
+        settlement = settlements[-1] if settlements else None
+        # Retain all work for this Start under the exact cleanup operation.
+        for item in settlements:
+            ctx.credential_settlements[item.submission_id] = replace(
+                item, stop_operation_id=stop_operation_id, report_suppressed=True,
             )
         for effect in (*ctx._manager._effects.values(), *ctx._manager._completed_effects.values()):
             if (
