@@ -1,7 +1,7 @@
 source_plan:
   path: docs/superpowers/plans/2026-11-15-gui-device-pairing.md
-  sha256: 3dbf9c9c8d00527c2023d5cb3219f420ac89a33e66629deafefa5ed37fd275b0
-  commit: dcce7fc533e725d2f6ed6523210a404ec0207781
+  sha256: cc4485a6fa4192ba7e9617c1d5f5f8f2996eadb5131ddc77719a7298d4fada55
+  commit: 96740a94675606e8f84edc3048a7a207d23a9048
   task_count: 9
 schema: 1
 topic: gui-device-pairing
@@ -1287,6 +1287,7 @@ tasks:
     owns:
       - src/airplay_linux/transport/doubletake.py
       - src/airplay_linux/domain/ports.py
+      - src/airplay_linux/domain/operations.py
       - src/airplay_linux/transport/__init__.py
       - tests/transport/test_doubletake.py
       - tests/adapter_contracts/test_transport_contract.py
@@ -1295,6 +1296,7 @@ tasks:
     ownership:
       - src/airplay_linux/transport/doubletake.py
       - src/airplay_linux/domain/ports.py
+      - src/airplay_linux/domain/operations.py
       - src/airplay_linux/transport/__init__.py
       - tests/transport/test_doubletake.py
       - tests/adapter_contracts/test_transport_contract.py
