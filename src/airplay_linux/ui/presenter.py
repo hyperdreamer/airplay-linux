@@ -1185,10 +1185,19 @@ class Presenter:
                 Action.dismiss_credential_recovery: DismissCredentialRecovery,
                 Action.restart_receiver_to_release: RestartReceiverToRelease,
             }[action]
+            origin_fence = self._fence(receiver_id)
+
+            def report_recovery_failure(error: object) -> None:
+                if (
+                    self._fence(receiver_id) == origin_fence
+                    and self._recovery_view(receiver_id)[0] == recovery
+                ):
+                    self._reject(receiver_id, error)
+
             self._schedule(self._dispatch(command_type(
                 receiver_id=recovery.receiver_id,
                 marker_generation=recovery.marker_generation,
-            )), receiver_id=recovery.receiver_id)
+            ), on_rejection=report_recovery_failure), receiver_id=recovery.receiver_id)
             return
         factory = _COMMAND_FACTORIES.get(action)
         if factory is not None:
@@ -1634,7 +1643,9 @@ class Presenter:
 
     # ---------------------------------------------------------------- dispatch
 
-    async def _dispatch(self, command: Command) -> None:
+    async def _dispatch(
+        self, command: Command, *, on_rejection: Callable[[object], None] | None = None,
+    ) -> None:
         """Dispatch one fresh command and apply only a still-current rejection."""
         receiver_id = getattr(command, "receiver_id", None)
         task = asyncio.current_task()
@@ -1651,18 +1662,17 @@ class Presenter:
         try:
             receipt = await self._manager.dispatch(command)
         except Exception:  # noqa: BLE001 - never surface port exception text
-            if fence is not None and fence != self._fence(receiver_id):
-                # An exception from a superseded operation is just as stale as a
-                # rejected receipt; it must not diagnose the newer intent.
+            error = None
+        else:
+            if bool(getattr(receipt, "accepted", False)):
                 return
-            self._reject(receiver_id, None)
-            return
-        if bool(getattr(receipt, "accepted", False)):
-            return
+            error = getattr(receipt, "diagnostic", None)
         if fence is not None and fence != self._fence(receiver_id):
-            # A newer intent already owns this receiver; the old refusal is stale.
+            # Both refusals and exceptions belong to the original owner intent.
             return
-        self._reject(receiver_id, getattr(receipt, "diagnostic", None))
+        self._reject(receiver_id, error)
+        if on_rejection is not None:
+            on_rejection(error)
 
     def _fence(self, receiver_id: Any) -> tuple[Any, ...] | None:
         if receiver_id is None:

@@ -25,6 +25,7 @@ import gc
 import json
 import weakref
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -44,6 +45,8 @@ from airplay_linux.domain.messages import (
     ConfirmOrphanRemoval,
     ConfirmSwitch,
     DiscoveryEvent,
+    DismissCredentialPrompt,
+    DismissCredentialRecovery,
     Forget,
     KeepCleanup,
     Pair,
@@ -58,6 +61,7 @@ from airplay_linux.domain.messages import (
     Start,
     StartVideoOnly,
     Stop,
+    StopCredentialRecovery,
     SubmitCredential,
     SubmitPairing,
 )
@@ -73,7 +77,9 @@ from airplay_linux.domain.operations import (
     StreamHandle,
 )
 from airplay_linux.domain.records import (
+    CredentialRecoveryMarker,
     LayoutSnapshot,
+    OriginalDaemonIdentity,
     OwnershipRecord,
     RecoveryItem,
     SavedReceiver,
@@ -2422,6 +2428,236 @@ async def test_mirror_start_refuses_when_the_screen_memory_cannot_be_cleared() -
         await prepared.settle(10)
 
 
+def relay_prompt() -> CredentialPromptState:
+    start_operation = OperationId(UUID(int=940))
+    request = CredentialRequest(
+        receiver_id=RECEIVER_A,
+        target=target("a"),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=941)),
+        daemon_instance_uuid=InstanceId(UUID(int=942)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    return CredentialPromptState(
+        request=request,
+        challenge=replace(
+            challenge(RECEIVER_A, challenge_id=943),
+            endpoint_fingerprint="endpoint-a-v1",
+            operation_id=start_operation,
+            session_generation=1,
+        ),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+
+
+@pytest.fixture
+async def credential_recovery(tmp_path: Path) -> Any:
+    """Confirmed marker authority with real durable transitions and target fences."""
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    coordinator = CredentialRecoveryCoordinator(store, object())
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+    marker = CredentialRecoveryMarker(
+        schema_version=1,
+        target=target("a").canonical_host,
+        receiver_id=RECEIVER_A,
+        start_operation_id=relay_prompt().request.start_operation_id,
+        original_daemon=OriginalDaemonIdentity(
+            launch_uuid=UUID(int=944),
+            instance_uuid=InstanceId(UUID(int=942)),
+            endpoint_generation=1,
+            daemon_process=ProcessIdentity(pid=101, start_ticks=501),
+            runtime_directory="/fake/private/relay-ui",
+            socket_path="/fake/private/relay-ui/control.sock",
+        ),
+        marker_generation=1,
+        state="watching",
+        automatic_status_checks=True,
+        release_attempt=None,
+        retirement=None,
+    )
+    assert await coordinator.begin_submission(marker) == Ok(value=marker)
+    assert await store.for_target(marker.target) == Ok(value=marker)
+    return coordinator, store, marker
+
+
+@pytest.mark.parametrize("invalidation", ["row_ended", "replacement_start"])
+async def test_authoritative_relay_invalidation_closes_real_dialog_and_wipes_input(
+    rig: PresenterRig, invalidation: str,
+) -> None:
+    factory = CapturingFactory(rig.window)
+    rig.presenter._dialogs = factory
+    await started(rig)
+    prompt = relay_prompt()
+    snapshot = rig.snapshot(
+        "a", operation_id=prompt.request.start_operation_id,
+        session_generation=1, credential_prompt=prompt,
+    )
+    await rig.settle()
+    (dialog,) = factory.created
+    field = dialog.findChild(QLineEdit, "secretField")
+    canary = f"relay-invalidation-canary-46c9-{invalidation}"
+    field.insert(canary)
+    assert dialog.isVisible()
+    assert rig.pane().credential_prompt == prompt.challenge
+
+    if invalidation == "row_ended":
+        replacement = replace(snapshot, credential_prompt=None)
+    else:
+        # Even a retained stale prompt must disappear under the new Start.
+        replacement = replace(
+            snapshot, operation_id=OperationId(UUID(int=945)),
+            session_generation=2,
+        )
+    rig.manager.emit_snapshot(replacement)
+    await rig.settle()
+
+    assert rig.pane().credential_prompt is None
+    field_wiped = field.text() == ""
+    assert field_wiped
+    assert not field.isUndoAvailable()
+    assert not dialog.isVisible()
+    assert prompt.challenge not in factory._pairing_prompts
+    assert dialog.take_input() is None
+    assert rig.manager.commands == []
+    retained = repr((replacement, rig.pane(), factory._pairing_prompts))
+    leaked = canary in retained + rig.activity_text()
+    assert not leaked
+
+
+async def test_real_relay_dialog_survives_table_selection_and_submits_to_owner(
+    rig: PresenterRig,
+) -> None:
+    factory = CapturingFactory(rig.window)
+    rig.presenter._dialogs = factory
+    rig.discover("a")
+    rig.discover("b")
+    await started(rig)
+    prompt = relay_prompt()
+    rig.snapshot("b")
+    rig.snapshot(
+        "a", operation_id=prompt.request.start_operation_id,
+        session_generation=1, credential_prompt=prompt,
+    )
+    await rig.settle()
+    (dialog,) = factory.created
+    field = dialog.findChild(QLineEdit, "secretField")
+    canary = "relay-table-selection-canary-a7d6"
+    field.insert(canary)
+
+    index = rig.window._model.index_of(RECEIVER_B)
+    rig.window._table.selectionModel().setCurrentIndex(
+        index,
+        QItemSelectionModel.SelectionFlag.ClearAndSelect
+        | QItemSelectionModel.SelectionFlag.Rows,
+    )
+    await rig.settle()
+
+    assert rig.presenter._selected == RECEIVER_B
+    assert dialog.isVisible()
+    assert len(factory.created) == 1
+    dialog.findChild(QPushButton, "pairingSubmitButton").click()
+    await rig.settle()
+
+    (command,) = rig.commands_of(SubmitCredential)
+    assert command.receiver_id == RECEIVER_A
+    assert command.challenge_id == prompt.challenge.challenge_id
+    correct_value = command.value.reveal_for_backend() == canary
+    assert correct_value
+    field_wiped = field.text() == ""
+    assert field_wiped
+    assert rig.commands_of(SubmitPairing) == []
+    retained = repr((command, rig.pane(), factory._relay_cancel_handlers))
+    leaked = canary in retained + rig.activity_text()
+    assert not leaked
+    factory.invalidate_pairing(prompt.challenge)
+    await rig.settle()
+
+
+async def test_real_relay_factory_retains_submission_and_observation_with_watching_marker(
+    rig: PresenterRig, credential_recovery: Any,
+) -> None:
+    coordinator, _, marker = credential_recovery
+    rig.presenter._credential_recovery = coordinator
+    factory = CapturingFactory(rig.window)
+    rig.presenter._dialogs = factory
+    await started(rig)
+    prompt = relay_prompt()
+    snapshot = rig.snapshot(
+        "a", operation_id=marker.start_operation_id, session_generation=1,
+        mode=Mode.MIRROR, intent_active=True, intent_stage=IntentStage.starting,
+        phase=SessionPhase.Connecting, transport=TransportState.Connecting,
+        credential_prompt=prompt,
+    )
+    await rig.settle()
+    assert len(factory.created) == 1
+    (dialog,) = factory.created
+    field = dialog.findChild(QLineEdit, "secretField")
+    submit = dialog.findChild(QPushButton, "pairingSubmitButton")
+    canary = "relay-real-observation-canary-684e"
+    field.insert(canary)
+    dispatch_gate = Deferred()
+    rig.manager.queue_result("dispatch", dispatch_gate)
+    submit.click()
+    await rig.settle()
+
+    submitting = replace(
+        prompt, state="submitting", submission_id=OperationId(UUID(int=946)),
+    )
+    rig.manager.emit_snapshot(replace(snapshot, credential_prompt=submitting))
+    await rig.settle()
+    assert factory._pairing_prompts.get(prompt.challenge) is dialog
+    assert dialog.isVisible()
+    assert not field.isEnabled()
+    assert not submit.isEnabled()
+    assert not dispatch_gate.resolved
+    assert Action.stop in rig.offered()
+
+    observing = replace(submitting, state="observing")
+    rig.manager.emit_snapshot(replace(snapshot, credential_prompt=observing))
+    await rig.settle()
+    assert factory._pairing_prompts.get(prompt.challenge) is dialog
+    assert dialog.isVisible()
+    assert field.isEnabled()
+    assert field.isReadOnly()
+    assert not submit.isEnabled()
+    field_wiped = field.text() == ""
+    assert field_wiped
+    assert not field.isUndoAvailable()
+    assert len(factory.created) == 1
+
+    dialog.findChild(QPushButton, "pairingCancelButton").click()
+    await rig.settle()
+    (dismiss,) = rig.commands_of(DismissCredentialPrompt)
+    assert dismiss.receiver_id == RECEIVER_A
+    assert dismiss.challenge_id == prompt.challenge.challenge_id
+    assert not dialog.isVisible()
+    assert not dispatch_gate.resolved
+    assert rig.commands_of(Stop) == []
+    assert rig.commands_of(SubmitPairing) == []
+    assert len(rig.commands_of(SubmitCredential)) == 1
+    dispatch_gate.resolve(CommandReceipt(
+        operation_id=OperationId(UUID(int=947)), accepted=True, diagnostic=None,
+    ))
+    await rig.settle()
+    retained = repr((rig.manager.commands, rig.pane(), factory._relay_cancel_handlers))
+    leaked = canary in retained + rig.activity_text()
+    assert not leaked
+
+
 async def test_relay_prompt_opens_for_its_owner_and_is_not_retargeted_by_selection(
     rig: PresenterRig,
 ) -> None:
@@ -2533,74 +2769,250 @@ async def test_relay_submit_after_table_selection_stays_bound_to_owner(
     assert rig.commands_of(SubmitPairing) == []
 
 
+@pytest.mark.parametrize(
+    ("action", "command_type"),
+    [
+        (Action.stop_credential_recovery, StopCredentialRecovery),
+        (Action.dismiss_credential_recovery, DismissCredentialRecovery),
+        (Action.restart_receiver_to_release, RestartReceiverToRelease),
+    ],
+)
 async def test_recovery_action_uses_marker_receiver_for_canonical_target_alias(
-    rig: PresenterRig,
+    rig: PresenterRig, credential_recovery: Any, action: Action, command_type: type,
 ) -> None:
-    await started(rig)
+    coordinator, store, marker = credential_recovery
+    pending = await coordinator.mark_release_pending_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    marker = pending.value
+    assert await store.for_target(marker.target) == Ok(value=marker)
+    rig.presenter._credential_recovery = coordinator
     rig.discover("b")
-    alias_target = replace(target("b"), canonical_host=target("a").canonical_host)
-    marker = SimpleNamespace(
-        receiver_id=RECEIVER_A,
-        target=target("a").canonical_host,
-        state="release_pending",
-        automatic_status_checks=False,
-        marker_generation=2,
-    )
-    rig.presenter._credential_recovery = SimpleNamespace(
-        _store_blocked=False,
-        markers=(marker,),
-    )
+    await started(rig)
+    alias_target = target("b", address=marker.target)
     rig.snapshot("b", target=alias_target)
     await rig.settle()
     rig.select("b")
     await rig.settle()
 
-    assert rig.pane().credential_recovery is not None
-    assert Action.restart_receiver_to_release in rig.offered()
-
-    rig.click(Action.restart_receiver_to_release)
+    assert isinstance(coordinator.require_start_allowed(
+        alias_target, OperationId(UUID(int=948)),
+    ), Err)
+    assert rig.presenter._selected == RECEIVER_B
+    recovery = rig.pane().credential_recovery
+    assert recovery is not None
+    assert recovery.receiver_id == RECEIVER_A
+    assert rig.pane().phase_label == "Cleanup pending"
+    warning = rig.window._notice.text()
+    assert "A delayed connection may still appear." in warning
+    assert "Stop may need to be used again." in warning
+    assert "keeping this target blocked" in warning
+    assert rig.offered() == frozenset({
+        Action.stop_credential_recovery, Action.dismiss_credential_recovery,
+        Action.restart_receiver_to_release,
+    })
+    restart = rig.window._buttons[Action.restart_receiver_to_release]
+    assert "every mirror" in restart.toolTip()
+    rig.click(Action.start)
+    rig.window._buttons[action].click()
     await rig.settle()
 
+    (command,) = rig.commands_of(command_type)
+    assert command.receiver_id == RECEIVER_A
+    assert command.marker_generation == marker.marker_generation
+    assert rig.commands_of(Start) == []
+    assert len(rig.manager.commands) == 1
+
+    # A different canonical host has independent admission and no marker view.
+    different_target = target("b", address="192.0.2.99")
+    rig.snapshot("b", target=different_target)
+    await rig.settle()
+    assert coordinator.require_start_allowed(
+        different_target, OperationId(UUID(int=949)),
+    ) == Ok(value=None)
+    assert rig.pane().credential_recovery is None
+    assert Action.start in rig.offered()
+
+
+async def test_recovery_action_matrix_is_state_and_marker_bound(
+    rig: PresenterRig, credential_recovery: Any,
+) -> None:
+    coordinator, store, marker = credential_recovery
+    rig.presenter._credential_recovery = coordinator
+    await started(rig)
+    snapshot = rig.snapshot(
+        "a", operation_id=marker.start_operation_id, session_generation=1,
+        intent_active=True, intent_stage=IntentStage.starting,
+        phase=SessionPhase.Connecting, transport=TransportState.Connecting,
+    )
+    await rig.settle()
+
+    assert rig.pane().phase_label == "Cleanup pending"
+    assert rig.offered() == frozenset({
+        Action.stop, Action.stop_credential_recovery, Action.dismiss_credential_recovery,
+    })
+    assert not rig.window._buttons[Action.restart_receiver_to_release].isVisibleTo(rig.window)
+    assert isinstance(coordinator.require_start_allowed(
+        target("a"), OperationId(UUID(int=950)),
+    ), Err)
+    rig.click(Action.start)
+    rig.click(Action.restart_receiver_to_release)
+    rig.window._buttons[Action.stop].click()
+    rig.window._buttons[Action.stop_credential_recovery].click()
+    rig.window._buttons[Action.dismiss_credential_recovery].click()
+    await rig.settle()
+    (ordinary_stop,) = rig.commands_of(Stop)
+    assert ordinary_stop.receiver_id == RECEIVER_A
+    (recovery_stop,) = rig.commands_of(StopCredentialRecovery)
+    (dismiss,) = rig.commands_of(DismissCredentialRecovery)
+    assert recovery_stop.receiver_id == dismiss.receiver_id == RECEIVER_A
+    assert recovery_stop.marker_generation == dismiss.marker_generation == 1
+    assert rig.commands_of(Start) == []
+    assert rig.commands_of(RestartReceiverToRelease) == []
+
+    dismissed = await coordinator.dismiss_for(marker, marker.marker_generation)
+    assert isinstance(dismissed, Ok)
+    marker = dismissed.value
+    assert marker.state == "release_pending"
+    assert not marker.automatic_status_checks
+    assert await store.for_target(marker.target) == Ok(value=marker)
+    rig.manager.emit_snapshot(snapshot)
+    await rig.settle()
+
+    assert rig.pane().phase_label == "Target blocked"
+    assert "remains fenced until the receiver restarts" in rig.window._notice.text()
+    assert rig.offered() == frozenset({
+        Action.stop, Action.stop_credential_recovery, Action.restart_receiver_to_release,
+    })
+    assert not rig.window._buttons[Action.dismiss_credential_recovery].isVisibleTo(rig.window)
+    assert isinstance(coordinator.require_start_allowed(
+        target("a"), OperationId(UUID(int=951)),
+    ), Err)
+    rig.click(Action.start)
+    rig.window._buttons[Action.restart_receiver_to_release].click()
+    await rig.settle()
+    (restart,) = rig.commands_of(RestartReceiverToRelease)
+    assert restart.receiver_id == RECEIVER_A
+    assert restart.marker_generation == 2
+    assert rig.commands_of(Start) == []
+
+
+@pytest.mark.parametrize("automatic_checks", [True, False])
+async def test_unknown_outcome_renders_retained_recovery_warning_and_actions(
+    rig: PresenterRig, credential_recovery: Any, automatic_checks: bool,
+) -> None:
+    coordinator, _, marker = credential_recovery
+    pending = await coordinator.mark_release_pending_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    marker = pending.value
+    if not automatic_checks:
+        dismissed = await coordinator.dismiss_for(marker, marker.marker_generation)
+        assert isinstance(dismissed, Ok)
+        marker = dismissed.value
+    rig.presenter._credential_recovery = coordinator
+    await started(rig)
+    prompt = replace(
+        relay_prompt(), state="submitting", submission_id=OperationId(UUID(int=952)),
+        report="outcome_unknown",
+    )
+    rig.snapshot(
+        "a", operation_id=marker.start_operation_id, session_generation=1,
+        credential_prompt=prompt,
+    )
+    await rig.settle()
+
+    assert rig.pane().credential_report == "outcome_unknown"
+    assert rig.pane().credential_prompt is None
+    notice = rig.window._notice
+    assert notice.isVisibleTo(rig.window)
+    assert "No complete command reply was received; the outcome is unknown." in notice.text()
+    if automatic_checks:
+        assert rig.pane().phase_label == "Cleanup pending"
+        assert "A delayed connection may still appear." in notice.text()
+        assert "Stop may need to be used again." in notice.text()
+        assert "Dismissal stops automatic checks while keeping this target blocked." in notice.text()
+    else:
+        assert rig.pane().phase_label == "Target blocked"
+        assert "This target remains fenced until the receiver restarts." in notice.text()
+    for action in (Action.stop_credential_recovery, Action.restart_receiver_to_release):
+        button = rig.window._buttons[action]
+        assert button.isVisibleTo(rig.window)
+        assert button.isEnabled()
+    dismiss = rig.window._buttons[Action.dismiss_credential_recovery]
+    assert dismiss.isVisibleTo(rig.window) == automatic_checks
+    assert Action.start not in rig.offered()
+
+
+@pytest.mark.parametrize("failure", ["receipt", "exception"])
+@pytest.mark.parametrize("superseded", ["current", "owner", "alias", "endpoint", "marker"])
+async def test_alias_recovery_failure_is_sanitized_and_fenced_to_its_origin(
+    rig: PresenterRig, credential_recovery: Any, monkeypatch: Any,
+    failure: str, superseded: str,
+) -> None:
+    coordinator, _, marker = credential_recovery
+    pending = await coordinator.dismiss_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    marker = pending.value
+    rig.presenter._credential_recovery = coordinator
+    rig.discover("a")
+    rig.discover("b")
+    await started(rig)
+    owner_snapshot = rig.snapshot(
+        "a", operation_id=marker.start_operation_id, session_generation=1,
+    )
+    alias_snapshot = rig.snapshot("b", session_generation=1)
+    await rig.settle()
+    rig.select("b")
+    await rig.settle()
+    assert rig.presenter._selected == RECEIVER_B
+    recovery = rig.pane().credential_recovery
+    assert recovery is not None
+    assert recovery.receiver_id == RECEIVER_A
+    canary = f"alias-recovery-failure-canary-24e8-{failure}-{superseded}"
+    gate = asyncio.get_running_loop().create_future()
+    dispatch = rig.manager.dispatch
+
+    async def held_dispatch(command: Command) -> CommandReceipt:
+        await dispatch(command)
+        return await gate
+
+    monkeypatch.setattr(rig.manager, "dispatch", held_dispatch)
+    rig.window._buttons[Action.restart_receiver_to_release].click()
+    await rig.settle()
     (command,) = rig.commands_of(RestartReceiverToRelease)
     assert command.receiver_id == RECEIVER_A
     assert command.marker_generation == marker.marker_generation
 
-
-async def test_recovery_action_matrix_is_state_and_marker_bound(
-    rig: PresenterRig,
-) -> None:
-    await started(rig)
-    marker = SimpleNamespace(
-        receiver_id=RECEIVER_A,
-        target=target("a").canonical_host,
-        state="watching",
-        automatic_status_checks=True,
-        marker_generation=1,
-    )
-    coordinator = SimpleNamespace(_store_blocked=False, markers=(marker,))
-    rig.presenter._credential_recovery = coordinator
-    rig.snapshot("a")
+    if superseded == "owner":
+        rig.manager.emit_snapshot(replace(owner_snapshot, session_generation=2))
+    elif superseded == "alias":
+        rig.manager.emit_snapshot(replace(alias_snapshot, session_generation=2))
+    elif superseded == "endpoint":
+        rig.manager.emit_snapshot(replace(alias_snapshot, target=target("b", 2)))
+    elif superseded == "marker":
+        assert isinstance(await coordinator.dismiss_for(marker, marker.marker_generation), Ok)
+    await rig.settle()
+    if failure == "receipt":
+        gate.set_result(CommandReceipt(
+            operation_id=OperationId(UUID(int=953)), accepted=False,
+            diagnostic=Diagnostic(
+                code=ErrorCode.transport_failed, message=canary,
+                recovery=(RecoveryAction.retry,), detail=canary,
+            ),
+        ))
+        expected_code = ErrorCode.transport_failed
+    else:
+        gate.set_exception(RuntimeError(canary))
+        expected_code = ErrorCode.stale_event
     await rig.settle()
 
-    assert Action.stop_credential_recovery in rig.offered()
-    assert Action.dismiss_credential_recovery in rig.offered()
-    assert Action.restart_receiver_to_release not in rig.offered()
-
-    coordinator.markers = (
-        SimpleNamespace(
-            receiver_id=RECEIVER_A,
-            target=target("a").canonical_host,
-            state="release_pending",
-            automatic_status_checks=False,
-            marker_generation=2,
-        ),
-    )
-    rig.snapshot("a")
-    await rig.settle()
-
-    assert Action.stop_credential_recovery in rig.offered()
-    assert Action.restart_receiver_to_release in rig.offered()
-    assert Action.dismiss_credential_recovery not in rig.offered()
+    if superseded == "current":
+        assert rig.error_text() == diagnostic(expected_code, RECEIVER_B).message
+        assert rig.window._error.isVisibleTo(rig.window)
+    else:
+        assert rig.error_text() == ""
+    assert Action.start not in rig.offered()
+    leaked = canary in repr(rig.pane()) + rig.error_text() + rig.activity_text()
+    assert not leaked
 
 
 async def test_qt_relay_dialog_releases_submitted_answer_after_terminal_close(

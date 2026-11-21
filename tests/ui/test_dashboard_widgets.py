@@ -2202,6 +2202,33 @@ def test_orphan_prompt_reports_a_missing_helper_instead_of_implying_one(qtbot) -
     assert "helper" in texts.lower()
 
 
+def test_transactional_pairing_accepts_leading_dash_credentials(qtbot) -> None:
+    from airplay_linux.domain.operations import SensitiveText
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(challenge("password"), relay=False)
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    canary = "-transactional-pairing-canary-2a9c"
+    field.insert(canary)
+    dialogue.findChild(QPushButton, "pairingSubmitButton").click()
+
+    answer = dialogue.take_result()
+    assert answer is not None
+    assert answer.action is Action.submit_pairing
+    assert isinstance(answer.value, SensitiveText)
+    accepted_exact_value = answer.value.reveal_for_backend() == canary
+    assert accepted_exact_value
+    field_wiped = field.text() == ""
+    assert field_wiped
+    assert not field.isUndoAvailable()
+    assert dialogue.take_input() is None
+    retained = dialogue.windowTitle() + repr(answer)
+    retained += " ".join(label.text() for label in dialogue.findChildren(QLabel))
+    leaked = canary in retained
+    assert not leaked
+
+
 def test_relay_dialog_offers_only_submit_and_cancel_and_validates_before_wrapping(qtbot) -> None:
     from airplay_linux.domain.operations import SensitiveText
     from airplay_linux.ui.dialogs import PairingDialog

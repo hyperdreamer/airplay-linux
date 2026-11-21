@@ -438,6 +438,8 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         notice = "The target was not observed streaming."
     elif report == "outcome_unknown":
         notice = "No complete command reply was received; the outcome is unknown."
+    if report is not None and recovery is not None:
+        notice = f"{notice}\n\n{recovery.warning}"
     if inputs.capabilities.volume and not volume_enabled:
         actions = actions - {Action.mute}
     if snapshot.volume_save_failed and report is None and recovery is None:

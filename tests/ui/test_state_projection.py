@@ -2091,7 +2091,10 @@ def test_unknown_relay_report_survives_recovery_overlay() -> None:
 
     assert pane.credential_prompt is None
     assert pane.credential_report == "outcome_unknown"
-    assert pane.notice == "No complete command reply was received; the outcome is unknown."
+    assert pane.notice == (
+        "No complete command reply was received; the outcome is unknown.\n\n"
+        "This target remains fenced until the receiver restarts."
+    )
     assert Action.restart_receiver_to_release in pane.actions
 
 
