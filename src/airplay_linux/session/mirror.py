@@ -103,7 +103,7 @@ def _start_gate(deps: ManagerDeps, mode: Mode, trust: TrustState) -> Result[None
 class _PreparedCredential:
     marker: Result[tuple[CredentialRecoveryMarker, OriginalDaemonIdentity]]
     submit: Callable[[OperationContext, DispatchFence], Awaitable[Result]] = field(repr=False)
-    submitted_at: float
+    command_deadline: float
 
 
 @dataclass
@@ -115,6 +115,7 @@ class _CredentialRun:
     last_status: StatusReply | None = None
     terminal: TerminalReplyRetirement | NoSpawnRetirement | None = None
     transition_pending: bool = False
+    release_pending_required: bool = False
     retirement_failed: bool = False
     retired: bool = False
     transport_generation: int = 0
@@ -547,12 +548,19 @@ class MirrorLifecycle:
             if previous == request:
                 ctx.credential_request_ended = True
                 ctx.dismissed_credential_prompt_id = None
-                if ctx.state.credential_prompt is not None and ctx.state.credential_prompt.submission_id is None:
+                prompt = ctx.state.credential_prompt
+                if prompt is not None and prompt.request == request:
+                    if prompt.submission_id in ctx.credential_settlements:
+                        settlement = ctx.credential_settlements[prompt.submission_id]
+                        ctx.credential_settlements[prompt.submission_id] = replace(settlement, report_suppressed=True)
                     ctx.apply(credential_prompt=None)
                 self.deps.transport.dismiss_credential_prompt(request.target, event.context)
             return True
         if previous == request:
             return True
+        for submission_id, settlement in tuple(ctx.credential_settlements.items()):
+            if settlement.owner.start_operation_id == request.start_operation_id:
+                ctx.credential_settlements[submission_id] = replace(settlement, report_suppressed=True)
         ctx.credential_request = request
         ctx.credential_request_ended = False
         ctx.dismissed_credential_prompt_id = None
@@ -564,6 +572,7 @@ class MirrorLifecycle:
             created_at=request.observed_at, expires_at=float("inf"), credential_kind=request.credential_kind,
         )
         ctx._credential_cleanup_settled = self._cleanup_credentials
+        ctx._credential_retry_transitions = self._retry_credential_transitions
         ctx.apply(credential_prompt=CredentialPromptState(
             request=request, challenge=challenge, state="editing", submission_id=None, report=None,
         ))
@@ -603,7 +612,7 @@ class MirrorLifecycle:
             daemon_instance_uuid=request.daemon_instance_uuid, relay_generation=request.generation,
             marker_generation=0,
         )
-        submitted_at = self.deps.clock.now()
+        command_deadline = self.deps.clock.now() + CONTROL_TIMEOUT
         ctx.apply(credential_prompt=replace(prompt, state="submitting", submission_id=operation.operation_id))
         self.deps.transport.dismiss_credential_prompt(
             request.target, replace(operation, operation_id=request.start_operation_id),
@@ -611,18 +620,61 @@ class MirrorLifecycle:
         value = message.value
 
         async def prepare():
-            marker = await coordinator.begin_submission_for(
-                request.receiver_id, request.target, request.start_operation_id,
-            )
+            try:
+                marker = await self._credential_call_before(
+                    command_deadline,
+                    lambda: coordinator.begin_submission_for(
+                        request.receiver_id, request.target, request.start_operation_id,
+                    ),
+                )
+            except TimeoutError:
+                marker = Err(error=diagnostic(ErrorCode.cleanup_timeout, owner.receiver_id))
 
             async def submit(context, dispatch_fence):
                 return await self.deps.transport.submit_credential(
                     request.target, value, context, dispatch_fence=dispatch_fence,
                 )
 
-            return Ok(value=_PreparedCredential(marker=marker, submit=submit, submitted_at=submitted_at))
+            return Ok(value=_PreparedCredential(marker=marker, submit=submit, command_deadline=command_deadline))
 
         ctx.launch(Route.mirror, "credential_prepare", operation, prepare, credential_owner=owner)
+
+    async def _credential_call_before(self, deadline, work):
+        """Use the operator-submit deadline through each awaited command stage."""
+        remaining = deadline - self.deps.clock.now()
+        if remaining <= 0:
+            raise TimeoutError
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        expired = False
+
+        def expire():
+            nonlocal expired
+            if not expired:
+                expired = True
+                task.cancel()
+
+        timer = self.deps.scheduler.call_at(deadline, expire)
+        realtime = loop.call_later(remaining, expire)
+        try:
+            result = await work()
+        except asyncio.CancelledError:
+            if expired:
+                raise TimeoutError from None
+            raise
+        finally:
+            timer.cancel()
+            realtime.cancel()
+            if expired:
+                task.uncancel()
+        if isinstance(result, Ok):
+            outcome = result.value
+            if (
+                (expired and isinstance(outcome, NoReply) and outcome.reason == "dispatch_cancelled")
+                or (isinstance(outcome, Submitted) and outcome.reply_at > deadline)
+            ):
+                return Ok(value=NoReply(reason="command_timeout"))
+        return result
 
     def _credential_effect(self, ctx, event, kind):
         effect = ctx._manager._completed_effects.get((event.receiver_id, event.operation_id, event.kind))
@@ -634,14 +686,20 @@ class MirrorLifecycle:
             prepared = event.result.value if isinstance(event.result, Ok) else None
             if not isinstance(prepared, _PreparedCredential) or isinstance(prepared.marker, Err):
                 error = prepared.marker.error if isinstance(prepared, _PreparedCredential) else diagnostic(ErrorCode.persistence_failed)
-                ctx.apply(last_error=error, credential_prompt=None)
+                prompt = ctx.state.credential_prompt
+                if prompt is not None and prompt.challenge.challenge_id == owner.challenge_id:
+                    ctx.apply(last_error=error, credential_prompt=None)
+                elif effect.credential_stop_operation_id is not None:
+                    ctx.apply(last_error=error)
                 self.cleanup._enqueue_recheck(ctx)
                 return True
             marker, identity = prepared.marker.value
             owner = replace(owner, marker_generation=marker.marker_generation)
             context = replace(effect.context, marker_generation=marker.marker_generation, owner_daemon=identity)
+            dispatch_current = ctx._manager._credential_owner_current(ctx.state, owner, None, for_dispatch=True)
             suppressed = (
-                effect.credential_stop_operation_id is not None
+                not dispatch_current
+                or effect.credential_stop_operation_id is not None
                 or ctx.dismissed_credential_prompt_id == owner.challenge_id
             )
             settlement = CredentialSubmissionSettlement(
@@ -653,34 +711,45 @@ class MirrorLifecycle:
             ctx.credential_settlements[event.operation_id] = settlement
             run = _CredentialRun(
                 marker=marker, context=context,
-                command_deadline=prepared.submitted_at + CONTROL_TIMEOUT,
+                command_deadline=prepared.command_deadline,
                 transport_generation=marker.marker_generation,
             )
             runs[event.operation_id] = run
-            if effect.credential_stop_operation_id is not None or identity.instance_uuid != owner.daemon_instance_uuid:
+            expired = self.deps.clock.now() >= run.command_deadline
+            if expired or not dispatch_current or identity.instance_uuid != owner.daemon_instance_uuid:
                 run.terminal = NoSpawnRetirement(
-                    failure=ErrorCode.stale_event, stop_cleanup_settled=False,
+                    failure=ErrorCode.cleanup_timeout if expired else ErrorCode.stale_event,
+                    stop_cleanup_settled=False,
                     observed_at=self.deps.clock.now(),
                 )
                 ctx.credential_settlements[event.operation_id] = replace(settlement, phase="cleanup")
+                self._credential_error(ctx, settlement, run.terminal.failure)
                 self._credential_finished(ctx, event.operation_id)
                 return True
             marker_fence = self.deps.credential_recovery.credential_dispatch_fence(marker, marker.marker_generation)
 
             def dispatch_fence():
-                if not ctx._manager._credential_owner_current(ctx.state, owner, None):
+                if self.deps.clock.now() >= run.command_deadline:
+                    return Err(error=diagnostic(ErrorCode.cleanup_timeout, owner.receiver_id))
+                if not ctx._manager._credential_owner_current(ctx.state, owner, None, for_dispatch=True):
                     return Err(error=diagnostic(ErrorCode.stale_event, owner.receiver_id))
                 return marker_fence()
 
             async def submit():
                 try:
-                    result = await prepared.submit(context, dispatch_fence)
+                    result = dispatch_fence()
+                    if isinstance(result, Ok):
+                        result = await self._credential_call_before(
+                            run.command_deadline, lambda: prepared.submit(context, dispatch_fence),
+                        )
                     if isinstance(result, Err):
                         outcome = Err(error=diagnostic(result.error.code, owner.receiver_id))
                     elif isinstance(result, Ok) and isinstance(result.value, (Submitted, NoReply)):
                         outcome = result.value
                     else:
                         outcome = NoReply(reason="incomplete_reply")
+                except TimeoutError:
+                    outcome = NoReply(reason="command_timeout")
                 except asyncio.CancelledError:
                     outcome = NoReply(reason="dispatch_cancelled")
                 except Exception:
@@ -714,12 +783,8 @@ class MirrorLifecycle:
                     self._read_credential_status(ctx, submission_id)
             elif isinstance(outcome, NoReply):
                 ctx.credential_settlements[submission_id] = replace(settlement, phase="cleanup")
-                run.transition_pending = True
-                ctx.launch(
-                    Route.mirror, "credential_transition", run.context,
-                    lambda: self.deps.credential_recovery.mark_release_pending_for(run.marker, settlement.marker_generation),
-                    credential_owner=owner,
-                )
+                run.release_pending_required = True
+                self._mark_credential_release_pending(ctx, submission_id)
             else:
                 run.terminal = NoSpawnRetirement(
                     failure=outcome.error.code, stop_cleanup_settled=False,
@@ -767,9 +832,12 @@ class MirrorLifecycle:
         if kind in {"credential_transition", "credential_retire", "credential_generation"}:
             run.transition_pending = False
             if isinstance(event.result, Err):
-                run.retirement_failed = True
+                if kind != "credential_transition":
+                    run.retirement_failed = True
                 ctx.apply(last_error=event.result.error)
             else:
+                if kind == "credential_transition":
+                    run.release_pending_required = False
                 if kind != "credential_generation":
                     marker = event.result.value
                     run.marker = marker
@@ -812,6 +880,24 @@ class MirrorLifecycle:
             return True
         return True
 
+    def _mark_credential_release_pending(self, ctx, submission_id):
+        settlement = ctx.credential_settlements[submission_id]
+        run = _credential_runs(ctx)[submission_id]
+        if not run.release_pending_required or run.transition_pending:
+            return
+        run.transition_pending = True
+        ctx.launch(
+            Route.mirror, "credential_transition", run.context,
+            lambda: self.deps.credential_recovery.mark_release_pending_for(run.marker, settlement.marker_generation),
+            credential_owner=replace(settlement.owner, marker_generation=settlement.marker_generation),
+        )
+
+    def _retry_credential_transitions(self, ctx):
+        runtime = runtime_for(ctx)
+        for submission_id, settlement in tuple(ctx.credential_settlements.items()):
+            if runtime.context is not None and settlement.stop_operation_id == runtime.context.operation_id:
+                self._mark_credential_release_pending(ctx, submission_id)
+
     def _credential_report(self, ctx, settlement, *, state=None, report=None):
         prompt = ctx.state.credential_prompt
         if settlement.report_suppressed or prompt is None or prompt.challenge.challenge_id != settlement.owner.challenge_id:
@@ -824,7 +910,11 @@ class MirrorLifecycle:
         ctx.apply(credential_prompt=replace(prompt, **changes))
 
     def _credential_error(self, ctx, settlement, code):
-        if not settlement.report_suppressed:
+        prompt = ctx.state.credential_prompt
+        if (
+            not settlement.report_suppressed and prompt is not None
+            and prompt.challenge.challenge_id == settlement.owner.challenge_id
+        ):
             ctx.apply(last_error=diagnostic(code, ctx.state.receiver_id), credential_prompt=None)
 
     def _credential_terminal(self, ctx, submission_id, observation):
@@ -866,7 +956,7 @@ class MirrorLifecycle:
             if runtime.context is None or settlement.stop_operation_id != runtime.context.operation_id:
                 continue
             run = _credential_runs(ctx)[submission_id]
-            if settlement.phase != "cleanup" or run.transition_pending:
+            if settlement.phase != "cleanup" or run.transition_pending or run.release_pending_required:
                 waiting = True
                 continue
             self._retire_credential(ctx, submission_id)

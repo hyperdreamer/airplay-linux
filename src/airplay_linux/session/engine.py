@@ -680,7 +680,28 @@ class SessionManager:
 
     def _credential_owner_current(
         self, state: SessionSnapshot, owner: CredentialEffectOwner, stop_operation_id: OperationId | None,
+        *, for_dispatch: bool = False,
     ) -> bool:
+        context = self._contexts[state.receiver_id]
+        if for_dispatch:
+            request = context.credential_request
+            prompt = state.credential_prompt
+            if (
+                request is None or context.credential_request_ended
+                or request.receiver_id != owner.receiver_id or request.target != owner.target
+                or request.start_operation_id != owner.start_operation_id
+                or request.endpoint_generation != owner.endpoint_generation
+                or request.session_generation != owner.session_generation
+                or request.owner_lease != owner.owner_lease
+                or request.daemon_instance_uuid != owner.daemon_instance_uuid
+                or request.generation != owner.relay_generation
+                or not (
+                    (prompt is not None and prompt.request == request
+                     and prompt.challenge.challenge_id == owner.challenge_id)
+                    or context.dismissed_credential_prompt_id == owner.challenge_id
+                )
+            ):
+                return False
         if stop_operation_id is not None:
             from .cleanup import runtime_for
             runtime = runtime_for(self._contexts[state.receiver_id])

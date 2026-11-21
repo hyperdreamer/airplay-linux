@@ -273,7 +273,7 @@ class OrderedCleanup:
                 # request after the transaction completes.
                 runtime.queued_start = None
                 ctx.apply(queued_start=None)
-            self._continue(ctx)
+            self._retry(ctx)
             return
 
         state = ctx.state
@@ -391,6 +391,9 @@ class OrderedCleanup:
 
         if runtime.pending_start_owner is not None:
             self._launch_pending_handoff(ctx)
+        retry_credential = getattr(ctx, "_credential_retry_transitions", None)
+        if retry_credential is not None:
+            retry_credential(ctx)
         self._launch_prepare(ctx)
 
     def _launch_pending_handoff(self, ctx: SessionContext) -> None:
@@ -431,6 +434,9 @@ class OrderedCleanup:
             if ctx.state.cleanup_pending or ctx.state.intent_stage is IntentStage.stopping:
                 self._stop(ctx, runtime.queued_start or ctx.state.queued_start)
             return
+        retry_credential = getattr(ctx, "_credential_retry_transitions", None)
+        if retry_credential is not None:
+            retry_credential(ctx)
         self._continue(ctx)
 
     def _continue(self, ctx: SessionContext) -> None:
@@ -467,7 +473,11 @@ class OrderedCleanup:
         )
         if preparing or any(
             settlement.stop_operation_id == runtime.context.operation_id
-            and (settlement.phase != "cleanup" or getattr(ctx, "_credential_runs", {})[settlement.submission_id].transition_pending)
+            and (
+                settlement.phase != "cleanup"
+                or getattr(ctx, "_credential_runs", {})[settlement.submission_id].transition_pending
+                or getattr(ctx, "_credential_runs", {})[settlement.submission_id].release_pending_required
+            )
             for settlement in ctx.credential_settlements.values()
         ):
             return
