@@ -1293,6 +1293,8 @@ tasks:
       - tests/adapter_contracts/test_transport_contract.py
       - tests/testing/test_fakes.py
       - tests/fixtures/processes/fake_doubletake.py
+      - src/airplay_linux/testing/adapters.py
+      - src/airplay_linux/process/daemon_registry.py
     ownership:
       - src/airplay_linux/transport/doubletake.py
       - src/airplay_linux/domain/ports.py
@@ -1302,6 +1304,8 @@ tasks:
       - tests/adapter_contracts/test_transport_contract.py
       - tests/testing/test_fakes.py
       - tests/fixtures/processes/fake_doubletake.py
+      - src/airplay_linux/testing/adapters.py
+      - src/airplay_linux/process/daemon_registry.py
     exclusive_resources: [/tmp/ap-relay-transport-pass]
     produces:
       - id: TransportPort.submit_credential
