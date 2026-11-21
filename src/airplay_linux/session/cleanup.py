@@ -33,7 +33,7 @@ from airplay_linux.domain.operations import (
     OwnerId,
     StreamHandle,
 )
-from airplay_linux.domain.records import NoSpawnRetirement, SessionSnapshot
+from airplay_linux.domain.records import SessionSnapshot
 from airplay_linux.domain.relay import PendingStartCleanupOwner
 from airplay_linux.domain.resources import (
     AudioState,
@@ -304,8 +304,13 @@ class OrderedCleanup:
             item for item in ctx.credential_settlements.values()
             if item.owner.start_operation_id == old_operation
         )
-        # The latest submission owns the handoff, including after prompt dismissal.
-        settlement = settlements[-1] if settlements else None
+        runs = getattr(ctx, "_credential_runs", {})
+        # Registration precedes transport admission. Earlier submissions can
+        # still own the transport while a replacement is waiting to enter it.
+        settlement = next((
+            item for item in reversed(settlements)
+            if item.submission_id in runs and runs[item.submission_id].transport_submitted
+        ), None)
         # Retain all work for this Start under the exact cleanup operation.
         for item in settlements:
             ctx.credential_settlements[item.submission_id] = replace(
@@ -319,8 +324,6 @@ class OrderedCleanup:
             ):
                 effect.credential_stop_operation_id = stop_operation_id
         request = ctx.credential_request if not ctx.credential_request_ended else None
-        run = getattr(ctx, "_credential_runs", {}).get(settlement.submission_id) if settlement is not None else None
-        dispatched = settlement is not None and not (run is not None and isinstance(run.terminal, NoSpawnRetirement))
         runtime.pending_start_owner = None
         runtime.handed_stream = None
         runtime.handoff_inflight = False
@@ -336,8 +339,8 @@ class OrderedCleanup:
                 session_generation=request.session_generation, trust_generation=state.trust_generation,
                 owner_lease=request.owner_lease, daemon_instance_uuid=request.daemon_instance_uuid,
                 stop_operation_id=stop_operation_id,
-                credential_submission_id=settlement.submission_id if dispatched else None,
-                marker_generation=settlement.marker_generation if dispatched else None,
+                credential_submission_id=settlement.submission_id if settlement is not None else None,
+                marker_generation=settlement.marker_generation if settlement is not None else None,
             )
         # A context owns one ephemeral cleanup transaction at a time.  A later
         # Stop after a completed start/stop cycle must not inherit the prior
@@ -406,10 +409,17 @@ class OrderedCleanup:
         if owner is None:
             return
         runtime.handoff_inflight = True
-        ctx.launch(
-            Route.cleanup, "credential_handoff", runtime.context,
-            lambda: self.deps.transport.stop_pending_start(owner, runtime.context),
-        )
+
+        async def handoff():
+            current_owner = owner
+            if owner.credential_submission_id is not None:
+                run = getattr(ctx, "_credential_runs", {}).get(owner.credential_submission_id)
+                if run is not None and not run.transport_submitted:
+                    current_owner = replace(owner, credential_submission_id=None, marker_generation=None)
+                    runtime.pending_start_owner = current_owner
+            return await self.deps.transport.stop_pending_start(current_owner, runtime.context)
+
+        ctx.launch(Route.cleanup, "credential_handoff", runtime.context, handoff)
 
     def _launch_prepare(self, ctx: SessionContext) -> None:
         runtime = runtime_for(ctx)

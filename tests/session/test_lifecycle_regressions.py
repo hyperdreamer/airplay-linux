@@ -1561,3 +1561,192 @@ async def test_no_reply_stop_waits_for_exact_durable_release_pending_retry_after
     assert h.coordinator.markers == (visible,)
     assert isinstance(h.coordinator.require_start_allowed(h.destination, UUID(int=999)), Err)
     assert_credential_private(h, secret)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dismissed", [False, True], ids=["visible", "dismissed"])
+async def test_stop_handoffs_before_replacement_submission_enters_transport(tmp_path, dismissed):
+    from airplay_linux.session.cleanup import runtime_for
+
+    h = await real_credential_rig(tmp_path)
+    h.store = h.coordinator._store
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    h.control.registry.gate = Deferred()
+    old_prompt = manager.snapshot(receiver_id).credential_prompt
+    old_secret = "registered-handoff-old-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=old_prompt.challenge.challenge_id,
+        value=SensitiveText(old_secret),
+    ))
+    await settle_resources(h.rig)
+    stream = h.rig.transport._streams[old_prompt.request.owner_lease]
+    h.rig.transport._observe_credential_request(stream, StatusReply(
+        state="pin_required", device=None, target=None, has_audio=False, audio_muted=False,
+        needs_credential=True, credential_kind="password",
+        streams=(BackendStream(
+            device="Receiver", target=h.destination.canonical_host, state="pin_required",
+            credential_kind="password", has_audio=False, audio_muted=False,
+        ),),
+    ))
+    await settle_resources(h.rig)
+    replacement = manager.snapshot(receiver_id).credential_prompt
+    h.control.registry.gate.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    assert h.coordinator.markers[0].retirement.kind == "no_spawn"
+    assert h.control.submission_context is None
+
+    gate = Deferred()
+    entered = asyncio.Event()
+    launch = manager._launch
+
+    def delay_submission(effect):
+        if effect.name == "credential_submit":
+            work = effect.work
+
+            async def delayed():
+                entered.set()
+                await gate.wait()
+                return await work()
+
+            effect.work = delayed
+        launch(effect)
+
+    manager._launch = delay_submission
+    secret = "registered-handoff-current-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=replacement.challenge.challenge_id,
+        value=SensitiveText(secret),
+    ))
+    await settle_resources(h.rig)
+    assert entered.is_set()
+    ctx = manager.context(receiver_id)
+    assert len(ctx.credential_settlements) == 2
+    assert h.coordinator.markers[0].state == "watching"
+    assert stream.credential_submission_id is None
+    if dismissed:
+        await manager.dispatch(DismissCredentialPrompt(
+            receiver_id=receiver_id, challenge_id=replacement.challenge.challenge_id,
+        ))
+        await settle_resources(h.rig)
+
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    captured_owner = runtime_for(ctx).pending_start_owner
+    assert captured_owner.credential_submission_id is None
+    assert captured_owner.marker_generation is None
+    await settle_resources(h.rig)
+    stop_id = manager.snapshot(receiver_id).operation_id
+    owner = runtime_for(ctx).pending_start_owner
+    assert owner.credential_submission_id is None
+    assert owner.marker_generation is None
+    assert all(item.stop_operation_id == stop_id for item in ctx.credential_settlements.values())
+    assert all(item.report_suppressed for item in ctx.credential_settlements.values())
+    assert stream.handoff_claimed
+    assert manager.snapshot(receiver_id).cleanup_pending
+    assert h.control.disconnects == []
+
+    gate.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    assert h.control.submission_context is None
+    assert h.control.disconnects == [h.destination.canonical_host]
+    assert not manager.snapshot(receiver_id).cleanup_pending
+    marker = h.coordinator.markers[0]
+    assert marker.retirement.kind == "no_spawn"
+    assert marker.retirement.no_spawn.stop_cleanup_settled
+    assert_credential_private(h, old_secret)
+    assert_credential_private(h, secret)
+
+
+@pytest.mark.asyncio
+async def test_stop_handoffs_after_transport_no_spawn_before_actor_completion(tmp_path):
+    from airplay_linux.session.cleanup import runtime_for
+
+    h = await real_credential_rig(tmp_path)
+    h.store = h.coordinator._store
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    prompt = manager.snapshot(receiver_id).credential_prompt
+    secret = "no-spawn-handoff-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=prompt.challenge.challenge_id,
+        value=SensitiveText(secret),
+    ))
+    await settle_resources(h.rig)
+    stream = h.rig.transport._streams[prompt.request.owner_lease]
+    assert stream.credential_submission_id == h.control.submission_context.operation_id
+    manager._draining.add(receiver_id)
+    h.control.no_spawn = True
+    h.control.reply.resolve(Ok(value=None))
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert stream.credential_submission_id is None
+    assert any(event.kind == "mirror:credential_submit" for event in manager._queues[receiver_id])
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    queue = manager._queues[receiver_id]
+    queue.appendleft(queue.pop())
+    manager._draining.remove(receiver_id)
+    await settle_resources(h.rig)
+    ctx = manager.context(receiver_id)
+    owner = runtime_for(ctx).pending_start_owner
+    assert owner.credential_submission_id is None
+    assert owner.marker_generation is None
+    assert stream.handoff_claimed
+    assert h.control.disconnects == [h.destination.canonical_host]
+    assert not manager.snapshot(receiver_id).cleanup_pending
+    assert h.coordinator.markers[0].retirement.kind == "no_spawn"
+    assert_credential_private(h, secret)
+
+
+@pytest.mark.asyncio
+async def test_stop_handoff_tracks_no_spawn_while_handoff_effect_is_queued(tmp_path):
+    from airplay_linux.session.cleanup import runtime_for
+
+    h = await real_credential_rig(tmp_path)
+    h.store = h.coordinator._store
+    manager = h.rig.manager
+    receiver_id = h.destination.receiver_id
+    prompt = manager.snapshot(receiver_id).credential_prompt
+    secret = "queued-handoff-no-spawn-" + uuid4().hex
+    await manager.dispatch(SubmitCredential(
+        receiver_id=receiver_id, challenge_id=prompt.challenge.challenge_id,
+        value=SensitiveText(secret),
+    ))
+    await settle_resources(h.rig)
+    stream = h.rig.transport._streams[prompt.request.owner_lease]
+    submission_id = stream.credential_submission_id
+    assert submission_id is not None
+    gate = Deferred()
+    entered = asyncio.Event()
+    launch = manager._launch
+
+    def delay_handoff(effect):
+        if effect.name == "credential_handoff":
+            work = effect.work
+
+            async def delayed():
+                entered.set()
+                await gate.wait()
+                return await work()
+
+            effect.work = delayed
+        launch(effect)
+
+    manager._launch = delay_handoff
+    await manager.dispatch(Stop(receiver_id=receiver_id))
+    await settle_resources(h.rig)
+    ctx = manager.context(receiver_id)
+    assert entered.is_set()
+    assert runtime_for(ctx).pending_start_owner.credential_submission_id == submission_id
+    h.control.no_spawn = True
+    h.control.reply.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    assert stream.credential_submission_id is None
+    assert manager.snapshot(receiver_id).cleanup_pending
+    assert h.control.disconnects == []
+    gate.resolve(Ok(value=None))
+    await settle_resources(h.rig)
+    assert stream.handoff_claimed
+    assert h.control.disconnects == [h.destination.canonical_host]
+    assert not manager.snapshot(receiver_id).cleanup_pending
+    assert h.coordinator.markers[0].retirement.kind == "no_spawn"
+    assert_credential_private(h, secret)

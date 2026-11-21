@@ -123,6 +123,7 @@ class _CredentialRun:
     retirement_failed: bool = False
     retired: bool = False
     transport_generation: int = 0
+    transport_submitted: bool = False
 
 
 def _credential_runs(ctx: SessionContext) -> dict[OperationId, _CredentialRun]:
@@ -739,12 +740,22 @@ class MirrorLifecycle:
                     return Err(error=diagnostic(ErrorCode.stale_event, owner.receiver_id))
                 return marker_fence()
 
+            async def invoke_transport():
+                # On admission the transport records its submission identity
+                # before yielding. A proven no-spawn result clears that identity
+                # before it returns, so keep the handoff evidence in step.
+                run.transport_submitted = True
+                result = await prepared.submit(context, dispatch_fence)
+                if isinstance(result, Err):
+                    run.transport_submitted = False
+                return result
+
             async def submit():
                 try:
                     result = dispatch_fence()
                     if isinstance(result, Ok):
                         result = await self._credential_call_before(
-                            run.command_deadline, lambda: prepared.submit(context, dispatch_fence),
+                            run.command_deadline, invoke_transport,
                         )
                     if isinstance(result, Err):
                         outcome = Err(error=diagnostic(result.error.code, owner.receiver_id))
