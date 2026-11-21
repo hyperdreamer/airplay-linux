@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     )
     from .records import (
         ActivityEvent,
+        CredentialRecoveryMarker,
+        NoSpawnRetirement,
+        OwnedDaemonReadinessEvidence,
+        ReleaseAttempt,
+        ReleaseEvidence,
+        TerminalReplyRetirement,
         AudioStartReceipt,
         DaemonCleanupIntent,
         DaemonRecord,
@@ -204,6 +210,46 @@ class CredentialStore(Protocol):
     ) -> Result[None]: ...
 
     async def mark_invalid(self, receiver_id: ReceiverId) -> Result[None]: ...
+
+
+class CredentialRecoveryMarkerStore(Protocol):
+    async def read_all(self) -> Result[tuple[CredentialRecoveryMarker, ...]]: ...
+
+    async def confirm_all_durable(self) -> Result[None]: ...
+
+    async def for_target(self, target: str) -> Result[CredentialRecoveryMarker | None]: ...
+
+    async def create(self, marker: CredentialRecoveryMarker) -> Result[CredentialRecoveryMarker]: ...
+
+    async def mark_release_pending(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def dismiss(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def record_release_attempt(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, attempt: ReleaseAttempt,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def record_replacement_ready(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+        readiness: OwnedDaemonReadinessEvidence,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_no_spawn(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, evidence: NoSpawnRetirement,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_after_reply(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+        evidence: TerminalReplyRetirement,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_after_replacement(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, evidence: ReleaseEvidence,
+    ) -> Result[CredentialRecoveryMarker]: ...
 
 
 class DisplayPort(Protocol):
