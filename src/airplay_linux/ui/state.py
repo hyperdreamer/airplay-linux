@@ -421,7 +421,7 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
     phase_label = _phase_label(snapshot)
     if recovery is not None:
         actions = set(recovery.actions)
-        if _credential_prompt_matches(snapshot):
+        if _session_owns_mode(snapshot):
             actions.add(Action.stop)
         actions = frozenset(actions)
         primary = _recovery_primary(recovery)
@@ -1118,7 +1118,9 @@ def _credential_prompt(
     recovery: CredentialRecoveryView | None,
 ) -> ChallengeView | None:
     """Expose only a live relay prompt owned by this Start and endpoint."""
-    if recovery is not None or not _credential_prompt_matches(state):
+    if recovery is not None and recovery.state == "release_pending":
+        return None
+    if not _credential_prompt_matches(state):
         return None
     return state.credential_prompt.challenge
 

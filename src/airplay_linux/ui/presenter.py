@@ -677,8 +677,7 @@ class Presenter:
         marker = next(
             (
                 item for item in getattr(coordinator, "markers", ())
-                if item.receiver_id == receiver_id
-                and item.target == target.canonical_host
+                if item.target == target.canonical_host
                 and item.state != "retired"
             ),
             None,
@@ -1957,16 +1956,11 @@ class QtDialogFactory:
                     del self._pairing_prompts[challenge]
 
         loop = asyncio.get_running_loop()
-        future: asyncio.Future[PairingAnswer | None] = loop.create_future()
+        future: asyncio.Future[None] = loop.create_future()
 
         def finish(*_args: object) -> None:
-            if future.done():
-                return
-            try:
-                answer = dialog.take_result()
-            except Exception:  # noqa: BLE001 - a destroyed prompt answers nothing
-                answer = None
-            future.set_result(answer)
+            if not future.done():
+                future.set_result(None)
 
         def retire(*_args: object) -> None:
             self._relay_cancel_handlers.pop(challenge, None)
@@ -1981,9 +1975,27 @@ class QtDialogFactory:
         answer: PairingAnswer | None = None
         try:
             dialog.open()
-            answer = await future
+            await future
+            try:
+                answer = dialog.take_result()
+            except RuntimeError:  # pragma: no cover - already destroyed
+                answer = None
             return answer
         finally:
+            for signal in (
+                dialog.finished,
+                dialog.destroyed,
+                dialog.relay_submitted,
+            ):
+                try:
+                    signal.disconnect(finish)
+                except (RuntimeError, TypeError):
+                    pass
+            for signal in (dialog.finished, dialog.destroyed):
+                try:
+                    signal.disconnect(retire)
+                except (RuntimeError, TypeError):
+                    pass
             # A submitted relay keeps its visible, cancelable reporting surface.
             # Cancellation, invalidation and ordinary dismissal retire it through
             # the dialog's lifecycle signals and this cleanup path.

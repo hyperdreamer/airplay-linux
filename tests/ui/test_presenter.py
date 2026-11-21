@@ -21,7 +21,9 @@ pumped explicitly by ``rig.settle`` (which never sleeps for wall-clock time).
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -2101,9 +2103,13 @@ class CapturingFactory(QtDialogFactory):
         *,
         actions: frozenset[Action] | None = None,
         retained_output: str | None = None,
+        relay: bool = False,
     ) -> Any:
         dialog = super()._pairing_dialog(
-            challenge, actions=actions, retained_output=retained_output,
+            challenge,
+            actions=actions,
+            retained_output=retained_output,
+            relay=relay,
         )
         self.created.append(dialog)
         return dialog
@@ -2561,6 +2567,169 @@ async def test_recovery_action_matrix_is_state_and_marker_bound(
     assert Action.stop_credential_recovery in rig.offered()
     assert Action.restart_receiver_to_release in rig.offered()
     assert Action.dismiss_credential_recovery not in rig.offered()
+
+
+async def test_qt_relay_dialog_releases_submitted_answer_after_terminal_close(
+    rig: PresenterRig,
+) -> None:
+    factory = CapturingFactory(rig.window)
+    task = asyncio.ensure_future(factory.pairing(
+        challenge(RECEIVER_A),
+        actions=frozenset({Action.submit_credential, Action.cancel}),
+        retained_output=None,
+        relay=True,
+    ))
+    await pump()
+    (dialog,) = factory.created
+    field = dialog.findChild(QLineEdit, "secretField")
+    field.insert("relay-callback-canary-7f4d")
+    dialog.findChild(QPushButton, "pairingSubmitButton").click()
+
+    answer = await task
+    answer_reference = weakref.ref(answer)
+    assert isinstance(answer, PairingAnswer)
+    assert isinstance(answer.value, SensitiveText)
+
+    factory.invalidate_pairing(challenge(RECEIVER_A))
+    await pump()
+    del answer, task, dialog
+    gc.collect()
+    await pump()
+    gc.collect()
+
+    assert answer_reference() is None
+
+
+async def test_watching_marker_keeps_relay_dialog_during_observation(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    gate = rig.dialogs.gate("pairing")
+    start_operation = OperationId(UUID(int=910))
+    request = CredentialRequest(
+        receiver_id=RECEIVER_A,
+        target=target("a"),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=911)),
+        daemon_instance_uuid=InstanceId(UUID(int=912)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(
+            challenge(RECEIVER_A, challenge_id=913),
+            endpoint_fingerprint="endpoint-a-v1",
+            operation_id=start_operation,
+            session_generation=1,
+        ),
+        state="submitting",
+        submission_id=OperationId(UUID(int=914)),
+        report=None,
+    )
+    marker = SimpleNamespace(
+        receiver_id=RECEIVER_A,
+        target=target("a").canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=1,
+    )
+    rig.presenter._credential_recovery = SimpleNamespace(
+        _store_blocked=False,
+        markers=(marker,),
+    )
+    rig.snapshot(
+        "a",
+        operation_id=start_operation,
+        session_generation=1,
+        intent_active=True,
+        intent_stage=IntentStage.starting,
+        phase=SessionPhase.Connecting,
+        transport=TransportState.Connecting,
+        credential_prompt=prompt,
+    )
+    await rig.settle()
+    assert rig.dialogs.pairing_calls == [prompt.challenge]
+
+    observed = replace(prompt, state="observing")
+    rig.snapshot(
+        "a",
+        operation_id=start_operation,
+        session_generation=1,
+        intent_active=True,
+        intent_stage=IntentStage.starting,
+        phase=SessionPhase.Connecting,
+        transport=TransportState.Connecting,
+        credential_prompt=observed,
+    )
+    await rig.settle()
+    gate.set_result(None)
+    await rig.settle()
+
+    assert rig.dialogs.invalidated_pairings == []
+
+
+async def test_recovery_view_follows_canonical_target_across_receiver_records(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    rig.discover("b")
+    marker = SimpleNamespace(
+        receiver_id=RECEIVER_A,
+        target=target("a").canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=2,
+    )
+    rig.presenter._credential_recovery = SimpleNamespace(
+        _store_blocked=False,
+        markers=(marker,),
+    )
+    rig.snapshot("b")
+    await rig.settle()
+    rig.select("b")
+    await rig.settle()
+
+    pane = rig.pane()
+    assert pane.credential_recovery is not None
+    assert Action.restart_receiver_to_release in pane.actions
+    assert Action.start not in pane.actions
+
+
+async def test_dismissed_relay_prompt_keeps_pending_start_stop(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    marker = SimpleNamespace(
+        receiver_id=RECEIVER_A,
+        target=target("a").canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=3,
+    )
+    rig.presenter._credential_recovery = SimpleNamespace(
+        _store_blocked=False,
+        markers=(marker,),
+    )
+    start_operation = OperationId(UUID(int=915))
+    rig.snapshot(
+        "a",
+        operation_id=start_operation,
+        intent_active=True,
+        intent_stage=IntentStage.starting,
+        phase=SessionPhase.Connecting,
+        transport=TransportState.Connecting,
+        credential_prompt=None,
+    )
+    await rig.settle()
+
+    assert Action.stop in rig.offered()
 
 
 async def test_retry_does_not_clear_the_remembered_screen(screen_rig: Any) -> None:

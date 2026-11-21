@@ -2143,7 +2143,32 @@ def test_watching_recovery_preserves_ordinary_stop_for_pending_relay_start() -> 
     assert Action.restart_receiver_to_release not in pane.actions
 
 
-def test_recovery_store_failure_blocks_start_globally() -> None:
+def test_watching_recovery_preserves_stop_after_prompt_dismissal() -> None:
+    recovery = CredentialRecoveryView(
+        target=target().canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=8,
+        title="Cleanup pending",
+        warning="A delayed connection may still appear.",
+        actions=frozenset({Action.stop_credential_recovery, Action.dismiss_credential_recovery}),
+    )
+
+    pane = project(
+        idle(
+            operation_id=OperationId(UUID(int=89)),
+            intent_active=True,
+            intent_stage=IntentStage.starting,
+            phase=SessionPhase.Connecting,
+            transport=TransportState.Connecting,
+            credential_prompt=None,
+        ),
+        inputs(credential_recovery=recovery),
+    )
+
+    assert Action.stop in pane.actions
+
+
     pane = project(idle(), inputs(recovery_store_blocked=True))
 
     assert pane.recovery_store_blocked is True
