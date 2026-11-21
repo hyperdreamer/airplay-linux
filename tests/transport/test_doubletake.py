@@ -27,7 +27,7 @@ from airplay_linux.domain.messages import (
 from airplay_linux.domain.relay import PendingStartCleanupOwner, Submitted
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandOutput
-from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
+from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord, OriginalDaemonIdentity
 from airplay_linux.domain.resources import (
     AudioPolicy, AudioState, Err, ErrorCode, Ok, PhysicalMonitorSource, VolumeLevel,
 )
@@ -315,6 +315,17 @@ def _pin_required_status(receiver):
     })
     assert isinstance(decoded, StatusReply), decoded
     return Ok(value=decoded)
+
+
+def _original_daemon(record, *, socket_path=None):
+    return OriginalDaemonIdentity(
+        launch_uuid=UUID(int=88),
+        instance_uuid=record.instance_uuid,
+        endpoint_generation=1,
+        daemon_process=record.daemon,
+        runtime_directory=record.runtime_directory,
+        socket_path=record.socket_path if socket_path is None else socket_path,
+    )
 
 
 def _production_source_verifier(*, unknown_enabled_output=False):
@@ -2934,10 +2945,16 @@ async def test_credential_request_ignores_non_unique_or_non_typed_rows(tmp_path,
     assert not any(event.kind is TransportEventKind.credential_request for event in h.events)
 
 
+@pytest.mark.parametrize(("target_volume", "initial_volume"), [(False, None), (True, 30)])
 @pytest.mark.asyncio
-async def test_submit_credential_maps_typed_reply_and_forwards_exact_fence(tmp_path):
-    h = Harness(tmp_path, credential_relay=True)
-    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+async def test_submit_credential_maps_typed_reply_and_forwards_exact_fence(
+    tmp_path, target_volume, initial_volume,
+):
+    h = Harness(tmp_path, credential_relay=True, target_volume=target_volume)
+    h.control.profile_features = h.features
+    handle = await h.handle(initial_volume=(VolumeLevel(value=initial_volume) if initial_volume is not None else None))
+    stream = h.transport._streams[handle.lease_id]
+    h.transport._observe_credential_request(stream, _pin_required_status(h.a).value)
     seen = {}
     fence = lambda: Ok(value=None)
 
@@ -2946,7 +2963,12 @@ async def test_submit_credential_maps_typed_reply_and_forwards_exact_fence(tmp_p
         return CredentialSubmissionReply(reply_at=3.5, accepted=False)
 
     h.control.submit_credential = submit
-    submission_context = context(operation_id=OperationId(UUID(int=77)))
+    submission_context = replace(
+        context(operation_id=OperationId(UUID(int=77)), lease=None),
+        transport_lease_id=handle.lease_id,
+        marker_generation=1,
+        owner_daemon=_original_daemon(h.registry.record),
+    )
     result = await h.transport.submit_credential(
         h.a, SensitiveText("transport-submit-canary"), submission_context,
         dispatch_fence=fence,
@@ -2955,10 +2977,242 @@ async def test_submit_credential_maps_typed_reply_and_forwards_exact_fence(tmp_p
     assert result == Ok(value=Submitted(reply_at=3.5, accepted=False, post_dispatch_error=None))
     assert seen["fence"] is fence
     assert seen["target"] == h.a
-    assert seen["payload"].audio == AudioPolicy(enabled=True)
-    assert seen["payload"].initial_volume == VolumeLevel(value=30)
+    assert seen["payload"].audio == (AudioPolicy(enabled=True) if target_volume else None)
+    assert seen["payload"].initial_volume == (
+        VolumeLevel(value=initial_volume) if initial_volume is not None else None
+    )
     assert "transport-submit-canary" not in repr((seen, result, h.control.journal.entries))
     assert h.transport._streams[handle.lease_id].credential_submission_id == submission_context.operation_id
+
+
+@pytest.mark.asyncio
+async def test_submit_requires_marker_generation_before_dispatch(tmp_path):
+    h = Harness(tmp_path, credential_relay=True)
+    handle = await h.handle()
+    stream = h.transport._streams[handle.lease_id]
+    h.transport._observe_credential_request(stream, _pin_required_status(h.a).value)
+    calls = []
+
+    async def submit(*args, **kwargs):
+        calls.append((args, kwargs))
+        return CredentialSubmissionReply(reply_at=4.0, accepted=True)
+
+    h.control.submit_credential = submit
+    missing = replace(stream.context, operation_id=OperationId(UUID(int=81)))
+    result = await h.transport.submit_credential(
+        h.a, SensitiveText("missing-marker-canary"), missing,
+        dispatch_fence=lambda: Ok(value=None),
+    )
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.stale_event
+    assert calls == []
+    assert stream.credential_submission_id is None
+
+
+@pytest.mark.asyncio
+async def test_submit_cancelled_after_admission_is_unknown_outcome(tmp_path):
+    from airplay_linux.domain.relay import NoReply
+
+    h = Harness(tmp_path, credential_relay=True)
+    handle = await h.handle()
+    stream = h.transport._streams[handle.lease_id]
+    h.transport._observe_credential_request(stream, _pin_required_status(h.a).value)
+
+    async def submit(*args, **kwargs):
+        raise asyncio.CancelledError
+
+    h.control.submit_credential = submit
+    submission_context = replace(
+        stream.context,
+        operation_id=OperationId(UUID(int=78)),
+        marker_generation=1,
+    )
+    result = await h.transport.submit_credential(
+        h.a, SensitiveText("cancelled-submit-canary"), submission_context,
+        dispatch_fence=lambda: Ok(value=None),
+    )
+
+    assert isinstance(result, Ok) and isinstance(result.value, NoReply)
+    assert result.value.reason == "dispatch_cancelled"
+    assert stream.credential_submission_id == submission_context.operation_id
+    assert "cancelled-submit-canary" not in repr((result, h.control.journal.entries))
+
+
+@pytest.mark.asyncio
+async def test_credential_request_rejects_a_normalized_alternative_address(tmp_path):
+    h = Harness(tmp_path)
+    receiver = replace(h.a, canonical_host="Living-Room.local.")
+    h.admit(receiver)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=receiver.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(receiver.receiver_id)
+    alias_status = replace(
+        _pin_required_status(receiver).value,
+        streams=(replace(
+            _pin_required_status(receiver).value.streams[0],
+            target="living-room.local",
+        ),),
+    )
+    h.control.results[BackendOperation.status].extend([
+        Ok(value=alias_status), _source_status(receiver, None),
+    ])
+
+    pending = asyncio.create_task(h.start(receiver=receiver))
+    for _ in range(100):
+        await asyncio.sleep(0)
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await asyncio.sleep(0)
+        if pending.done():
+            break
+
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    assert not any(event.kind is TransportEventKind.credential_request for event in h.events)
+
+
+@pytest.mark.asyncio
+async def test_read_credential_status_uses_marker_bound_daemon_after_handle_retirement(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    original = h.registry.record
+    expected = _source_status(h.a, None)
+    h.control.results[BackendOperation.status].append(expected)
+    h.transport._drop(h.transport._streams[handle.lease_id])
+    h.registry.record = daemon(10)
+    replacement = h.factory(h.registry.record)
+    operation = replace(
+        context(lease=None),
+        transport_lease_id=handle.lease_id,
+        marker_generation=4,
+        owner_daemon=_original_daemon(original),
+    )
+
+    result = await h.transport.read_credential_status(h.a, operation)
+
+    assert result == expected
+    assert len(h.control.calls(BackendOperation.status)) == 1
+    assert not replacement.calls(BackendOperation.status)
+
+
+@pytest.mark.asyncio
+async def test_read_credential_status_rejects_a_mismatched_marker_daemon(tmp_path):
+    h = Harness(tmp_path)
+    handle = await h.handle()
+    original = h.registry.record
+    h.transport._drop(h.transport._streams[handle.lease_id])
+    operation = replace(
+        context(lease=None),
+        transport_lease_id=handle.lease_id,
+        marker_generation=4,
+        owner_daemon=_original_daemon(
+            original, socket_path="/run/private/replacement/daemon.sock",
+        ),
+    )
+
+    result = await h.transport.read_credential_status(h.a, operation)
+
+    assert isinstance(result, Err)
+    assert h.control.calls(BackendOperation.status) == []
+
+
+@pytest.mark.asyncio
+async def test_read_credential_status_refuses_a_dispatched_read_without_marker_context(tmp_path):
+    h = Harness(tmp_path, credential_relay=True)
+    handle = await h.handle()
+    stream = h.transport._streams[handle.lease_id]
+    h.transport._observe_credential_request(stream, _pin_required_status(h.a).value)
+    submission_context = replace(
+        stream.context, operation_id=OperationId(UUID(int=79)), marker_generation=4,
+    )
+
+    # The stream remembers the marker generation at submit admission. A later
+    # status read cannot silently omit the marker-bound owner context.
+    async def submit(target, payload, operation, *, dispatch_fence):
+        return CredentialSubmissionReply(reply_at=4.0, accepted=True)
+
+    h.control.submit_credential = submit
+    await h.transport.submit_credential(
+        h.a, SensitiveText("status-owner-canary"), submission_context,
+        dispatch_fence=lambda: Ok(value=None),
+    )
+    missing = replace(submission_context, marker_generation=None, owner_daemon=None)
+    result = await h.transport.read_credential_status(h.a, missing)
+
+    assert isinstance(result, Err)
+    assert h.control.calls(BackendOperation.status) == []
+
+
+@pytest.mark.asyncio
+async def test_dismiss_credential_prompt_resumes_its_start_readiness_budget(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    pending = asyncio.create_task(h.start())
+    try:
+        await _drain_transport()
+        event = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
+        stream = h.transport._streams[event.context.transport_lease_id]
+        h.scheduler.advance(12.5)
+        await _drain_transport()
+        assert not pending.done()
+
+        dismissed = h.transport.dismiss_credential_prompt(h.a, stream.context)
+
+        assert dismissed is None
+        assert stream.readiness_paused_at is None
+        assert stream.readiness_pause_total == pytest.approx(
+            h.clock.now() - event.payload.request.observed_at,
+        )
+    finally:
+        if not pending.done():
+            pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_submit_resumes_its_start_readiness_budget_before_reply(tmp_path):
+    h = Harness(tmp_path, credential_relay=True)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    pending = asyncio.create_task(h.start())
+    submission = None
+    gate = Gate()
+    try:
+        await _drain_transport()
+        event = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
+        stream = h.transport._streams[event.context.transport_lease_id]
+
+        async def submit(target, payload, operation, *, dispatch_fence):
+            return await gate.wait()
+
+        h.control.submit_credential = submit
+        submission_context = replace(
+            stream.context, operation_id=OperationId(UUID(int=80)), marker_generation=1,
+        )
+        submission = asyncio.create_task(h.transport.submit_credential(
+            h.a, SensitiveText("submit-resume-canary"), submission_context,
+            dispatch_fence=lambda: Ok(value=None),
+        ))
+        await gate.entered.wait()
+        assert stream.readiness_paused_at is None
+        assert stream.readiness_pause_total == pytest.approx(
+            h.clock.now() - event.payload.request.observed_at,
+        )
+    finally:
+        gate.release(Ok(value=CredentialSubmissionReply(reply_at=h.clock.now(), accepted=True)))
+        if submission is not None:
+            await asyncio.gather(submission, return_exceptions=True)
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -3182,7 +3436,7 @@ async def test_dispatched_handoff_preserves_command_status_and_exact_target_clea
     from airplay_linux.transport.doubletake import CONTROL_TIMEOUT
 
     h = Harness(tmp_path, credential_relay=True)
-    h.control.connected.add(h.b.receiver_id)
+    other_handle = await h.handle(h.b, ctx=context(lease=2))
     h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
         operation="connect", target=h.a.canonical_host, state="connecting",
     )))
@@ -3206,13 +3460,16 @@ async def test_dispatched_handoff_preserves_command_status_and_exact_target_clea
         command_entered = asyncio.Event()
         loop = asyncio.get_running_loop()
         command_deadline = loop.create_future()
+        observations = {}
 
         async def submit(target, payload, operation, *, dispatch_fence):
             command_entered.set()
+            observations["submission_task"] = asyncio.current_task()
             scheduled = h.scheduler.call_at(
                 h.clock.now() + CONTROL_TIMEOUT,
                 lambda: command_deadline.set_result(None),
             )
+            observations["deadline_handle"] = scheduled
             try:
                 await command_deadline
                 return CredentialSubmissionReply(reply_at=h.clock.now(), accepted=True)
@@ -3220,12 +3477,18 @@ async def test_dispatched_handoff_preserves_command_status_and_exact_target_clea
                 scheduled.cancel()
 
         h.control.submit_credential = submit
-        submission_context = replace(stream.context, operation_id=OperationId(UUID(int=94)))
+        submission_context = replace(
+            stream.context,
+            operation_id=OperationId(UUID(int=94)),
+            marker_generation=1,
+            owner_daemon=_original_daemon(h.registry.record),
+        )
         submission = asyncio.create_task(h.transport.submit_credential(
             h.a, SensitiveText("dispatched-handoff-f10-canary"), submission_context,
             dispatch_fence=lambda: Ok(value=None),
         ))
         await command_entered.wait()
+        command_deadline_handle = observations["deadline_handle"]
         h.control.gates[(BackendOperation.status, None)] = status_gate
         status_read = asyncio.create_task(h.transport.read_credential_status(h.a, submission_context))
         await status_gate.entered.wait()
@@ -3256,12 +3519,17 @@ async def test_dispatched_handoff_preserves_command_status_and_exact_target_clea
         )
         assert isinstance(transferred, Ok)
         assert not stream.lock.locked()
+        assert observations["submission_task"] is submission
+        assert observations["deadline_handle"] is command_deadline_handle
+        assert not command_deadline_handle.cancelled
         assert isinstance(await h.transport.stop_pending_start(owner, stop_context), Err)
         assert isinstance(await start, Err)
         assert not submission.done() and not status_read.done()
         h.scheduler.advance(CONTROL_TIMEOUT - 2.0)
         await _drain_transport()
-        assert isinstance(await submission, Ok)
+        submission_result = await asyncio.wait_for(submission, timeout=1.0)
+        assert isinstance(submission_result, Ok)
+        assert isinstance(submission_result.value, Submitted)
         assert not status_read.done()
         connecting = _source_status(h.a, None, "connecting")
         status_gate.release(connecting)
@@ -3269,6 +3537,7 @@ async def test_dispatched_handoff_preserves_command_status_and_exact_target_clea
         h.control.results[BackendOperation.status].append(_pin_required_status(h.b))
         assert isinstance(await h.transport.stop_stream(transferred.value, stop_context), Ok)
         assert h.control.connected == {h.b.receiver_id}
+        assert h.transport._streams[other_handle.lease_id].handle == other_handle
         disconnects = h.control.calls(BackendOperation.disconnect)
         assert len(disconnects) == 1
         assert disconnects[0]["target"]["canonical_host"] == h.a.canonical_host
@@ -3304,7 +3573,12 @@ async def test_handoff_rejects_stale_marker_generation_before_signalling(tmp_pat
         await _drain_transport()
         event = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
         stream = h.transport._streams[event.context.transport_lease_id]
-        submit_context = replace(stream.context, operation_id=OperationId(UUID(int=92)))
+        submit_context = replace(
+            stream.context,
+            operation_id=OperationId(UUID(int=92)),
+            marker_generation=1,
+            owner_daemon=_original_daemon(h.registry.record),
+        )
         submission = asyncio.create_task(h.transport.submit_credential(
             h.a, SensitiveText("stale-marker-generation-f4-canary"), submit_context,
             dispatch_fence=lambda: Ok(value=None),
@@ -3343,7 +3617,8 @@ async def test_handoff_rejects_stale_marker_generation_before_signalling(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_unclassified_submit_exception_keeps_unknown_outcome(tmp_path):
+@pytest.mark.parametrize("failure", ["exception", "unknown_result"])
+async def test_unclassified_submit_completion_keeps_unknown_outcome(tmp_path, failure):
     from airplay_linux.domain.relay import NoReply
 
     h = Harness(tmp_path, credential_relay=True)
@@ -3352,14 +3627,24 @@ async def test_unclassified_submit_exception_keeps_unknown_outcome(tmp_path):
 
     async def submit(target, payload, operation, *, dispatch_fence):
         dispatched.append(True)
-        raise RuntimeError("credential-unknown-outcome-canary")
+        if failure == "exception":
+            raise RuntimeError("credential-unknown-outcome-canary")
+        return object()
 
     h.control.submit_credential = submit
-    operation = replace(context(operation_id=OperationId(UUID(int=91))), transport_lease_id=handle.lease_id)
+    operation = replace(
+        context(operation_id=OperationId(UUID(int=91))),
+        transport_lease_id=handle.lease_id,
+        marker_generation=1,
+        owner_daemon=_original_daemon(h.registry.record),
+    )
+    stream = h.transport._streams[handle.lease_id]
+    h.transport._observe_credential_request(stream, _pin_required_status(h.a).value)
     result = await h.transport.submit_credential(
         h.a, SensitiveText("credential-unknown-outcome-canary"), operation,
         dispatch_fence=lambda: Ok(value=None),
     )
     assert dispatched == [True]
     assert isinstance(result, Ok) and isinstance(result.value, NoReply)
+    assert result.value.reason == "incomplete_reply"
     assert "credential-unknown-outcome-canary" not in repr(result)

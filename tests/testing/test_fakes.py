@@ -1473,6 +1473,67 @@ def test_fake_process_credential_run_applies_fence_and_redacts_secret_metadata()
     assert canary not in repr(process.journal.entries)
 
 
+def test_fake_process_deferred_credential_output_is_safe_in_failed_assertions(tmp_path):
+    import os
+    import sys
+    from pathlib import Path
+
+    canary = "fake-process-deferred-output-canary-29f1"
+    script = tmp_path / "test_deferred_credential_output.py"
+    script.write_text(
+        "import asyncio\n"
+        "from airplay_linux.domain import ports\n"
+        "from airplay_linux.domain.resources import Ok\n"
+        "from airplay_linux.testing.adapters import Deferred, FakeProcess\n"
+        f"CANARY = {canary!r}\n"
+        "def test_output_stays_transient():\n"
+        "    process = FakeProcess()\n"
+        "    command = ports.CommandSpec(\n"
+        "        argv=('doubletake-ctl', 'connect', '192.0.2.10', CANARY),\n"
+        "        env={}, secret_indices=(3,),\n"
+        "    )\n"
+        "    deferred = Deferred()\n"
+        "    process.queue_result('run_credential', deferred)\n"
+        "    async def complete():\n"
+        "        task = asyncio.create_task(process.run_credential(\n"
+        "            command, 5.0, lambda: Ok(value=None),\n"
+        "        ))\n"
+        "        await asyncio.sleep(0)\n"
+        "        deferred.resolve(ports.CredentialProcessCompleted(\n"
+        "            output=ports.CommandOutput(exit_code=0, stdout=CANARY.encode(), stderr=b''),\n"
+        "        ))\n"
+        "        return await task\n"
+        "    result = asyncio.run(complete())\n"
+        "    assert CANARY not in repr((result, deferred.value, process.credential_runs, process.journal.entries))\n"
+        "    invalid = ports.CommandSpec(\n"
+        "        argv=('doubletake-ctl', 'connect', '192.0.2.10', CANARY), env={},\n"
+        "    )\n"
+        "    diagnostic = asyncio.run(process.run_credential(\n"
+        "        invalid, 5.0, lambda: Ok(value=None),\n"
+        "    )).diagnostic\n"
+        "    assert CANARY not in repr(diagnostic)\n"
+        "    assert result == result and False\n",
+        encoding="utf-8",
+    )
+    source_root = Path(ports.__file__).parents[2]
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(source_root)
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", str(script), "-vv", "--tb=long"],
+        cwd=source_root.parent,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    output = completed.stdout + completed.stderr
+    if completed.returncode == 0:
+        pytest.fail("the intentional safe-representation assertion did not fail", pytrace=False)
+    if canary in output:
+        pytest.fail("a deferred credential result leaked into assertion output", pytrace=False)
+
+
 def test_fake_process_credential_run_enforces_timeout_for_unresolved_deferred_result():
     async def scenario():
         process = FakeProcess()

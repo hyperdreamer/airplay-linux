@@ -717,6 +717,23 @@ class _Daemon:
 # ---------------------------------------------------------------------------
 
 
+def _credential_connect_argument(rest: list[str]) -> bool:
+    """Whether a target-first connect has a final credential operand."""
+    if len(rest) <= 2 or rest[0] != "connect":
+        return False
+    operands = rest[2:]
+    position = 0
+    if position < len(operands) and operands[position] == "--audio":
+        if position + 1 >= len(operands) or operands[position + 1] not in {"on", "off"}:
+            return True
+        position += 2
+    if position < len(operands) and operands[position] == "--volume":
+        if position + 1 >= len(operands) or not operands[position + 1].isdigit():
+            return True
+        position += 2
+    return position < len(operands)
+
+
 def _ctl(argv: list[str]) -> int:
     journal_path = None
     mode = os.environ.get(CTL_MODE_ENV, "normal")
@@ -746,8 +763,8 @@ def _ctl(argv: list[str]) -> int:
         else:
             return 64
         recorded_argv = list(argv)
-        if operation == "connect" and len(rest) > 2:
-            recorded_argv[index + 4:] = ["<redacted>"] * (len(rest) - 2)
+        if _credential_connect_argument(rest):
+            recorded_argv[-1] = "<redacted>"
         _append(journal_path, {
             "process": "ctl", "outcome": "start", "operation": operation,
             "request_id": request_id, "argv": recorded_argv, "env_keys": sorted(os.environ),

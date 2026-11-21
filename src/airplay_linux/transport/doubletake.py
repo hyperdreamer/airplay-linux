@@ -41,7 +41,7 @@ from airplay_linux.domain.operations import (
 from airplay_linux.domain.ports import (
     CapturePort, Clock, CredentialStore, IdFactory, ReceiverStore, Scheduler, Subscription,
 )
-from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
+from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord, OriginalDaemonIdentity
 from airplay_linux.domain.relay import (
     CredentialRequest, NoReply, PendingStartCleanupOwner, RelayStartOptions, Submitted,
 )
@@ -246,6 +246,7 @@ class _Stream:
     credential_request_ended: bool = False
     credential_kinds_seen: set[str] = field(default_factory=set)
     credential_submission_id: OperationId | None = None
+    credential_marker_generation: int | None = None
     readiness_paused_at: float | None = None
     readiness_pause_total: float = 0.0
     abandoned: bool = False
@@ -966,19 +967,21 @@ class DoubleTakeTransport:
                 handshake += pause_delta
             applied_pause = paused
             prepared = examined and len(matches) == 1 and matches[0].source is not None
-            if stream.readiness_paused_at is not None:
-                pass
-            elif prepared:
+            if prepared:
                 if handshake is None:
                     handshake = now + CONNECT_STREAMING_TIMEOUT
-                if now >= handshake:
+                if now >= handshake and stream.readiness_paused_at is None:
                     return _failure(ErrorCode.unsupported_source)
             else:
                 handshake = None
-                if examined and seen and not matches and not stream.credential_request_ended:
+                if (
+                    examined and seen and not matches
+                    and not stream.credential_request_ended
+                    and stream.readiness_paused_at is None
+                ):
                     # The stream this target had is gone: the backend dropped it.
                     return _failure(ErrorCode.unsupported_source)
-                if not seen and now >= accepted:
+                if not seen and now >= accepted and stream.readiness_paused_at is None:
                     # No stream for this target ever appeared: the backend never
                     # accepted the capture, so no prompt is pending.
                     return _failure(ErrorCode.unsupported_source)
@@ -1238,9 +1241,11 @@ class DoubleTakeTransport:
         stream = self._streams.get(lease) if lease is not None else None
         if stream is None or stream.target != target or stream.daemon is None:
             return _failure(ErrorCode.stale_event)
-        if stream.credential_request_ended:
+        if stream.credential_request is None or stream.credential_request_ended:
             return _failure(ErrorCode.stale_event)
         if stream.credential_submission_id is not None:
+            return _failure(ErrorCode.stale_event)
+        if context.marker_generation is None:
             return _failure(ErrorCode.stale_event)
         checked = self._current(target, context)
         if isinstance(checked, Err):
@@ -1251,18 +1256,28 @@ class DoubleTakeTransport:
             or context.trust_generation != stream.context.trust_generation
         ):
             return _failure(ErrorCode.stale_event)
+        if context.owner_daemon is not None and not self._marker_daemon_matches(
+            stream.daemon, context.owner_daemon,
+        ):
+            return _failure(ErrorCode.stale_event)
         if not self._features.credential_relay:
+            return _failure(ErrorCode.unsupported_operation)
+        start_options = stream.credential_request.start_options
+        if not start_options.target_volume_proven and (
+            not stream.audio_policy.enabled or stream.initial_volume is not None
+        ):
             return _failure(ErrorCode.unsupported_operation)
         submitter = getattr(stream.daemon.control, "submit_credential", None)
         if submitter is None:
             return _failure(ErrorCode.dependency_incompatible)
         stream.credential_submission_id = context.operation_id
+        stream.credential_marker_generation = context.marker_generation
         self._resume_credential_readiness(stream)
         payload = CredentialPayload(
             value=value,
-            audio=stream.audio_policy,
+            audio=start_options.audio if start_options.target_volume_proven else None,
             initial_volume=(
-                stream.initial_volume if stream.audio_policy.enabled else None
+                start_options.initial_volume if start_options.target_volume_proven else None
             ),
         )
         try:
@@ -1270,7 +1285,7 @@ class DoubleTakeTransport:
                 target, payload, context, dispatch_fence=dispatch_fence,
             )
         except asyncio.CancelledError:
-            raise
+            return Ok(value=NoReply(reason="dispatch_cancelled"))
         except Exception:
             return Ok(value=NoReply(reason="incomplete_reply"))
         if isinstance(result, CredentialSubmissionReply):
@@ -1282,6 +1297,7 @@ class DoubleTakeTransport:
             if result.dispatch_state == "no_spawn":
                 if stream.credential_submission_id == context.operation_id:
                     stream.credential_submission_id = None
+                    stream.credential_marker_generation = None
                 return Err(error=result.error)
             if result.dispatch_state == "acknowledged":
                 return Ok(value=Submitted(
@@ -1293,6 +1309,62 @@ class DoubleTakeTransport:
                 ))
             return Ok(value=NoReply(reason=result.reason))
         return Ok(value=NoReply(reason="incomplete_reply"))
+
+    @staticmethod
+    def _marker_daemon_matches(
+        daemon: _Daemon | None, owner: OriginalDaemonIdentity,
+    ) -> bool:
+        if daemon is None or type(owner) is not OriginalDaemonIdentity:
+            return False
+        record = daemon.record
+        return (
+            record.instance_uuid == owner.instance_uuid
+            and record.socket_path == owner.socket_path
+            and record.runtime_directory == owner.runtime_directory
+            and record.daemon == owner.daemon_process
+        )
+
+    def _daemon_for_recovery(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> Result[_Daemon]:
+        owner = context.owner_daemon
+        if (
+            type(owner) is not OriginalDaemonIdentity
+            or context.marker_generation is None
+            or owner.endpoint_generation != target.endpoint_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        daemon = self._daemons.get(owner.instance_uuid)
+        if (
+            not self._marker_daemon_matches(daemon, owner)
+            or not daemon.alive
+            or not daemon.authenticated
+        ):
+            return _failure(ErrorCode.stale_event)
+        return Ok(value=daemon)
+
+    def dismiss_credential_prompt(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> None:
+        if type(target) is not ReceiverTarget or type(context) is not OperationContext:
+            return
+        lease = context.transport_lease_id
+        stream = self._streams.get(lease) if lease is not None else None
+        if (
+            stream is None
+            or stream.target != target
+            or stream.context.operation_id != context.operation_id
+            or stream.context.session_generation != context.session_generation
+            or stream.context.endpoint_generation != context.endpoint_generation
+            or stream.context.trust_generation != context.trust_generation
+            or stream.credential_request is None
+            or stream.credential_request_ended
+            or stream.released
+        ):
+            return
+        if isinstance(self._current(target, context), Err):
+            return
+        self._resume_credential_readiness(stream)
 
     async def read_credential_status(
         self, target: ReceiverTarget, context: OperationContext,
@@ -1310,11 +1382,38 @@ class DoubleTakeTransport:
         ):
             return _failure(ErrorCode.stale_event)
         daemon = stream.daemon if stream is not None else None
+        if stream is None:
+            recovered = self._daemon_for_recovery(target, context)
+            if isinstance(recovered, Err):
+                return recovered
+            daemon = recovered.value
+        elif stream.credential_submission_id is not None and (
+            context.marker_generation is None
+            or context.marker_generation != stream.credential_marker_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        if (context.marker_generation is None) != (context.owner_daemon is None):
+            return _failure(ErrorCode.stale_event)
+        if stream is not None and context.marker_generation is not None and (
+            stream.credential_submission_id is None
+            or context.marker_generation != stream.credential_marker_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        if context.owner_daemon is not None:
+            recovered = self._daemon_for_recovery(target, context)
+            if isinstance(recovered, Err) or recovered.value is not daemon:
+                return _failure(ErrorCode.stale_event)
         if daemon is None or not daemon.alive or not daemon.authenticated:
             return _failure(ErrorCode.stale_event)
         result = await self._read_status(daemon, code=ErrorCode.transport_failed)
         if isinstance(result, Err):
             return result
+        if not daemon.alive or self._daemons.get(daemon.record.instance_uuid) is not daemon:
+            return _failure(ErrorCode.stale_event)
+        if context.owner_daemon is not None and not self._marker_daemon_matches(
+            daemon, context.owner_daemon,
+        ):
+            return _failure(ErrorCode.stale_event)
         checked = self._current(target, context)
         return checked if isinstance(checked, Err) else result
 
@@ -1331,8 +1430,23 @@ class DoubleTakeTransport:
             return current
         fence = self._fences.get(stream.target.receiver_id)
         handle = stream.handle
+        marker_matches = (
+            stream.credential_submission_id is None
+            and owner.credential_submission_id is None
+            and stream.credential_marker_generation is None
+            and owner.marker_generation is None
+        ) or (
+            stream.credential_submission_id is not None
+            and stream.credential_marker_generation is not None
+            and owner.credential_submission_id == stream.credential_submission_id
+            and owner.marker_generation == stream.credential_marker_generation
+        )
+        if not marker_matches:
+            return _failure(ErrorCode.stale_event)
         if (
-            stream.target.receiver_id != owner.receiver_id
+            stream.credential_request is None
+            or stream.credential_request_ended
+            or stream.target.receiver_id != owner.receiver_id
             or stream.target != owner.target
             or stream.context.operation_id != owner.start_operation_id
             or stream.target.endpoint_fingerprint != owner.endpoint_fingerprint

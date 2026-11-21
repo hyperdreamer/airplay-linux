@@ -475,6 +475,11 @@ class FakeTransport(_Scripted, _EventSource):
             return scripted
         return _failure(ErrorCode.dependency_incompatible, "Credential status is not scripted")
 
+    def dismiss_credential_prompt(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> None:
+        self._record("dismiss_credential_prompt", target=target, context=context)
+
     async def stop_pending_start(self, owner: Any, stop_context: OperationContext) -> Result[Any]:
         self._record("stop_pending_start", owner=owner, stop_context=stop_context)
         scripted = await self._take("stop_pending_start")

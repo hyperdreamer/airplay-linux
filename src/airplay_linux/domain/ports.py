@@ -144,6 +144,10 @@ class TransportPort(Protocol):
         self, target: ReceiverTarget, context: OperationContext,
     ) -> Result[StatusReply]: ...
 
+    def dismiss_credential_prompt(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> None: ...
+
     async def stop_pending_start(
         self, owner: PendingStartCleanupOwner, stop_context: OperationContext,
     ) -> Result[StreamHandle]: ...
