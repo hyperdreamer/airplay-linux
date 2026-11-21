@@ -23,7 +23,7 @@ testable as a deterministic function of typed domain records.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Final
@@ -106,6 +106,7 @@ class Badge:
 class CredentialRecoveryView:
     """Validated, target-bound recovery facts prepared for the dashboard."""
 
+    receiver_id: ReceiverId = field(repr=False)
     target: str
     state: str
     automatic_status_checks: bool

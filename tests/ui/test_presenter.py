@@ -52,6 +52,7 @@ from airplay_linux.domain.messages import (
     RetryAudio,
     RetryCleanup,
     RetryRevocation,
+    RestartReceiverToRelease,
     SetMuted,
     SetVolume,
     Start,
@@ -2530,6 +2531,39 @@ async def test_relay_submit_after_table_selection_stays_bound_to_owner(
     assert len(commands) == 1
     assert commands[0].receiver_id == RECEIVER_A
     assert rig.commands_of(SubmitPairing) == []
+
+
+async def test_recovery_action_uses_marker_receiver_for_canonical_target_alias(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    rig.discover("b")
+    alias_target = replace(target("b"), canonical_host=target("a").canonical_host)
+    marker = SimpleNamespace(
+        receiver_id=RECEIVER_A,
+        target=target("a").canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=2,
+    )
+    rig.presenter._credential_recovery = SimpleNamespace(
+        _store_blocked=False,
+        markers=(marker,),
+    )
+    rig.snapshot("b", target=alias_target)
+    await rig.settle()
+    rig.select("b")
+    await rig.settle()
+
+    assert rig.pane().credential_recovery is not None
+    assert Action.restart_receiver_to_release in rig.offered()
+
+    rig.click(Action.restart_receiver_to_release)
+    await rig.settle()
+
+    (command,) = rig.commands_of(RestartReceiverToRelease)
+    assert command.receiver_id == RECEIVER_A
+    assert command.marker_generation == marker.marker_generation
 
 
 async def test_recovery_action_matrix_is_state_and_marker_bound(

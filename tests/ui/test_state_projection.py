@@ -1962,6 +1962,7 @@ def test_relay_prompt_is_transient_and_blocks_transactional_challenge() -> None:
 
 def test_recovery_view_blocks_start_and_exposes_only_recovery_actions() -> None:
     recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
         target=target().canonical_host,
         state="release_pending",
         automatic_status_checks=False,
@@ -2020,6 +2021,7 @@ def test_relay_prompt_requires_exact_canonical_target() -> None:
 
 def test_offline_saved_target_retains_release_recovery_view() -> None:
     recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
         target=target().canonical_host,
         state="release_pending",
         automatic_status_checks=False,
@@ -2064,6 +2066,7 @@ def test_unknown_relay_report_survives_recovery_overlay() -> None:
         report="outcome_unknown",
     )
     recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
         target=target().canonical_host,
         state="release_pending",
         automatic_status_checks=False,
@@ -2117,6 +2120,7 @@ def test_watching_recovery_preserves_ordinary_stop_for_pending_relay_start() -> 
         report=None,
     )
     recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
         target=target().canonical_host,
         state="watching",
         automatic_status_checks=True,
@@ -2145,6 +2149,7 @@ def test_watching_recovery_preserves_ordinary_stop_for_pending_relay_start() -> 
 
 def test_watching_recovery_preserves_stop_after_prompt_dismissal() -> None:
     recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
         target=target().canonical_host,
         state="watching",
         automatic_status_checks=True,

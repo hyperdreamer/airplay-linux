@@ -697,6 +697,7 @@ class Presenter:
             "This target remains fenced until the receiver restarts."
         )
         return CredentialRecoveryView(
+            receiver_id=marker.receiver_id,
             target=marker.target,
             state=marker.state,
             automatic_status_checks=marker.automatic_status_checks,
@@ -1185,9 +1186,9 @@ class Presenter:
                 Action.restart_receiver_to_release: RestartReceiverToRelease,
             }[action]
             self._schedule(self._dispatch(command_type(
-                receiver_id=receiver_id,
+                receiver_id=recovery.receiver_id,
                 marker_generation=recovery.marker_generation,
-            )), receiver_id=receiver_id)
+            )), receiver_id=recovery.receiver_id)
             return
         factory = _COMMAND_FACTORIES.get(action)
         if factory is not None:
