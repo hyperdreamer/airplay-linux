@@ -981,3 +981,180 @@ async def test_every_owned_termination_passes_strict_true(private_socket_root, m
             c.close()
         elif path != "namespace_probe":
             c.close()
+
+
+def marker_for_receipt(receipt, *, target="192.0.2.41"):
+    from airplay_linux.domain.records import CredentialRecoveryMarker, OriginalDaemonIdentity
+
+    return CredentialRecoveryMarker(
+        schema_version=1, target=target, receiver_id="airplay-device:recovery",
+        start_operation_id=UUID(int=151), marker_generation=1, state="watching",
+        automatic_status_checks=True, release_attempt=None, retirement=None,
+        original_daemon=OriginalDaemonIdentity(
+            launch_uuid=receipt.launch_uuid, instance_uuid=receipt.daemon_instance_uuid,
+            endpoint_generation=receipt.endpoint_generation, daemon_process=receipt.daemon,
+            runtime_directory=receipt.runtime_directory,
+            socket_path=str(Path(receipt.runtime_directory) / receipt.socket_name),
+        ),
+    )
+
+
+async def test_recovery_exemption_retains_authenticated_original_as_current(application_daemon_identity_cases):
+    # Breaks when reconciliation stops a marker-owned daemon or fails to adopt it.
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    marker = marker_for_receipt(receipt)
+    c.reopen()
+    exempted = await c.registry.authenticate_recovery(marker)
+    assert isinstance(exempted, Ok) and exempted.value is not None
+    exemption = exempted.value
+    assert exemption.marker_identity == marker
+    assert exemption.marker_generation == 1
+    assert exemption.kind == "watching_original"
+    assert exemption.daemon_identity == marker.original_daemon
+    assert await c.registry.reconcile_previous(recovery_exemptions=(exemption,)) == Ok(value=None)
+    assert c.registry._record == replace(c.record, lifecycle="running")
+    assert c.registry._ready
+    assert (await c.current()) == receipt
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+    assert (await c.registry.ensure()).value.instance_uuid == marker.original_daemon.instance_uuid
+    assert len(c.process.spawned) == 1
+
+
+@pytest.mark.parametrize("field", ["launch_uuid", "instance_uuid", "endpoint_generation", "pid", "start_ticks", "runtime_directory", "socket_path"])
+async def test_recovery_original_requires_every_historical_identity_field(application_daemon_identity_cases, field):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old = marker.original_daemon
+    changed = {
+        "launch_uuid": UUID(int=170), "instance_uuid": InstanceId(UUID(int=171)),
+        "endpoint_generation": old.endpoint_generation + 1,
+        "runtime_directory": old.runtime_directory + "-other",
+        "socket_path": old.runtime_directory + "/other.sock",
+    }
+    if field in {"pid", "start_ticks"}:
+        identity = replace(old.daemon_process, **{field: getattr(old.daemon_process, field) + 1})
+        old = replace(old, daemon_process=identity)
+    else:
+        old = replace(old, **{field: changed[field]})
+    c.reopen()
+    c.events.clear()
+    result = await c.registry.authenticate_recovery(replace(marker, original_daemon=old))
+    assert isinstance(result, Ok) and result.value is None
+    assert "status-poll" not in c.events
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("change", ["same_address_process", "stale_socket", "missing_daemon", "supervisor_intent"])
+async def test_recovery_unavailable_original_is_never_contacted(application_daemon_identity_cases, change):
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+    from test_owned_launcher import DAEMON
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    marker = marker_for_receipt(receipt)
+    if change == "same_address_process":
+        c.facts.peer_pid = 999
+    elif change == "stale_socket":
+        c.replace_entry()
+    elif change == "missing_daemon":
+        c.process.exit(DAEMON)
+    else:
+        intent = SupervisorReleaseIntent(
+            schema_version=1, launch_uuid=receipt.launch_uuid, instance_uuid=receipt.instance_uuid,
+            app=receipt.app, supervisor=receipt.supervisor, daemon=receipt.daemon,
+            reason="application-exited", intent_at=1.0,
+        )
+        assert isinstance(await c.supervisor_intents(receipt.runtime_directory).write(intent), Ok)
+    c.reopen()
+    c.events.clear()
+    result = await c.registry.authenticate_recovery(marker)
+    assert isinstance(result, Ok) and result.value is None
+    assert "status-poll" not in c.events
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("change", ["launch_uuid", "process", "generation", "target", "marker_generation", "marker_bool", "socket"])
+async def test_registry_revalidates_exemption_before_any_cleanup(application_daemon_identity_cases, change):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+    result = await c.registry.authenticate_recovery(marker)
+    assert isinstance(result, Ok) and result.value is not None
+    exemption = result.value
+    if change == "launch_uuid":
+        exemption = replace(exemption, daemon_identity=replace(exemption.daemon_identity, launch_uuid=UUID(int=172)))
+    elif change == "process":
+        c.process.register(replace(marker.original_daemon.daemon_process, start_ticks=999), {})
+    elif change == "generation":
+        exemption = replace(exemption, daemon_identity=replace(exemption.daemon_identity, endpoint_generation=99))
+    elif change == "target":
+        exemption = replace(exemption, marker_identity=replace(marker, target="192.0.2.42"))
+    elif change == "marker_generation":
+        exemption = replace(exemption, marker_generation=2)
+    elif change == "marker_bool":
+        exemption = replace(exemption, marker_generation=True)
+    else:
+        c.facts.peer_pid = 999
+    c.events.clear()
+    refused = await c.registry.reconcile_previous(recovery_exemptions=(exemption,))
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert "status-poll" not in c.events
+    assert (await c.current()).state == "ready"
+
+
+async def test_recovery_exemption_still_reconciles_every_unrelated_receipt(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+    exemption = (await c.registry.authenticate_recovery(marker)).value
+    terminal = replace(await c.current(), launch_uuid=UUID(int=173), endpoint_generation=2,
+                       runtime_directory=str(c.root / "unrelated"), state="stopped",
+                       daemon_instance_uuid=InstanceId(UUID(int=174)), daemon=ProcessIdentity(pid=175, start_ticks=176),
+                       supervisor=ProcessIdentity(pid=177, start_ticks=178), peer_pid=175, peer_start_ticks=176)
+    Path(terminal.runtime_directory).mkdir(mode=0o700)
+    info = Path(terminal.runtime_directory).stat()
+    terminal = replace(terminal, runtime_device=info.st_dev, runtime_inode=info.st_ino)
+    from airplay_linux.storage.codecs import encode_launch_receipt
+    path = c.root / "daemon/receipts" / (str(terminal.launch_uuid) + ".json")
+    path.write_bytes(encode_launch_receipt(terminal))
+    assert await c.registry.reconcile_previous(recovery_exemptions=(exemption,)) == Ok(value=None)
+    assert any(intent.launch_uuid == terminal.launch_uuid for intent in (await c.cleanup.all()).value)
+    assert c.registry._record.instance_uuid == marker.original_daemon.instance_uuid
+    assert c.process.terminated == []
+
+
+async def test_startup_restores_watching_marker_before_registry_can_stop_original(application_daemon_identity_cases):
+    # Breaks if ordinary reconciliation runs before the marker's exemption is
+    # restored, even when startup later reconstructs the target fence.
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.runtime import compose_manager
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    c.reopen()
+    rig = SessionRig()
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    coordinator = CredentialRecoveryCoordinator(store, c.registry, fences=rig.fences)
+    deps = replace(rig.deps, credential_recovery=coordinator)
+    manager = compose_manager(deps)
+    result = await StartupRecovery(manager, deps, c.registry).run()
+    assert isinstance(result, Ok)
+    assert c.process.terminated == []
+    assert (await c.current()).state == "ready"
+    assert c.registry._record.instance_uuid == marker.original_daemon.instance_uuid
+    assert coordinator.markers == (marker,)

@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
 from uuid import UUID
 
 from airplay_linux.diagnostics import diagnostic
@@ -90,6 +90,9 @@ from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 from .fencing import accept_challenge, accept_cleanup, accept_display, accept_transport
 from .phase import derive_phase
 
+if TYPE_CHECKING:
+    from .recovery import CredentialRecoveryCoordinator
+
 
 class Route(StrEnum):
     mirror = "mirror"
@@ -124,6 +127,7 @@ class ManagerDeps:
     activity: ActivitySink
     capabilities: Callable[[], CapabilityReport]
     restart_daemon: Callable[[], Awaitable[Result[DaemonRecord]]]
+    credential_recovery: CredentialRecoveryCoordinator | None = None
 
 
 @dataclass
@@ -361,6 +365,11 @@ class SessionManager:
                 accepted=False,
                 diagnostic=diagnostic(ErrorCode.unsupported_operation, receiver_id),
             )
+        if isinstance(command, Start) and self.deps.credential_recovery is not None:
+            state = self._ensure(receiver_id)
+            allowed = self.deps.credential_recovery.require_start_allowed(state.target, operation_id)
+            if isinstance(allowed, Err):
+                return CommandReceipt(operation_id=operation_id, accepted=False, diagnostic=allowed.error)
         self._commands_accepted = True
         self._ensure(receiver_id)
         self._queues[receiver_id].append(command)

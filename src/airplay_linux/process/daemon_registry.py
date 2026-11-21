@@ -37,13 +37,16 @@ from airplay_linux.domain.ports import (
     SupervisorReleaseIntentStore,
 )
 from airplay_linux.domain.records import (
-    AuthorityOwner, DaemonCleanupIntent, DaemonRecord, LaunchReceipt, SupervisorReleaseIntent,
+    AuthorityOwner, CredentialRecoveryMarker, DaemonCleanupIntent, DaemonRecord,
+    LaunchReceipt, SupervisorReleaseIntent,
 )
 from airplay_linux.domain.relay import TerminationProof
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
 from airplay_linux.process.authority import AuthorityLease, SharedRootAuthority
 from airplay_linux.process.launcher import LaunchCapability
-from airplay_linux.process.ownership import verify_owned_endpoint
+from airplay_linux.process.ownership import (
+    DaemonRecoveryExemption, recovery_identity_matches, verify_owned_endpoint,
+)
 from airplay_linux.process.teardown import CleanupOutcomeWriter
 from airplay_linux.process.procfs import (
     OWNER_TOKEN_ENV, RUNTIME_DIRECTORY_ENV, IdentityEvidence, IdentityState, OwnedProcessScan, owned_processes,
@@ -53,7 +56,8 @@ from airplay_linux.process.supervisor import (
     TERMINATION_GRACE, config_pipe, module_environment, private_directory,
     socket_info, unlink_stale_socket,
 )
-from airplay_linux.storage import AtomicFiles, StorageError
+from airplay_linux.storage import AtomicFiles, RecordError, StorageError
+from airplay_linux.storage.codecs import encode_credential_recovery_marker
 from airplay_linux.storage.repositories import (
     JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore, JsonSupervisorReleaseIntentStore,
 )
@@ -204,6 +208,7 @@ class DaemonRegistry:
         self._accepted_status: StatusReply | None = None
         self._endpoint_generations: dict[tuple[str, str], int] = {}
         self._current_receipts: dict[tuple[str, str], LaunchReceipt] = {}
+        self._issued_recovery_exemptions: dict[str, DaemonRecoveryExemption] = {}
         self._restarts: deque[float] = deque()
         self._has_launched = False
         self._record: DaemonRecord | None = None
@@ -322,11 +327,133 @@ class DaemonRegistry:
                 return reconciled
             return await self._launch()
 
-    async def reconcile_previous(self) -> Result[None]:
+    async def reconcile_previous(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         async with self._operation() as acquired:
             if isinstance(acquired, Err):
                 return acquired
-            return await self._reconcile_locked()
+            return await self._reconcile_locked(recovery_exemptions=recovery_exemptions)
+
+    def _watching_recovery_record(
+        self, marker: CredentialRecoveryMarker, history: tuple[LaunchReceipt, ...],
+        records: tuple[DaemonRecord, ...], channels: dict[str, SupervisorReleaseIntent | None],
+    ) -> tuple[LaunchReceipt, DaemonRecord] | None:
+        old = marker.original_daemon
+        receipts = tuple(r for r in history if r.launch_uuid == old.launch_uuid)
+        matches = tuple(r for r in records if r.instance_uuid == old.instance_uuid)
+        if len(receipts) != 1 or len(matches) != 1:
+            return None
+        receipt, record = receipts[0], matches[0]
+        if not recovery_identity_matches(old, receipt, record):
+            return None
+        endpoint = tuple(r for r in history if (
+            r.runtime_directory == old.runtime_directory
+            and str(Path(r.runtime_directory) / r.socket_name) == old.socket_path
+        ))
+        if (
+            not endpoint or max(r.endpoint_generation for r in endpoint) != old.endpoint_generation
+            or sum(r.state not in {'failed', 'stopped'} for r in endpoint) != 1
+            or channels.get(old.runtime_directory) is not None
+            or not self._exact_process(record.supervisor, receipt.owner_uid)
+            or not self._exact_process(record.daemon, receipt.owner_uid)
+            or self._inspect(record.daemon.pid).parent != record.supervisor.pid
+        ):
+            return None
+        verified = verify_owned_endpoint(receipt, current_generation=max(r.endpoint_generation for r in endpoint))
+        if not isinstance(verified, Ok):
+            return None
+        return receipt, record
+
+    async def authenticate_recovery(
+        self, marker: CredentialRecoveryMarker,
+    ) -> Result[DaemonRecoveryExemption | None]:
+        """Authenticate one complete watching identity before any status request."""
+        try:
+            encode_credential_recovery_marker(marker)
+        except (RecordError, UnicodeError):
+            return Ok(value=None)
+        if marker.state != 'watching' or not marker.automatic_status_checks or not self._public_lifecycle():
+            return Ok(value=None)
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            checked = await self._receipt_obligations_locked()
+            if isinstance(checked, Err):
+                return checked
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            channels = await self._owned_runtime_channels(self._receipt_history, records.value)
+            if isinstance(channels, Err):
+                return channels
+            intents = await self._cleanup_intents.all()
+            if isinstance(intents, Err):
+                return intents
+            if any(intent.launch_uuid == marker.original_daemon.launch_uuid for intent in intents.value):
+                return Ok(value=None)
+            selected = self._watching_recovery_record(marker, self._receipt_history, records.value, channels.value)
+            if selected is None:
+                return Ok(value=None)
+            receipt, record = selected
+            proof = await self._authenticate(record)
+            if isinstance(proof, Err):
+                return Ok(value=None)
+            # Ownership work awaited external adapters. Re-read the durable
+            # channels and re-probe the exact process/socket before issuing.
+            history = await self._receipts.all()
+            records = await self._store.all()
+            intents = await self._cleanup_intents.all()
+            if isinstance(history, Err) or isinstance(records, Err) or isinstance(intents, Err):
+                return _error(ErrorCode.persistence_failed)
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return channels
+            if (any(intent.launch_uuid == receipt.launch_uuid for intent in intents.value)
+                    or self._watching_recovery_record(marker, history.value, records.value, channels.value) != selected):
+                return Ok(value=None)
+            exemption = DaemonRecoveryExemption(
+                marker_identity=marker, marker_generation=marker.marker_generation,
+                kind='watching_original', daemon_identity=marker.original_daemon,
+            )
+            self._issued_recovery_exemptions[marker.target] = exemption
+            return Ok(value=exemption)
+
+    async def _validate_recovery_exemptions(
+        self, exemptions: tuple[DaemonRecoveryExemption, ...], history: tuple[LaunchReceipt, ...],
+        records: tuple[DaemonRecord, ...], channels: dict[str, SupervisorReleaseIntent | None],
+    ) -> Result[dict[UUID, DaemonRecord]]:
+        if type(exemptions) is not tuple:
+            return _error(ErrorCode.ownership_mismatch)
+        intents = await self._cleanup_intents.all()
+        if isinstance(intents, Err):
+            return intents
+        retained: dict[UUID, DaemonRecord] = {}
+        targets: set[str] = set()
+        for exemption in exemptions:
+            if type(exemption) is not DaemonRecoveryExemption:
+                return _error(ErrorCode.ownership_mismatch)
+            marker = exemption.marker_identity
+            if (
+                type(marker) is not CredentialRecoveryMarker or marker.target in targets
+                or self._issued_recovery_exemptions.get(marker.target) != exemption
+                or marker.state != 'watching' or not marker.automatic_status_checks
+                or exemption.kind != 'watching_original'
+                or type(exemption.marker_generation) is not int
+                or exemption.marker_generation != marker.marker_generation
+                or exemption.daemon_identity != marker.original_daemon
+                or any(intent.launch_uuid == marker.original_daemon.launch_uuid for intent in intents.value)
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+            selected = self._watching_recovery_record(marker, history, records, channels)
+            if selected is None:
+                return _error(ErrorCode.ownership_mismatch)
+            receipt, record = selected
+            retained[receipt.launch_uuid] = record
+            targets.add(marker.target)
+        if len(retained) > 1:
+            return _error(ErrorCode.ownership_mismatch)
+        return Ok(value=retained)
 
     async def restart(self) -> Result[DaemonRecord]:
         async with self._operation() as acquired:
@@ -1025,7 +1152,9 @@ class DaemonRegistry:
             channels[runtime] = intent
         return Ok(value=channels)
 
-    async def _reconcile_owned_locked(self) -> Result[None]:
+    async def _reconcile_owned_locked(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         checked = await self._receipt_obligations_locked()
         if isinstance(checked, Err):
             return self._cleanup_required(checked)
@@ -1036,7 +1165,12 @@ class DaemonRegistry:
         channels = await self._owned_runtime_channels(history, records.value)
         if isinstance(channels, Err):
             return self._cleanup_required(channels)
+        retained = await self._validate_recovery_exemptions(recovery_exemptions, history, records.value, channels.value)
+        if isinstance(retained, Err):
+            return self._cleanup_required(retained)
         for receipt in history:
+            if receipt.launch_uuid in retained.value:
+                continue
             endpoint = tuple(r for r in history if r.runtime_directory == receipt.runtime_directory)
             newest = max(r.endpoint_generation for r in endpoint)
             if (sum(r.endpoint_generation == newest for r in endpoint) != 1
@@ -1069,6 +1203,21 @@ class DaemonRegistry:
         if any(not any(r.runtime_directory == record.runtime_directory for r in history)
                for record in records.value):
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
+        if retained.value:
+            history = await self._receipts.all()
+            records = await self._store.all()
+            if isinstance(history, Err) or isinstance(records, Err):
+                return self._cleanup_required(_error(ErrorCode.persistence_failed))
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return self._cleanup_required(channels)
+            retained = await self._validate_recovery_exemptions(recovery_exemptions, history.value, records.value, channels.value)
+            if isinstance(retained, Err):
+                return self._cleanup_required(retained)
+            self._record = next(iter(retained.value.values()))
+            self.runtime_directory = Path(self._record.runtime_directory)
+            self._ready, self._exited = True, False
+            return Ok(value=None)
         if history:
             owner = self._authority.owner
             cleared = await self._authority.clear_owner(owner) if owner is not None else Ok(value=None)
@@ -1354,11 +1503,15 @@ class DaemonRegistry:
         """Retain the delivered fixture seam inside the operation's shared lease."""
         return await self._reconcile_locked()
 
-    async def _reconcile_locked(self) -> Result[None]:
+    async def _reconcile_locked(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         if self._authority_lease is None or self._authority_lease._unlocked:
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         if self._public_lifecycle():
-            return await self._reconcile_owned_locked()
+            return await self._reconcile_owned_locked(recovery_exemptions=recovery_exemptions)
+        if recovery_exemptions:
+            return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         obligations = await self._receipt_obligations_locked()
         if isinstance(obligations, Err):
             return self._cleanup_required(obligations)

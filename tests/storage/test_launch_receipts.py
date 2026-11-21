@@ -512,3 +512,49 @@ async def test_malformed_receipt_cannot_reach_launch_writer(tmp_path, monkeypatc
         assert unlinks == []
     assert ("doubletake", "--help") in process.observations
     assert ("doubletake", "-capabilities") in process.observations
+
+
+@pytest.mark.parametrize("missing", [None, "daemon_instance_uuid", "daemon", "supervisor", "entry_device", "entry_inode", "socket_inode", "peer_pid", "peer_start_ticks", "peer_uid"])
+async def test_recovery_identity_never_accepts_partial_historical_receipt(receipt_state_documents, missing):
+    # Breaks when historical recovery accepts a partial observed identity or
+    # treats unpopulated peer evidence as proof of the original endpoint.
+    from airplay_linux.domain.records import DaemonRecord, OriginalDaemonIdentity
+    from airplay_linux.process.ownership import recovery_identity_matches
+
+    receipt = receipt_state_documents["ready"]
+    old = OriginalDaemonIdentity(
+        launch_uuid=receipt.launch_uuid, instance_uuid=receipt.daemon_instance_uuid,
+        endpoint_generation=receipt.endpoint_generation, daemon_process=receipt.daemon,
+        runtime_directory=receipt.runtime_directory,
+        socket_path=receipt.runtime_directory + "/" + receipt.socket_name,
+    )
+    record = DaemonRecord(
+        schema_version=1, instance_uuid=receipt.daemon_instance_uuid, owner_token="unused",
+        app=receipt.app, supervisor=receipt.supervisor, daemon=receipt.daemon,
+        protocol_version=receipt.protocol_version, runtime_directory=receipt.runtime_directory,
+        socket_path=old.socket_path, lifecycle="running",
+    )
+    if missing is not None:
+        receipt = replace(receipt, **{missing: None})
+    assert recovery_identity_matches(old, receipt, record) is (missing is None)
+
+
+async def test_production_composes_marker_coordinator_from_existing_atomic_root(public_storage_graph):
+    from airplay_linux.domain.resources import Err, RecoveryAction
+    from tests.storage.test_credential_recovery import marker
+
+    graph = public_storage_graph
+    item = marker()
+    files = AtomicFiles(graph.config.state_root)
+    store = repositories.JsonCredentialRecoveryMarkerStore(files)
+    assert isinstance(await store.create(item), Ok)
+    built = await graph.module.build_runtime(graph.config, overrides={"process": graph.recorder})
+    assert isinstance(built, Ok)
+    coordinator = built.value.deps.credential_recovery
+    assert coordinator is not None
+    blocked = coordinator.require_start_allowed("192.0.2.99", UUID(int=999))
+    assert isinstance(blocked, Err)
+    assert blocked.error.recovery == (RecoveryAction.keep_blocked,)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    assert coordinator.markers == (item,)
+    assert not graph.recorder.launches and not graph.recorder.signals
