@@ -213,11 +213,13 @@
 **Files:**
 
 - Modify: `src/airplay_linux/process/linux.py:1-972`
+- Modify: `src/airplay_linux/testing/adapters.py:1043-1280`
 - Modify: `src/airplay_linux/process/credential_probe.py:1-1379`
 - Modify: `src/airplay_linux/backend/contract.py:100-430`
 - Modify: `src/airplay_linux/backend/control.py:1-1474`
 - Modify: `src/airplay_linux/domain/ports.py:145-250`
 - Test: `tests/process/test_linux_runner.py:1-1882`
+- Test: `tests/testing/test_fakes.py:1-1947`
 - Test: `tests/process/test_credential_probe.py:1-1105`
 - Test: `tests/backend/test_control.py:1-1245`
 - Create: `tests/backend/test_credential_relay.py`
@@ -239,13 +241,13 @@
 
 - [ ] **Step 2: Run the focused tests and confirm they fail**
 
-  Run: `/data/home/guest/Development/airplay-linux/.venv/bin/python -m pytest tests/process/test_linux_runner.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py --basetemp=/tmp/ap-relay-dispatch`
+  Run: `/data/home/guest/Development/airplay-linux/.venv/bin/python -m pytest tests/process/test_linux_runner.py tests/testing/test_fakes.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py --basetemp=/tmp/ap-relay-dispatch`
 
   Expected: FAIL because credential-specific process admission, capability proofs, relay dispatch, and typed decoder results are incomplete.
 
 - [ ] **Step 3: Implement the fenced process boundary**
 
-  Extend `ProcessPort` and `LinuxProcessRunner` with `run_credential`. Validate the command and secret index, invoke the supplied fence synchronously in the same task immediately before subprocess creation, and leave no await or task scheduling between the predicate and `asyncio.create_subprocess_exec`. Contain process exceptions and classify only proven pre-child failures as `NotSpawned`. Classify every post-admission timeout, cancellation, uncertain cleanup, or lost completion as `Uncertain`. Keep output transient and redacted in all retained fake and runner observations.
+  Extend `ProcessPort`, `LinuxProcessRunner`, and `FakeProcess` in `testing/adapters.py` with `run_credential`. The fake evaluates the same fence and returns the same typed admission results as the Linux runner. Its deferred callbacks and command-journal projections use the declared secret indices before retaining any record. Validate the command and secret index, invoke the supplied fence synchronously in the same task immediately before subprocess creation, and leave no await or task scheduling between the predicate and `asyncio.create_subprocess_exec`. Contain process exceptions and classify only proven pre-child failures as `NotSpawned`. Classify every post-admission timeout, cancellation, uncertain cleanup, or lost completion as `Uncertain`. Keep output transient and redacted in all retained fake and runner observations.
 
 - [ ] **Step 4: Implement capability proof, command mapping, and adapter dispatch**
 
@@ -253,14 +255,14 @@
 
 - [ ] **Step 5: Run dispatch tests and mutation probes**
 
-  Run: `/data/home/guest/Development/airplay-linux/.venv/bin/python -m pytest tests/process/test_linux_runner.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py --basetemp=/tmp/ap-relay-dispatch-pass`
+  Run: `/data/home/guest/Development/airplay-linux/.venv/bin/python -m pytest tests/process/test_linux_runner.py tests/testing/test_fakes.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py --basetemp=/tmp/ap-relay-dispatch-pass`
 
   Expected: PASS. In disposable copies, hard-code the secret index, skip one redacted observer, drop `dispatch_fence` forwarding, classify uncertainty as `Err`, remove final fence timing, or make the legacy profile carry unsupported audio/volume. Each mutation must fail a specific control while the clean baseline passes. Run the existing transactional pairing and backend control tests as a regression gate.
 
 - [ ] **Step 6: Commit credential dispatch**
 
   ```bash
-  git add src/airplay_linux/process/linux.py src/airplay_linux/process/credential_probe.py src/airplay_linux/backend/contract.py src/airplay_linux/backend/control.py src/airplay_linux/domain/ports.py tests/process/test_linux_runner.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py
+  git add src/airplay_linux/process/linux.py src/airplay_linux/testing/adapters.py src/airplay_linux/process/credential_probe.py src/airplay_linux/backend/contract.py src/airplay_linux/backend/control.py src/airplay_linux/domain/ports.py tests/process/test_linux_runner.py tests/testing/test_fakes.py tests/process/test_credential_probe.py tests/backend/test_control.py tests/backend/test_credential_relay.py tests/adapter_contracts/test_keyring_contract.py
   git commit -m "feat(relay): fence credential process dispatch"
   ```
 
