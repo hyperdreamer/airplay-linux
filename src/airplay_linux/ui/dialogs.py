@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from airplay_linux.domain.operations import ChallengeView, SensitiveText
+from airplay_linux.domain.relay import relay_credential_representable
 from airplay_linux.domain.records import RecoveryItem
 from airplay_linux.domain.resources import Mode, Size
 from airplay_linux.ui.state import Action
@@ -62,7 +63,7 @@ _MODE_LABELS: dict[Mode, str] = {
 #: The only choices a pairing prompt may render.  The projection decides whether
 #: each one is offered; the dialog never invents an extra command.
 _PAIRING_ACTIONS: Final[frozenset[Action]] = frozenset(
-    {Action.submit_pairing, Action.cancel, Action.retry}
+    {Action.submit_pairing, Action.submit_credential, Action.cancel, Action.retry}
 )
 
 
@@ -221,6 +222,8 @@ class PairingDialog(_DecisionDialog):
         retained_output: str | None = None,
         actions: frozenset[Action] | None = None,
         parent: QWidget | None = None,
+        *,
+        relay: bool = False,
     ) -> None:
         if not isinstance(challenge, ChallengeView):
             raise TypeError("PairingDialog requires a ChallengeView")
@@ -228,9 +231,10 @@ class PairingDialog(_DecisionDialog):
             "Pair with receiver", "pairingDialog", parent, blocks_owner=False
         )
         self._challenge = challenge
+        self._relay = relay
         self._input: SensitiveText | None = None
         self._action: Action | None = None
-        self._actions = self._pairing_actions(actions, retained_output)
+        self._actions = self._pairing_actions(actions, retained_output, relay=relay)
         self._submit: QPushButton | None = None
         self._pin = challenge.credential_kind == "pin"
         noun = "PIN" if self._pin else "password"
@@ -241,7 +245,8 @@ class PairingDialog(_DecisionDialog):
             f"Enter the {noun} shown by the receiver. The {noun} is used once and "
             "is never stored, displayed back, or written to the activity log."
         )
-        self._body(self._expiry_text(challenge))
+        if not self._relay:
+            self._body(self._expiry_text(challenge))
         if retained_output:
             self._body(
                 f"The output {retained_output} is still owned by this session. "
@@ -263,6 +268,11 @@ class PairingDialog(_DecisionDialog):
         self._field.textChanged.connect(self._sync_submit)
         self._layout.addWidget(self._field)
 
+        self._feedback = self._body("")
+        self._feedback.setObjectName("secretValidationFeedback")
+        self._feedback.setStyleSheet("color: #b00020;")
+        self._feedback.setVisible(False)
+
         self._build_actions(noun)
         self._sync_submit(self._field.text())
 
@@ -271,6 +281,14 @@ class PairingDialog(_DecisionDialog):
     def take_input(self) -> SensitiveText | None:
         """Hand the secret to the caller exactly once, then forget it."""
         value, self._input = self._input, None
+        if value is None and self._field.isEnabled() and not self._field.isReadOnly():
+            text = self._field.text()
+            error = self._validate_raw(text)
+            if error is None:
+                value = SensitiveText(text)
+                self._clear_field()
+            else:
+                self._show_validation(error)
         return value
 
     def take_result(self) -> PairingAnswer | None:
@@ -284,9 +302,11 @@ class PairingDialog(_DecisionDialog):
     def confirm_input(self) -> None:
         """Accept the typed secret if there is one; blank input is not submitted."""
         text = self._field.text()
-        if not text.strip():
+        error = self._validate_raw(text)
+        if error is not None:
+            self._show_validation(error)
             return
-        self._action = Action.submit_pairing
+        self._action = Action.submit_credential if self._relay else Action.submit_pairing
         self._input = SensitiveText(text)
         self._clear_field()
         self.accept()
@@ -340,7 +360,7 @@ class PairingDialog(_DecisionDialog):
         row = QHBoxLayout()
         row.addStretch(1)
         first: QPushButton | None = None
-        if Action.submit_pairing in self._actions:
+        if Action.submit_pairing in self._actions or Action.submit_credential in self._actions:
             submit = QPushButton(f"Submit {noun}", self)
             submit.setObjectName("pairingSubmitButton")
             submit.setAccessibleName(f"Submit {noun}")
@@ -388,8 +408,13 @@ class PairingDialog(_DecisionDialog):
 
     @staticmethod
     def _pairing_actions(
-        actions: frozenset[Action] | None, retained_output: str | None
+        actions: frozenset[Action] | None, retained_output: str | None, *, relay: bool,
     ) -> frozenset[Action]:
+        if relay:
+            resolved = frozenset(actions or {Action.submit_credential, Action.cancel})
+            if resolved != frozenset({Action.submit_credential, Action.cancel}):
+                raise ValueError("relay PairingDialog must offer submit and cancel only")
+            return resolved
         if actions is None:
             # Mirrors the projection's pairing branch: a blind retry is not the
             # design's action while an output is still owned.
@@ -409,7 +434,35 @@ class PairingDialog(_DecisionDialog):
 
     def _sync_submit(self, text: str) -> None:
         if self._submit is not None:
-            self._submit.setEnabled(bool(text.strip()))
+            self._submit.setEnabled(bool(text.strip()) and self._field.isEnabled() and not self._field.isReadOnly())
+
+    def set_submitting(self) -> None:
+        self._field.setEnabled(False)
+        if self._submit is not None:
+            self._submit.setEnabled(False)
+
+    def set_observing(self) -> None:
+        self._field.setEnabled(True)
+        self._field.setReadOnly(True)
+        if self._submit is not None:
+            self._submit.setEnabled(False)
+
+    def _validate_raw(self, text: str) -> str | None:
+        if not text.strip():
+            return "Invalid value. Enter the value shown by the receiver."
+        if "\x00" in text:
+            return "Invalid value. The value contains an unsupported character."
+        try:
+            text.encode()
+        except UnicodeEncodeError:
+            return "Invalid value. The value cannot be represented by this system."
+        if not relay_credential_representable(text):
+            return "Invalid value. The value cannot begin with a dash."
+        return None
+
+    def _show_validation(self, message: str) -> None:
+        self._feedback.setText(message)
+        self._feedback.setVisible(True)
 
     def _clear_field(self) -> None:
         # ``setReadOnly`` also drops the widget's undo/redo history, so Ctrl+Z in a

@@ -2202,6 +2202,53 @@ def test_orphan_prompt_reports_a_missing_helper_instead_of_implying_one(qtbot) -
     assert "helper" in texts.lower()
 
 
+def test_relay_dialog_offers_only_submit_and_cancel_and_validates_before_wrapping(qtbot) -> None:
+    from airplay_linux.domain.operations import SensitiveText
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(
+        challenge("pin"),
+        relay=True,
+        actions=frozenset({Action.submit_credential, Action.cancel}),
+    )
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+    submit = dialogue.findChild(QPushButton, "pairingSubmitButton")
+
+    field.setText("-leading-dash")
+    dialogue.confirm_input()
+    assert dialogue.take_input() is None
+    assert field.text() == "-leading-dash"
+    assert "invalid" in " ".join(label.text() for label in dialogue.findChildren(QLabel)).lower()
+
+    canary = "relay-canary-7f4d"
+    field.setText(canary)
+    assert submit.isEnabled()
+    value = dialogue.take_input()
+    assert isinstance(value, SensitiveText)
+    assert field.text() == ""
+    assert canary not in dialogue.windowTitle()
+    assert canary not in " ".join(label.text() for label in dialogue.findChildren(QLabel))
+
+
+def test_relay_dialog_exposes_submission_and_observation_widget_states(qtbot) -> None:
+    from airplay_linux.ui.dialogs import PairingDialog
+
+    dialogue = PairingDialog(
+        challenge("password"),
+        relay=True,
+        actions=frozenset({Action.submit_credential, Action.cancel}),
+    )
+    qtbot.addWidget(dialogue)
+    field = dialogue.findChild(QLineEdit, "secretField")
+
+    dialogue.set_submitting()
+    assert field.isEnabled() is False
+    dialogue.set_observing()
+    assert field.isReadOnly() is True
+    assert field.isEnabled() is True
+
+
 def test_every_dialog_button_is_text_and_every_icon_control_has_a_tooltip(qtbot) -> None:
     from airplay_linux.domain.records import RecoveryItem
     from airplay_linux.ui.dialogs import (

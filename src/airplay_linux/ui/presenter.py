@@ -76,6 +76,8 @@ from airplay_linux.domain.messages import (
     ChooseResolution,
     Command,
     ConfirmOrphanRemoval,
+    DismissCredentialPrompt,
+    DismissCredentialRecovery,
     ConfirmSwitch,
     KeepCleanup,
     Pair,
@@ -89,9 +91,13 @@ from airplay_linux.domain.messages import (
     Start,
     StartVideoOnly,
     Stop,
+    StopCredentialRecovery,
+    RestartReceiverToRelease,
+    SubmitCredential,
     SubmitPairing,
 )
 from airplay_linux.domain.operations import ChallengeView, SensitiveText
+from airplay_linux.domain.relay import CredentialPromptState
 from airplay_linux.domain.records import (
     OwnershipRecord,
     RecoveryItem,
@@ -127,7 +133,14 @@ from airplay_linux.ui.dialogs import (
     PairingDialog,
     ResolutionDialog,
 )
-from airplay_linux.ui.state import Action, PaneState, ViewInputs, project, project_row
+from airplay_linux.ui.state import (
+    Action,
+    CredentialRecoveryView,
+    PaneState,
+    ViewInputs,
+    project,
+    project_row,
+)
 from airplay_linux.ui.window import MainWindow
 
 if TYPE_CHECKING:
@@ -159,6 +172,7 @@ class DialogFactory(Protocol):
         *,
         actions: frozenset[Action],
         retained_output: str | None,
+        relay: bool = False,
     ) -> PairingAnswer | None: ...
 
     def invalidate_pairing(self, challenge: ChallengeView) -> None: ...
@@ -304,6 +318,7 @@ class Presenter:
         *,
         refresh_capabilities: Callable[[], Awaitable[Any]] | None = None,
         screencast: Any | None = None,
+        credential_recovery: Any | None = None,
     ) -> None:
         if not isinstance(window, MainWindow):
             raise TypeError("window must be a MainWindow")
@@ -333,6 +348,9 @@ class Presenter:
         # portal's remembered screen approvals.  A composition that supplies no
         # permission store fails the action instead of pretending it is absent.
         self._screencast = screencast
+        self._credential_recovery = credential_recovery or getattr(
+            getattr(manager, "deps", None), "credential_recovery", None,
+        )
 
         # -- authoritative caches (GUI-thread owned) -----------------------
         self._views: dict[ReceiverId, Any] = {}
@@ -369,6 +387,8 @@ class Presenter:
         # -- prompt tracking (no secret is ever stored) --------------------
         self._pairing_pending: dict[ReceiverId, ChallengeView] = {}
         self._pairing_seen: dict[ReceiverId, ChallengeView] = {}
+        self._relay_prompt_key: tuple[ReceiverId, Any, str] | None = None
+        self._relay_prompt_seen: dict[ReceiverId, tuple[ReceiverId, Any, str]] = {}
         self._switch_pending: set[ReceiverId] = set()
         self._switch_queued: dict[ReceiverId, tuple[int, Mode]] = {}
         self._resolution_pending: set[ReceiverId] = set()
@@ -641,7 +661,48 @@ class Presenter:
         decision = self._decision_for(receiver_id, size) if size is not None else None
         return StartRequest(mode=Mode.VIRTUAL, resolution=decision, audio=audio, volume=volume)
 
+    def _recovery_view(self, receiver_id: ReceiverId) -> tuple[CredentialRecoveryView | None, bool]:
+        coordinator = self._credential_recovery
+        if coordinator is None:
+            return None, False
+        blocked = bool(getattr(coordinator, "_store_blocked", False))
+        snapshot = self._snapshot(receiver_id)
+        target = snapshot.target if snapshot.online else None
+        if target is None:
+            return None, blocked
+        marker = next(
+            (
+                item for item in getattr(coordinator, "markers", ())
+                if item.target == target.canonical_host and item.state != "retired"
+            ),
+            None,
+        )
+        if marker is None:
+            return None, blocked
+        actions = {Action.stop_credential_recovery}
+        if marker.automatic_status_checks:
+            actions.add(Action.dismiss_credential_recovery)
+        if marker.state == "release_pending":
+            actions.add(Action.restart_receiver_to_release)
+        title = "Cleanup pending" if marker.automatic_status_checks else "Target blocked"
+        warning = (
+            "A delayed connection may still appear. Stop may need to be used again. "
+            "Dismissal stops automatic checks while keeping this target blocked."
+            if marker.automatic_status_checks else
+            "This target remains fenced until the receiver restarts."
+        )
+        return CredentialRecoveryView(
+            target=marker.target,
+            state=marker.state,
+            automatic_status_checks=marker.automatic_status_checks,
+            marker_generation=marker.marker_generation,
+            title=title,
+            warning=warning,
+            actions=frozenset(actions),
+        ), blocked
+
     def _inputs(self, receiver_id: ReceiverId, report: CapabilityReport) -> ViewInputs:
+        recovery, blocked = self._recovery_view(receiver_id)
         return ViewInputs(
             receiver=self._view(receiver_id),
             saved=self._saved.get(receiver_id),
@@ -651,6 +712,8 @@ class Presenter:
             resolution_choices=self._resolution_choices(receiver_id),
             ownership=self._ownership_for(receiver_id),
             orphans=self._orphans_for(receiver_id),
+            credential_recovery=recovery,
+            recovery_store_blocked=blocked,
         )
 
     def _pane(self, receiver_id: ReceiverId) -> PaneState:
@@ -760,6 +823,7 @@ class Presenter:
         if size is not None:
             self._window.select_resolution(size)
         self._ensure_selection_loads(selected)
+        self._maybe_open_relay_prompts()
         self._maybe_open_pairing(selected, pane)
 
     # ------------------------------------------------------------------- loads
@@ -945,6 +1009,19 @@ class Presenter:
         self._snapshots[snapshot.receiver_id] = snapshot
         self._saved_publication += 1
         self._start_saved_load()
+        relay_prompt = snapshot.credential_prompt
+        if relay_prompt is None:
+            self._relay_prompt_seen.pop(snapshot.receiver_id, None)
+        else:
+            current_key = (
+                snapshot.receiver_id,
+                relay_prompt.request.start_operation_id,
+                relay_prompt.challenge.credential_kind,
+            )
+            if self._relay_prompt_seen.get(snapshot.receiver_id) != current_key:
+                self._relay_prompt_seen.pop(snapshot.receiver_id, None)
+        if relay_prompt is not None and self._pane(snapshot.receiver_id).credential_prompt == relay_prompt.challenge:
+            self._open_relay_prompt(snapshot.receiver_id, relay_prompt)
         pairing = self._pairing_pending.get(snapshot.receiver_id)
         if pairing is not None and self._pane(snapshot.receiver_id).challenge != pairing:
             # Snapshot publication is authoritative even when this receiver is
@@ -1050,6 +1127,35 @@ class Presenter:
         if action is Action.submit_pairing:
             if pane.challenge is not None:
                 self._open_pairing(receiver_id, pane.challenge)
+            return
+        if action is Action.submit_credential:
+            if pane.credential_prompt is not None:
+                self._open_relay_prompt(receiver_id, pane.credential_prompt)
+            return
+        if action is Action.dismiss_credential_prompt:
+            prompt = pane.credential_prompt
+            if prompt is not None:
+                self._schedule(self._dispatch(DismissCredentialPrompt(
+                    receiver_id=receiver_id, challenge_id=prompt.challenge.challenge_id,
+                )), receiver_id=receiver_id)
+            return
+        if action in (
+            Action.stop_credential_recovery,
+            Action.dismiss_credential_recovery,
+            Action.restart_receiver_to_release,
+        ):
+            recovery = pane.credential_recovery
+            if recovery is None:
+                return
+            command_type = {
+                Action.stop_credential_recovery: StopCredentialRecovery,
+                Action.dismiss_credential_recovery: DismissCredentialRecovery,
+                Action.restart_receiver_to_release: RestartReceiverToRelease,
+            }[action]
+            self._schedule(self._dispatch(command_type(
+                receiver_id=receiver_id,
+                marker_generation=recovery.marker_generation,
+            )), receiver_id=receiver_id)
             return
         factory = _COMMAND_FACTORIES.get(action)
         if factory is not None:
@@ -1234,6 +1340,52 @@ class Presenter:
             )
         finally:
             self._switch_pending.discard(receiver_id)
+
+    def _maybe_open_relay_prompts(self) -> None:
+        """Route each live relay prompt to its producing receiver."""
+        for receiver_id in tuple(self._snapshots):
+            prompt = self._snapshot(receiver_id).credential_prompt
+            if prompt is not None and self._pane(receiver_id).credential_prompt == prompt.challenge:
+                self._open_relay_prompt(receiver_id, prompt)
+
+    def _open_relay_prompt(self, receiver_id: ReceiverId, prompt: CredentialPromptState) -> None:
+        key = (receiver_id, prompt.request.start_operation_id, prompt.challenge.credential_kind)
+        if self._relay_prompt_key == key or self._relay_prompt_seen.get(receiver_id) == key:
+            return
+        self._relay_prompt_key = key
+        self._relay_prompt_seen[receiver_id] = key
+        self._schedule(self._relay_prompt(receiver_id, prompt), receiver_id=receiver_id)
+
+    async def _relay_prompt(self, receiver_id: ReceiverId, prompt: CredentialPromptState) -> None:
+        try:
+            answer = await self._dialogs.pairing(
+                prompt.challenge,
+                actions=frozenset({Action.submit_credential, Action.cancel}),
+                retained_output=None,
+                relay=True,
+            )
+        except Exception:
+            answer = None
+        finally:
+            key = (receiver_id, prompt.request.start_operation_id, prompt.challenge.credential_kind)
+            if self._relay_prompt_key == key:
+                self._relay_prompt_key = None
+        if not isinstance(answer, PairingAnswer):
+            return
+        current = self._pane(receiver_id)
+        if current.credential_prompt != prompt.challenge:
+            return
+        if answer.action is Action.submit_credential and isinstance(answer.value, SensitiveText):
+            await self._dispatch(SubmitCredential(
+                receiver_id=receiver_id,
+                challenge_id=prompt.challenge.challenge_id,
+                value=answer.value,
+            ))
+        elif answer.action is Action.cancel:
+            await self._dispatch(DismissCredentialPrompt(
+                receiver_id=receiver_id,
+                challenge_id=prompt.challenge.challenge_id,
+            ))
 
     def _open_pairing(
         self,
@@ -1715,12 +1867,17 @@ class QtDialogFactory:
         *,
         actions: frozenset[Action] | None = None,
         retained_output: str | None = None,
+        relay: bool = False,
     ) -> PairingAnswer | None:
         if not isinstance(challenge, ChallengeView):
             raise TypeError("pairing requires a ChallengeView")
-        dialog = self._pairing_dialog(
-            challenge, actions=actions, retained_output=retained_output,
-        )
+        dialog_kwargs = {
+            "actions": actions,
+            "retained_output": retained_output,
+        }
+        if relay:
+            dialog_kwargs["relay"] = True
+        dialog = self._pairing_dialog(challenge, **dialog_kwargs)
         self._pairing_prompts[challenge] = dialog
         try:
             return await _resolve_dialog(dialog, dialog.take_result, None)
@@ -1762,6 +1919,7 @@ class QtDialogFactory:
         *,
         actions: frozenset[Action] | None = None,
         retained_output: str | None = None,
+        relay: bool = False,
     ) -> PairingDialog:
         return PairingDialog(
             challenge,
@@ -1769,6 +1927,7 @@ class QtDialogFactory:
             retained_output=retained_output,
             actions=actions,
             parent=self._window,
+            relay=relay,
         )
 
     def _confirm_stop_dialog(self, mode: Mode) -> ConfirmStopDialog:

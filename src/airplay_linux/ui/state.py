@@ -31,6 +31,7 @@ from typing import Final
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverView
 from airplay_linux.domain.operations import ChallengeView
+from airplay_linux.domain.relay import CredentialPromptState
 from airplay_linux.domain.records import (
     OwnershipRecord,
     RecoveryItem,
@@ -70,6 +71,11 @@ class Action(StrEnum):
     stop = "stop"
     pair = "pair"
     submit_pairing = "submit_pairing"
+    submit_credential = "submit_credential"
+    dismiss_credential_prompt = "dismiss_credential_prompt"
+    stop_credential_recovery = "stop_credential_recovery"
+    dismiss_credential_recovery = "dismiss_credential_recovery"
+    restart_receiver_to_release = "restart_receiver_to_release"
     cancel = "cancel"
     scan = "scan"
     remove_metadata = "remove_metadata"
@@ -98,6 +104,19 @@ class Badge:
 
 
 @dataclass(frozen=True)
+class CredentialRecoveryView:
+    """Validated, target-bound recovery facts prepared for the dashboard."""
+
+    target: str
+    state: str
+    automatic_status_checks: bool
+    marker_generation: int
+    title: str
+    warning: str
+    actions: frozenset[Action]
+
+
+@dataclass(frozen=True)
 class ViewInputs:
     """Everything the projection needs that is not a session resource fact.
 
@@ -115,6 +134,8 @@ class ViewInputs:
     resolution_choices: tuple[Size, ...] = ()
     ownership: OwnershipRecord | None = None
     orphans: tuple[RecoveryItem, ...] = ()
+    credential_recovery: CredentialRecoveryView | None = None
+    recovery_store_blocked: bool = False
 
     def __post_init__(self) -> None:
         if self.receiver is not None and not isinstance(self.receiver, ReceiverView):
@@ -127,6 +148,20 @@ class ViewInputs:
             raise TypeError("selected_mode must be a Mode")
         if self.ownership is not None and not isinstance(self.ownership, OwnershipRecord):
             raise TypeError("ownership must be an OwnershipRecord or None")
+        if self.credential_recovery is not None and not isinstance(
+            self.credential_recovery, CredentialRecoveryView
+        ):
+            raise TypeError("credential_recovery must be a CredentialRecoveryView or None")
+        if type(self.recovery_store_blocked) is not bool:
+            raise TypeError("recovery_store_blocked must be a boolean")
+        if self.credential_recovery is not None:
+            allowed = frozenset({
+                Action.stop_credential_recovery,
+                Action.dismiss_credential_recovery,
+                Action.restart_receiver_to_release,
+            })
+            if not self.credential_recovery.actions <= allowed:
+                raise ValueError("credential recovery contains an unsupported action")
         _freeze_sequence(self, "physical_sources", PhysicalMonitorSource)
         _freeze_sequence(self, "resolution_choices", Size)
         _freeze_sequence(self, "orphans", RecoveryItem)
@@ -169,6 +204,10 @@ class PaneState:
     volume_readout: str = "—"
     volume_tooltip: str = ""
     volume_save_failed: bool = False
+    credential_prompt: ChallengeView | None = None
+    credential_recovery: CredentialRecoveryView | None = None
+    recovery_store_blocked: bool = False
+    credential_report: str | None = None
 
 
 @dataclass(frozen=True)
@@ -328,6 +367,10 @@ _NOTICE_MISMATCH: Final[str] = (
     "The receiver accepted {size}. The output is still owned: recreate it at that "
     "size, or stop to remove it."
 )
+_NOTICE_RECOVERY_STORE_BLOCKED: Final[str] = (
+    "Recovery state could not be verified, so new starts remain blocked."
+)
+
 
 #: Diagnostic details that name a capability belonging to one mode.  Details are
 #: fixed vocabulary written by the capability probe, never backend text.
@@ -370,22 +413,41 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
     ownership = _ownership_for(snapshot, inputs)
     orphans = _orphans_for(snapshot, inputs)
     decision = _decide(snapshot, inputs, ownership, orphans)
+    recovery = _matching_recovery(snapshot, inputs.credential_recovery)
+    credential_prompt = _credential_prompt(snapshot, inputs, recovery)
     volume_enabled, volume_reason = _volume_control(snapshot, inputs)
     actions = decision.actions
+    primary = decision.primary
+    notice = decision.notice
+    phase_label = _phase_label(snapshot)
+    if recovery is not None:
+        actions = recovery.actions
+        primary = _recovery_primary(recovery)
+        phase_label = recovery.title
+        notice = recovery.warning
+    elif inputs.recovery_store_blocked:
+        actions = actions - {Action.start}
+        notice = _NOTICE_RECOVERY_STORE_BLOCKED
+    report = snapshot.credential_prompt.report if credential_prompt is not None and snapshot.credential_prompt is not None else None
+    if report == "connected":
+        notice = f"Connected to {_title(snapshot, inputs)}."
+    elif report == "not_observed_streaming":
+        notice = "The target was not observed streaming."
+    elif report == "outcome_unknown":
+        notice = "No complete command reply was received; the outcome is unknown."
     if inputs.capabilities.volume and not volume_enabled:
         actions = actions - {Action.mute}
-    notice = decision.notice
-    if snapshot.volume_save_failed:
+    if snapshot.volume_save_failed and report is None and recovery is None:
         notice = "Applied, but could not be saved."
     level = snapshot.effective_volume
     return PaneState(
         title=_title(snapshot, inputs),
-        phase_label=_phase_label(snapshot),
+        phase_label=phase_label,
         badges=_badges(snapshot, ownership),
         actions=actions,
         mode_enabled=_mode_enabled(snapshot, ownership),
         visible_mode=_visible_mode(snapshot, inputs),
-        primary_label=decision.primary,
+        primary_label=primary,
         source_enabled=_source_enabled(snapshot, inputs),
         resolution_enabled=_resolution_enabled(snapshot, inputs),
         mute_enabled=Action.mute in actions,
@@ -411,6 +473,10 @@ def project(snapshot: SessionSnapshot, inputs: ViewInputs) -> PaneState:
         volume_readout="—" if level is None else "Mute" if level == 0 else f"{level}%",
         volume_tooltip=volume_reason,
         volume_save_failed=snapshot.volume_save_failed,
+        credential_prompt=credential_prompt,
+        credential_recovery=recovery,
+        recovery_store_blocked=inputs.recovery_store_blocked,
+        credential_report=report,
     )
 
 
@@ -980,7 +1046,7 @@ def _resolution_enabled(state: SessionSnapshot, inputs: ViewInputs) -> bool:
 
 
 def _actionable_challenge(state: SessionSnapshot) -> ChallengeView | None:
-    """Expose a challenge only while the session lane still treats it as live."""
+    """Expose transactional pairing only while its trust challenge is live."""
     if (
         state.challenge is None
         or state.trust is not TrustState.Pairing
@@ -992,7 +1058,58 @@ def _actionable_challenge(state: SessionSnapshot) -> ChallengeView | None:
     return state.challenge
 
 
-# --------------------------------------------------------------------------- values
+def _matching_recovery(
+    state: SessionSnapshot, recovery: CredentialRecoveryView | None,
+) -> CredentialRecoveryView | None:
+    """Keep recovery evidence bound to the exact current canonical target."""
+    if recovery is None or state.target is None:
+        return None
+    if recovery.target != state.target.canonical_host:
+        return None
+    if recovery.state == "retired":
+        return None
+    return recovery
+
+
+def _credential_prompt(
+    state: SessionSnapshot,
+    inputs: ViewInputs,
+    recovery: CredentialRecoveryView | None,
+) -> CredentialPromptState | None:
+    """Expose only a live relay prompt owned by this Start and endpoint."""
+    prompt = state.credential_prompt
+    target = state.target
+    if (
+        prompt is None
+        or recovery is not None
+        or target is None
+        or state.challenge is not None
+        or state.cleanup_pending
+        or _teardown_in_progress(state)
+        or prompt.request.receiver_id != state.receiver_id
+        or prompt.request.target.canonical_host != target.canonical_host
+        or prompt.request.target.endpoint_fingerprint != target.endpoint_fingerprint
+        or prompt.request.endpoint_generation != target.endpoint_generation
+        or prompt.request.start_operation_id != state.operation_id
+        or prompt.request.session_generation != state.session_generation
+        or prompt.challenge.receiver_id != state.receiver_id
+        or prompt.challenge.operation_id != prompt.request.start_operation_id
+        or prompt.challenge.endpoint_fingerprint != target.endpoint_fingerprint
+        or prompt.challenge.endpoint_generation != target.endpoint_generation
+        or prompt.challenge.session_generation != state.session_generation
+    ):
+        return None
+    return prompt.challenge
+
+
+def _recovery_primary(recovery: CredentialRecoveryView) -> str:
+    if Action.restart_receiver_to_release in recovery.actions:
+        return "Restart receiver to release"
+    if Action.stop_credential_recovery in recovery.actions:
+        return "Stop"
+    return recovery.title
+
+
 
 
 def _require(snapshot: object, inputs: object) -> None:
@@ -1269,6 +1386,7 @@ def _capability_diagnostic(
 __all__ = [
     "Action",
     "Badge",
+    "CredentialRecoveryView",
     "PaneState",
     "ReceiverRow",
     "SEVERITY_ERROR",

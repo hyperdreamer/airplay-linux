@@ -74,6 +74,7 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
+from airplay_linux.domain.relay import CredentialPromptState, CredentialRequest, RelayStartOptions
 from airplay_linux.domain.resources import (
     AudioPolicy,
     AudioState,
@@ -246,7 +247,7 @@ class FakeDialogs:
 
     def __init__(self) -> None:
         self.pairing_calls: list[ChallengeView] = []
-        self.pairing_contexts: list[tuple[frozenset[Action], str | None]] = []
+        self.pairing_contexts: list[tuple[frozenset[Action], str | None, bool]] = []
         self.invalidated_pairings: list[ChallengeView] = []
         self.stop_calls: list[Mode] = []
         self.resolution_calls: list[tuple[Size, ...]] = []
@@ -271,9 +272,10 @@ class FakeDialogs:
         *,
         actions: frozenset[Action] | None = None,
         retained_output: str | None = None,
+        relay: bool = False,
     ) -> SensitiveText | PairingAnswer | None:
         self.pairing_calls.append(challenge)
-        self.pairing_contexts.append((actions or frozenset(), retained_output))
+        self.pairing_contexts.append((actions or frozenset(), retained_output, relay))
         gate, self.pairing_gate = self.pairing_gate, None
         if gate is not None:
             return await gate
@@ -2409,6 +2411,53 @@ async def test_mirror_start_refuses_when_the_screen_memory_cannot_be_cleared() -
     finally:
         await prepared.presenter.close()
         await prepared.settle(10)
+
+
+async def test_relay_prompt_opens_for_its_owner_and_is_not_retargeted_by_selection(
+    rig: PresenterRig,
+) -> None:
+    await started(rig)
+    start_operation = OperationId(UUID(int=801))
+    request = CredentialRequest(
+        receiver_id=RECEIVER_A,
+        target=target("a"),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=802)),
+        daemon_instance_uuid=InstanceId(UUID(int=803)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(
+            challenge(RECEIVER_A, challenge_id=804),
+            endpoint_fingerprint="endpoint-a-v1",
+            operation_id=start_operation,
+            session_generation=1,
+        ),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+    rig.snapshot("a", operation_id=start_operation, session_generation=1, credential_prompt=prompt)
+    rig.snapshot("b")
+    await rig.settle()
+    rig.select("b")
+    await rig.settle()
+
+    assert rig.dialogs.pairing_calls == [prompt.challenge]
+    assert rig.dialogs.pairing_contexts[0][0] == frozenset({Action.submit_credential, Action.cancel})
+    assert rig.dialogs.pairing_contexts[0][2] is True
+
+    rig.snapshot("a", operation_id=start_operation, session_generation=1, credential_prompt=prompt)
+    await rig.settle()
+    assert rig.dialogs.pairing_calls == [prompt.challenge]
 
 
 async def test_retry_does_not_clear_the_remembered_screen(screen_rig: Any) -> None:

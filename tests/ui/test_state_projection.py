@@ -41,6 +41,7 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
+from airplay_linux.domain.relay import CredentialPromptState, CredentialRequest, RelayStartOptions
 from airplay_linux.domain.resources import (
     AudioPolicy,
     AudioState,
@@ -61,6 +62,7 @@ from airplay_linux.testing.builders import physical, service, target, virtual_ha
 from airplay_linux.ui.state import (
     Action,
     Badge,
+    CredentialRecoveryView,
     PaneState,
     ReceiverRow,
     ViewInputs,
@@ -1918,3 +1920,69 @@ def test_a_captured_source_ends_the_pending_prompt() -> None:
 
     assert pane.awaiting_capture is False
     assert pane.captured_connector == "DP-3"
+
+
+def test_relay_prompt_is_transient_and_blocks_transactional_challenge() -> None:
+    start_operation = OperationId(UUID(int=71))
+    request = CredentialRequest(
+        receiver_id=RECEIVER,
+        target=target(),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=72)),
+        daemon_instance_uuid=InstanceId(UUID(int=73)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=challenge(operation_id=start_operation),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+
+    pane = project(
+        idle(
+            operation_id=start_operation,
+            session_generation=1,
+            credential_prompt=prompt,
+        ),
+        inputs(),
+    )
+
+    assert pane.credential_prompt == prompt.challenge
+    assert pane.challenge is None
+
+
+def test_recovery_view_blocks_start_and_exposes_only_recovery_actions() -> None:
+    recovery = CredentialRecoveryView(
+        target=target().canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=4,
+        title="Target blocked",
+        warning="This target remains blocked until the receiver restarts.",
+        actions=frozenset({Action.stop_credential_recovery, Action.restart_receiver_to_release}),
+    )
+
+    pane = project(idle(), inputs(credential_recovery=recovery))
+
+    assert pane.phase_label == "Target blocked"
+    assert pane.notice == recovery.warning
+    assert Action.start not in pane.actions
+    assert pane.actions == recovery.actions
+    assert pane.credential_recovery == recovery
+
+
+def test_recovery_store_failure_blocks_start_globally() -> None:
+    pane = project(idle(), inputs(recovery_store_blocked=True))
+
+    assert pane.recovery_store_blocked is True
+    assert Action.start not in pane.actions
+    assert "recovery" in (pane.notice or "").lower()
