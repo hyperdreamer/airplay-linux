@@ -276,6 +276,7 @@
 
 - Modify: `src/airplay_linux/transport/doubletake.py:1-1477`
 - Modify: `src/airplay_linux/domain/ports.py:120-250`
+- Modify: `src/airplay_linux/domain/operations.py:80-120`
 - Modify: `src/airplay_linux/transport/__init__.py:1-120`
 - Modify: `tests/transport/test_doubletake.py:1-2846`
 - Modify: `tests/adapter_contracts/test_transport_contract.py:1-300`
@@ -289,6 +290,8 @@
 - Produces: one exact `credential_request` transport event with `CredentialRequestPayload` lifecycle `live | ended`, owner identity, endpoint and daemon identity, and optional pending handle. The event is emitted before `start_stream` returns its handle or after the handle is installed, with stale events rejected by existing fences.
 - Produces: target-specific connect and recovery behavior that reads the pinned daemon socket, maps only a unique matching row, never treats aggregate `pin_required` as a refusal or request, and disconnects only an exact matching target row.
 - Produces: pending-start readiness handoff that validates the complete owner including optional submission ID, signals a per-lease readiness-stop event without `stream.lock`, transfers one exact handle, and never cancels credential dispatch or owner-correlated status observation.
+- Produces: the transport-side credential context the specification's validation requires. Extend `OperationContext` with optional `marker_generation: int | None` and `owner_daemon: OriginalDaemonIdentity | None`, so a submission records the expected marker generation on its pending stream and a recovery status read carries the marker-bound daemon identity and socket. Extend `TransportPort` with `dismiss_credential_prompt(target, context) -> None` so a local dialog dismissal resumes the owning Start's suspended readiness budget. Keep every existing field and signature backward compatible; the actor supplies these values in the later settlement task and the transport fails closed when a dispatched handoff or recovery read arrives without them.
+- Produces: a marker-generation comparison in `stop_pending_start` against the generation recorded on the pending stream at submission, and a refusal when the owner's generation differs; a recovery status read that uses the marker-bound daemon and socket and fails closed when that daemon cannot be read.
 
 **Dependencies:** Tasks 1 and 4. Task 6 consumes these events and methods. Preserve the existing non-relay stream, audio, source, and transactional pairing behavior.
 
