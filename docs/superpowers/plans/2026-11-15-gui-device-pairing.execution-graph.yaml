@@ -1536,6 +1536,7 @@ tasks:
       - tests/session/test_lifecycle_regressions.py
       - src/airplay_linux/session/recovery.py
       - src/airplay_linux/runtime.py
+      - src/airplay_linux/transport/doubletake.py
     ownership:
       - src/airplay_linux/session/engine.py
       - src/airplay_linux/session/fencing.py
@@ -1550,6 +1551,7 @@ tasks:
       - tests/session/test_lifecycle_regressions.py
       - src/airplay_linux/session/recovery.py
       - src/airplay_linux/runtime.py
+      - src/airplay_linux/transport/doubletake.py
     exclusive_resources: [/tmp/ap-relay-session-pass]
     produces:
       - id: SessionSnapshot.credential_prompt
