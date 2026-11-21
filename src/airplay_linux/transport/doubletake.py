@@ -15,29 +15,36 @@ from inspect import Parameter, signature
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from airplay_linux.backend.contract import AckReply, BackendFeatures, BackendReply, StatusReply
+from airplay_linux.backend.contract import (
+    AckReply, BackendFeatures, BackendReply, CredentialDispatchFailure,
+    CredentialSubmissionReply, StatusReply,
+)
 from airplay_linux.capture.source import (
     SourceObservation, SourceRefusal, SourceVerificationRefusal,
 )
 from airplay_linux.backend.control import (
-    BackendControl, BackendOperation, BackendPayload, ConnectPayload, EmptyPayload,
-    Handshake, ModesPayload, MutePayload, OwnershipProof, requires_dispatch_fence,
-    VolumePayload, AudioGatePayload,
+    BackendControl, BackendOperation, BackendPayload, ConnectPayload, CredentialPayload,
+    EmptyPayload, Handshake, ModesPayload, MutePayload, OwnershipProof,
+    requires_dispatch_fence, VolumePayload, AudioGatePayload,
 )
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.messages import (
     EmptyPayload as EventEmpty, FailurePayload, MutePayload as EventMute,
-    SourceVerificationPayload, TransportEvent, TransportEventKind, VolumePayload as EventVolume,
+    CredentialRequestPayload, SourceVerificationPayload, TransportEvent,
+    TransportEventKind, VolumePayload as EventVolume,
 )
 from airplay_linux.domain.operations import (
-    ChallengeId, InstanceId, LeaseId, OperationContext, PairingChallenge,
+    ChallengeId, InstanceId, LeaseId, OperationContext, OperationId, PairingChallenge,
     PairingResult, SensitiveText, StreamHandle,
 )
 from airplay_linux.domain.ports import (
     CapturePort, Clock, CredentialStore, IdFactory, ReceiverStore, Scheduler, Subscription,
 )
 from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
+from airplay_linux.domain.relay import (
+    CredentialRequest, NoReply, PendingStartCleanupOwner, RelayStartOptions, Submitted,
+)
 from airplay_linux.domain.resources import (
     AudioPolicy, AudioState, CaptureSource, Err, ErrorCode, Ok,
     PhysicalMonitorSource, ReceiverCapabilities, Result, VirtualOutputSource, VolumeLevel,
@@ -231,6 +238,13 @@ class _Stream:
     volume_task: _VolumeTask | None = None
     close_task: _CloseTask | None = None
     source_observation: SourceObservation | None = None
+    readiness_stop: asyncio.Event = field(default_factory=asyncio.Event)
+    handoff_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    handoff_requested: bool = False
+    handoff_claimed: bool = False
+    credential_request: CredentialRequest | None = None
+    credential_request_ended: bool = False
+    credential_submission_id: OperationId | None = None
     abandoned: bool = False
     released: bool = False
 
@@ -435,17 +449,25 @@ class DoubleTakeTransport:
         return _Subscription(action=remove)
 
     def _emit(self, stream: _Stream, kind: TransportEventKind, payload=None, context=None) -> None:
-        if stream.handle is None:
+        handle = stream.handle
+        if handle is None and kind is not TransportEventKind.credential_request:
+            return
+        daemon_instance_uuid = (
+            handle.daemon_instance_uuid
+            if handle is not None
+            else stream.daemon.record.instance_uuid if stream.daemon is not None else None
+        )
+        if daemon_instance_uuid is None:
             return
         ctx = replace(
             context or stream.context, endpoint_generation=stream.target.endpoint_generation,
             transport_lease_id=stream.lease,
         )
         event = TransportEvent(
-            kind=kind, receiver_id=stream.target.receiver_id, stream=stream.handle,
+            kind=kind, receiver_id=stream.target.receiver_id, stream=handle,
             endpoint_fingerprint=stream.target.endpoint_fingerprint,
             endpoint_generation=stream.target.endpoint_generation,
-            daemon_instance_uuid=stream.handle.daemon_instance_uuid,
+            daemon_instance_uuid=daemon_instance_uuid,
             context=ctx, payload=payload if payload is not None else EventEmpty(),
         )
         for callback in tuple(self._callbacks):
@@ -785,17 +807,79 @@ class DoubleTakeTransport:
             if not polling.done():
                 polling.cancel()
 
+    def _observe_credential_request(self, stream: _Stream, status: StatusReply) -> bool:
+        """Publish the first exact target-row credential request, if any."""
+        matches = tuple(
+            item for item in status.streams
+            if item.target == stream.target.canonical_host
+        )
+        matching = (
+            matches[0]
+            if len(matches) == 1 and matches[0].state == "pin_required"
+            and matches[0].credential_kind in {"pin", "password"}
+            else None
+        )
+        if matching is not None:
+            if stream.credential_request is None and not stream.credential_request_ended:
+                options = RelayStartOptions(
+                    target_volume_proven=self._features.target_volume is True,
+                    audio=stream.audio_policy,
+                    initial_volume=(
+                        stream.initial_volume if stream.audio_policy.enabled else None
+                    ),
+                )
+                request = CredentialRequest(
+                    receiver_id=stream.target.receiver_id,
+                    target=stream.target,
+                    credential_kind=matching.credential_kind,
+                    start_operation_id=stream.context.operation_id,
+                    endpoint_generation=stream.target.endpoint_generation,
+                    session_generation=stream.context.session_generation,
+                    owner_lease=stream.lease,
+                    daemon_instance_uuid=stream.daemon.record.instance_uuid,
+                    generation=1,
+                    observed_at=self._clock.now(),
+                    start_options=options,
+                )
+                stream.credential_request = request
+                self._emit(
+                    stream, TransportEventKind.credential_request,
+                    CredentialRequestPayload(request=request, lifecycle="live", reason=None),
+                )
+            return True
+        if (
+            stream.credential_request is not None
+            and stream.credential_submission_id is None
+            and not stream.credential_request_ended
+            and not matches
+        ):
+            stream.credential_request_ended = True
+            self._emit(
+                stream, TransportEventKind.credential_request,
+                CredentialRequestPayload(
+                    request=stream.credential_request, lifecycle="ended", reason="row_ended",
+                ),
+            )
+        return False
+
+    async def _read_status(self, daemon: _Daemon, *, code: ErrorCode) -> Result[StatusReply]:
+        result = await _safe(
+            daemon.control.request(BackendOperation.status, None, EmptyPayload(), None), code,
+        )
+        if isinstance(result, Err):
+            return result
+        if not isinstance(result.value, StatusReply):
+            return _failure(code)
+        return result
+
     async def _await_connecting_stream(self, stream: _Stream) -> Result[None]:
         """Wait for an accepted ``connect`` to reach streaming evidence.
 
         A ``connecting`` acknowledgement is progress: the backend is still
         preparing capture, which for a desktop capture means waiting for the
         portal's screen prompt. That phase is a human answer, so it is generously
-        bounded and stays cancellable; once the stream carries a source only the
-        RTSP handshake is left and the connect budget applies. Readiness is never
-        inferred from the acknowledgement, credential prompts end the wait as
-        their own refusal, and target or daemon loss outranks any later
-        observation.
+        bounded and stays cancellable. Credential state is meaningful only on one
+        exact target row. Aggregate state and other rows remain progress data.
         """
         accepted = self._clock.now() + CONNECT_STREAMING_TIMEOUT
         permission = self._clock.now() + PERMISSION_WAIT_TIMEOUT
@@ -805,15 +889,28 @@ class DoubleTakeTransport:
         loop = asyncio.get_running_loop()
         while True:
             daemon = stream.daemon
+            if stream.readiness_stop.is_set():
+                stream.handoff_requested = True
+                return _failure(ErrorCode.stale_event)
             if stream.abandoned or daemon is None or not daemon.alive or not daemon.authenticated:
                 return _failure(ErrorCode.stale_event)
             checked = self._current(stream.target, stream.context)
             if isinstance(checked, Err):
                 return checked
-            status = await _safe(
-                daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
-                ErrorCode.unsupported_source,
+            status_task = self._spawn(self._safe_status_request(daemon))
+            stop_task = asyncio.create_task(stream.readiness_stop.wait())
+            done, _ = await asyncio.wait(
+                (status_task, stop_task), return_when=asyncio.FIRST_COMPLETED,
             )
+            if stop_task in done:
+                if not status_task.done():
+                    status_task.cancel()
+                    await asyncio.gather(status_task, return_exceptions=True)
+                stream.handoff_requested = True
+                return _failure(ErrorCode.stale_event)
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
+            status = status_task.result()
             if isinstance(status, Err):
                 # A status read can time out while the backend is blocked on the
                 # portal prompt. One unanswered read is not a failed capture, but
@@ -832,18 +929,11 @@ class DoubleTakeTransport:
                     item for item in status.value.streams
                     if item.target == stream.target.canonical_host
                 )
-                seen = seen or bool(matches)
-                prompting = (
-                    status.value.state == "pin_required"
-                    or status.value.needs_credential
-                    or status.value.credential_kind is not None
-                    or any(
-                        item.state == "pin_required" or item.credential_kind is not None
-                        for item in matches
-                    )
-                )
-                if prompting:
-                    return _failure(ErrorCode.dependency_incompatible)
+                self._observe_credential_request(stream, status.value)
+                if stream.credential_request_ended and not matches:
+                    seen = False
+                else:
+                    seen = seen or bool(matches)
                 if len(matches) == 1 and matches[0].state == "streaming":
                     return Ok(value=None)
             # The backend publishes a connecting stream before it has a capture
@@ -858,7 +948,7 @@ class DoubleTakeTransport:
                     return _failure(ErrorCode.unsupported_source)
             else:
                 handshake = None
-                if examined and seen and not matches:
+                if examined and seen and not matches and not stream.credential_request_ended:
                     # The stream this target had is gone: the backend dropped it.
                     return _failure(ErrorCode.unsupported_source)
                 if not seen and self._clock.now() >= accepted:
@@ -877,12 +967,28 @@ class DoubleTakeTransport:
                 self._clock.now() + SOURCE_POLL_INTERVAL, tick,
             )
             try:
-                await wake
+                stop_wait = asyncio.create_task(stream.readiness_stop.wait())
+                done, _ = await asyncio.wait(
+                    (wake, stop_wait), return_when=asyncio.FIRST_COMPLETED,
+                )
+                if stop_wait in done:
+                    stream.handoff_requested = True
+                    return _failure(ErrorCode.stale_event)
+                stop_wait.cancel()
+                await asyncio.gather(stop_wait, return_exceptions=True)
             finally:
                 scheduled.cancel()
 
+    async def _safe_status_request(self, daemon: _Daemon) -> Result[StatusReply]:
+        return await _safe(
+            daemon.control.request(BackendOperation.status, None, EmptyPayload(), None),
+            ErrorCode.unsupported_source,
+        )
+
     async def _claim_streaming_readiness(self, stream: _Stream) -> Err | None:
         """Publish the ready event from local evidence, or return the refusal."""
+        if stream.readiness_stop.is_set() or stream.handoff_requested:
+            return _failure(ErrorCode.stale_event)
         source_checked = (
             Ok(value=None)
             if isinstance(stream.source, VirtualOutputSource)
@@ -1039,9 +1145,7 @@ class DoubleTakeTransport:
                     # Preserve the virtual acquisition contract: the caller owns
                     # this handle while waiting for a separate readiness event.
                     return Ok(value=stream.handle)
-                if self._features.owned_daemon_control and result.value.state == "pin_required":
-                    failure = _failure(ErrorCode.dependency_incompatible)
-                elif result.value.state == "connecting" and not isinstance(
+                if result.value.state == "connecting" and not isinstance(
                     stream.source, VirtualOutputSource
                 ):
                     # The backend accepts ``connect`` before its handshake and
@@ -1053,22 +1157,28 @@ class DoubleTakeTransport:
                         waited if isinstance(waited, Err)
                         else await self._claim_streaming_readiness(stream)
                     )
-                    if not isinstance(claimed, Err):
+                    if not isinstance(claimed, Err) and not stream.handoff_requested:
                         return Ok(value=stream.handle)
-                    failure = claimed
+                    failure = claimed if isinstance(claimed, Err) else _failure(ErrorCode.stale_event)
                 elif result.value.state != "streaming":
                     failure = _failure(ErrorCode.unsupported_source)
                 else:
                     claimed = await self._claim_streaming_readiness(stream)
-                    if not isinstance(claimed, Err):
+                    if not isinstance(claimed, Err) and not stream.handoff_requested:
                         return Ok(value=stream.handle)
-                    failure = claimed
+                    failure = claimed if isinstance(claimed, Err) else _failure(ErrorCode.stale_event)
             else:
                 failure = result if isinstance(result, Err) else (
                     checked if isinstance(checked, Err) else _failure(
                         ErrorCode.stale_event if stream.abandoned else ErrorCode.transport_failed
                     )
                 )
+        if stream.handoff_requested:
+            # Stop owns the existing handle. The acquisition reports stale to
+            # its original caller after the stream lock has been released and
+            # never enters the ordinary failure-cleanup tail.
+            stream.handoff_ready.set()
+            return _failure(ErrorCode.stale_event)
         # Source provenance is local verification plus the affirmed feature;
         # the exact request ack supplies connect acceptance only.
         cleaned = await self._wait(
@@ -1091,6 +1201,159 @@ class DoubleTakeTransport:
             ):
                 return _failure(ErrorCode.stale_event)
         return Ok(value=stream)
+
+    async def submit_credential(
+        self,
+        target: ReceiverTarget,
+        value: SensitiveText,
+        context: OperationContext,
+        *,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> Result[Submitted | NoReply]:
+        if (
+            type(target) is not ReceiverTarget
+            or type(value) is not SensitiveText
+            or type(context) is not OperationContext
+            or not callable(dispatch_fence)
+        ):
+            return _failure(ErrorCode.invalid_input)
+        lease = context.transport_lease_id
+        stream = self._streams.get(lease) if lease is not None else None
+        if stream is None or stream.target != target or stream.daemon is None:
+            return _failure(ErrorCode.stale_event)
+        if stream.credential_request_ended:
+            return _failure(ErrorCode.stale_event)
+        if stream.credential_submission_id is not None:
+            return _failure(ErrorCode.stale_event)
+        checked = self._current(target, context)
+        if isinstance(checked, Err):
+            return checked
+        if (
+            context.session_generation != stream.context.session_generation
+            or context.endpoint_generation != stream.context.endpoint_generation
+            or context.trust_generation != stream.context.trust_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        if not self._features.credential_relay:
+            return _failure(ErrorCode.unsupported_operation)
+        submitter = getattr(stream.daemon.control, "submit_credential", None)
+        if submitter is None:
+            return _failure(ErrorCode.dependency_incompatible)
+        stream.credential_submission_id = context.operation_id
+        payload = CredentialPayload(
+            value=value,
+            audio=stream.audio_policy,
+            initial_volume=(
+                stream.initial_volume if stream.audio_policy.enabled else None
+            ),
+        )
+        try:
+            result = await submitter(
+                target, payload, context, dispatch_fence=dispatch_fence,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return _failure(ErrorCode.transport_failed)
+        if isinstance(result, CredentialSubmissionReply):
+            return Ok(value=Submitted(
+                reply_at=result.reply_at, accepted=result.accepted,
+                post_dispatch_error=None,
+            ))
+        if isinstance(result, CredentialDispatchFailure):
+            if result.dispatch_state == "no_spawn":
+                if stream.credential_submission_id == context.operation_id:
+                    stream.credential_submission_id = None
+                return Err(error=result.error)
+            if result.dispatch_state == "acknowledged":
+                return Ok(value=Submitted(
+                    reply_at=result.reply_at,
+                    accepted=bool(result.reply_accepted),
+                    post_dispatch_error=(
+                        result.error.code if result.refusal == "stale" else None
+                    ),
+                ))
+            return Ok(value=NoReply(reason=result.reason))
+        return _failure(ErrorCode.dependency_incompatible)
+
+    async def read_credential_status(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> Result[StatusReply]:
+        if type(target) is not ReceiverTarget or type(context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input)
+        checked = self._current(target, context)
+        if isinstance(checked, Err):
+            return checked
+        stream = self._streams.get(context.transport_lease_id) if context.transport_lease_id else None
+        if stream is not None and (
+            stream.target != target
+            or stream.context.session_generation != context.session_generation
+            or stream.context.trust_generation != context.trust_generation
+        ):
+            return _failure(ErrorCode.stale_event)
+        daemon = stream.daemon if stream is not None else None
+        if daemon is None:
+            admitted = await self._admit(target, context)
+            if isinstance(admitted, Err):
+                return admitted
+            daemon = admitted.value
+        result = await self._read_status(daemon, code=ErrorCode.transport_failed)
+        if isinstance(result, Err):
+            return result
+        checked = self._current(target, context)
+        return checked if isinstance(checked, Err) else result
+
+    async def stop_pending_start(
+        self, owner: PendingStartCleanupOwner, stop_context: OperationContext,
+    ) -> Result[StreamHandle]:
+        if type(owner) is not PendingStartCleanupOwner or type(stop_context) is not OperationContext:
+            return _failure(ErrorCode.invalid_input)
+        stream = self._streams.get(owner.owner_lease)
+        if stream is None or stream.handle is None or stream.daemon is None or stream.released:
+            return _failure(ErrorCode.stale_event)
+        current = self._current(stream.target, stream.context)
+        if isinstance(current, Err):
+            return current
+        handle = stream.handle
+        if (
+            stream.target.receiver_id != owner.receiver_id
+            or stream.target != owner.target
+            or stream.context.operation_id != owner.start_operation_id
+            or stream.target.endpoint_fingerprint != owner.endpoint_fingerprint
+            or stream.target.endpoint_generation != owner.endpoint_generation
+            or stream.context.session_generation != owner.session_generation
+            or (stream.context.trust_generation or 0) != owner.trust_generation
+            or stream.lease != owner.owner_lease
+            or handle.daemon_instance_uuid != owner.daemon_instance_uuid
+            or stream.credential_submission_id != owner.credential_submission_id
+            or stop_context.operation_id != owner.stop_operation_id
+            or stop_context.endpoint_generation != owner.endpoint_generation
+            or stop_context.session_generation != owner.session_generation
+            or stop_context.trust_generation != owner.trust_generation
+            or (
+                stop_context.transport_lease_id is not None
+                and stop_context.transport_lease_id != owner.owner_lease
+            )
+        ):
+            return _failure(ErrorCode.stale_event)
+        if stream.handoff_claimed:
+            return _failure(ErrorCode.stale_event)
+        stream.handoff_requested = True
+        stream.readiness_stop.set()
+        if not stream.handoff_ready.is_set():
+            async def wait_for_handoff() -> Result[None]:
+                await stream.handoff_ready.wait()
+                return Ok(value=None)
+
+            settled = await self._wait(
+                self._spawn(wait_for_handoff()), ErrorCode.cleanup_timeout,
+            )
+            if isinstance(settled, Err):
+                return settled
+        if stream.handle is None or stream.released or stream.handoff_claimed:
+            return _failure(ErrorCode.stale_event)
+        stream.handoff_claimed = True
+        return Ok(value=stream.handle)
 
     async def stop_stream(self, handle: StreamHandle, context: OperationContext) -> Result[None]:
         if handle in self._released:
@@ -1116,10 +1379,23 @@ class DoubleTakeTransport:
             checked = self._targets.require_cleanup(stream.target)
             if isinstance(checked, Err):
                 return checked
-            if not _ack(result, BackendOperation.disconnect, stream.target) or not stream.daemon.alive or (
-                result.value.state in ("streaming", "connecting", "pin_required")
-            ):
+            disconnect_ack = _ack(result, BackendOperation.disconnect, stream.target)
+            negative_disconnect = isinstance(result, Err) and result.error.code is ErrorCode.receiver_rejected
+            if not (disconnect_ack or negative_disconnect) or not stream.daemon.alive:
                 return _failure(ErrorCode.cleanup_timeout)
+            if stream.credential_request is not None:
+                status = await self._read_status(stream.daemon, code=ErrorCode.cleanup_timeout)
+                if isinstance(status, Err):
+                    return status
+                matching = tuple(
+                    item for item in status.value.streams
+                    if item.target == stream.target.canonical_host
+                )
+                if matching:
+                    return _failure(ErrorCode.cleanup_timeout)
+            checked = self._targets.require_cleanup(stream.target)
+            if isinstance(checked, Err):
+                return checked
             self._drop(stream)
             self._released.add(stream.handle)
             self._emit(stream, TransportEventKind.stopped, context=context)

@@ -10,7 +10,10 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.backend.contract import AckReply, BackendSource, BackendStream, StatusReply, decode_status
+from airplay_linux.backend.contract import (
+    AckReply, BackendSource, BackendStream, CredentialSubmissionReply, StatusReply,
+    decode_status,
+)
 from airplay_linux.capture.source import SourceRefusal, verify_reported_source
 from airplay_linux.display.inventory import KScreenInventory, KScreenReportedSourceVerifier
 from airplay_linux.backend.control import (
@@ -18,7 +21,10 @@ from airplay_linux.backend.control import (
     ProfileCommand, PublishedDoubletakeControl, PublishedDoubletakeProfile,
 )
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.messages import MutePayload, SourceVerificationPayload, TransportEventKind
+from airplay_linux.domain.messages import (
+    CredentialRequestPayload, MutePayload, SourceVerificationPayload, TransportEventKind,
+)
+from airplay_linux.domain.relay import PendingStartCleanupOwner, Submitted
 from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import CommandOutput
 from airplay_linux.domain.records import AudioStartReceipt, DaemonRecord
@@ -1574,12 +1580,24 @@ async def test_connecting_ack_surfaces_a_credential_prompt_immediately(tmp_path)
     )))
     h.control.connected.add(h.a.receiver_id)
     h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    empty_status = Ok(value=StatusReply(
+        state="idle", device=None, target=None, has_audio=False, audio_muted=False,
+        needs_credential=False, credential_kind=None, streams=(),
+    ))
+    h.control.results[BackendOperation.status].extend([empty_status] * 10)
 
     pending = asyncio.create_task(h.start())
     await _drain_transport()
+    assert not pending.done()
+    requests = [event for event in h.events if event.kind is TransportEventKind.credential_request]
+    assert len(requests) == 1
+    assert requests[0].payload.lifecycle == "live"
+    assert requests[0].payload.request.target.canonical_host == h.a.canonical_host
+    h.scheduler.advance(PERMISSION_WAIT_TIMEOUT)
+    await _drain_transport()
     result = await pending
 
-    assert_error(result, ErrorCode.dependency_incompatible)
+    assert_error(result, ErrorCode.unsupported_source)
     assert not any(event.kind is TransportEventKind.ready for event in h.events)
     assert len(h.control.calls(BackendOperation.disconnect)) == 1
 
@@ -2844,3 +2862,150 @@ async def test_volume_close_timeout_needs_fresh_acknowledgement(volume_control):
         await asyncio.sleep(0)
     assert isinstance(await h.transport.close_audio(handle, context()), Ok)
     assert len(h.control.calls(BackendOperation.audio_off)) == 2
+
+
+@pytest.mark.asyncio
+async def test_credential_request_requires_one_exact_target_row_and_emits_end(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    matching = _pin_required_status(h.a).value
+    aggregate_only = replace(matching, streams=())
+    streaming = _source_status(h.a, None).value
+    h.control.results[BackendOperation.status].extend([
+        Ok(value=matching), Ok(value=aggregate_only), Ok(value=streaming),
+    ])
+    pending = asyncio.create_task(h.start())
+    for _ in range(100):
+        await asyncio.sleep(0)
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await asyncio.sleep(0)
+        if pending.done():
+            break
+    result = await pending
+
+    assert isinstance(result, Ok), result
+    requests = [event for event in h.events if event.kind is TransportEventKind.credential_request]
+    assert [event.payload.lifecycle for event in requests] == ["live", "ended"]
+    assert all(isinstance(event.payload, CredentialRequestPayload) for event in requests)
+    assert requests[0].payload.request.target.canonical_host == h.a.canonical_host
+    assert requests[1].payload.reason == "row_ended"
+    assert requests[0].payload.request.start_operation_id == context().operation_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_factory", ["aggregate", "other", "duplicate", "untyped"])
+async def test_credential_request_ignores_non_unique_or_non_typed_rows(tmp_path, status_factory):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    matching = _pin_required_status(h.a).value
+    row = matching.streams[0]
+    if status_factory == "aggregate":
+        first = replace(matching, streams=())
+    elif status_factory == "other":
+        first = replace(matching, streams=(_pin_required_status(h.b).value.streams[0],))
+    elif status_factory == "duplicate":
+        first = replace(matching, streams=(row, row))
+    else:
+        first = replace(
+            matching, needs_credential=False, credential_kind=None,
+            streams=(replace(row, credential_kind=None),),
+        )
+    h.control.results[BackendOperation.status].extend([
+        Ok(value=first), _source_status(h.a, None),
+    ])
+    pending = asyncio.create_task(h.start())
+
+    for _ in range(100):
+        await asyncio.sleep(0)
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await asyncio.sleep(0)
+        if pending.done():
+            break
+    result = await pending
+    assert isinstance(result, Ok), result
+    assert not any(event.kind is TransportEventKind.credential_request for event in h.events)
+
+
+@pytest.mark.asyncio
+async def test_submit_credential_maps_typed_reply_and_forwards_exact_fence(tmp_path):
+    h = Harness(tmp_path, credential_relay=True)
+    handle = await h.handle(initial_volume=VolumeLevel(value=30))
+    seen = {}
+    fence = lambda: Ok(value=None)
+
+    async def submit(target, payload, operation, *, dispatch_fence):
+        seen.update(target=target, payload=payload, context=operation, fence=dispatch_fence)
+        return CredentialSubmissionReply(reply_at=3.5, accepted=False)
+
+    h.control.submit_credential = submit
+    submission_context = context(operation_id=OperationId(UUID(int=77)))
+    result = await h.transport.submit_credential(
+        h.a, SensitiveText("transport-submit-canary"), submission_context,
+        dispatch_fence=fence,
+    )
+
+    assert result == Ok(value=Submitted(reply_at=3.5, accepted=False, post_dispatch_error=None))
+    assert seen["fence"] is fence
+    assert seen["target"] == h.a
+    assert seen["payload"].audio == AudioPolicy(enabled=True)
+    assert seen["payload"].initial_volume == VolumeLevel(value=30)
+    assert "transport-submit-canary" not in repr((seen, result, h.control.journal.entries))
+    assert h.transport._streams[handle.lease_id].credential_submission_id == submission_context.operation_id
+
+
+@pytest.mark.asyncio
+async def test_stop_pending_start_transfers_one_exact_handle_without_canceling_submission(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    h.control.results[BackendOperation.status].append(_pin_required_status(h.a))
+    status_gate = None
+    def hold_after_request(event):
+        nonlocal status_gate
+        if event.kind is TransportEventKind.credential_request and event.payload.lifecycle == "live":
+            status_gate = h.control.gates[(BackendOperation.status, None)] = Gate()
+    h.transport.subscribe(hold_after_request)
+    pending = asyncio.create_task(h.start())
+    for _ in range(30):
+        await asyncio.sleep(0)
+        h.scheduler.advance(SOURCE_POLL_INTERVAL)
+        await asyncio.sleep(0)
+        if any(event.kind is TransportEventKind.credential_request for event in h.events):
+            break
+    request = next(event for event in h.events if event.kind is TransportEventKind.credential_request)
+    stream = h.transport._streams[request.context.transport_lease_id]
+    stop_context = context(operation_id=OperationId(UUID(int=88)))
+    owner = PendingStartCleanupOwner(
+        receiver_id=h.a.receiver_id, target=h.a,
+        start_operation_id=stream.context.operation_id,
+        endpoint_fingerprint=h.a.endpoint_fingerprint,
+        endpoint_generation=h.a.endpoint_generation,
+        session_generation=stream.context.session_generation,
+        trust_generation=stream.context.trust_generation or 0,
+        owner_lease=stream.lease,
+        daemon_instance_uuid=stream.daemon.record.instance_uuid,
+        stop_operation_id=stop_context.operation_id,
+        credential_submission_id=None, marker_generation=None,
+    )
+
+    transferred = await h.transport.stop_pending_start(owner, stop_context)
+    duplicate = await h.transport.stop_pending_start(owner, stop_context)
+    if status_gate is not None:
+        status_gate.release()
+    start_result = await pending
+
+    assert isinstance(transferred, Ok), transferred
+    assert transferred.value == stream.handle
+    assert isinstance(duplicate, Err)
+    assert duplicate.error.code is ErrorCode.stale_event
+    assert isinstance(start_result, Err)
+    assert start_result.error.code is ErrorCode.stale_event
+    assert not h.control.calls(BackendOperation.submit_pairing)
