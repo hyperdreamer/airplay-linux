@@ -3461,6 +3461,29 @@ async def test_ordinary_disconnect_does_not_release_active_target(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_unready_virtual_disconnect_requires_exact_target_absence_after_complete_reply(tmp_path):
+    h = Harness(tmp_path)
+    h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
+        operation="connect", target=h.a.canonical_host, state="connecting",
+    )))
+    h.control.connected.add(h.a.receiver_id)
+    handle = await h.handle(source=virtual_handle().source)
+    assert h.transport._streams[handle.lease_id].ready is False
+
+    h.control.results[BackendOperation.disconnect].append(Ok(value=AckReply(
+        operation="disconnect", target=h.a.canonical_host, state=None,
+    )))
+    h.control.results[BackendOperation.status].append(_source_status(h.a, None))
+
+    result = await h.transport.stop_stream(handle, context())
+
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.cleanup_timeout
+    assert len(h.control.calls(BackendOperation.status)) == 1
+    assert handle.lease_id in h.transport._streams
+
+
+@pytest.mark.asyncio
 async def test_dispatched_handoff_preserves_command_status_and_exact_target_cleanup(tmp_path):
     from airplay_linux.transport.doubletake import CONTROL_TIMEOUT
 

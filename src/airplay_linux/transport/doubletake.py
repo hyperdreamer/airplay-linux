@@ -1245,7 +1245,12 @@ class DoubleTakeTransport:
         # Source provenance is local verification plus the affirmed feature;
         # the exact request ack supplies connect acceptance only.
         cleaned = await self._wait(
-            self._spawn(self._stop_owned(stream, stream.context)), ErrorCode.cleanup_timeout,
+            self._spawn(
+                self._stop_owned(
+                    stream, stream.context, verify_target_absence=False,
+                )
+            ),
+            ErrorCode.cleanup_timeout,
         )
         return self._failed(stream, cleaned if isinstance(cleaned, Err) else failure)
 
@@ -1655,7 +1660,13 @@ class DoubleTakeTransport:
         self._retire_volume(owned.value)
         return await self._wait(self._spawn(self._stop_owned(owned.value, context)), ErrorCode.cleanup_timeout)
 
-    async def _stop_owned(self, stream: _Stream, context: OperationContext) -> Result[None]:
+    async def _stop_owned(
+        self,
+        stream: _Stream,
+        context: OperationContext,
+        *,
+        verify_target_absence: bool = True,
+    ) -> Result[None]:
         async with stream.lock:
             if stream.released:
                 return Ok(value=None)
@@ -1672,7 +1683,7 @@ class DoubleTakeTransport:
             negative_disconnect = isinstance(result, Err) and result.error.code is ErrorCode.receiver_rejected
             if not (disconnect_ack or negative_disconnect) or not stream.daemon.alive:
                 return _failure(ErrorCode.cleanup_timeout)
-            if not stream.ready and stream.credential_request is None:
+            if not verify_target_absence and not stream.ready and stream.credential_request is None:
                 if not disconnect_ack or result.value.state in ("streaming", "connecting", "pin_required"):
                     return _failure(ErrorCode.cleanup_timeout)
             else:
