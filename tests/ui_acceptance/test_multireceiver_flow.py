@@ -54,6 +54,7 @@ from airplay_linux.domain.resources import (
     Ok,
     TransportState,
     TrustState,
+    VirtualOutputSource,
 )
 from airplay_linux.runtime import RuntimeConfig
 from airplay_linux.session import Route
@@ -185,12 +186,22 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
         self.release_status = asyncio.Event()
         self.submit_entered = asyncio.Event()
         self.request_event: TransportEvent | None = None
+        self.request_events: list[TransportEvent] = []
         self.hold_start = False
         self.start_waiting = asyncio.Event()
         self.release_start = asyncio.Event()
         self.start_finished = asyncio.Event()
         self.pending_handle: StreamHandle | None = None
+        self.pending_target: ReceiverTarget | None = None
         self.pending_owner = None
+        self.pending_start_stopped = False
+        self.transferred_handles: list[StreamHandle] = []
+        self.submission_targets: list[ReceiverTarget] = []
+        self.status_read_states: list[str] = []
+        self.status_read_cancelled = 0
+        self.cleanup_statuses: list[StatusReply] = []
+        self.cleanup_status_sequence: list[StatusReply] = []
+        self.cleanup_ack_states: list[str] = []
 
     async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
         result = await super().start_stream(
@@ -200,6 +211,7 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
             return result
         handle = result.value
         self.pending_handle = handle
+        self.pending_target = destination
         decoy = BackendStream(
             device="TV B", target="192.0.2.20", state="pin_required",
             has_audio=False, audio_muted=False, credential_kind="pin",
@@ -218,7 +230,7 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
             if row.target == destination.canonical_host and row.state == "pin_required"
             and row.credential_kind in {"pin", "password"}
         )
-        if len(rows) == 1:
+        if not isinstance(source, VirtualOutputSource) and len(rows) == 1:
             request = CredentialRequest(
                 receiver_id=destination.receiver_id,
                 target=destination,
@@ -245,6 +257,7 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
                 payload=CredentialRequestPayload(request=request, lifecycle="live", reason=None),
             )
             self.request_event = event
+            self.request_events.append(event)
             self.emit(event)
             self.request_emitted_before_return = True
         try:
@@ -253,14 +266,34 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
                 await self.release_start.wait()
         finally:
             self.start_finished.set()
+        if self.pending_start_stopped:
+            return Err(error=diagnostic(ErrorCode.stale_event))
         return result
 
     async def stop_pending_start(self, owner, stop_context):
         self._record("stop_pending_start", owner=owner, stop_context=stop_context)
         self.pending_owner = owner
+        self.pending_start_stopped = True
         self.release_start.set()
         await self.start_finished.wait()
+        self.transferred_handles.append(self.pending_handle)
         return Ok(value=self.pending_handle)
+
+    async def stop_stream(self, handle, context):
+        if self.pending_target is None or not self.cleanup_status_sequence:
+            return await super().stop_stream(handle, context)
+        self.cleanup_ack_states.append("pin_required")
+        for status in self.cleanup_status_sequence:
+            self.cleanup_statuses.append(status)
+            matches = tuple(
+                row for row in status.streams
+                if row.target == self.pending_target.canonical_host
+            )
+            if len(matches) > 1:
+                return Err(error=diagnostic(ErrorCode.transport_failed))
+            if not matches:
+                return await super().stop_stream(handle, context)
+        return Err(error=diagnostic(ErrorCode.cleanup_timeout))
 
     def end_credential_request(self) -> None:
         event = self.request_event
@@ -279,6 +312,7 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
             dispatch_fence=dispatch_fence is not None,
         )
         self.submission_target = target
+        self.submission_targets.append(target)
         self.canary_matched = value.reveal_for_backend() == self.CANARY
         if not self.coordinator.markers or self.coordinator.markers[0].state != "watching":
             return Err(error=diagnostic(ErrorCode.persistence_failed))
@@ -294,9 +328,14 @@ class _AssemblyCredentialTransport(AcceptanceTransport):
     async def read_credential_status(self, target, context):
         self._record("read_credential_status", target=target, context=context)
         self.status_targets.append(target)
+        self.status_read_states.append(self.observed_state)
         if self.hold_status:
             self.status_entered.set()
-            await self.release_status.wait()
+            try:
+                await self.release_status.wait()
+            except asyncio.CancelledError:
+                self.status_read_cancelled += 1
+                raise
         row = BackendStream(
             device="TV A" if self.observed_state != "absent" else "TV B",
             target=target.canonical_host if self.observed_state != "absent" else "192.0.2.20",
@@ -484,18 +523,36 @@ async def test_assembled_dismissal_after_dispatch_suppresses_late_reporting(
     assert "Connected to" not in app.notice
 
 
-async def test_assembled_stop_hands_off_a_pending_credential_start_without_submitting(
+async def test_assembled_pre_submit_stop_verifies_exact_target_absence_before_cleanup(
     build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
     transport.hold_start = True
     app.discover("a")
+    app.discover("b", address="192.0.2.20")
     await app.settle()
     app.click(Action.start)
     await app.settle()
 
-    assert app.state("a").credential_prompt is not None
-    assert app.state("a").stream is None
+    state = app.state("a")
+    start_handle = transport.pending_handle
+    assert state.credential_prompt is not None
+    assert state.stream is None
+    assert start_handle is not None
+    assert len(transport.request_status.streams) == 2
+    assert any(
+        row.target == state.target.canonical_host and row.state == "pin_required"
+        for row in transport.request_status.streams
+    )
+
+    aggregate = transport.request_status
+    target_present = aggregate
+    target_absent = replace(
+        aggregate,
+        streams=tuple(row for row in aggregate.streams if row.target != state.target.canonical_host),
+    )
+    transport.cleanup_status_sequence = [target_present, target_absent]
+
     await app.dispatchem(Stop(receiver_id=a()))
 
     assert transport.start_finished.is_set()
@@ -504,10 +561,124 @@ async def test_assembled_stop_hands_off_a_pending_credential_start_without_submi
     assert transport.pending_owner.marker_generation is None
     assert coordinator.markers == ()
     assert app.state("a").credential_prompt is None
-    assert app.rig.journal.calls("transport.submit_credential") == []
+    assert transport.submission_targets == []
+    assert len(transport.transferred_handles) == 1
+    assert transport.transferred_handles[0] == start_handle
+    assert len(transport.cleanup_statuses) == 2
+    first_targets = {row.target for row in transport.cleanup_statuses[0].streams}
+    final_targets = {row.target for row in transport.cleanup_statuses[1].streams}
+    assert first_targets == {state.target.canonical_host, "192.0.2.20"}
+    assert final_targets == {"192.0.2.20"}
+    assert all(status.state == "pin_required" for status in transport.cleanup_statuses)
+    assert transport.cleanup_ack_states == ["pin_required"]
     assert app.rig.journal.calls("transport.stop_pending_start")
-    assert app.rig.journal.calls("transport.stop_stream")
+    stop_calls = app.rig.journal.calls("transport.stop_stream")
+    assert len(stop_calls) == 1
+    assert field_of(stop_calls[0]["handle"], "receiver_id") == state.receiver_id
+    assert field_of(stop_calls[0]["handle"], "endpoint_fingerprint") == state.target.endpoint_fingerprint
     assert app.state("a").stream is None
+
+
+async def test_assembled_dispatched_stop_hands_off_while_target_is_connecting(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    outcome = Deferred()
+    app, coordinator, transport = await _build_credential_app(
+        build, monkeypatch, tmp_path, outcome=outcome,
+    )
+    transport.hold_start = True
+    transport.hold_status = True
+    app.discover("a")
+    app.discover("b", address="192.0.2.20")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+
+    start_handle = transport.pending_handle
+    state = app.state("a")
+    assert start_handle is not None
+    assert state.credential_prompt is not None
+    assert state.stream is None
+    dialog = await app.prompt("pairingDialog")
+    canary = "route-b-stop-after-dispatch-canary-5842"
+    field = dialog.findChild(QLineEdit, "secretField")
+    field.insert(canary)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await asyncio.wait_for(transport.submit_entered.wait(), timeout=2)
+    await app.settle()
+    assert transport.submission_targets == [state.target]
+
+    matching = next(
+        row for row in transport.request_status.streams
+        if row.target == state.target.canonical_host
+    )
+    transport.request_status = replace(
+        transport.request_status,
+        streams=tuple(
+            replace(row, state="connecting") if row is matching else row
+            for row in transport.request_status.streams
+        ),
+    )
+    transport.observed_state = "connecting"
+    transport.cleanup_status_sequence = [
+        transport.request_status,
+        replace(
+            transport.request_status,
+            streams=tuple(
+                row for row in transport.request_status.streams
+                if row.target != state.target.canonical_host
+            ),
+        ),
+    ]
+
+    await app.dispatchem(Stop(receiver_id=a()))
+
+    assert transport.start_finished.is_set()
+    assert transport.pending_owner is not None
+    assert transport.pending_owner.credential_submission_id is not None
+    assert transport.pending_owner.marker_generation is not None
+    assert len(transport.transferred_handles) == 1
+    assert transport.transferred_handles[0] == start_handle
+    assert not outcome.resolved
+    assert app.rig.journal.calls("transport.stop_stream") == []
+    assert app.state("a").stream is None
+
+    outcome.resolve(Ok(value=Submitted(reply_at=0.0, accepted=True, post_dispatch_error=None)))
+    await asyncio.wait_for(transport.status_entered.wait(), timeout=2)
+    await app.settle()
+    assert transport.status_read_states == ["connecting"]
+    assert transport.status_read_cancelled == 0
+    assert app.rig.journal.calls("transport.stop_stream") == []
+
+    transport.observed_state = "streaming"
+    transport.release_status.set()
+    await app.settle()
+
+    assert transport.status_read_cancelled == 0
+    assert transport.status_targets == [state.target]
+    assert len(transport.transferred_handles) == 1
+    stop_calls = app.rig.journal.calls("transport.stop_stream")
+    assert len(stop_calls) == 1
+    assert field_of(stop_calls[0]["handle"], "receiver_id") == state.receiver_id
+    assert field_of(stop_calls[0]["handle"], "endpoint_fingerprint") == state.target.endpoint_fingerprint
+    assert transport.cleanup_ack_states == ["pin_required"]
+    assert len(transport.cleanup_statuses) == 2
+    first_targets = {row.target for row in transport.cleanup_statuses[0].streams}
+    final_targets = {row.target for row in transport.cleanup_statuses[1].streams}
+    assert first_targets == {state.target.canonical_host, "192.0.2.20"}
+    assert final_targets == {"192.0.2.20"}
+    assert all(status.state == "pin_required" for status in transport.cleanup_statuses)
+    assert app.state("a").stream is None
+    assert app.rig.journal.calls("transport.submit_credential")
+    assert len(app.rig.journal.calls("transport.submit_credential")) == 1
+    assert transport.events.count("credential_dispatch") == 1
+    assert len(transport.submission_targets) == 1
+    assert app.notice == ""
+    assert field.text() == ""
+    assert canary not in repr(app.state("a"))
+    assert canary not in repr(coordinator.markers)
+    assert canary not in repr(app.journal)
+    assert canary not in app.activity_text
 
 
 async def test_assembled_no_reply_reports_unknown_and_keeps_the_target_marker(
@@ -618,7 +789,7 @@ async def test_virtual_display_start_cannot_open_a_credential_prompt(
     await app.start_virtual()
 
     assert app.state("a").mode is Mode.VIRTUAL
-    assert transport.request_emitted_before_return is True
+    assert transport.request_events == []
     assert app.state("a").credential_prompt is None
     assert coordinator.markers == ()
     assert app.presenter._relay_prompt_pending == {}
