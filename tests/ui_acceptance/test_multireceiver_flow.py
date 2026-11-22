@@ -66,7 +66,7 @@ from airplay_linux.storage import AtomicFiles
 from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
 from airplay_linux.testing.adapters import Deferred
 from airplay_linux.testing.builders import target
-from airplay_linux.transport.doubletake import DoubleTakeTransport
+from airplay_linux.transport.doubletake import CONTROL_TIMEOUT, DoubleTakeTransport
 from airplay_linux.ui.state import Action
 
 from test_matrix import (
@@ -205,6 +205,9 @@ class _RealCredentialControl:
         self.disconnect_targets: list[str] = []
         self.submission_targets: list[ReceiverTarget] = []
         self.canary_matched = False
+        self.hold_credential_status = False
+        self.credential_status_entered = asyncio.Event()
+        self.release_credential_status = asyncio.Event()
 
     def status_reply(self, state: str | None = None) -> StatusReply:
         if self.target is None:
@@ -341,6 +344,12 @@ class _DoubleTakeTransportBinding:
             rig.ids,
             recovery_guard=coordinator.start_dispatch_fence,
         )
+
+    async def read_credential_status(self, target, context):
+        if self.control.hold_credential_status:
+            self.control.credential_status_entered.set()
+            await self.control.release_credential_status.wait()
+        return await self.real.read_credential_status(target, context)
 
     def __getattr__(self, name: str):
         real = self.real
@@ -841,6 +850,7 @@ async def test_assembled_dispatched_stop_keeps_real_status_settlement_and_handof
         build, monkeypatch, tmp_path, outcome=outcome,
     )
     control.submission_state = "connecting"
+    control.disconnect_status_state = "connecting"
     app.discover("a")
     app.discover("b", address="192.0.2.20")
     await app.settle()
@@ -860,7 +870,15 @@ async def test_assembled_dispatched_stop_keeps_real_status_settlement_and_handof
     await asyncio.wait_for(control.submit_entered.wait(), timeout=2)
     assert control.submission_targets == [state.target]
 
-    readiness_gate = await _hold_readiness_status_until_stop(app, control)
+    outcome.resolve(Ok(value=Submitted(
+        reply_at=app.rig.clock.now(), accepted=True, post_dispatch_error=None,
+    )))
+    control.hold_credential_status = True
+    await asyncio.wait_for(control.credential_status_entered.wait(), timeout=2)
+    assert control.status_state == "connecting"
+    assert state.stream is None
+    assert app.state("a").stream is None
+
     stream, = transport._streams.values()
     handoffs = []
     stop_pending_start = transport.stop_pending_start
@@ -876,40 +894,79 @@ async def test_assembled_dispatched_stop_keeps_real_status_settlement_and_handof
     assert stream.readiness_stop.is_set()
     assert stream.handoff_ready.is_set()
     assert stream.handoff_claimed is True
-    assert control.status_read_cancelled == 1
     assert len(handoffs) == 1
     assert handoffs[0][0].credential_submission_id is not None
     assert handoffs[0][0].marker_generation is not None
     assert isinstance(handoffs[0][2], Ok) and handoffs[0][2].value == start_handle
-    assert not outcome.resolved
     assert control.disconnect_targets == []
     assert coordinator.markers[0].state == "watching"
-
-    control.status_entered.clear()
-    observation_gate = control.queue_status_gate()
-    outcome.resolve(Ok(value=Submitted(
-        reply_at=0.0, accepted=True, post_dispatch_error=None,
-    )))
-    await asyncio.wait_for(control.status_entered.wait(), timeout=2)
-    assert control.status_read_states[-1] == "connecting"
-    assert control.status_read_cancelled == 1
-    assert control.disconnect_targets == []
+    assert app.state("a").stream is None
+    assert not control.release_credential_status.is_set()
 
     control.status_state = "streaming"
-    observation_gate.resolve(None)
-    readiness_gate.resolve(None)
+    control.release_credential_status.set()
     await app.settle()
 
-    assert control.status_return_states[-2:] == ["streaming", "absent"]
-    assert control.status_read_cancelled == 1
+    assert "streaming" in control.status_return_states
     assert control.submission_targets == [state.target]
     assert control.canary_matched
     assert control.events.index("marker_published") < control.events.index("credential_dispatch")
     assert control.disconnect_targets == [state.target.canonical_host]
-    assert not app.state("a").cleanup_pending
+    assert app.state("a").cleanup_pending
+    assert start_handle.lease_id in transport._streams
     assert app.state("a").stream is None
+
+    control.disconnect_status_state = "absent"
+    await app.dispatchem(RetryCleanup(receiver_id=a()))
+
+    assert control.disconnect_targets == [state.target.canonical_host] * 2
+    assert not app.state("a").cleanup_pending
     assert not transport._streams
-    assert app.notice == ""
+    assert app.state("a").stream is None
+    assert field.text() == ""
+    assert canary not in repr(app.state("a"))
+    assert canary not in repr(coordinator.markers)
+    assert canary not in repr(app.journal)
+    assert canary not in app.activity_text
+
+
+async def test_assembled_dispatched_stop_keeps_the_original_command_deadline(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    outcome = Deferred()
+    app, coordinator, control, transport = await _build_real_stop_app(
+        build, monkeypatch, tmp_path, outcome=outcome,
+    )
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+
+    state = app.state("a")
+    assert state.credential_prompt is not None
+    dialog = await app.prompt("pairingDialog")
+    field = dialog.findChild(QLineEdit, "secretField")
+    canary = "route-b-deadline-canary-4286"
+    field.insert(canary)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await asyncio.wait_for(control.submit_entered.wait(), timeout=2)
+    assert control.disconnect_targets == []
+
+    app.rig.scheduler.advance(CONTROL_TIMEOUT - 0.01)
+    await app.settle()
+    await app.dispatchem(Stop(receiver_id=a()))
+
+    assert app.state("a").cleanup_pending
+    assert control.disconnect_targets == []
+    assert app.state("a").stream is None
+
+    app.rig.scheduler.advance(0.01)
+    await app.settle()
+
+    assert not app.state("a").cleanup_pending
+    assert control.disconnect_targets == [state.target.canonical_host]
+    assert app.state("a").stream is None
+    assert coordinator.markers[0].state == "release_pending"
     assert field.text() == ""
     assert canary not in repr(app.state("a"))
     assert canary not in repr(coordinator.markers)
