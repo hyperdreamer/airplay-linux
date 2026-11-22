@@ -44,7 +44,8 @@ async def test_unknown_outcome_runs_automatic_late_target_cleanup(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path):
+@pytest.mark.parametrize('marker_state', ['watching', 'release_pending'])
+async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path, marker_state):
     import asyncio
     from dataclasses import replace
     from airplay_linux.process.ownership import DaemonRecoveryExemption
@@ -52,9 +53,15 @@ async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path):
     from airplay_linux.session.recovery import CredentialRecoveryCoordinator
 
     h = await credential_rig(tmp_path, installed=True)
-    await submit_credential(h, Ok(value=NoReply(reason='command_timeout')))
+    if marker_state == 'watching':
+        created = await h.coordinator.begin_submission_for(
+            h.destination.receiver_id, h.destination, h.event.context.operation_id,
+        )
+        assert isinstance(created, Ok)
+    else:
+        await submit_credential(h, Ok(value=NoReply(reason='command_timeout')))
     marker = h.coordinator.markers[0]
-    assert marker.state == 'release_pending'
+    assert marker.state == marker_state
     calls = []
 
     async def authenticate(restored):
@@ -65,9 +72,12 @@ async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path):
         ))
 
     async def stop_recovery_target(restored, target, context, fence):
+        assert restored == marker
         assert fence() == Ok(value=None)
         assert context.owner_daemon == marker.original_daemon
         assert context.marker_generation == marker.marker_generation
+        assert target.receiver_id == marker.receiver_id
+        assert target.endpoint_generation == marker.original_daemon.endpoint_generation
         calls.append(target.canonical_host)
         return Ok(value=None)
 
@@ -80,12 +90,27 @@ async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path):
     exemptions = await restored.recover_before_registry_reconciliation()
     assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
     restored._startup_completed()
-    h.rig.scheduler.advance(4.0)
-    for _ in range(20):
-        await asyncio.sleep(0)
-    assert calls == [marker.target]
-    assert restored.markers[0] == marker
-    restored.stop_automatic_checks()
+    try:
+        for interval in range(1, 4):
+            h.rig.scheduler.advance(4.0)
+            for _ in range(20):
+                await asyncio.sleep(0)
+                await manager.drain()
+            assert calls == [marker.target] * interval
+            assert restored.markers == (marker,)
+            assert await h.store.for_target(marker.target) == Ok(value=marker)
+
+        dismissed = await restored.dismiss_for(marker, marker.marker_generation)
+        assert isinstance(dismissed, Ok)
+        assert dismissed.value.automatic_status_checks is False
+        h.rig.scheduler.advance(12.0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            await manager.drain()
+        assert calls == [marker.target] * 3
+        assert restored.markers == (dismissed.value,)
+    finally:
+        restored.stop_automatic_checks()
 
 
 @pytest.mark.asyncio

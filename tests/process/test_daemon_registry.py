@@ -1173,22 +1173,31 @@ async def test_recovery_exemption_still_reconciles_every_unrelated_receipt(appli
     assert c.process.terminated == []
 
 
-async def test_startup_restores_watching_marker_before_registry_can_stop_original(application_daemon_identity_cases):
+@pytest.mark.parametrize('marker_state', ['watching', 'release_pending'])
+async def test_startup_restores_watching_marker_before_registry_can_stop_original(
+    application_daemon_identity_cases, marker_state,
+):
     # Breaks if ordinary reconciliation runs before the marker's exemption is
-    # restored, even when startup later reconstructs the target fence.
+    # restored, or if its enabled periodic checks omit pre-outcome markers.
+    from airplay_linux.backend.contract import BackendStream
+    from airplay_linux.domain.records import SessionSnapshot
     from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
     from airplay_linux.session.testing import SessionRig
     from airplay_linux.runtime import compose_manager
     from airplay_linux.storage import AtomicFiles
     from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from airplay_linux.testing.builders import target
 
     c = application_daemon_identity_cases
     assert isinstance(await c.launch(), Ok)
-    marker = marker_for_receipt(await c.current())
+    marker = replace(marker_for_receipt(await c.current()), receiver_id=target().receiver_id)
     store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
     assert isinstance(await store.create(marker), Ok)
+    if marker_state == 'release_pending':
+        marker = (await store.mark_release_pending(marker, marker.marker_generation)).value
     c.reopen()
     rig = SessionRig()
+    assert await rig.sessions.save(SessionSnapshot.idle(marker.receiver_id)) == Ok(value=None)
     for subscription in rig.manager._subscriptions:
         subscription.close()
     coordinator = CredentialRecoveryCoordinator(store, c.registry, fences=rig.fences)
@@ -1200,6 +1209,68 @@ async def test_startup_restores_watching_marker_before_registry_can_stop_origina
     assert (await c.current()).state == "ready"
     assert c.registry._record.instance_uuid == marker.original_daemon.instance_uuid
     assert coordinator.markers == (marker,)
+    calls = []
+    target_present = False
+
+    class RecoveryControl:
+        def __init__(self, record):
+            self.record = record
+
+        async def request(
+            self, operation, destination, payload, context, *,
+            dispatch_fence=None, ownership_proof=None,
+        ):
+            assert self.record.socket_path == marker.original_daemon.socket_path
+            assert ownership_proof.daemon == marker.original_daemon.daemon_process
+            assert ownership_proof.generation == marker.original_daemon.endpoint_generation
+            if operation is BackendOperation.status:
+                calls.append((operation, destination))
+                rows = (BackendStream(
+                    device='Other receiver', target='192.0.2.99', state='pin_required',
+                    has_audio=False, audio_muted=False, credential_kind='pin',
+                ),)
+                if target_present:
+                    rows += (BackendStream(
+                        device='Receiver', target=marker.target, state='streaming',
+                        has_audio=False, audio_muted=False,
+                    ),)
+                return Ok(value=StatusReply(
+                    state='pin_required', device=None, target=None, has_audio=False,
+                    audio_muted=False, needs_credential=True, credential_kind='pin',
+                    streams=rows,
+                ))
+            assert operation is BackendOperation.disconnect
+            assert destination.canonical_host == marker.target
+            assert destination.receiver_id == marker.receiver_id
+            assert context.operation_id == marker.start_operation_id
+            assert context.marker_generation == marker.marker_generation
+            assert context.owner_daemon == marker.original_daemon
+            assert callable(dispatch_fence) and dispatch_fence() == Ok(value=None)
+            calls.append((operation, destination))
+            return Ok(value=AckReply(operation='disconnect', target=marker.target))
+
+        async def close(self):
+            return None
+
+    c.registry._control_factory = RecoveryControl
+    try:
+        for interval, target_present in enumerate((False, True, True)):
+            rig.scheduler.advance(4.0)
+            for _ in range(50):
+                await asyncio.sleep(0)
+                await manager.drain()
+            assert any(operation is BackendOperation.status for operation, _ in calls)
+            disconnects = tuple(
+                destination.canonical_host for operation, destination in calls
+                if operation is BackendOperation.disconnect
+            )
+            assert disconnects == (marker.target,) * interval
+            assert coordinator.markers == (marker,)
+            assert await store.for_target(marker.target) == Ok(value=marker)
+            assert isinstance(coordinator.require_start_allowed(marker.target, UUID(int=991)), Err)
+        assert c.process.terminated == []
+    finally:
+        coordinator.stop_automatic_checks()
 
 
 async def test_registry_exposes_endpoint_changing_release_operation(

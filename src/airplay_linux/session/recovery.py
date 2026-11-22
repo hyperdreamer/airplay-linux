@@ -153,7 +153,7 @@ class CredentialRecoveryCoordinator:
             or self._automatic_clock is None
             or self._startup_pending
             or self._store_blocked
-            or marker.state != "release_pending"
+            or marker.state not in {"watching", "release_pending"}
             or not marker.automatic_status_checks
         ):
             self._cancel_automatic_check(target)
@@ -198,7 +198,7 @@ class CredentialRecoveryCoordinator:
             marker is None
             or self._automatic_shutdown
             or marker.marker_generation != generation
-            or marker.state != "release_pending"
+            or marker.state not in {"watching", "release_pending"}
             or not marker.automatic_status_checks
             or self._store_blocked
         ):
