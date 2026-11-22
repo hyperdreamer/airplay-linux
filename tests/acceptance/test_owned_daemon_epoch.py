@@ -307,6 +307,10 @@ async def public_runtime(public_production_graph, monkeypatch):
     monkeypatch.setattr(composition, "DaemonRegistry", observed_registry)
     monkeypatch.setattr(composition, "PortalClient", lambda: portal)
     runtime = await witness.build_complete_production_and_probe()
+    coordinator = runtime.deps.credential_recovery
+    assert coordinator is not None
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
     case.runtime_graph = runtime
     case.witness = witness
     case.portal = portal
@@ -665,6 +669,11 @@ async def test_connect_challenge_disconnects_only_exact_target(tmp_path, challen
         h.control.results[BackendOperation.connect].append(Ok(value=AckReply(
             operation="connect", target=h.a.canonical_host, state="pin_required",
         )))
+        # Aggregate acknowledgements are progress. The exact target row and
+        # source observation determine whether this Start is ready.
+        h.control.results[BackendOperation.status].extend([
+            _source_status(h.a, source), _source_status(h.a, source),
+        ])
     else:
         reported = _source_status(h.a, source).value
         h.control.results[BackendOperation.status].append(Ok(value=replace(
@@ -672,6 +681,13 @@ async def test_connect_challenge_disconnects_only_exact_target(tmp_path, challen
             streams=(replace(reported.streams[0], state="pin_required", credential_kind="pin"),),
         )))
     result = await h.start()
+    if challenge_at == "ack":
+        assert isinstance(result, Ok)
+        assert h.control.calls(BackendOperation.disconnect) == []
+        assert h.transport._streams[other.lease_id].handle == other
+        assert any(event.kind is TransportEventKind.ready for event in h.events)
+        assert not any(event.kind is TransportEventKind.credential_request for event in h.events)
+        return
     assert isinstance(result, Err) and result.error.code is ErrorCode.dependency_incompatible
     disconnects = h.control.calls(BackendOperation.disconnect)
     assert len(disconnects) == 1

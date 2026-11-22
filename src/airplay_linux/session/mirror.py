@@ -780,7 +780,10 @@ class MirrorLifecycle:
 
         settlement = next((item for item in ctx.credential_settlements.values() if (
             item.owner.challenge_id == owner.challenge_id
-            and item.marker_generation == owner.marker_generation
+            and (
+                item.submission_id == event.operation_id
+                or item.marker_generation == owner.marker_generation
+            )
         )), None)
         if settlement is None:
             return True

@@ -1040,12 +1040,13 @@ async def test_authenticate_exact_identity_rejects_each_mismatched_field(
     assert c.process.terminated == []
 
 
-async def test_recovery_exemption_retains_authenticated_original_as_current(application_daemon_identity_cases):
+@pytest.mark.parametrize('state', ['watching', 'release_pending'])
+async def test_recovery_exemption_retains_authenticated_original_as_current(application_daemon_identity_cases, state):
     # Breaks when reconciliation stops a marker-owned daemon or fails to adopt it.
     c = application_daemon_identity_cases
     assert isinstance(await c.launch(), Ok)
     receipt = await c.current()
-    marker = marker_for_receipt(receipt)
+    marker = replace(marker_for_receipt(receipt), state=state)
     c.reopen()
     exempted = await c.registry.authenticate_recovery(marker)
     assert isinstance(exempted, Ok) and exempted.value is not None
@@ -1237,6 +1238,7 @@ async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_ta
     destination = target("recovery", address=marker.target)
     calls = []
     disconnected = asyncio.Event()
+    late_target = {"present": True}
 
     class RecoveryControl:
         def __init__(self, record):
@@ -1254,7 +1256,7 @@ async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_ta
                     streams=(BackendStream(
                         device="Receiver", target=marker.target, state="pin_required",
                         credential_kind="pin", has_audio=False, audio_muted=False,
-                    ),),
+                    ),) if late_target["present"] else (),
                 ))
             assert operation is BackendOperation.disconnect
             assert requested_target.canonical_host == marker.target
@@ -1306,7 +1308,8 @@ async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_ta
     manager = SessionManager(deps, build_recovery_handlers(deps))
     disconnected.clear()
     accepted = await manager.dispatch(StopCredentialRecovery(
-        receiver_id=marker.receiver_id, marker_generation=marker.marker_generation,
+        receiver_id=marker.receiver_id, target=marker.target,
+        marker_generation=marker.marker_generation,
     ))
     assert accepted.accepted
     await asyncio.wait_for(disconnected.wait(), 1.0)
@@ -1316,6 +1319,55 @@ async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_ta
     assert routed[-1][0] == marker.original_daemon.socket_path
     assert routed[-1][2] == destination
     assert coordinator.markers == (marker,)
+
+    pending = await coordinator.mark_release_pending_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    late_target["present"] = False
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await manager.drain()
+    assert any(call[1] is BackendOperation.status for call in calls)
+    assert not any(call[1] is BackendOperation.disconnect for call in calls)
+    assert coordinator.markers == (pending.value,)
+
+    late_target["present"] = True
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await manager.drain()
+    automatic_disconnects = [call for call in calls if call[1] is BackendOperation.disconnect]
+    assert len(automatic_disconnects) == 1
+    assert automatic_disconnects[0][0] == marker.original_daemon.socket_path
+    assert automatic_disconnects[0][2].canonical_host == marker.target
+    assert coordinator.markers == (pending.value,)
+    coordinator.stop_automatic_checks()
+
+    # Restore the durable marker and authenticate its original daemon before
+    # ordinary registry reconciliation, then observe a late target again.
+    c.reopen()
+    c.registry._control_factory = RecoveryControl
+    restored = CredentialRecoveryCoordinator(marker_store, c.registry, fences=session.fences)
+    restored_deps = replace(session.deps, credential_recovery=restored)
+    restored_manager = SessionManager(restored_deps, build_recovery_handlers(restored_deps))
+    assert await restored.load_before_startup() == Ok(value=None)
+    exemptions = await restored.recover_before_registry_reconciliation()
+    assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
+    assert await c.registry.reconcile_previous(recovery_exemptions=exemptions.value) == Ok(value=None)
+    restored._startup_completed()
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await restored_manager.drain()
+    restored_disconnects = [call for call in calls if call[1] is BackendOperation.disconnect]
+    assert len(restored_disconnects) == 1
+    assert restored_disconnects[0][0] == marker.original_daemon.socket_path
+    assert restored_disconnects[0][2].canonical_host == marker.target
+    assert restored.markers == (pending.value,)
+    restored.stop_automatic_checks()
 
 
 async def test_release_refuses_ready_receipt_with_starting_record_before_teardown(
@@ -1627,7 +1679,8 @@ async def test_operator_restart_command_runs_endpoint_release_through_session_ma
 
     c.hooks['exit-proof'] = new_processes
     dismissed = await manager.dispatch(DismissCredentialRecovery(
-        receiver_id=marker.receiver_id, marker_generation=marker.marker_generation,
+        receiver_id=marker.receiver_id, target=marker.target,
+        marker_generation=marker.marker_generation,
     ))
     assert dismissed.accepted
     assert manager.snapshot(marker.receiver_id).operation_id == original_operation
@@ -1639,7 +1692,8 @@ async def test_operator_restart_command_runs_endpoint_release_through_session_ma
     pending = coordinator.markers[0]
     assert pending.state == 'release_pending'
     accepted = await manager.dispatch(RestartReceiverToRelease(
-        receiver_id=pending.receiver_id, marker_generation=pending.marker_generation,
+        receiver_id=pending.receiver_id, target=pending.target,
+        marker_generation=pending.marker_generation,
     ))
     assert accepted.accepted
     assert manager.snapshot(marker.receiver_id).operation_id == original_operation

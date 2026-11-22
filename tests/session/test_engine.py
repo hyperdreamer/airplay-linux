@@ -600,6 +600,7 @@ async def test_credential_commands_reach_their_closed_actor_route(name, route):
         fields["challenge_id"] = ChallengeId(UUID(int=999))
     else:
         fields["marker_generation"] = 1
+        fields["target"] = "192.0.2.10"
     if name == "SubmitCredential":
         fields["value"] = SensitiveText("route-canary-" + name)
     command = getattr(messages, name)(**fields)

@@ -373,6 +373,26 @@ def test_relay_command(relay_help_tables, table, proven, audio, level, expected_
         assert shaped.error.code is ErrorCode.invalid_input
 
 
+@pytest.mark.parametrize("table", ["legacy", "extended"])
+def test_relay_command_preserves_nonempty_whitespace(relay_help_tables, table):
+    profile = _relay_profile(relay_help_tables, table)
+    receiver = target()
+    value = "  "
+
+    result = profile.try_argv(
+        BackendOperation.submit_pairing, receiver,
+        CredentialPayload(value=SensitiveText(value)),
+    )
+
+    assert isinstance(result, Ok)
+    assert result.value.argv == (
+        "doubletake-ctl", "-socket", profile.socket_path, "connect",
+        receiver.canonical_host, value,
+    )
+    assert result.value.secret_indices == (len(result.value.argv) - 1,)
+    assert result.value.redacted_argv[-1] == "<redacted>"
+
+
 def test_relay_command_rejects_unrepresentable_values_before_building_argv(relay_help_tables):
     for table in ("legacy", "extended"):
         profile = _relay_profile(relay_help_tables, table)

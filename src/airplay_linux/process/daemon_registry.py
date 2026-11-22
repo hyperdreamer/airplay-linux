@@ -402,12 +402,12 @@ class DaemonRegistry:
     async def authenticate_recovery(
         self, marker: CredentialRecoveryMarker,
     ) -> Result[DaemonRecoveryExemption | None]:
-        """Authenticate one complete watching identity before any status request."""
+        """Authenticate one retained marker identity before any status request."""
         try:
             encode_credential_recovery_marker(marker)
         except (RecordError, UnicodeError):
             return Ok(value=None)
-        if marker.state != 'watching' or not marker.automatic_status_checks or not self._public_lifecycle():
+        if marker.state not in {'watching', 'release_pending'} or not marker.automatic_status_checks or not self._public_lifecycle():
             return Ok(value=None)
         async with self._operation() as acquired:
             if isinstance(acquired, Err):
@@ -693,7 +693,7 @@ class DaemonRegistry:
             ):
                 return _error(ErrorCode.ownership_mismatch)
             if exemption.kind == 'watching_original':
-                if (marker.state != 'watching' or not marker.automatic_status_checks
+                if (marker.state not in {'watching', 'release_pending'} or not marker.automatic_status_checks
                         or exemption.daemon_identity != marker.original_daemon
                         or any(intent.launch_uuid == marker.original_daemon.launch_uuid for intent in intents.value)):
                     return _error(ErrorCode.ownership_mismatch)

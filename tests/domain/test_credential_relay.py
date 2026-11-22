@@ -192,9 +192,9 @@ def test_new_commands_are_closed_and_routeable_shapes():
     shapes = {
         messages.SubmitCredential: ("receiver_id", "challenge_id", "value"),
         messages.DismissCredentialPrompt: ("receiver_id", "challenge_id"),
-        messages.StopCredentialRecovery: ("receiver_id", "marker_generation"),
-        messages.DismissCredentialRecovery: ("receiver_id", "marker_generation"),
-        messages.RestartReceiverToRelease: ("receiver_id", "marker_generation"),
+        messages.StopCredentialRecovery: ("receiver_id", "marker_generation", "target"),
+        messages.DismissCredentialRecovery: ("receiver_id", "marker_generation", "target"),
+        messages.RestartReceiverToRelease: ("receiver_id", "marker_generation", "target"),
     }
     for command_type, expected in shapes.items():
         assert tuple(field.name for field in fields(command_type)) == expected

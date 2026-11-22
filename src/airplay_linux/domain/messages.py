@@ -76,18 +76,21 @@ class DismissCredentialPrompt:
 class StopCredentialRecovery:
     receiver_id: ReceiverId
     marker_generation: int
+    target: str
 
 
 @dataclass(frozen=True, kw_only=True)
 class DismissCredentialRecovery:
     receiver_id: ReceiverId
     marker_generation: int
+    target: str
 
 
 @dataclass(frozen=True, kw_only=True)
 class RestartReceiverToRelease:
     receiver_id: ReceiverId
     marker_generation: int
+    target: str
 
 
 @dataclass(frozen=True, kw_only=True)

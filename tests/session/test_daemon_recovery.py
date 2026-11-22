@@ -541,7 +541,8 @@ async def test_stop_credential_recovery_reaches_recorded_daemon_path(tmp_path):
     rig.manager = SessionManager(rig.deps, build_recovery_handlers(rig.deps))
 
     accepted = await rig.manager.dispatch(StopCredentialRecovery(
-        receiver_id=destination.receiver_id, marker_generation=recorded.marker_generation,
+        receiver_id=destination.receiver_id, target=recorded.target,
+        marker_generation=recorded.marker_generation,
     ))
     await rig.manager.drain()
 

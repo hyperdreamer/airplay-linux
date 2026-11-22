@@ -344,6 +344,10 @@ class AudioProcess:
                 reply = {"ok": True, "state": "connecting", "device": "192.0.2.10",
                          "has_audio": False, "audio_muted": False}
             elif command == "disconnect":
+                self.current = {
+                    "ok": True, "state": "idle", "has_audio": False,
+                    "audio_muted": False, "streams": [],
+                }
                 reply = {"ok": True, "state": "idle", "has_audio": False, "audio_muted": False}
             else:
                 raise AssertionError(f"unscripted audio control: {command}")
@@ -663,6 +667,7 @@ async def test_reconnect_refused_retry_uses_current_lease_admitted_level(compose
     assert rig.receivers.receivers[target().receiver_id].remembered_volume == 30
     ready = published_audio_status(level=30)
     rig.process.responses["status"].extend([
+        {"ok": True, "state": "idle", "has_audio": False, "audio_muted": False, "streams": []},
         ready, ready, published_audio_status(state="refused", level=None),
     ])
     rig.manager.ingest(audio_event(rig, TransportEventKind.network_lost))

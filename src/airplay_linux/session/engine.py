@@ -75,7 +75,7 @@ from airplay_linux.domain.ports import (
     Subscription,
     TransportPort,
 )
-from airplay_linux.domain.records import DaemonRecord, SessionSnapshot
+from airplay_linux.domain.records import CredentialRecoveryMarker, DaemonRecord, SessionSnapshot
 from airplay_linux.domain.relay import (
     CredentialEffectOwner, CredentialRequest, CredentialSubmissionSettlement,
 )
@@ -158,6 +158,8 @@ class _Effect:
     ownership_uuid: OwnerId | None
     daemon_instance_uuid: InstanceId | None
     credential_owner: CredentialEffectOwner | None = None
+    recovery_marker: CredentialRecoveryMarker | None = None
+    credential_completion_generation: int | None = None
     credential_stop_operation_id: OperationId | None = None
     task: asyncio.Task[object] | None = None
 
@@ -183,6 +185,7 @@ class SessionContext:
         self.credential_request_ended = False
         self.dismissed_credential_prompt_id = None
         self.credential_settlements: dict[OperationId, CredentialSubmissionSettlement] = {}
+        self.credential_dismissals: dict[object, list[EffectEvent]] = {}
 
     @property
     def state(self) -> SessionSnapshot:
@@ -287,6 +290,7 @@ class SessionContext:
         acquisition: bool = False,
         resource: StreamHandle | DisplayHandle | PhysicalMonitorSource | None = None,
         *, credential_owner: CredentialEffectOwner | None = None,
+        recovery_marker: CredentialRecoveryMarker | None = None,
     ) -> None:
         self._require_dispatch()
         effect = _Effect(
@@ -299,6 +303,10 @@ class SessionContext:
             resource=resource,
             acquisition=acquisition,
             credential_owner=credential_owner,
+            recovery_marker=recovery_marker,
+            credential_completion_generation=(
+                credential_owner.marker_generation if credential_owner is not None else None
+            ),
             context=context,
             endpoint_fingerprint=self.state.target.endpoint_fingerprint if self.state.target else None,
             ownership_uuid=self.state.ownership_uuid,
@@ -432,6 +440,9 @@ class SessionManager:
         return await asyncio.shield(self._shutdown_task)
 
     async def _shutdown_once(self) -> Result[None]:
+        coordinator = self.deps.credential_recovery
+        if coordinator is not None:
+            coordinator.stop_automatic_checks()
         self._shutdown = True
         self._subscribers.clear()
         for state in tuple(self._states.values()):
@@ -529,6 +540,16 @@ class SessionManager:
             while queue:
                 message = queue.popleft()
                 context = self._contexts[receiver_id]
+                if isinstance(message, EffectEvent) and message.kind in {
+                    "mirror:credential_submit", "mirror:credential_status",
+                    "mirror:credential_transition", "mirror:credential_retire",
+                }:
+                    effect = self._completed_effects.get((receiver_id, message.operation_id, message.kind))
+                    owner = effect.credential_owner if effect is not None else None
+                    pending = context.credential_dismissals.get(owner.challenge_id) if owner is not None else None
+                    if pending is not None:
+                        pending.append(message)
+                        continue
                 if isinstance(message, DiscoveryEvent):
                     self._apply_discovery(context, message)
                 route = self._route(message)
@@ -630,6 +651,9 @@ class SessionManager:
         elif isinstance(message, EffectEvent):
             key = (message.receiver_id, message.operation_id, message.kind)
             effect = self._completed_effects.get(key)
+            if (route is Route.recovery and message.kind == "recovery:credential_dismiss"
+                    and effect is not None and context.credential_dismissals):
+                return route, message
             if route is Route.mirror and message.kind in {
                 "mirror:credential_prepare", "mirror:credential_submit", "mirror:credential_status",
                 "mirror:credential_transition", "mirror:credential_retire", "mirror:credential_generation",
@@ -745,7 +769,15 @@ class SessionManager:
         operation_id = completion.submission_id if effect.name == "credential_submit" else completion.read_id
         if operation_id != event.operation_id:
             return False
-        return all(getattr(completion, item.name) == getattr(owner, item.name) for item in fields(CredentialEffectOwner))
+        for item in fields(CredentialEffectOwner):
+            value = getattr(completion, item.name)
+            expected = getattr(owner, item.name)
+            if item.name == "marker_generation":
+                if value != effect.credential_completion_generation:
+                    return False
+            elif value != expected:
+                return False
+        return True
 
     def _effect_current(self, state: SessionSnapshot, effect: _Effect) -> bool:
         owner = effect.credential_owner

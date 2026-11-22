@@ -453,7 +453,7 @@ class PairingDialog(_DecisionDialog):
     def _sync_submit(self, text: str) -> None:
         if self._submit is not None:
             self._submit.setEnabled(
-                bool(text.strip())
+                bool(text if self._relay else text.strip())
                 and self._field.isEnabled()
                 and not self._field.isReadOnly()
             )
@@ -470,7 +470,7 @@ class PairingDialog(_DecisionDialog):
             self._submit.setEnabled(False)
 
     def _validate_raw(self, text: str) -> str | None:
-        if not text.strip():
+        if not text:
             return "Invalid value. Enter the value shown by the receiver."
         if "\x00" in text:
             return "Invalid value. The value contains an unsupported character."

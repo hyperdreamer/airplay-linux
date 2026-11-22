@@ -390,6 +390,7 @@ class Presenter:
         self._relay_prompt_pending: dict[ReceiverId, ChallengeView] = {}
         self._relay_prompt_key: tuple[ReceiverId, Any, str] | None = None
         self._relay_prompt_seen: dict[ReceiverId, tuple[ReceiverId, Any, str]] = {}
+        self._relay_prompt_dismissed: set[ChallengeView] = set()
         self._switch_pending: set[ReceiverId] = set()
         self._switch_queued: dict[ReceiverId, tuple[int, Mode]] = {}
         self._resolution_pending: set[ReceiverId] = set()
@@ -1201,6 +1202,7 @@ class Presenter:
 
             self._schedule(self._dispatch(command_type(
                 receiver_id=recovery.receiver_id,
+                target=recovery.target,
                 marker_generation=recovery.marker_generation,
             ), on_rejection=report_recovery_failure), receiver_id=recovery.receiver_id)
             return
@@ -1407,6 +1409,17 @@ class Presenter:
             except Exception:  # noqa: BLE001 - a stale prompt is already safe
                 pass
 
+    def _dismiss_relay_prompt(self, receiver_id: ReceiverId, challenge: ChallengeView) -> None:
+        if challenge in self._relay_prompt_dismissed:
+            return
+        current = self._snapshot(receiver_id).credential_prompt
+        if current is None or current.challenge != challenge:
+            return
+        self._relay_prompt_dismissed.add(challenge)
+        self._schedule(self._dispatch(DismissCredentialPrompt(
+            receiver_id=receiver_id, challenge_id=challenge.challenge_id,
+        )), receiver_id=receiver_id)
+
     def _set_relay_cancel_handler(
         self, receiver_id: ReceiverId, challenge: ChallengeView,
     ) -> None:
@@ -1415,12 +1428,7 @@ class Presenter:
             return
 
         def dismiss() -> None:
-            current = self._snapshot(receiver_id).credential_prompt
-            if current is None or current.challenge != challenge:
-                return
-            self._schedule(self._dispatch(DismissCredentialPrompt(
-                receiver_id=receiver_id, challenge_id=challenge.challenge_id,
-            )), receiver_id=receiver_id)
+            self._dismiss_relay_prompt(receiver_id, challenge)
 
         try:
             setter(challenge, dismiss)
@@ -1433,6 +1441,7 @@ class Presenter:
             return
         self._relay_prompt_key = key
         self._relay_prompt_seen[receiver_id] = key
+        self._relay_prompt_dismissed.discard(prompt.challenge)
         self._relay_prompt_pending[receiver_id] = prompt.challenge
         self._schedule(self._relay_prompt(receiver_id, prompt), receiver_id=receiver_id)
 
@@ -1440,6 +1449,7 @@ class Presenter:
         if self._pane(receiver_id).credential_prompt != prompt.challenge:
             return
         try:
+            self._set_relay_cancel_handler(receiver_id, prompt.challenge)
             answer = await self._dialogs.pairing(
                 prompt.challenge,
                 actions=frozenset({Action.submit_credential, Action.cancel}),
@@ -1465,10 +1475,7 @@ class Presenter:
                 value=answer.value,
             ))
         elif answer.action is Action.cancel:
-            await self._dispatch(DismissCredentialPrompt(
-                receiver_id=receiver_id,
-                challenge_id=prompt.challenge.challenge_id,
-            ))
+            self._dismiss_relay_prompt(receiver_id, prompt.challenge)
 
     def _open_pairing(
         self,
@@ -1945,6 +1952,7 @@ class QtDialogFactory:
         self._window = window
         self._pairing_prompts: dict[ChallengeView, PairingDialog] = {}
         self._relay_cancel_handlers: dict[ChallengeView, Callable[[], None]] = {}
+        self._relay_cancel_connections: dict[ChallengeView, tuple[PairingDialog, Callable[..., None]]] = {}
 
     async def pairing(
         self,
@@ -1964,6 +1972,10 @@ class QtDialogFactory:
             dialog_kwargs["relay"] = True
         dialog = self._pairing_dialog(challenge, **dialog_kwargs)
         self._pairing_prompts[challenge] = dialog
+        if relay:
+            handler = self._relay_cancel_handlers.get(challenge)
+            if handler is not None:
+                self._connect_relay_cancel_handler(challenge, dialog, handler)
         if not relay:
             try:
                 return await _resolve_dialog(dialog, dialog.take_result, None)
@@ -1979,7 +1991,7 @@ class QtDialogFactory:
                 future.set_result(None)
 
         def retire(*_args: object) -> None:
-            self._relay_cancel_handlers.pop(challenge, None)
+            self._detach_relay_cancel_handler(challenge)
             if self._pairing_prompts.get(challenge) is dialog:
                 del self._pairing_prompts[challenge]
 
@@ -2025,16 +2037,45 @@ class QtDialogFactory:
                     pass
                 retire()
 
+    def _connect_relay_cancel_handler(
+        self, challenge: ChallengeView, dialog: PairingDialog, handler: Callable[[], None],
+    ) -> None:
+        self._detach_relay_cancel_handler(challenge)
+
+        def invoke(*_args: object) -> None:
+            handler()
+            self._detach_relay_cancel_handler(challenge)
+            if self._pairing_prompts.get(challenge) is dialog:
+                del self._pairing_prompts[challenge]
+
+        for signal in (dialog.relay_cancelled, dialog.finished, dialog.destroyed):
+            try:
+                signal.connect(invoke)
+            except (RuntimeError, TypeError):
+                pass
+        self._relay_cancel_connections[challenge] = (dialog, invoke)
+
+    def _detach_relay_cancel_handler(self, challenge: ChallengeView) -> None:
+        connection = self._relay_cancel_connections.pop(challenge, None)
+        if connection is None:
+            return
+        dialog, invoke = connection
+        for signal in (dialog.relay_cancelled, dialog.finished, dialog.destroyed):
+            try:
+                signal.disconnect(invoke)
+            except (RuntimeError, TypeError):
+                pass
+        self._relay_cancel_handlers.pop(challenge, None)
+
     def set_relay_cancel_handler(
         self, challenge: ChallengeView, handler: Callable[[], None],
     ) -> None:
         if not callable(handler):
             raise TypeError("relay cancel handler must be callable")
-        dialog = self._pairing_prompts.get(challenge)
-        if dialog is None:
-            return
         self._relay_cancel_handlers[challenge] = handler
-        dialog.relay_cancelled.connect(handler)
+        dialog = self._pairing_prompts.get(challenge)
+        if dialog is not None:
+            self._connect_relay_cancel_handler(challenge, dialog, handler)
 
     def set_relay_state(self, challenge: ChallengeView, state: str) -> None:
         dialog = self._pairing_prompts.get(challenge)
@@ -2048,7 +2089,7 @@ class QtDialogFactory:
     def invalidate_pairing(self, challenge: ChallengeView) -> None:
         """Close the exact live prompt for an invalidated challenge."""
         dialog = self._pairing_prompts.pop(challenge, None)
-        self._relay_cancel_handlers.pop(challenge, None)
+        self._detach_relay_cancel_handler(challenge)
         if dialog is None:
             return
         try:

@@ -23,7 +23,7 @@ from airplay_linux.domain.messages import (
     StopCredentialRecovery,
 )
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
-from airplay_linux.domain.operations import OpaqueCredentialRef, OperationId
+from airplay_linux.domain.operations import OpaqueCredentialRef, OperationContext, OperationId
 from airplay_linux.domain.ports import CredentialRecoveryMarkerStore
 from airplay_linux.domain.records import (
     CredentialRecoveryMarker, DaemonRecord, LaunchReceipt, NoSpawnRetirement,
@@ -41,6 +41,9 @@ from airplay_linux.trust.fences import TrustFence, TrustFenceRegistry
 
 from .engine import Handler, ManagerDeps, Route, SessionContext, SessionManager
 from .reconnect import _runtime as reconnect_runtime
+
+
+RECOVERY_STATUS_INTERVAL = 4.0
 
 
 def _recovery_refusal(code: ErrorCode = ErrorCode.persistence_failed) -> Err:
@@ -74,6 +77,172 @@ class CredentialRecoveryCoordinator:
         self._loaded = False
         self._store_blocked = True
         self._startup_pending = True
+        self._automatic_clock = None
+        self._automatic_scheduler = None
+        self._automatic_handles: dict[str, object] = {}
+        self._automatic_tasks: dict[str, asyncio.Task[object]] = {}
+        self._automatic_generations: dict[str, int] = {}
+        self._automatic_shutdown = False
+        self._automatic_dispatches: dict[ReceiverId, Callable[[str, int], None]] = {}
+        self._automatic_requests: list[tuple[ReceiverId, str, int]] = []
+
+    def attach_automatic_dispatch(
+        self, receiver_id: ReceiverId, dispatch: Callable[[str, int], None],
+    ) -> None:
+        self._automatic_dispatches[receiver_id] = dispatch
+
+    def take_automatic_requests(self, receiver_id: ReceiverId) -> tuple[tuple[str, int], ...]:
+        selected = tuple(
+            (target, generation)
+            for receiver, target, generation in self._automatic_requests
+            if receiver == receiver_id
+        )
+        self._automatic_requests = [
+            item for item in self._automatic_requests if item[0] != receiver_id
+        ]
+        return selected
+
+    def attach_automatic_checks(self, clock, scheduler) -> None:
+        self._automatic_clock = clock
+        self._automatic_scheduler = scheduler
+        self._automatic_shutdown = False
+        if self._loaded and not self._startup_pending:
+            for marker in self.markers:
+                self._schedule_automatic_check(marker)
+
+    def stop_automatic_checks(self) -> None:
+        self._automatic_shutdown = True
+        for handle in tuple(self._automatic_handles.values()):
+            try:
+                handle.cancel()
+            except Exception:
+                pass
+        self._automatic_handles.clear()
+        for task in tuple(self._automatic_tasks.values()):
+            task.cancel()
+        self._automatic_tasks.clear()
+        self._automatic_generations.clear()
+        self._automatic_dispatches.clear()
+        self._automatic_requests.clear()
+
+    def _automatic_target(self, marker: CredentialRecoveryMarker) -> ReceiverTarget:
+        return ReceiverTarget(
+            receiver_id=marker.receiver_id,
+            service_records=(),
+            canonical_host=marker.target,
+            service_port=7000,
+            protocol="airplay",
+            endpoint_fingerprint=f"recovery:{marker.original_daemon.launch_uuid.hex}",
+            endpoint_generation=marker.original_daemon.endpoint_generation,
+        )
+
+    def _cancel_automatic_check(self, target: str) -> None:
+        handle = self._automatic_handles.pop(target, None)
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:
+                pass
+        self._automatic_generations.pop(target, None)
+
+    def _schedule_automatic_check(self, marker: CredentialRecoveryMarker) -> None:
+        target = marker.target
+        if (
+            self._automatic_shutdown
+            or self._automatic_scheduler is None
+            or self._automatic_clock is None
+            or self._startup_pending
+            or self._store_blocked
+            or marker.state != "release_pending"
+            or not marker.automatic_status_checks
+        ):
+            self._cancel_automatic_check(target)
+            return
+        generation = marker.marker_generation
+        if self._automatic_generations.get(target) == generation:
+            if target in self._automatic_handles or target in self._automatic_tasks:
+                return
+        self._cancel_automatic_check(target)
+        if target in self._automatic_tasks:
+            self._automatic_generations[target] = generation
+            return
+        self._automatic_generations[target] = generation
+        when = self._automatic_clock.now() + RECOVERY_STATUS_INTERVAL
+        self._automatic_handles[target] = self._automatic_scheduler.call_at(
+            when, lambda: self._automatic_tick(target, generation),
+        )
+
+    def _automatic_tick(self, target: str, generation: int) -> None:
+        self._automatic_handles.pop(target, None)
+        if self._automatic_shutdown or target in self._automatic_tasks:
+            return
+        marker = self._markers.get(target)
+        dispatch = (
+            self._automatic_dispatches.get(marker.receiver_id)
+            if marker is not None else None
+        )
+        if dispatch is not None:
+            dispatch(target, generation)
+            return
+        task = asyncio.create_task(self._run_automatic_check(target, generation))
+        self._automatic_tasks[target] = task
+        task.add_done_callback(
+            lambda done, target=target, generation=generation: self._automatic_finished(
+                target, generation, done,
+            )
+        )
+
+    async def _run_automatic_check(self, target: str, generation: int) -> None:
+        marker = self._markers.get(target)
+        if (
+            marker is None
+            or self._automatic_shutdown
+            or marker.marker_generation != generation
+            or marker.state != "release_pending"
+            or not marker.automatic_status_checks
+            or self._store_blocked
+        ):
+            return
+        stop_target = getattr(self._registry, "stop_recovery_target", None)
+        if not callable(stop_target):
+            return
+        destination = self._automatic_target(marker)
+        context = OperationContext(
+            operation_id=marker.start_operation_id,
+            session_generation=0,
+            endpoint_generation=destination.endpoint_generation,
+            transport_lease_id=None,
+            marker_generation=marker.marker_generation,
+            owner_daemon=marker.original_daemon,
+        )
+
+        def fence() -> Result[None]:
+            current = self._markers.get(target)
+            if (
+                self._automatic_shutdown
+                or self._store_blocked
+                or current != marker
+                or current is None
+                or current.marker_generation != generation
+            ):
+                return _recovery_refusal(ErrorCode.ownership_mismatch)
+            return Ok(value=None)
+
+        try:
+            await stop_target(marker, destination, context, fence)
+        except Exception:
+            return
+
+    def _automatic_finished(
+        self, target: str, generation: int, task: asyncio.Task[object],
+    ) -> None:
+        if self._automatic_tasks.get(target) is task:
+            self._automatic_tasks.pop(target, None)
+        if task.cancelled() or self._automatic_shutdown:
+            return
+        marker = self._markers.get(target)
+        if marker is not None and marker.marker_generation == generation:
+            self._schedule_automatic_check(marker)
 
     @property
     def markers(self) -> tuple[CredentialRecoveryMarker, ...]:
@@ -166,7 +335,7 @@ class CredentialRecoveryCoordinator:
                         return _recovery_refusal(ErrorCode.ownership_mismatch)
                     exemptions.append(exemption)
                 continue
-            if marker.state != "watching" or not marker.automatic_status_checks:
+            if marker.state not in {"watching", "release_pending"} or not marker.automatic_status_checks:
                 continue
             if not callable(authenticate):
                 continue
@@ -194,6 +363,8 @@ class CredentialRecoveryCoordinator:
 
     def _startup_completed(self) -> None:
         self._startup_pending = False
+        for marker in self.markers:
+            self._schedule_automatic_check(marker)
 
     def require_start_allowed(self, target, start_operation_id: OperationId) -> Result[None]:
         if self._store_blocked:
@@ -382,6 +553,7 @@ class CredentialRecoveryCoordinator:
             except Exception:
                 return _recovery_refusal()
             self._markers[identity.target] = updated
+            self._schedule_automatic_check(updated)
             return Ok(value=updated)
 
     async def mark_release_pending_for(self, identity, expected_generation: int) -> Result[CredentialRecoveryMarker]:
@@ -565,19 +737,42 @@ class RecoveryHandlers:
         self.deps = deps
         self.items: dict[object, tuple[RecoveryItem, ...]] = {}
         self.approving: set[object] = set()
+        coordinator = deps.credential_recovery
+        if coordinator is not None:
+            coordinator.attach_automatic_checks(deps.clock, deps.scheduler)
+
+    def _queue_automatic(self, ctx: SessionContext, target: str, generation: int) -> None:
+        coordinator = self.deps.credential_recovery
+        if coordinator is None:
+            return
+        coordinator._automatic_requests.append((ctx.state.receiver_id, target, generation))
+        ctx.enqueue(EffectEvent(
+            receiver_id=ctx.state.receiver_id,
+            operation_id=ctx.state.operation_id or OperationId(self.deps.ids.new()),
+            session_generation=ctx.state.session_generation,
+            kind="recovery:automatic",
+            result=Ok(value=None),
+            resource=None,
+        ))
 
     def __call__(self, ctx: SessionContext, message: object) -> bool:
+        coordinator = self.deps.credential_recovery
+        if coordinator is not None:
+            coordinator.attach_automatic_dispatch(
+                ctx.state.receiver_id,
+                lambda target, generation, ctx=ctx: self._queue_automatic(ctx, target, generation),
+            )
         if isinstance(message, StopCredentialRecovery):
             coordinator = self.deps.credential_recovery
+            requested_target = message.target
             matches = tuple(marker for marker in coordinator.markers if (
                 marker.receiver_id == message.receiver_id
+                and marker.target == requested_target
                 and marker.marker_generation == message.marker_generation
                 and marker.state != 'retired'
             )) if coordinator is not None else ()
             target = ctx.state.target
-            if len(matches) != 1 or (
-                target is not None and target.canonical_host != matches[0].target
-            ):
+            if len(matches) != 1:
                 ctx.apply(last_error=diagnostic(ErrorCode.stale_event, ctx.state.receiver_id))
                 return True
             marker = matches[0]
@@ -590,8 +785,10 @@ class RecoveryHandlers:
                     receiver_id=marker.receiver_id, service_records=(), canonical_host=marker.target,
                     service_port=7000, protocol='airplay',
                     endpoint_fingerprint=f'recovery:{marker.original_daemon.launch_uuid.hex}',
-                    endpoint_generation=0,
+                    endpoint_generation=marker.original_daemon.endpoint_generation,
                 )
+            elif target.canonical_host != marker.target:
+                target = replace(target, canonical_host=marker.target)
             owner_target = target
             registry = getattr(coordinator, '_registry', None)
             stop_target = getattr(registry, 'stop_recovery_target', None)
@@ -616,8 +813,6 @@ class RecoveryHandlers:
                     or ctx.state.session_generation != owner_session_generation
                     or ctx.state.trust_generation != owner_trust_generation
                     or ctx.state.target != owner_state_target
-                    or (owner_state_target is not None
-                        and owner_state_target.canonical_host != marker.target)
                 ):
                     return _recovery_refusal(ErrorCode.ownership_mismatch)
                 return Ok(value=None)
@@ -625,12 +820,15 @@ class RecoveryHandlers:
             ctx.launch(
                 Route.recovery, 'credential_stop', operation,
                 lambda: stop_target(marker, owner_target, operation, still_current),
+                recovery_marker=marker,
             )
             return True
         if isinstance(message, DismissCredentialRecovery):
             coordinator = self.deps.credential_recovery
+            requested_target = message.target
             matches = tuple(marker for marker in coordinator.markers if (
                 marker.receiver_id == message.receiver_id
+                and marker.target == requested_target
                 and marker.marker_generation == message.marker_generation
                 and marker.state != 'retired' and marker.automatic_status_checks
             )) if coordinator is not None else ()
@@ -638,18 +836,56 @@ class RecoveryHandlers:
                 ctx.apply(last_error=diagnostic(ErrorCode.stale_event, ctx.state.receiver_id))
                 return True
             marker = matches[0]
+            prior_settlements = tuple(
+                (
+                    submission_id,
+                    settlement,
+                    getattr(ctx, "_credential_runs", {}).get(submission_id),
+                )
+                for submission_id, settlement in ctx.credential_settlements.items()
+                if settlement.owner.target.canonical_host == marker.target
+                and settlement.marker_generation == marker.marker_generation
+            )
+            if any(settlement.owner.challenge_id in ctx.credential_dismissals
+                   for _, settlement, _ in prior_settlements):
+                ctx.apply(last_error=diagnostic(ErrorCode.stale_event, ctx.state.receiver_id))
+                return True
+            for _, settlement, _ in prior_settlements:
+                ctx.credential_dismissals[settlement.owner.challenge_id] = []
             operation = ctx.operation()
             if ctx.state.operation_id is not None:
                 operation = replace(operation, operation_id=ctx.state.operation_id)
+
+            async def dismiss_and_rebind():
+                dismissed = await coordinator.dismiss_for(marker, marker.marker_generation)
+                if isinstance(dismissed, Err):
+                    return dismissed
+                updated = dismissed.value
+                for submission_id, settlement, run in prior_settlements:
+                    if run is None or not run.transport_submitted:
+                        continue
+                    rebound = await self.deps.transport.record_credential_marker_generation(
+                        settlement.owner.target,
+                        run.context,
+                        submission_id=submission_id,
+                        previous_generation=marker.marker_generation,
+                        expected_generation=updated.marker_generation,
+                    )
+                    if isinstance(rebound, Err):
+                        return rebound
+                return Ok(value=updated)
+
             ctx.launch(
                 Route.recovery, 'credential_dismiss', operation,
-                lambda: coordinator.dismiss_for(marker, marker.marker_generation),
+                dismiss_and_rebind, recovery_marker=marker,
             )
             return True
         if isinstance(message, RestartReceiverToRelease):
             coordinator = self.deps.credential_recovery
+            requested_target = message.target
             matches = tuple(marker for marker in coordinator.markers if (
                 marker.receiver_id == message.receiver_id
+                and marker.target == requested_target
                 and marker.marker_generation == message.marker_generation
                 and marker.state == 'release_pending'
             )) if coordinator is not None else ()
@@ -682,27 +918,81 @@ class RecoveryHandlers:
         if not isinstance(message, EffectEvent):
             return False
         kind = message.kind.split(":", 1)[-1]
+        if kind == 'automatic':
+            coordinator = self.deps.credential_recovery
+            if coordinator is None:
+                return True
+            for target, generation in coordinator.take_automatic_requests(ctx.state.receiver_id):
+                operation = ctx.operation()
+
+                async def run(target=target, generation=generation):
+                    await coordinator._run_automatic_check(target, generation)
+                    marker = coordinator._markers.get(target)
+                    if marker is not None:
+                        coordinator._schedule_automatic_check(marker)
+                    return Ok(value=None)
+
+                ctx.launch(Route.recovery, "credential_automatic", operation, run)
+            return True
         if kind == 'credential_stop':
             effect = ctx._manager._completed_effects.get((message.receiver_id, message.operation_id, message.kind))
-            if effect is None or effect.context.owner_daemon is None or effect.context.marker_generation is None:
+            if effect is None or effect.recovery_marker is None:
                 return True
-            current = next((item for item in coordinator.markers if (
-                item.receiver_id == ctx.state.receiver_id
-                and item.original_daemon == effect.context.owner_daemon
-                and item.marker_generation == effect.context.marker_generation
-                and (
-                    ctx.state.target is None
-                    or item.target == ctx.state.target.canonical_host
-                )
-            )), None) if (coordinator := self.deps.credential_recovery) is not None else None
-            if current is None or (
-                ctx.state.target is not None
-                and ctx.state.target.canonical_host != current.target
-            ):
+            coordinator = self.deps.credential_recovery
+            marker = effect.recovery_marker
+            if coordinator is None or coordinator._markers.get(marker.target) != marker:
                 return True
             ctx.apply(last_error=message.result.error if isinstance(message.result, Err) else None)
             return True
-        if kind in {'credential_release', 'credential_dismiss'}:
+        if kind == 'credential_dismiss':
+            effect = ctx._manager._completed_effects.get((message.receiver_id, message.operation_id, message.kind))
+            previous = effect.recovery_marker if effect is not None else None
+            coordinator = self.deps.credential_recovery
+            updated = coordinator._markers.get(previous.target) if coordinator is not None and previous is not None else None
+            if (
+                updated is not None and _marker_identity(updated) == _marker_identity(previous)
+                and updated.marker_generation == previous.marker_generation + 1
+                and updated.state == 'release_pending' and not updated.automatic_status_checks
+            ):
+                for submission_id, settlement in tuple(ctx.credential_settlements.items()):
+                    if (
+                        settlement.owner.target.canonical_host != updated.target
+                        or settlement.marker_generation != updated.marker_generation - 1
+                    ):
+                        continue
+                    owner = replace(settlement.owner, marker_generation=updated.marker_generation)
+                    ctx.credential_settlements[submission_id] = replace(
+                        settlement,
+                        owner=owner,
+                        marker_generation=updated.marker_generation,
+                        report_suppressed=True,
+                    )
+                    run = getattr(ctx, "_credential_runs", {}).get(submission_id)
+                    if run is not None:
+                        run.marker = updated
+                        run.context = replace(
+                            run.context, marker_generation=updated.marker_generation,
+                        )
+                    for effect in (*ctx._manager._effects.values(), *ctx._manager._completed_effects.values()):
+                        if (
+                            effect.receiver_id == ctx.state.receiver_id
+                            and effect.credential_owner is not None
+                            and effect.credential_owner.challenge_id == owner.challenge_id
+                        ):
+                            effect.credential_owner = replace(
+                                effect.credential_owner,
+                                marker_generation=updated.marker_generation,
+                            )
+                            effect.context = replace(
+                                effect.context, marker_generation=updated.marker_generation,
+                            )
+            for challenge_id, events in tuple(ctx.credential_dismissals.items()):
+                ctx.credential_dismissals.pop(challenge_id, None)
+                for event in events:
+                    ctx.enqueue(event)
+            ctx.apply(last_error=message.result.error if isinstance(message.result, Err) else None)
+            return True
+        if kind in {'credential_release'}:
             ctx.apply(last_error=message.result.error if isinstance(message.result, Err) else None)
             return True
         if kind == "startup":
