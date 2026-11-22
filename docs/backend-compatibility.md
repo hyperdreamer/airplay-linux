@@ -87,18 +87,42 @@ tokens grant nothing. A half-installed sender/ctl pair must be repaired as a pai
 
 All application commands use `doubletake-ctl -socket <explicit-private-path> ...`. Status,
 discover and devices are read operations. Connect, disconnect, mute and unmute retain their
-published target forms. A capable connect adds `--audio on`, optionally `--volume N`, or
-`--audio off` for video-only. Live changes use `volume N T`; closure uses `audio off T`.
-The application always supplies the target for mutation, never emits the targetless broadcast
-forms, and never places a PIN/password in process arguments. There is no `audio on` command.
+published target forms. The relay's two recognized credential profiles use the target-first forms
+below.
 
-A legacy saved level cannot send new flags: connect remains `connect T`, and target
-mute/unmute keep their existing semantics. Version strings and remembered preferences cannot
-promote support.
+The legacy profile invokes
 
-Status retains `ok`, `state`, audio fields, `needs_credential`, `credential_kind`, legacy
-`needs_pin` and per-stream identity. Credential kinds decode only as `pin` or `password`;
-unknown values refuse. Optional `streams[i].volume` is an exact integer 0..100;
+```text
+doubletake-ctl -socket SOCKET connect TARGET CREDENTIAL
+```
+
+The extended profile invokes
+
+```text
+doubletake-ctl -socket SOCKET connect TARGET [--audio on|off] [--volume N] CREDENTIAL
+```
+
+The extended flags preserve the audio and initial-volume choices captured by the owning Start.
+They are used only when the extended help table, source tokens and target-volume token are all
+proven. A profile that cannot carry those original choices is refused before process creation. The
+credential is one final argv element. `ProfileCommand.secret_indices` contains exactly
+`len(argv) - 1`, and every redacted argv projection replaces that element with the fixed redaction
+token. The historical targetless `pin` command is never invoked.
+
+The `connect` row proves credential relay only when its signature and exact pinned summary match the
+recognized table. Extended `volume`, `audio`, `disconnect`, `mute` and `unmute` rows each need an
+exact `[target]` declaration and their own affirmative `only the given IP` wording. A scope claim
+from another row cannot prove a command. There is no `audio on` command. A complete command reply
+still requires target-specific status observation before the UI reports success.
+
+Legacy saved levels cannot send extended flags. Target mute and unmute retain their existing
+semantics. The credential value is transient and is never placed in session metadata, recovery
+markers, journals, diagnostics or exports.
+
+Target-scoped live changes use `volume N T`, and closure uses `audio off T`. These target-volume
+commands remain separate from credential relay. Status retains `ok`, `state`, audio fields,
+`needs_credential`, `credential_kind`, legacy `needs_pin` and per-stream identity. Credential kinds
+decode only as `pin` or `password`; unknown values refuse. Optional `streams[i].volume` is an exact integer 0..100;
 `volume_state` is unrequested/pending/applied/refused;
 `audio_closed` is an exact boolean. Missing evidence stays absent, applied requires a level,
 and present null/invalid members refuse decoding. These facts never come from an aggregate or
@@ -110,13 +134,40 @@ Only a receiver RTSP 200 acknowledges a requested level. Remote-control changes 
 and an acknowledgement cannot prove the receiver honored audible gain. Operational readouts,
 last audible restore, save failures and audio decisions are described in [Operations](operations.md).
 
+## Credential relay and authorization boundaries
+
+The relay recognizes two complete ctl help tables, the published `doubletake` 0.5.0 legacy table
+and the exact extended target-volume table from the pinned patch chain. Each must match the full
+argument-signature inventory. Credential relay additionally requires the exact `connect` signature
+and pinned `Start mirroring (to target IP, or first free device)` summary. Partial, malformed,
+contradictory or negated help fails closed. The source-reporting sender surface is a separate
+accepted profile and requires its own advertised source tokens.
+
+`credential_relay` is independent from `owned_daemon_control`, `keyring`, physical-source
+identity and transactional trust capabilities. The runtime's `keyring` capability comes from its
+three-leg credential-service proof. Public Mirror Start admission requires composed
+`owned_daemon_control` and `keyring`, together with the remaining mode evidence. The profile's
+`keyring == false` does not negate the composed runtime keyring proof. The relay does not enable
+`target_bound_pairing`, `provisional_commit`, `cancel_pairing` or `revoke_pairing`, and it never
+enters the transactional pairing coordinator or claims remembered pairing.
+
+Credential dispatch uses the existing `EvidenceAuthority` path. Each authorization callback
+rereads the complete durable launch-receipt set and validates the exact daemon instance, process
+identity, private runtime directory, explicit socket path and endpoint generation. Cached receipt
+proof cannot authorize a later command. The same target and daemon identity remain required through
+credential dispatch, status observation and target-specific cleanup.
+
+The separate `target_volume` capability requires the exact extended control table, source tokens and
+target-volume token. It proves that the extended audio and volume arguments can be preserved. It
+does not grant ownership, keyring, source identity or transactional pairing authority.
+
 ## Public evidence and composition evidence
 
 The public help/token decoder leaves foreground control, owner handshake, physical/virtual
 source identity, keyring transactions, target-bound pairing, provisional commit, cancellation,
 revocation and mode querying unproven. `-daemonize`, `-cred-backend keyring` and capture flags
-alone cannot prove those permissions. Credential-bearing connect and pin forms stay outside
-the application adapter's secret-safe contract.
+alone cannot prove those permissions. The four transaction flags remain false. The credential relay
+uses a separate secret-redacted transport call and does not activate transactional pairing.
 
 Current production composition can derive `owned_daemon_control` from receipt-backed launch,
 endpoint and teardown evidence, `keyring` from its isolated credential-service witness, and

@@ -216,7 +216,7 @@ def test_volume_contract_defaults_and_port_annotations():
         (IntentStage, ("idle", "starting", "active", "resolution", "audio_decision", "reconfiguring", "recovering", "stopping", "cleanup")),
         (ErrorCode, ("portal_cancelled", "portal_denied", "keyring_unavailable", "unsupported_source", "unsupported_mode", "unsupported_operation", "dependency_missing", "dependency_incompatible", "audio_denied", "audio_unavailable", "audio_mute_failed", "audio_volume_failed", "volume_unavailable", "volume_preference_invalid", "volume_preference_failed", "receiver_rejected", "stale_target", "stale_event", "stale_socket", "ownership_mismatch", "helper_failed", "configuration_failed", "cleanup_timeout", "trust_cleanup_required", "resolution_mismatch", "discovery_failed", "transport_failed", "daemon_failed", "persistence_failed", "invalid_input", "pairing_expired")),
         (RecoveryAction, ("retry", "stop", "back", "choose_mode", "video_only", "retry_audio", "retry_cleanup", "retry_revocation", "keep_blocked", "remove_metadata", "recreate", "confirm_remove", "keep")),
-        (messages.TransportEventKind, ("ready", "stopped", "network_lost", "pairing_required", "credential_invalid", "audio_start_failed", "audio_failed", "audio_recovered", "mute_result", "volume_result", "accepted_mode", "failed", "daemon_exit")),
+        (messages.TransportEventKind, ("ready", "stopped", "network_lost", "pairing_required", "credential_request", "credential_invalid", "audio_start_failed", "audio_failed", "audio_recovered", "mute_result", "volume_result", "accepted_mode", "failed", "daemon_exit")),
     ],
 )
 def test_serialized_enums_round_trip(enum, values):
@@ -285,7 +285,7 @@ def test_idle_snapshot_has_no_acquired_resources_or_pending_intent():
     assert offline.session_generation == offline.trust_generation == offline.reconnect_attempt == 0
     assert offline.cleanup_pending is False
     assert offline.audio_close_pending is offline.volume_save_failed is False
-    for name in ("target", "mode", "physical_source", "display_handle", "ownership_uuid", "resolution", "observed_resolution", "accepted_resolution", "stream", "challenge", "last_error", "next_retry_at", "operation_id", "transport_lease_id", "audio_operation_id", "queued_start", "remembered_volume", "effective_volume", "last_audible_volume", "volume_state"):
+    for name in ("target", "mode", "physical_source", "display_handle", "ownership_uuid", "resolution", "observed_resolution", "accepted_resolution", "stream", "challenge", "credential_prompt", "last_error", "next_retry_at", "operation_id", "transport_lease_id", "audio_operation_id", "queued_start", "remembered_volume", "effective_volume", "last_audible_volume", "volume_state"):
         assert getattr(offline, name) is None, name
 
 
@@ -453,13 +453,13 @@ def test_protocol_boundaries_exist_without_instantiating_adapters():
         "IdFactory": ("new",), "Subscription": ("close",),
         "DiscoveryPort": ("start", "refresh", "current", "subscribe", "close"),
         "CapturePort": ("list_physical", "select", "verify", "release"),
-        "TransportPort": ("update_target", "query_modes", "start_stream", "stop_stream", "set_muted", "start_audio", "set_volume", "close_audio", "subscribe", "shutdown"),
+        "TransportPort": ("update_target", "query_modes", "start_stream", "submit_credential", "read_credential_status", "stop_pending_start", "stop_stream", "set_muted", "start_audio", "set_volume", "close_audio", "subscribe", "shutdown"),
         "PairingPort": ("begin_pairing", "submit_pairing", "cancel_pairing", "forget_trust", "mark_invalid", "retry_revocation"),
         "CredentialStore": ("load_credential_ref", "prepare_pairing", "commit_pairing", "cancel_pairing", "revoke_pairing", "mark_invalid"),
         "DisplayPort": ("create", "prepare_teardown", "mark_removing", "remove", "reconcile", "approve_orphan", "subscribe"),
         "SessionStore": ("save", "load_all"), "ReceiverStore": ("get", "all", "put", "remove_metadata"),
         "OwnershipStore": ("write", "all", "delete"), "DaemonStore": ("write", "all", "delete"),
-        "ActivitySink": ("emit",), "ProcessPort": ("run", "spawn", "identity", "owned", "terminate", "subscribe"),
+        "ActivitySink": ("emit",), "ProcessPort": ("run", "run_credential", "spawn", "identity", "owned", "terminate", "subscribe"),
         "AudioProbe": ("check",), "ManagerPort": ("dispatch", "ingest", "snapshot", "subscribe", "shutdown"),
     }
     for name, methods in expected.items():

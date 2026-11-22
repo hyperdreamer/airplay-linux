@@ -62,6 +62,7 @@ from airplay_linux.session.mirror import build_lifecycle_handlers
 from airplay_linux.session.persistence import SessionPersistence
 from airplay_linux.session.reconnect import build_reconnect_handlers, compose_reconnect_handlers
 from airplay_linux.session.recovery import (
+    CredentialRecoveryCoordinator,
     StartupRecovery,
     build_recovery_handlers,
 )
@@ -81,6 +82,7 @@ from airplay_linux.storage import (
     decode_launch_receipt,
 )
 from airplay_linux.storage.repositories import (
+    JsonCredentialRecoveryMarkerStore,
     LAUNCH_RECEIPT_DIRECTORY, ReceiverPreferenceWriter, _lifecycle_all,
 )
 from airplay_linux.transport.doubletake import DoubleTakeTransport
@@ -231,6 +233,7 @@ OVERRIDABLE = frozenset(
         "ids",
         "activity",
         "restart_daemon",
+        "credential_recovery",
         "presenter",
         "screencast",
         "shutdown_hook",
@@ -255,6 +258,7 @@ _ADAPTER_OVERRIDES = frozenset(
         "activity",
         "capabilities",
         "restart_daemon",
+        "credential_recovery",
     }
 )
 
@@ -343,7 +347,7 @@ class _SystemIds:
 class _NoopRegistry:
     """Registry boundary for an explicitly injected test dependency bundle."""
 
-    async def reconcile_previous(self) -> Result[tuple[object, ...]]:
+    async def reconcile_previous(self, *, recovery_exemptions=()) -> Result[tuple[object, ...]]:
         return Ok(value=())
 
     async def shutdown(self) -> Result[None]:
@@ -591,6 +595,9 @@ async def _compose_production(
     )
 
     fences = TrustFenceRegistry()
+    credential_recovery = CredentialRecoveryCoordinator(
+        JsonCredentialRecoveryMarkerStore(files), registry, fences=fences,
+    )
     credentials = BackendKeyringStore(UnsupportedControl(), features)
     transport_ref: dict[str, DoubleTakeTransport] = {}
 
@@ -653,6 +660,7 @@ async def _compose_production(
         scheduler,
         ids,
         source_verifier=source_verifier,
+        recovery_guard=credential_recovery.start_dispatch_fence,
     )
     # DoubleTakeTransport owns the only control that is bound to a concrete
     # receiver/daemon lease. Rebind the real store to that control immediately;
@@ -723,6 +731,7 @@ async def _compose_production(
         activity=activity,
         capabilities=capabilities,
         restart_daemon=registry.restart,
+        credential_recovery=credential_recovery,
     )
 
     manager = compose_manager(deps)
@@ -780,10 +789,10 @@ class Runtime:
         return self._diagnostics
 
     async def _start_once(self) -> Result[None]:
-        self.persistence.start()
         recovery = await self.startup_recovery.run()
         if isinstance(recovery, Err):
             return recovery
+        self.persistence.start()
         started = await self.deps.discovery.start()
         if isinstance(started, Err):
             return started

@@ -37,6 +37,52 @@ desktop, and a usable Secret Service. Virtual mode additionally requires `krfb-v
 and its ownership association verifier. Availability must be observed on the intended host;
 the offline suite supplies controlled boundaries and proves no current host readiness.
 
+## Credential relay during Mirror
+
+During an operator-started Mirror, the application can show a PIN or password prompt only for the
+exact target row that belongs to that Start. A prompt from another target, an aggregate status field,
+or a virtual-display Start cannot create the prompt. The application sends the entered value through
+the proven target-bound `connect` profile and reports `Connected to <TV>.` only when that target's
+status reports `streaming`.
+
+Address continuity is the boundary for this flow. The target address and the owned daemon endpoint
+are checked through Start, dispatch, status observation and cleanup. The application cannot prove
+that a later device at the same address is the same physical receiver. A complete command reply is
+not a streaming result. A target absent after submission or still non-streaming at the observation
+deadline produces `The target was not observed streaming.` without diagnosing the cause.
+
+A command that does not produce a complete decoded reply, including service shutdown, has an unknown
+outcome. The application reports `No complete command reply was received; the outcome is unknown.`
+It retains a secret-free recovery marker before dispatch and keeps the target fenced. A delayed
+connection may still appear after cleanup. The application does not promise frame delivery or a
+remembered credential.
+
+Stop cannot atomically cancel a credential command after dispatch. It keeps the command's original
+settlement and status observation under their captured owner, transfers a pending Start handle once,
+and performs target-specific disconnect cleanup. Use Stop again when the target remains present or
+cleanup is still pending. A second target's `pin_required` row and an aggregate disconnect
+acknowledgement do not prove that the stopped target is gone. Cleanup settles only after an exact
+status row for the stopped target is absent.
+
+Dismissing the prompt sends no command. Dismissing a recovery warning disables automatic checks only
+after the durable transition succeeds. The same target remains fenced and offers
+`Restart receiver to release`. That action interrupts every Mirror owned by the shared daemon, uses a
+fresh private endpoint and attempt identity, and releases the target only after exact old-daemon
+termination and replacement readiness are durably proven.
+
+On application restart, the recovery marker is confirmed before any Start or ordinary daemon
+reconciliation. The application resumes checks only after authenticating the recorded daemon
+identity and socket. If a marker-owned check is already running, another check waits for that task
+to finish. Every status read and disconnect re-resolves the marker's canonical target, generation
+and original daemon. If an endpoint-changing `Restart receiver to release` advances the generation
+while a check is in flight, completion re-evaluates the current durable marker after the owned task
+exits and schedules its current generation when the existing eligibility checks pass. Dismissal,
+retirement, replacement and application shutdown stop future scheduling. The checks report only the
+exact target's observed status and never store or remember the credential. If the application is
+stopped, no monitoring promise applies. A dismissed marker remains blocked until the
+recovery-specific restart completes.
+
+
 ## Receiver volume and session mute
 
 The **Volume** row stays visible below the primary actions, including with no receiver selected

@@ -55,6 +55,15 @@ from airplay_linux.domain.operations import (
 )
 from airplay_linux.domain.records import (
     AuthorityOwner,
+    CredentialRecoveryMarker,
+    MarkerRetirement,
+    NoSpawnRetirement,
+    OriginalDaemonIdentity,
+    OwnedDaemonReadinessEvidence,
+    ReleaseAttempt,
+    ReleaseAttemptTerminalEvidence,
+    ReleaseEvidence,
+    TerminalReplyRetirement,
     DaemonCleanupIntent,
     DaemonReservation,
     LaunchReceipt,
@@ -66,6 +75,7 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
+from airplay_linux.domain.relay import TerminationProof
 from airplay_linux.domain.resources import (
     AudioPolicy,
     AudioState,
@@ -1263,6 +1273,7 @@ _NEW_RECEIPT_FIELDS = _NEW_RESERVATION_FIELDS + (
     ("credential_service", _plain(_frozen(frozenset({"keyring_proven", "file_refused", "unknown"})))),
     ("failure", _nullable(_ERROR_CODE)),
     ("updated_at", _plain(_new_time)),
+    ("recovery_attempt_id", _nullable(_NEW_UUID)),
 )
 
 
@@ -1385,17 +1396,22 @@ _NewRecord = TypeVar("_NewRecord")
 def _new_members(
     document: dict[str, object], schema: str,
     fields: tuple[tuple[str, _Codec], ...], envelope: bool,
+    optional_fields: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     expected = {name for name, _ in fields} | ({"schema", "version"} if envelope else set())
     if set(document) - expected:
         raise RecordError("unknown_field")
-    if expected - set(document):
+    missing = expected - set(document)
+    if missing - optional_fields:
         raise RecordError("missing_field")
     if type(document["schema"]) is not str or document["schema"] != schema:
         raise RecordError("unknown_schema")
     if "version" in expected and (type(document["version"]) is not int or document["version"] != 1):
         raise RecordError("unknown_version")
-    return _object({name: document[name] for name, _ in fields}, fields)
+    return _object(
+        {name: document.get(name) if name in optional_fields else document[name] for name, _ in fields},
+        fields,
+    )
 
 
 def _new_encode(
@@ -1425,9 +1441,10 @@ def _new_decode(
     payload: bytes, cls: type[_NewRecord], schema: str,
     fields: tuple[tuple[str, _Codec], ...], *, envelope: bool = True,
     consistency: Callable[[dict[str, object]], None] | None = None,
+    optional_fields: frozenset[str] = frozenset(),
 ) -> _NewRecord:
     document = _new_json(payload, bounded_verdict=cls is ProbeVerdict)
-    values = _new_members(document, schema, fields, envelope)
+    values = _new_members(document, schema, fields, envelope, optional_fields)
     if consistency is not None:
         consistency(values)
     return cls(**values)
@@ -1442,11 +1459,17 @@ def decode_daemon_reservation(payload: bytes) -> DaemonReservation:
 
 
 def encode_launch_receipt(record: LaunchReceipt) -> bytes:
-    return _new_encode(record, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+    if type(record) is not LaunchReceipt:
+        _invalid()
+    fields = _NEW_RECEIPT_FIELDS if record.recovery_attempt_id is not None else _NEW_RECEIPT_FIELDS[:-1]
+    return _new_encode(record, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, fields, consistency=_new_receipt_consistency)
 
 
 def decode_launch_receipt(payload: bytes) -> LaunchReceipt:
-    return _new_decode(payload, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+    return _new_decode(
+        payload, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS,
+        consistency=_new_receipt_consistency, optional_fields=frozenset({"recovery_attempt_id"}),
+    )
 
 
 def encode_daemon_cleanup_intent(record: DaemonCleanupIntent) -> bytes:
@@ -1481,7 +1504,222 @@ def decode_probe_verdict(payload: bytes) -> ProbeVerdict:
     return _new_decode(payload, ProbeVerdict, PROBE_VERDICT_SCHEMA, _NEW_VERDICT_FIELDS, envelope=False, consistency=_new_verdict_consistency)
 
 
+CREDENTIAL_RECOVERY_SCHEMA: Final = "airplay-linux/credential-recovery"
+_RECOVERY_POSITIVE = _plain(lambda value: _integer(value, low=1))
+_RECOVERY_TIME = _plain(_new_time)
+_RECOVERY_PATH = _plain(_new_path)
+_RECOVERY_BOOL = _plain(_flag)
+
+
+def _recovery_receiver(value: object) -> str:
+    text = _identifier(value)
+    if _RECEIVER_ID.fullmatch(text) is None:
+        _invalid()
+    return text
+
+
+def _recovery_nested(cls: type, fields: tuple, consistency=None) -> _Codec:
+    def dump(value: object) -> object:
+        if type(value) is not cls:
+            _invalid()
+        document = _fields_of(value, fields)
+        decoded = _object(document, fields)
+        if consistency is not None:
+            consistency(decoded)
+        return document
+
+    def load(value: object) -> object:
+        decoded = _object(value, fields)
+        if consistency is not None:
+            consistency(decoded)
+        return cls(**decoded)
+
+    return _Codec(dump=dump, load=load)
+
+
+_RECOVERY_ORIGINAL_FIELDS = (
+    ("launch_uuid", _NEW_UUID), ("instance_uuid", _NEW_UUID),
+    ("endpoint_generation", _RECOVERY_POSITIVE), ("daemon_process", _NEW_PROCESS),
+    ("runtime_directory", _RECOVERY_PATH), ("socket_path", _RECOVERY_PATH),
+)
+_RECOVERY_ORIGINAL = _recovery_nested(OriginalDaemonIdentity, _RECOVERY_ORIGINAL_FIELDS)
+_RECOVERY_READY_FIELDS = (
+    ("launch_uuid", _NEW_UUID), ("recovery_attempt_id", _NEW_UUID),
+    ("instance_uuid", _NEW_UUID), ("endpoint_generation", _RECOVERY_POSITIVE),
+    ("runtime_directory", _RECOVERY_PATH), ("socket_path", _RECOVERY_PATH),
+    ("daemon_pid", _plain(lambda value: _integer(value, low=1, high=2**31 - 1))),
+    ("daemon_start_ticks", _plain(_integer)), ("socket_device", _plain(_integer)),
+    ("socket_inode", _RECOVERY_POSITIVE), ("verified_at", _RECOVERY_TIME),
+)
+_RECOVERY_READY = _recovery_nested(OwnedDaemonReadinessEvidence, _RECOVERY_READY_FIELDS)
+_RECOVERY_TERMINAL_FIELDS = (
+    ("outcome", _plain(_frozen(frozenset({"not_spawned", "replacement_terminated"})))),
+    ("replacement_launch_uuid", _nullable(_NEW_UUID)),
+    ("process_evidence", _plain(_frozen(frozenset({"no_child", "pid_absent", "pidfd_exited"})))),
+    ("verified_at", _RECOVERY_TIME),
+)
+
+
+def _recovery_terminal_consistency(values: dict[str, object]) -> None:
+    no_child = values["outcome"] == "not_spawned"
+    if no_child != (values["replacement_launch_uuid"] is None):
+        _invalid()
+    if no_child != (values["process_evidence"] == "no_child"):
+        _invalid()
+
+
+_RECOVERY_TERMINAL = _recovery_nested(
+    ReleaseAttemptTerminalEvidence, _RECOVERY_TERMINAL_FIELDS, _recovery_terminal_consistency,
+)
+_RECOVERY_ATTEMPT_FIELDS = (
+    ("attempt_id", _NEW_UUID), ("replacement_runtime_directory", _RECOVERY_PATH),
+    ("replacement_socket_path", _RECOVERY_PATH),
+    ("status", _plain(_frozen(frozenset({"intended", "ready", "terminal"})))),
+    ("replacement_instance_uuid", _nullable(_NEW_UUID)),
+    ("replacement_endpoint_generation", _nullable(_RECOVERY_POSITIVE)),
+    ("readiness", _nullable(_RECOVERY_READY)),
+    ("terminal_evidence", _nullable(_RECOVERY_TERMINAL)),
+)
+
+
+def _recovery_attempt_consistency(values: dict[str, object]) -> None:
+    status = values["status"]
+    ready = values["readiness"]
+    instance = values["replacement_instance_uuid"]
+    generation = values["replacement_endpoint_generation"]
+    terminal = values["terminal_evidence"]
+    if status == "ready":
+        if ready is None or instance is None or generation is None or terminal is not None:
+            _invalid()
+        if (ready.recovery_attempt_id, ready.instance_uuid, ready.endpoint_generation,
+                ready.runtime_directory, ready.socket_path) != (
+                values["attempt_id"], instance, generation,
+                values["replacement_runtime_directory"], values["replacement_socket_path"]):
+            _invalid()
+    elif any(value is not None for value in (ready, instance, generation)):
+        _invalid()
+    elif (status == "terminal") != (terminal is not None):
+        _invalid()
+
+
+_RECOVERY_ATTEMPT = _recovery_nested(ReleaseAttempt, _RECOVERY_ATTEMPT_FIELDS, _recovery_attempt_consistency)
+_RECOVERY_PROOF_FIELDS = (
+    ("daemon_instance_uuid", _NEW_UUID), ("daemon", _NEW_PROCESS),
+    ("runtime_directory", _RECOVERY_PATH), ("launch_uuid", _NEW_UUID),
+    ("receipt_state", _plain(_frozen(frozenset({"stopped", "failed"})))),
+    ("cleanup_outcome", _nullable(_plain(_frozen(frozenset({"stopped"}))))),
+    ("cleanup_completed_at", _nullable(_RECOVERY_TIME)),
+    ("process_evidence", _plain(_frozen(frozenset({"pid_absent", "pidfd_exited"})))),
+    ("identity_verified_at", _RECOVERY_TIME), ("observed_at", _RECOVERY_TIME),
+)
+
+
+def _recovery_proof_consistency(values: dict[str, object]) -> None:
+    if (values["cleanup_outcome"] is None) != (values["cleanup_completed_at"] is None):
+        _invalid()
+
+
+_RECOVERY_PROOF = _recovery_nested(TerminationProof, _RECOVERY_PROOF_FIELDS, _recovery_proof_consistency)
+_RECOVERY_NO_SPAWN_FIELDS = (
+    ("failure", _ERROR_CODE), ("stop_cleanup_settled", _RECOVERY_BOOL), ("observed_at", _RECOVERY_TIME),
+)
+_RECOVERY_NO_SPAWN = _recovery_nested(NoSpawnRetirement, _RECOVERY_NO_SPAWN_FIELDS)
+_RECOVERY_REPLY_FIELDS = (
+    ("reply_at", _RECOVERY_TIME), ("accepted", _RECOVERY_BOOL),
+    ("target_observation", _plain(_frozen(frozenset({"streaming", "absent", "not_streaming_at_deadline"})))),
+    ("observation_at", _RECOVERY_TIME), ("stop_cleanup_settled", _RECOVERY_BOOL),
+)
+def _recovery_reply_consistency(values: dict[str, object]) -> None:
+    if values["observation_at"] < values["reply_at"] or not values["stop_cleanup_settled"]:
+        _invalid()
+
+
+_RECOVERY_REPLY = _recovery_nested(TerminalReplyRetirement, _RECOVERY_REPLY_FIELDS, _recovery_reply_consistency)
+_RECOVERY_RELEASE_FIELDS = (
+    ("old_daemon_termination", _RECOVERY_PROOF), ("replacement_instance_uuid", _NEW_UUID),
+    ("replacement_endpoint_generation", _RECOVERY_POSITIVE),
+    ("replacement_runtime_directory", _RECOVERY_PATH), ("replacement_socket_path", _RECOVERY_PATH),
+    ("readiness", _RECOVERY_READY),
+)
+_RECOVERY_RELEASE = _recovery_nested(ReleaseEvidence, _RECOVERY_RELEASE_FIELDS)
+_RECOVERY_RETIREMENT_FIELDS = (
+    ("kind", _plain(_frozen(frozenset({"no_spawn", "terminal_reply", "daemon_replaced"})))),
+    ("no_spawn", _nullable(_RECOVERY_NO_SPAWN)), ("reply", _nullable(_RECOVERY_REPLY)),
+    ("release", _nullable(_RECOVERY_RELEASE)),
+)
+
+
+def _recovery_retirement_consistency(values: dict[str, object]) -> None:
+    selected = {"no_spawn": "no_spawn", "terminal_reply": "reply", "daemon_replaced": "release"}[values["kind"]]
+    if any((values[name] is None) == (name == selected) for name in ("no_spawn", "reply", "release")):
+        _invalid()
+    if selected == "reply" and not values["reply"].stop_cleanup_settled:
+        _invalid()
+
+
+_RECOVERY_RETIREMENT = _recovery_nested(MarkerRetirement, _RECOVERY_RETIREMENT_FIELDS, _recovery_retirement_consistency)
+_RECOVERY_FIELDS = (
+    ("schema_version", _NEW_VERSION), ("target", _plain(_new_text)),
+    ("receiver_id", _plain(_recovery_receiver)), ("start_operation_id", _NEW_UUID),
+    ("original_daemon", _RECOVERY_ORIGINAL), ("marker_generation", _RECOVERY_POSITIVE),
+    ("state", _plain(_frozen(frozenset({"watching", "release_pending", "retired"})))),
+    ("automatic_status_checks", _RECOVERY_BOOL), ("release_attempt", _nullable(_RECOVERY_ATTEMPT)),
+    ("retirement", _nullable(_RECOVERY_RETIREMENT)),
+)
+
+
+def _recovery_marker_consistency(values: dict[str, object]) -> None:
+    state = values["state"]
+    retirement = values["retirement"]
+    attempt = values["release_attempt"]
+    original = values["original_daemon"]
+    if (state == "retired") != (retirement is not None):
+        _invalid()
+    if state == "retired" and values["automatic_status_checks"]:
+        _invalid()
+    if state == "watching" and (not values["automatic_status_checks"] or attempt is not None):
+        _invalid()
+    if attempt is not None:
+        if (attempt.replacement_runtime_directory == original.runtime_directory
+                or attempt.replacement_socket_path == original.socket_path):
+            _invalid()
+        ready = attempt.readiness
+        if ready is not None and (
+            ready.instance_uuid == original.instance_uuid
+            or ready.launch_uuid == original.launch_uuid
+            or (ready.daemon_pid, ready.daemon_start_ticks)
+            == (original.daemon_process.pid, original.daemon_process.start_ticks)
+        ):
+            _invalid()
+    if retirement is not None and retirement.kind != "daemon_replaced" and attempt is not None:
+        _invalid()
+    if retirement is not None and retirement.kind == "daemon_replaced":
+        release = retirement.release
+        if attempt is None or attempt.status != "ready":
+            _invalid()
+        proof = release.old_daemon_termination
+        if (proof.launch_uuid, proof.daemon_instance_uuid, proof.daemon, proof.runtime_directory) != (
+                original.launch_uuid, original.instance_uuid, original.daemon_process, original.runtime_directory):
+            _invalid()
+        if (release.readiness, release.replacement_instance_uuid, release.replacement_endpoint_generation,
+                release.replacement_runtime_directory, release.replacement_socket_path) != (
+                attempt.readiness, attempt.replacement_instance_uuid, attempt.replacement_endpoint_generation,
+                attempt.replacement_runtime_directory, attempt.replacement_socket_path):
+            _invalid()
+
+
+def encode_credential_recovery_marker(record: CredentialRecoveryMarker) -> bytes:
+    return _new_encode(record, CredentialRecoveryMarker, CREDENTIAL_RECOVERY_SCHEMA,
+                       _RECOVERY_FIELDS, consistency=_recovery_marker_consistency)
+
+
+def decode_credential_recovery_marker(payload: bytes) -> CredentialRecoveryMarker:
+    return _new_decode(payload, CredentialRecoveryMarker, CREDENTIAL_RECOVERY_SCHEMA,
+                       _RECOVERY_FIELDS, consistency=_recovery_marker_consistency)
+
+
 __all__ = [
+    "CREDENTIAL_RECOVERY_SCHEMA", "encode_credential_recovery_marker", "decode_credential_recovery_marker",
     "DAEMON_RESERVATION_SCHEMA", "LAUNCH_RECEIPT_SCHEMA", "DAEMON_CLEANUP_INTENT_SCHEMA",
     "SUPERVISOR_RELEASE_INTENT_SCHEMA", "AUTHORITY_OWNER_SCHEMA", "PROBE_VERDICT_SCHEMA",
     "encode_daemon_reservation", "decode_daemon_reservation", "encode_launch_receipt", "decode_launch_receipt",

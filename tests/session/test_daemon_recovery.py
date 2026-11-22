@@ -437,3 +437,170 @@ async def test_failed_first_connect_after_each_successful_restart_stops_on_regis
     assert state.display is DisplayState.Owned
     assert state.intent_active
     assert not rig.scheduler.pending()
+
+
+async def test_credential_recovery_reserves_target_before_create_await(tmp_path):
+    # Breaks if a second Start can enter during the durable marker publication.
+    from test_startup_recovery import assert_recovery_blocked, credential_startup
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    backing = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Store:
+        read_all = backing.read_all
+        confirm_all_durable = backing.confirm_all_durable
+
+        async def create(self, item):
+            entered.set()
+            await release.wait()
+            return await backing.create(item)
+
+    _, coordinator, startup = await credential_startup(tmp_path, store=Store())
+    assert isinstance(await startup.run(), Ok)
+    item = marker()
+    submitted = asyncio.create_task(coordinator.begin_submission(item))
+    await asyncio.wait_for(entered.wait(), 1)
+    other = replace(item, start_operation_id=UUID(int=121))
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, other.start_operation_id), ErrorCode.ownership_mismatch)
+    assert_recovery_blocked(await coordinator.begin_submission(other), ErrorCode.ownership_mismatch)
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(item, 1)(), ErrorCode.ownership_mismatch)
+    assert coordinator.markers == ()
+    release.set()
+    assert await submitted == Ok(value=item)
+    assert coordinator.markers == (item,)
+    assert coordinator.require_start_allowed(item.target, item.start_operation_id) == Ok(value=None)
+    assert coordinator.credential_dispatch_fence(item, 1)() == Ok(value=None)
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(other, 1)(), ErrorCode.ownership_mismatch)
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(item, 2)(), ErrorCode.ownership_mismatch)
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(item, True)(), ErrorCode.ownership_mismatch)
+
+
+async def test_credential_recovery_failed_publication_cannot_commit_visible_marker(tmp_path):
+    from test_startup_recovery import assert_recovery_blocked, credential_startup
+    from airplay_linux.storage import AtomicFiles, StorageError
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    class Files(AtomicFiles):
+        fail = False
+
+        def write(self, path, payload):
+            super().write(path, payload)
+            if self.fail:
+                raise StorageError("write_failed", path)
+
+    files = Files(tmp_path)
+    store = JsonCredentialRecoveryMarkerStore(files)
+    _, coordinator, startup = await credential_startup(tmp_path, store=store)
+    assert isinstance(await startup.run(), Ok)
+    item = marker()
+    files.fail = True
+    assert_recovery_blocked(await coordinator.begin_submission(item))
+    assert await store.for_target(item.target) == Ok(value=item)
+    assert coordinator.markers == ()
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(item, 1)())
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=122)))
+    files.fail = False
+    assert await coordinator.begin_submission(item) == Ok(value=item)
+    assert coordinator.markers == (item,)
+    assert coordinator.credential_dispatch_fence(item, 1)() == Ok(value=None)
+
+
+async def test_stop_credential_recovery_reaches_recorded_daemon_path(tmp_path):
+    from dataclasses import replace
+
+    from airplay_linux.domain.messages import StopCredentialRecovery
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, build_recovery_handlers
+    from airplay_linux.session.testing import SessionRig
+    from tests.storage.test_credential_recovery import marker as recovery_marker
+
+    rig = SessionRig()
+    destination = target()
+    rig.discovery.add_target(destination)
+    recorded = replace(
+        recovery_marker(target=destination.canonical_host),
+        receiver_id=destination.receiver_id,
+    )
+    calls = []
+
+    class Registry:
+        async def stop_recovery_target(self, marker, target, context, fence):
+            calls.append((marker, target, context))
+            assert fence() == Ok(value=None)
+            return Ok(value=None)
+
+    coordinator = CredentialRecoveryCoordinator(object(), Registry())
+    coordinator._markers[recorded.target] = recorded
+    coordinator._loaded = True
+    coordinator._store_blocked = False
+    rig.deps = replace(rig.deps, credential_recovery=coordinator)
+    rig.manager = SessionManager(rig.deps, build_recovery_handlers(rig.deps))
+
+    accepted = await rig.manager.dispatch(StopCredentialRecovery(
+        receiver_id=destination.receiver_id, target=recorded.target,
+        marker_generation=recorded.marker_generation,
+    ))
+    await rig.manager.drain()
+
+    assert accepted.accepted
+    assert len(calls) == 1
+    assert calls[0][0] == recorded
+    assert calls[0][1] == destination
+    assert calls[0][2].owner_daemon == recorded.original_daemon
+    assert calls[0][2].marker_generation == recorded.marker_generation
+
+
+async def test_credential_recovery_start_fence_rechecks_receiver_endpoint(tmp_path):
+    from test_startup_recovery import credential_startup
+    from airplay_linux.trust.fences import TrustFence
+
+    rig, coordinator, startup = await credential_startup(tmp_path)
+    assert isinstance(await startup.run(), Ok)
+    destination = target()
+    rig.fences.set(TrustFence(receiver_id=destination.receiver_id,
+                              endpoint_fingerprint=destination.endpoint_fingerprint,
+                              endpoint_generation=destination.endpoint_generation,
+                              session_generation=1, trust_generation=2, active_challenge_id=None))
+    fence = coordinator.start_dispatch_fence(destination, UUID(int=123))
+    assert fence() == Ok(value=None)
+    original = rig.fences.get(destination.receiver_id)
+    rig.fences.set(replace(original, endpoint_fingerprint="different-endpoint", endpoint_generation=2))
+    result = fence()
+    assert isinstance(result, Err)
+    assert result.error.code is ErrorCode.stale_target
+
+
+@pytest.mark.parametrize("with_attempt", [False, True])
+async def test_credential_recovery_release_pending_never_exempts_or_admits_start(tmp_path, with_attempt):
+    from test_startup_recovery import Registry, assert_recovery_blocked, credential_startup
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker, attempt
+
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    item = marker()
+    assert isinstance(await store.create(item), Ok)
+    pending = (await store.dismiss(item, 1)).value
+    if with_attempt:
+        pending = (await store.record_release_attempt(pending, 2, attempt())).value
+
+    class RegistryWithoutRelease(Registry):
+        async def authenticate_recovery(self, marker):
+            raise AssertionError("release-pending marker attempted original-daemon observation")
+
+    _, coordinator, startup = await credential_startup(tmp_path, store=store, registry=RegistryWithoutRelease([]))
+    if with_attempt:
+        # An unresolved attempt must be classified before registry reconciliation.
+        assert_recovery_blocked(await startup.run(), ErrorCode.ownership_mismatch)
+        assert coordinator.markers == (pending,)
+        assert_recovery_blocked(await coordinator.recover_before_registry_reconciliation(), ErrorCode.ownership_mismatch)
+    else:
+        assert isinstance(await startup.run(), Ok)
+        assert coordinator.markers == (pending,)
+        assert await coordinator.recover_before_registry_reconciliation() == Ok(value=())
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, item.start_operation_id), ErrorCode.ownership_mismatch)
+    assert_recovery_blocked(coordinator.credential_dispatch_fence(item, 1)(), ErrorCode.ownership_mismatch)

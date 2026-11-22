@@ -16,7 +16,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, Literal
 
 from airplay_linux.backend.control import (
     BackendFeatures, BackendOperation, DispatchFence, OwnershipProof,
@@ -25,14 +25,16 @@ from airplay_linux.backend.control import (
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.identity import ReceiverTarget
 from airplay_linux.domain.operations import ProcessIdentity
+from airplay_linux.domain.records import (
+    CredentialRecoveryMarker, DaemonRecord, LaunchReceipt,
+    OriginalDaemonIdentity, OwnedDaemonReadinessEvidence,
+)
 from airplay_linux.domain.resources import Err, ErrorCode, Ok, Result
 from airplay_linux.process.procfs import IdentityState, read_identity_evidence
 
 if TYPE_CHECKING:
     from airplay_linux.domain.ports import ProcessPort
-    from airplay_linux.domain.records import (
-        DaemonRecord, DaemonReservation, LaunchReceipt, SupervisorReleaseIntent,
-    )
+    from airplay_linux.domain.records import DaemonReservation, SupervisorReleaseIntent
     from airplay_linux.process.procfs import TerminationEvidence
 
 # Keep the delivered grace without importing the supervisor's launch machinery.
@@ -41,6 +43,42 @@ _MAX_READ = 1 << 20
 _NONTERMINAL = frozenset({"reserved", "detached", "bound", "ready", "stopping"})
 _TERMINAL = frozenset({"failed", "stopped"})
 _BOUND_FIELDS = ("entry_device", "entry_inode", "socket_inode", "peer_pid", "peer_start_ticks", "peer_uid")
+
+
+@dataclass(frozen=True, kw_only=True)
+class DaemonRecoveryExemption:
+    marker_identity: CredentialRecoveryMarker = field(repr=False)
+    marker_generation: int
+    kind: Literal["watching_original", "release_replacement"]
+    daemon_identity: OriginalDaemonIdentity | OwnedDaemonReadinessEvidence = field(repr=False)
+
+
+def recovery_identity_matches(
+    identity: OriginalDaemonIdentity, receipt: LaunchReceipt, record: DaemonRecord,
+) -> bool:
+    """Join every historical field before probing a marker-owned endpoint."""
+    if (
+        type(identity) is not OriginalDaemonIdentity
+        or type(receipt) is not LaunchReceipt or type(record) is not DaemonRecord
+        or type(identity.daemon_process) is not ProcessIdentity
+        or type(receipt.supervisor) is not ProcessIdentity
+    ):
+        return False
+    return (
+        receipt.state == "ready" and record.lifecycle == "running"
+        and receipt.launch_uuid == identity.launch_uuid
+        and receipt.daemon_instance_uuid == identity.instance_uuid == record.instance_uuid
+        and receipt.endpoint_generation == identity.endpoint_generation
+        and receipt.daemon == identity.daemon_process == record.daemon
+        and receipt.runtime_directory == identity.runtime_directory == record.runtime_directory
+        and receipt.runtime_directory + "/" + receipt.socket_name == identity.socket_path == record.socket_path
+        and receipt.app == record.app and receipt.supervisor == record.supervisor
+        and receipt.protocol_version == record.protocol_version
+        and all(getattr(receipt, name) is not None for name in _BOUND_FIELDS)
+        and receipt.peer_pid == identity.daemon_process.pid
+        and receipt.peer_start_ticks == identity.daemon_process.start_ticks
+        and receipt.peer_uid == receipt.owner_uid
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -615,4 +653,7 @@ class EvidenceAuthority:
             return _err(ErrorCode.ownership_mismatch)
 
 
-__all__ = ["EvidenceAuthority", "VerifiedEndpoint", "verify_owned_endpoint"]
+__all__ = [
+    "DaemonRecoveryExemption", "EvidenceAuthority", "VerifiedEndpoint",
+    "recovery_identity_matches", "verify_owned_endpoint",
+]

@@ -23,6 +23,7 @@ from airplay_linux.domain.resources import (
     ErrorCode,
     Ok,
     Result,
+    NoReplyReason,
 )
 
 
@@ -73,6 +74,9 @@ _VOLUME_CTL_COMMANDS: Final[dict[str, str]] = {
     "volume": "<0-100> [target]",
     "audio": "off [target]",
 }
+_PINNED_050_CONNECT_SUMMARY: Final[str] = (
+    "Start mirroring (to target IP, or first free device)"
+)
 _TARGET_VOLUME_TOKEN: Final[str] = "target-volume"
 _PINNED_050_PROFILE: Final[str] = "doubletake-0.5"
 _PINNED_050_VERSION: Final[str] = "0.5.0"
@@ -361,6 +365,20 @@ BackendReply: TypeAlias = StatusReply | DevicesReply | AckReply
 
 
 @dataclass(frozen=True, kw_only=True)
+class CredentialSubmissionReply:
+    """A complete relay envelope with only its typed acceptance bit."""
+
+    reply_at: float
+    accepted: bool
+
+    def __post_init__(self) -> None:
+        if type(self.reply_at) is not float:
+            raise TypeError("reply_at must be a float")
+        if type(self.accepted) is not bool:
+            raise TypeError("accepted must be a boolean")
+
+
+@dataclass(frozen=True, kw_only=True)
 class CredentialDispatchFailure(Err):
     """A relay credential command's sanitized refusal and proved classification.
 
@@ -373,14 +391,40 @@ class CredentialDispatchFailure(Err):
 
     dispatch_state: Literal["no_spawn", "acknowledged", "uncertain"]
     refusal: Literal["shutdown", "ended", "stale", "rejected"] | None = None
+    reply_at: float | None = None
+    reply_accepted: bool | None = None
+    reason: NoReplyReason | None = None
 
     def __post_init__(self) -> None:
-        if self.dispatch_state not in {"no_spawn", "acknowledged", "uncertain"}:
-            raise ValueError("invalid credential dispatch state")
-        if self.refusal is not None and self.refusal not in {
-            "shutdown", "ended", "stale", "rejected",
+        if type(self.dispatch_state) is not str or self.dispatch_state not in {
+            "no_spawn", "acknowledged", "uncertain",
         }:
+            raise ValueError("invalid credential dispatch state")
+        if self.refusal is not None and (
+            type(self.refusal) is not str or self.refusal not in {
+                "shutdown", "ended", "stale", "rejected",
+            }
+        ):
             raise ValueError("invalid credential dispatch refusal")
+        if self.reply_at is not None and type(self.reply_at) is not float:
+            raise TypeError("reply_at must be a float or None")
+        if self.reply_accepted is not None and type(self.reply_accepted) is not bool:
+            raise TypeError("reply_accepted must be a boolean or None")
+        if self.reason is not None and (
+            type(self.reason) is not str or self.reason not in {
+                "command_timeout", "service_shutdown", "child_cleanup_uncertain",
+                "incomplete_reply", "malformed_reply", "dispatch_cancelled",
+            }
+        ):
+            raise ValueError("invalid credential dispatch reason")
+        if self.dispatch_state == "no_spawn":
+            if self.reply_at is not None or self.reply_accepted is not None or self.reason is not None:
+                raise ValueError("no-spawn credential failure cannot carry a reply")
+        elif self.dispatch_state == "acknowledged":
+            if self.reply_at is None or self.reply_accepted is None or self.reason is not None:
+                raise ValueError("acknowledged credential failure requires a reply")
+        elif self.reply_at is not None or self.reply_accepted is not None or self.reason is None:
+            raise ValueError("uncertain credential failure requires a reason")
 
 
 def _exact_dict(value: object) -> dict[str, Any] | None:
@@ -873,14 +917,14 @@ def _target_scope_proven(command: _CtlCommand | None) -> bool:
 
 def _credential_relay_proven(
     *, verified: bool, signatures: dict[str, str] | None,
+    connect_summary: str | None,
 ) -> bool:
     """Whether this exact verified control table proves the relay connect form.
 
-    Both recognized tables carry the target-bound ``connect``/``pin`` rows; a
-    missing row, an added row or a changed signature matches neither.  Nothing is
-    inferred from version text, keyring, a ``-pair`` flag or prose.
+    Both recognized tables carry the same pinned target-first connect summary.
+    A changed summary is not evidence that the supplied target is honored.
     """
-    return verified and (
+    return verified and connect_summary == _PINNED_050_CONNECT_SUMMARY and (
         signatures == _PINNED_050_CTL_COMMANDS
         or signatures == _VOLUME_CTL_COMMANDS
     )
@@ -913,9 +957,13 @@ def features_from_help(
         None if ctl_commands is None
         else {name: row.arguments for name, row in ctl_commands.items()}
     )
-    ctl_pinned = signatures == _PINNED_050_CTL_COMMANDS
+    connect_row = None if ctl_commands is None else ctl_commands.get("connect")
+    connect_summary = None if connect_row is None else connect_row.summary
+    connect_scope_proven = connect_summary == _PINNED_050_CONNECT_SUMMARY
+    ctl_pinned = signatures == _PINNED_050_CTL_COMMANDS and connect_scope_proven
     ctl_volume = (
         signatures == _VOLUME_CTL_COMMANDS
+        and connect_scope_proven
         and _target_scope_proven(ctl_commands.get("volume"))
         and _target_scope_proven(ctl_commands.get("audio"))
     )
@@ -936,6 +984,7 @@ def features_from_help(
     patched_surface = verified and source_surface
     credential_relay = _credential_relay_proven(
         verified=verified, signatures=signatures,
+        connect_summary=connect_summary,
     )
     source_complete = patched_surface and {
         _CAPABILITY_SCHEMA_TOKEN, _STATUS_SOURCE_TOKEN, _STATUS_SOURCE_COMPLETE_TOKEN,
@@ -1120,6 +1169,7 @@ __all__ = [
     "BackendStream",
     "CredentialDispatchFailure",
     "CredentialProofVerdict",
+    "CredentialSubmissionReply",
     "DevicesReply",
     "StatusReply",
     "decode_devices",

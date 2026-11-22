@@ -5,6 +5,8 @@ from uuid import UUID
 
 import pytest
 
+from virtual_scenarios import settle as settle_resources
+
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     EffectEvent,
@@ -604,3 +606,59 @@ async def test_desktop_capture_records_the_captured_connector_on_the_start_path(
     assert after.stream is not None
     assert after.physical_source is not None
     assert after.physical_source.connector == "DP-3"
+
+
+@pytest.mark.asyncio
+async def test_credential_dismissal_suppresses_reopening_and_preserves_start_and_trust(tmp_path):
+    from test_lifecycle_regressions import credential_rig
+    from airplay_linux.domain.messages import CredentialRequestPayload, DismissCredentialPrompt
+    h = await credential_rig(tmp_path)
+    before = h.rig.manager.snapshot(h.destination.receiver_id)
+    assert before.credential_prompt is not None
+    await h.rig.manager.dispatch(DismissCredentialPrompt(
+        receiver_id=h.destination.receiver_id,
+        challenge_id=before.credential_prompt.challenge.challenge_id,
+    ))
+    h.rig.manager.ingest(h.event)
+    await settle_resources(h.rig)
+    dismissed = h.rig.manager.snapshot(h.destination.receiver_id)
+    assert dismissed.credential_prompt is None
+    assert dismissed.operation_id == before.operation_id
+    assert dismissed.transport_lease_id == before.transport_lease_id
+    assert dismissed.trust_generation == before.trust_generation
+    assert dismissed.trust == before.trust
+    assert len(h.rig.transport.journal.calls("transport.dismiss_credential_prompt")) == 1
+    h.rig.manager.ingest(replace(h.event, payload=CredentialRequestPayload(
+        request=h.event.payload.request, lifecycle="ended", reason="row_ended",
+    )))
+    h.rig.manager.ingest(replace(h.event, payload=replace(
+        h.event.payload, request=replace(h.event.payload.request, generation=2),
+    )))
+    await settle_resources(h.rig)
+    assert h.rig.manager.snapshot(h.destination.receiver_id).credential_prompt is not None
+    h.pending.resolve(Ok(value=h.handle))
+    await settle_resources(h.rig)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_kind", ["error", "absent", "connecting", "duplicate"])
+async def test_credential_status_is_owner_wrapped_and_has_one_bounded_report(tmp_path, status_kind):
+    from test_lifecycle_regressions import credential_rig, credential_status, submit_credential
+    from airplay_linux.domain.relay import Submitted
+    h = await credential_rig(tmp_path, installed=True)
+    result = (Err(error=diagnostic(ErrorCode.transport_failed)) if status_kind == "error"
+              else credential_status(h, None if status_kind == "absent" else "connecting",
+                                     duplicate=status_kind == "duplicate"))
+    h.rig.transport.queue_result("read_credential_status", result)
+    await submit_credential(h, Ok(value=Submitted(reply_at=0.0, accepted=False, post_dispatch_error=None)))
+    if status_kind == "connecting":
+        assert h.rig.manager.snapshot(h.destination.receiver_id).credential_prompt.report is None
+        h.rig.scheduler.advance(20.0)
+        await settle_resources(h.rig)
+    state = h.rig.manager.snapshot(h.destination.receiver_id)
+    if status_kind in ("error", "duplicate"):
+        assert h.coordinator.markers[0].state == "watching"
+        assert state.last_error is not None
+    else:
+        assert state.credential_prompt.report == "not_observed_streaming"
+        assert h.coordinator.markers[0].state == "retired"

@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeAlias
 from uuid import UUID
 
 if TYPE_CHECKING:
-    # Postponed foundation-lane signature; no import of the unfinished implementation.
+    from airplay_linux.backend.contract import StatusReply
     from airplay_linux.process.procfs import TerminationEvidence
 
     from .identity import ReceiverId, ReceiverTarget, ReceiverView
@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     )
     from .records import (
         ActivityEvent,
+        CredentialRecoveryMarker,
+        NoSpawnRetirement,
+        OwnedDaemonReadinessEvidence,
+        ReleaseAttempt,
+        ReleaseEvidence,
+        TerminalReplyRetirement,
         AudioStartReceipt,
         DaemonCleanupIntent,
         DaemonRecord,
@@ -49,14 +55,17 @@ if TYPE_CHECKING:
         SavedReceiver,
         SessionSnapshot,
     )
+    from .relay import NoReply, PendingStartCleanupOwner, Submitted
     from .resources import (
         AudioPolicy,
         CaptureSource,
+        Diagnostic,
         PhysicalMonitorSource,
         ReceiverCapabilities,
         Result,
         Size,
         VolumeLevel,
+        NoReplyReason,
     )
 
 
@@ -122,6 +131,37 @@ class TransportPort(Protocol):
         initial_volume: VolumeLevel | None = None,
     ) -> Result[StreamHandle]: ...
 
+    async def submit_credential(
+        self,
+        target: ReceiverTarget,
+        value: SensitiveText,
+        context: OperationContext,
+        *,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> Result[Submitted | NoReply]: ...
+
+    async def read_credential_status(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> Result[StatusReply]: ...
+
+    async def record_credential_marker_generation(
+        self,
+        target: ReceiverTarget,
+        context: OperationContext,
+        *,
+        submission_id: OperationId,
+        expected_generation: int,
+        previous_generation: int,
+    ) -> Result[None]: ...
+
+    def dismiss_credential_prompt(
+        self, target: ReceiverTarget, context: OperationContext,
+    ) -> None: ...
+
+    async def stop_pending_start(
+        self, owner: PendingStartCleanupOwner, stop_context: OperationContext,
+    ) -> Result[StreamHandle]: ...
+
     async def stop_stream(self, handle: StreamHandle, context: OperationContext) -> Result[None]: ...
 
     async def set_muted(
@@ -184,6 +224,46 @@ class CredentialStore(Protocol):
     ) -> Result[None]: ...
 
     async def mark_invalid(self, receiver_id: ReceiverId) -> Result[None]: ...
+
+
+class CredentialRecoveryMarkerStore(Protocol):
+    async def read_all(self) -> Result[tuple[CredentialRecoveryMarker, ...]]: ...
+
+    async def confirm_all_durable(self) -> Result[None]: ...
+
+    async def for_target(self, target: str) -> Result[CredentialRecoveryMarker | None]: ...
+
+    async def create(self, marker: CredentialRecoveryMarker) -> Result[CredentialRecoveryMarker]: ...
+
+    async def mark_release_pending(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def dismiss(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def record_release_attempt(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, attempt: ReleaseAttempt,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def record_replacement_ready(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+        readiness: OwnedDaemonReadinessEvidence,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_no_spawn(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, evidence: NoSpawnRetirement,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_after_reply(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+        evidence: TerminalReplyRetirement,
+    ) -> Result[CredentialRecoveryMarker]: ...
+
+    async def retire_after_replacement(
+        self, identity: CredentialRecoveryMarker, expected_generation: int, evidence: ReleaseEvidence,
+    ) -> Result[CredentialRecoveryMarker]: ...
 
 
 class DisplayPort(Protocol):
@@ -330,6 +410,47 @@ class CommandOutput:
 
 
 @dataclass(frozen=True, kw_only=True)
+class CredentialProcessNotSpawned:
+    diagnostic: Diagnostic
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialProcessCompleted:
+    """Completed child output, which must remain transient at process boundaries."""
+
+    output: CommandOutput = field(repr=False, compare=False)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(output=<transient>)"
+
+    def __getstate__(self) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+    def __reduce__(self) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("credential process output cannot be serialized")
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialProcessUncertain:
+    reason: NoReplyReason
+
+    def __post_init__(self) -> None:
+        if type(self.reason) is not str or self.reason not in {
+            "command_timeout", "service_shutdown", "child_cleanup_uncertain",
+            "incomplete_reply", "malformed_reply", "dispatch_cancelled",
+        }:
+            raise ValueError("invalid credential process uncertainty reason")
+
+
+CredentialProcessResult: TypeAlias = (
+    CredentialProcessNotSpawned | CredentialProcessCompleted | CredentialProcessUncertain
+)
+
+
+@dataclass(frozen=True, kw_only=True)
 class ProcessExit:
     identity: ProcessIdentity
     exit_code: int
@@ -339,6 +460,13 @@ class ProcessPort(Protocol):
     async def run(
         self, spec: CommandSpec, timeout: float, stdin: bytes | None = None,
     ) -> Result[CommandOutput]: ...
+
+    async def run_credential(
+        self,
+        spec: CommandSpec,
+        timeout: float,
+        dispatch_fence: Callable[[], Result[None]],
+    ) -> CredentialProcessResult: ...
 
     async def spawn(self, spec: CommandSpec) -> Result[ProcessIdentity]: ...
 

@@ -8,6 +8,7 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal
 
 from .identity import _validate_generation
+from .relay import TerminationProof
 from .resources import (
     AudioPolicy,
     AudioState,
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
         ProcessIdentity,
         StreamHandle,
     )
-    from .relay import RelayLeaseView, RelayNotice
+    from .relay import CredentialPromptState
     from .resources import (
         Diagnostic,
         ErrorCode,
@@ -141,6 +142,7 @@ class LaunchReceipt(DaemonReservation):
     credential_service: Literal["keyring_proven", "file_refused", "unknown"]
     failure: ErrorCode | None
     updated_at: float
+    recovery_attempt_id: OperationId | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -181,6 +183,99 @@ class ProbeVerdict:
     backend_positive_leg: Literal["passed", "failed", "not_run"]
     backend_negative_leg: Literal["passed", "failed", "not_run"]
     failure: ErrorCode | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OriginalDaemonIdentity:
+    launch_uuid: UUID = field(repr=False)
+    instance_uuid: InstanceId = field(repr=False)
+    endpoint_generation: int
+    daemon_process: ProcessIdentity = field(repr=False)
+    runtime_directory: str = field(repr=False)
+    socket_path: str = field(repr=False)
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnedDaemonReadinessEvidence:
+    launch_uuid: UUID = field(repr=False)
+    recovery_attempt_id: OperationId = field(repr=False)
+    instance_uuid: InstanceId = field(repr=False)
+    endpoint_generation: int
+    runtime_directory: str = field(repr=False)
+    socket_path: str = field(repr=False)
+    daemon_pid: int
+    daemon_start_ticks: int
+    socket_device: int
+    socket_inode: int
+    verified_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReleaseAttemptTerminalEvidence:
+    outcome: Literal["not_spawned", "replacement_terminated"]
+    replacement_launch_uuid: UUID | None = field(repr=False)
+    process_evidence: Literal["no_child", "pid_absent", "pidfd_exited"]
+    verified_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReleaseAttempt:
+    attempt_id: OperationId = field(repr=False)
+    replacement_runtime_directory: str = field(repr=False)
+    replacement_socket_path: str = field(repr=False)
+    status: Literal["intended", "ready", "terminal"]
+    replacement_instance_uuid: InstanceId | None = field(repr=False)
+    replacement_endpoint_generation: int | None
+    readiness: OwnedDaemonReadinessEvidence | None
+    terminal_evidence: ReleaseAttemptTerminalEvidence | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class NoSpawnRetirement:
+    failure: ErrorCode
+    stop_cleanup_settled: bool
+    observed_at: float
+
+
+@dataclass(frozen=True, kw_only=True)
+class TerminalReplyRetirement:
+    reply_at: float
+    accepted: bool
+    target_observation: Literal["streaming", "absent", "not_streaming_at_deadline"]
+    observation_at: float
+    stop_cleanup_settled: bool
+
+
+@dataclass(frozen=True, kw_only=True)
+class ReleaseEvidence:
+    old_daemon_termination: TerminationProof
+    replacement_instance_uuid: InstanceId = field(repr=False)
+    replacement_endpoint_generation: int
+    replacement_runtime_directory: str = field(repr=False)
+    replacement_socket_path: str = field(repr=False)
+    readiness: OwnedDaemonReadinessEvidence
+
+
+@dataclass(frozen=True, kw_only=True)
+class MarkerRetirement:
+    kind: Literal["no_spawn", "terminal_reply", "daemon_replaced"]
+    no_spawn: NoSpawnRetirement | None
+    reply: TerminalReplyRetirement | None
+    release: ReleaseEvidence | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialRecoveryMarker:
+    schema_version: int
+    target: str = field(repr=False)
+    receiver_id: ReceiverId = field(repr=False)
+    start_operation_id: OperationId = field(repr=False)
+    original_daemon: OriginalDaemonIdentity
+    marker_generation: int
+    state: Literal["watching", "release_pending", "retired"]
+    automatic_status_checks: bool
+    release_attempt: ReleaseAttempt | None
+    retirement: MarkerRetirement | None
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -255,8 +350,7 @@ class SessionSnapshot:
     volume_state: str | None = None
     audio_close_pending: bool = False
     volume_save_failed: bool = False
-    relay: RelayLeaseView | None = None
-    relay_notice: RelayNotice | None = None
+    credential_prompt: CredentialPromptState | None = None
 
     def __post_init__(self) -> None:
         _validate_generation("session_generation", self.session_generation)

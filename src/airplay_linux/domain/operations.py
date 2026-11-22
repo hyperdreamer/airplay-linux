@@ -9,6 +9,7 @@ from uuid import UUID
 from .identity import _validate_generation
 
 if TYPE_CHECKING:
+    from .records import OriginalDaemonIdentity
     from .identity import ReceiverId
     from .resources import Diagnostic, VirtualOutputSource
 
@@ -91,12 +92,16 @@ class OperationContext:
     transport_lease_id: LeaseId | None = None
     trust_generation: int | None = None
     audio_operation_id: OperationId | None = None
+    marker_generation: int | None = None
+    owner_daemon: OriginalDaemonIdentity | None = None
 
     def __post_init__(self) -> None:
         _validate_generation("session_generation", self.session_generation)
         _validate_generation("endpoint_generation", self.endpoint_generation)
         if self.trust_generation is not None:
             _validate_generation("trust_generation", self.trust_generation)
+        if self.marker_generation is not None:
+            _validate_generation("marker_generation", self.marker_generation)
 
 
 @dataclass(frozen=True, kw_only=True)

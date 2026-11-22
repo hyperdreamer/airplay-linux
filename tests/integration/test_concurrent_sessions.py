@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from airplay_linux.backend.contract import AckReply
+from airplay_linux.backend.contract import AckReply, BackendStream, StatusReply
 from airplay_linux.backend.control import ApplicationContractProfile, BackendOperation, Handshake
 from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
@@ -74,6 +74,7 @@ class Control:
         self.gates = {}
         self.calls = []
         self.connected, self.audio, self.muted = set(), set(), {}
+        self.targets = {}
         self.closed = False
 
     def subscribe(self, callback):
@@ -90,6 +91,23 @@ class Control:
                 return checked
         self.calls.append((operation, destination, context))
         self.journal.record("backend.request", operation=operation, target=destination, context=context)
+        if operation is BackendOperation.status:
+            streams = tuple(
+                BackendStream(
+                    device=str(receiver_id), target=target,
+                    state="streaming", has_audio=True,
+                    audio_muted=self.muted.get(receiver_id, False),
+                    credential_kind=None,
+                )
+                for receiver_id, target in self.targets.items()
+                if receiver_id in self.connected
+            )
+            return Ok(value=StatusReply(
+                state="streaming" if streams else "idle",
+                device=None, target=None, has_audio=bool(streams),
+                audio_muted=False, needs_credential=False,
+                credential_kind=None, streams=streams,
+            ))
         gate = self.gates.pop((operation, destination.receiver_id), None)
         if gate is not None:
             result = await gate.wait()
@@ -97,8 +115,10 @@ class Control:
                 return result
         if operation is BackendOperation.connect:
             self.connected.add(destination.receiver_id)
+            self.targets[destination.receiver_id] = destination.canonical_host
         if operation is BackendOperation.disconnect:
             self.connected.discard(destination.receiver_id)
+            self.targets.pop(destination.receiver_id, None)
             self.audio.discard(destination.receiver_id)
         if operation is BackendOperation.start_audio:
             self.audio.add(destination.receiver_id)
@@ -172,9 +192,12 @@ async def test_two_receivers_keep_mode_resources_audio_and_failure_independent(a
     assert len(app.display.outputs) == (mode_a is Mode.VIRTUAL)
 
 
-async def test_provider_serializes_simultaneous_creations_and_cancel_is_receiver_local(app_factory, tmp_path):
+async def test_provider_serializes_simultaneous_creations_and_cancel_is_receiver_local(app_factory, tmp_path, monkeypatch):
     from test_crash_recovery import World
 
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    monkeypatch.setenv("XDG_SESSION_DESKTOP", "KDE")
     world = World(tmp_path)
     app = await app_factory(configure=world.configure, directory=tmp_path)
     await app.online()

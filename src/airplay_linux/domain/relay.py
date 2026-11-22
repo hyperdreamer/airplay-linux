@@ -1,10 +1,4 @@
-"""Secret-free mirror pairing relay records and their single eligibility predicate.
-
-Every record here is a transient projection: none holds credential text, and no
-persistent codec admits one. :func:`can_submit` is the one predicate shared by the
-presentation, the actor's command admission and the transport's final spawn fence,
-so it performs no I/O, schedules no timer and derives no deadline of its own.
-"""
+"""Start-bound credential relay records and secret-free observations."""
 
 from __future__ import annotations
 
@@ -16,27 +10,30 @@ from .identity import _validate_generation
 if TYPE_CHECKING:
     from uuid import UUID
 
-    from airplay_linux.backend.contract import AckReply, StatusReply
-
     from .identity import ReceiverId, ReceiverTarget
-    from .operations import ChallengeView, InstanceId, LeaseId, ProcessIdentity
-    from .resources import AudioPolicy, ErrorCode, VolumeLevel
+    from .operations import (
+        ChallengeId,
+        ChallengeView,
+        InstanceId,
+        LeaseId,
+        OperationId,
+        ProcessIdentity,
+    )
+    from .resources import AudioPolicy, ErrorCode, NoReplyReason, VolumeLevel
 
 
 CredentialKind = Literal["pin", "password"]
-RequestState = Literal["live", "succeeded", "Ended", "Expired", "Stale", "cancelled"]
-DispatchState = Literal["none", "no_spawn", "acknowledged", "uncertain", "settled"]
-ReleaseState = Literal["none", "settling", "released", "retained"]
-RelayPhase = Literal["none", "permission", "credential", "handshake", "source", "closed"]
-RelayNotice = Literal[
-    "credential_requested", "pin_rejected", "pairing_failed", "pairing_cancelled",
-    "receiver_changed", "daemon_stopping", "uncertain", "waiting_start",
+CredentialPromptLifecycle = Literal["live", "ended"]
+CredentialPromptStateName = Literal["editing", "submitting", "observing"]
+CredentialPromptReport = Literal[
+    "connected", "not_observed_streaming", "outcome_unknown",
 ]
+SettlementPhase = Literal["awaiting_reply", "observing", "cleanup"]
 
 
 @dataclass(frozen=True, kw_only=True)
 class RelayStartOptions:
-    """Options snapshotted once from the admitted original connect."""
+    """Options snapshotted from the owning Mirror Start."""
 
     target_volume_proven: bool
     audio: AudioPolicy | None
@@ -45,11 +42,12 @@ class RelayStartOptions:
 
 @dataclass(frozen=True, kw_only=True)
 class CredentialRequest:
-    """One target's matching ``pin_required`` evidence; never the credential."""
+    """One matching target-row request, owned by one pending Start."""
 
     receiver_id: ReceiverId
     target: ReceiverTarget
     credential_kind: CredentialKind
+    start_operation_id: OperationId
     endpoint_generation: int
     session_generation: int
     owner_lease: LeaseId
@@ -65,61 +63,112 @@ class CredentialRequest:
 
 
 @dataclass(frozen=True, kw_only=True)
-class SuccessPending:
-    """Set once on matching streaming evidence; cleared by trust commit or failure."""
+class CredentialPromptState:
+    """Transient actor projection for one local credential prompt."""
 
-    generation: int
-    attempt: int
-    observed_at: float
-
-    def __post_init__(self) -> None:
-        _validate_generation("generation", self.generation)
-        _validate_generation("attempt", self.attempt)
+    request: CredentialRequest
+    challenge: ChallengeView
+    state: CredentialPromptStateName
+    submission_id: OperationId | None
+    report: CredentialPromptReport | None
 
 
 @dataclass(frozen=True, kw_only=True)
-class RelayLeaseView:
-    """A frozen copy of the transport lease's relay state, never a second authority."""
+class CredentialEffectOwner:
+    """Immutable ownership tuple carried through credential effects."""
+
+    challenge_id: ChallengeId
+    receiver_id: ReceiverId
+    target: ReceiverTarget
+    start_operation_id: OperationId
+    endpoint_fingerprint: str
+    endpoint_generation: int
+    session_generation: int
+    trust_generation: int
+    owner_lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    relay_generation: int
+    marker_generation: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "endpoint_generation", "session_generation", "trust_generation",
+            "relay_generation", "marker_generation",
+        ):
+            _validate_generation(name, getattr(self, name))
+
+
+@dataclass(frozen=True, kw_only=True)
+class Submitted:
+    """A complete positive or negative credential command reply."""
+
+    reply_at: float
+    accepted: bool
+    post_dispatch_error: ErrorCode | None
+
+    def __post_init__(self) -> None:
+        if type(self.accepted) is not bool:
+            raise TypeError("accepted must be a boolean")
+
+
+@dataclass(frozen=True, kw_only=True)
+class NoReply:
+    """A dispatched command whose complete reply was not decoded."""
+
+    reason: NoReplyReason
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialSubmissionSettlement:
+    """Actor-local ownership for one dispatched credential submission."""
+
+    submission_id: OperationId
+    read_id: OperationId | None
+    owner: CredentialEffectOwner
+    marker_generation: int
+    stop_operation_id: OperationId | None
+    report_suppressed: bool
+    phase: SettlementPhase
+
+    def __post_init__(self) -> None:
+        _validate_generation("marker_generation", self.marker_generation)
+        if type(self.report_suppressed) is not bool:
+            raise TypeError("report_suppressed must be a boolean")
+
+
+@dataclass(frozen=True, kw_only=True)
+class PendingStartCleanupOwner:
+    """Exact owner captured before a pending Start is superseded by Stop."""
 
     receiver_id: ReceiverId
     target: ReceiverTarget
+    start_operation_id: OperationId
+    endpoint_fingerprint: str
     endpoint_generation: int
     session_generation: int
+    trust_generation: int
     owner_lease: LeaseId
     daemon_instance_uuid: InstanceId
-    owner_live: bool
-    generation: int
-    request: CredentialRequest | None
-    request_state: RequestState
-    request_waiting: bool
-    challenge: ChallengeView | None
-    submit_inflight: int | None
-    submit_fenced: bool
-    dispatch_state: DispatchState
-    success_pending: SuccessPending | None
-    prepared_source: bool
-    streaming: bool
-    consumed_submissions: int
-    release_state: ReleaseState
-    phase: RelayPhase
-    expires_at: float | None
-    notice: RelayNotice | None
+    stop_operation_id: OperationId
+    credential_submission_id: OperationId | None
+    marker_generation: int | None
 
     def __post_init__(self) -> None:
-        _validate_generation("endpoint_generation", self.endpoint_generation)
-        _validate_generation("session_generation", self.session_generation)
-        _validate_generation("generation", self.generation)
-        _validate_generation("consumed_submissions", self.consumed_submissions)
+        for name in (
+            "endpoint_generation", "session_generation", "trust_generation",
+        ):
+            _validate_generation(name, getattr(self, name))
+        if (self.credential_submission_id is None) != (self.marker_generation is None):
+            raise ValueError(
+                "credential submission and marker generation must be captured together"
+            )
+        if self.marker_generation is not None:
+            _validate_generation("marker_generation", self.marker_generation)
 
 
 @dataclass(frozen=True, kw_only=True)
 class TerminationProof:
-    """Positive, exact-instance process termination evidence.
-
-    ``cleanup_completed_at`` copies the persisted ``DaemonCleanupIntent`` wall-clock
-    value unchanged; ``identity_verified_at`` and ``observed_at`` are monotonic and
-    are never compared with it.
-    """
+    """Positive, exact-instance process termination evidence."""
 
     daemon_instance_uuid: InstanceId
     daemon: ProcessIdentity
@@ -133,61 +182,16 @@ class TerminationProof:
     observed_at: float
 
 
-@dataclass(frozen=True, kw_only=True)
-class ReleaseEvidence:
-    """One release attempt's sanitized evidence; never a credential or argv."""
+def relay_credential_representable(value: str) -> bool:
+    """Return whether a transient credential is safe as the final argv token."""
 
-    reason: ErrorCode | None
-    observed_at: float
-    disconnect_ack: AckReply | None = None
-    status: StatusReply | None = None
-    daemon_instance_uuid: InstanceId | None = None
-    endpoint_generation: int | None = None
-    termination: TerminationProof | None = None
-
-    def __post_init__(self) -> None:
-        if self.endpoint_generation is not None:
-            _validate_generation("endpoint_generation", self.endpoint_generation)
+    return not value.startswith("-")
 
 
-def can_submit(lease: RelayLeaseView) -> bool:
-    r = lease.request
-    c = lease.challenge
-    return (
-        # A request generation is live for exactly this target and owner.
-        r is not None
-        and c is not None
-        and lease.owner_live
-        and lease.request_state == "live"
-        and lease.request_waiting
-        and r.generation == lease.generation
-        and r.receiver_id == lease.receiver_id == c.receiver_id
-        and r.target == lease.target
-        and r.endpoint_generation == lease.endpoint_generation == c.endpoint_generation
-        and r.session_generation == lease.session_generation == c.session_generation
-        and r.owner_lease == lease.owner_lease
-        and r.daemon_instance_uuid == lease.daemon_instance_uuid
-        # No superseded or stale challenge is answerable.
-        and c.credential_kind == r.credential_kind
-        and c.endpoint_fingerprint == lease.target.endpoint_fingerprint
-        # The acquisition and release barriers are shared by all callers.
-        and lease.submit_inflight is None
-        and not lease.submit_fenced
-        and lease.dispatch_state in {"none", "settled"}
-        # Progress retires input before trust completion.
-        and lease.success_pending is None
-        and not lease.prepared_source
-        and not lease.streaming
-    )
-
-
-def relay_credential_representable(
-    value: str, *, target_volume_proven: bool,
-) -> bool:
-    """Whether the selected CLI can carry this transient credential as its last token.
-
-    The extended table's parser interprets ``--audio``/``--volume`` and rejects other
-    tokens beginning with ``-``; it supplies no end-of-options escape. The value is
-    examined and never retained, rewritten or logged.
-    """
-    return not (target_volume_proven and value.startswith("-"))
+__all__ = [
+    "CredentialEffectOwner", "CredentialKind", "CredentialPromptState",
+    "CredentialPromptLifecycle", "CredentialPromptReport", "CredentialPromptStateName",
+    "CredentialRequest", "CredentialSubmissionSettlement", "NoReply", "PendingStartCleanupOwner",
+    "RelayStartOptions", "SettlementPhase", "Submitted", "TerminationProof",
+    "relay_credential_representable",
+]

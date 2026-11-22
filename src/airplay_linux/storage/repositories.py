@@ -35,6 +35,13 @@ from airplay_linux.domain.identity import ReceiverId, ReceiverRecordSet, Receive
 from airplay_linux.domain.ports import DiscoveryPort, ReceiverStore
 from airplay_linux.domain.operations import InstanceId, OwnerId
 from airplay_linux.domain.records import (
+    CredentialRecoveryMarker,
+    MarkerRetirement,
+    NoSpawnRetirement,
+    OwnedDaemonReadinessEvidence,
+    ReleaseAttempt,
+    ReleaseEvidence,
+    TerminalReplyRetirement,
     DaemonCleanupIntent,
     LaunchReceipt,
     SupervisorReleaseIntent,
@@ -44,12 +51,15 @@ from airplay_linux.domain.records import (
     SessionSnapshot,
 )
 from airplay_linux.domain.resources import (
-    Diagnostic, Err, ErrorCode, Ok, ResolutionDecision, Result, VolumeLevel,
+    Diagnostic, Err, ErrorCode, Ok, RecoveryAction, ResolutionDecision, Result, VolumeLevel,
 )
 
 from .atomic import AtomicFiles, StorageError
 from .codecs import (
+    MAX_TEXT,
     RecordError,
+    decode_credential_recovery_marker,
+    encode_credential_recovery_marker,
     decode_launch_receipt,
     encode_launch_receipt,
     decode_daemon_cleanup_intent,
@@ -382,7 +392,7 @@ _LifecycleRecord = TypeVar("_LifecycleRecord", LaunchReceipt, DaemonCleanupInten
 _RESERVATION_IDENTITY = (
     "schema_version", "launch_uuid", "instance_uuid", "app", "owner_uid", "boot_id",
     "runtime_directory", "runtime_device", "runtime_inode", "endpoint_generation",
-    "socket_name", "protocol_version",
+    "socket_name", "protocol_version", "recovery_attempt_id",
 )
 _OBSERVED_IDENTITY = (
     "daemon_instance_uuid", "supervisor", "daemon", "entry_device", "entry_inode",
@@ -567,6 +577,275 @@ class JsonSupervisorReleaseIntentStore:
         return Ok(value=None)
 
 
+# --------------------------------------------------------------------------- credential recovery
+
+
+CREDENTIAL_RECOVERY_DIRECTORY: Final[str] = "credential-recovery"
+
+
+def _recovery_error(code: ErrorCode = ErrorCode.persistence_failed) -> Err:
+    return Err(error=Diagnostic(
+        code=code, message="Recovery state could not be verified.",
+        recovery=(RecoveryAction.keep_blocked,),
+    ))
+
+
+def _recovery_path(target: str) -> str:
+    return f"{CREDENTIAL_RECOVERY_DIRECTORY}/{sha256(target.encode('utf-8')).hexdigest()}.json"
+
+
+def _marker_identity(marker: CredentialRecoveryMarker) -> tuple:
+    return (marker.target, marker.receiver_id, marker.start_operation_id, marker.original_daemon)
+
+
+class JsonCredentialRecoveryMarkerStore:
+    """Serialize marker transitions and require confirmed atomic publication."""
+
+    def __init__(self, files: AtomicFiles) -> None:
+        self._files = files
+        self._lock = asyncio.Lock()
+        self._reservations: dict[str, CredentialRecoveryMarker] = {}
+        self._inflight: set[str] = set()
+        self._pending: dict[str, tuple[CredentialRecoveryMarker | None, CredentialRecoveryMarker, bytes]] = {}
+
+    def _read_all(self) -> tuple[tuple[CredentialRecoveryMarker, bytes], ...]:
+        entries = []
+        targets: set[str] = set()
+        for name in self._files.names(CREDENTIAL_RECOVERY_DIRECTORY, include_hidden=True):
+            if len(name) != 69 or not name.endswith(".json") or any(
+                character not in "0123456789abcdef" for character in name[:64]
+            ):
+                raise RecordError("invalid_value")
+            payload = self._files.read(f"{CREDENTIAL_RECOVERY_DIRECTORY}/{name}")
+            if payload is None:
+                raise RecordError("invalid_value")
+            marker = decode_credential_recovery_marker(payload)
+            if _recovery_path(marker.target) != f"{CREDENTIAL_RECOVERY_DIRECTORY}/{name}" or marker.target in targets:
+                raise RecordError("invalid_value")
+            targets.add(marker.target)
+            entries.append((marker, payload))
+        return tuple(entries)
+
+    async def read_all(self) -> Result[tuple[CredentialRecoveryMarker, ...]]:
+        async with self._lock:
+            try:
+                return Ok(value=tuple(marker for marker, _ in self._read_all()))
+            except (RecordError, StorageError, UnicodeError):
+                return _recovery_error()
+
+    async def for_target(self, target: str) -> Result[CredentialRecoveryMarker | None]:
+        async with self._lock:
+            try:
+                records = self._read_all()
+                if (type(target) is not str or not target or len(target) > MAX_TEXT
+                        or "\x00" in target):
+                    raise RecordError("invalid_value")
+                target.encode("utf-8")
+                return Ok(value=next((marker for marker, _ in records if marker.target == target), None))
+            except (RecordError, StorageError, UnicodeError):
+                return _recovery_error()
+
+    async def confirm_all_durable(self) -> Result[None]:
+        async with self._lock:
+            try:
+                records = self._read_all()
+                for marker, payload in records:
+                    pending = self._pending.get(marker.target)
+                    if pending is not None and pending[2] != payload:
+                        raise RecordError("invalid_value")
+                if set(self._pending) - {marker.target for marker, _ in records}:
+                    raise RecordError("invalid_value")
+                for marker, payload in records:
+                    self._files.write(_recovery_path(marker.target), payload)
+            except (RecordError, StorageError, UnicodeError):
+                return _recovery_error()
+            for target in self._pending:
+                if target not in self._inflight:
+                    self._reservations.pop(target, None)
+            self._pending.clear()
+            return Ok(value=None)
+
+    def _publish(
+        self, previous: CredentialRecoveryMarker | None, marker: CredentialRecoveryMarker,
+        payload: bytes,
+    ) -> Result[CredentialRecoveryMarker]:
+        target = marker.target
+        self._pending[target] = (previous, marker, payload)
+        path = _recovery_path(target)
+        try:
+            self._files.write(path, payload)
+        except StorageError:
+            try:
+                visible = self._files.read(path)
+                if visible != payload:
+                    old = None if previous is None else encode_credential_recovery_marker(previous)
+                    if visible == old:
+                        self._pending.pop(target, None)
+                    return _recovery_error()
+                self._files.write(path, payload)
+            except (RecordError, StorageError, UnicodeError):
+                return _recovery_error()
+        self._pending.pop(target, None)
+        if self._reservations.get(target) == marker:
+            self._reservations.pop(target, None)
+        return Ok(value=marker)
+
+    async def create(self, marker: CredentialRecoveryMarker) -> Result[CredentialRecoveryMarker]:
+        try:
+            payload = encode_credential_recovery_marker(marker)
+            if marker.state != "watching" or not marker.automatic_status_checks:
+                return _recovery_error(ErrorCode.ownership_mismatch)
+            target = marker.target
+        except (RecordError, UnicodeError):
+            return _recovery_error()
+        owner = self._reservations.get(target)
+        if target in self._inflight or (owner is not None and owner != marker):
+            return _recovery_error(ErrorCode.ownership_mismatch)
+        self._reservations[target] = marker
+        self._inflight.add(target)
+        try:
+            async with self._lock:
+                try:
+                    records = self._read_all()
+                    pending = self._pending.get(target)
+                    if pending is not None:
+                        if pending[1] != marker or pending[2] != payload:
+                            return _recovery_error(ErrorCode.ownership_mismatch)
+                        visible = next((raw for item, raw in records if item.target == target), None)
+                        if visible != payload:
+                            return _recovery_error()
+                        return self._publish(*pending)
+                    if self._pending:
+                        return _recovery_error()
+                    previous = next((item for item, _ in records if item.target == target), None)
+                    if previous is not None and (
+                        previous.state != "retired" or marker.marker_generation <= previous.marker_generation
+                    ):
+                        return _recovery_error(ErrorCode.ownership_mismatch)
+                    return self._publish(previous, marker, payload)
+                except (RecordError, StorageError, UnicodeError):
+                    return _recovery_error()
+        finally:
+            self._inflight.discard(target)
+            if target not in self._pending and self._reservations.get(target) == marker:
+                self._reservations.pop(target, None)
+
+    async def _transition(
+        self, identity: CredentialRecoveryMarker, expected_generation: int,
+        update: Callable[[CredentialRecoveryMarker], CredentialRecoveryMarker | None],
+    ) -> Result[CredentialRecoveryMarker]:
+        if type(identity) is not CredentialRecoveryMarker or type(expected_generation) is not int:
+            return _recovery_error(ErrorCode.ownership_mismatch)
+        try:
+            encode_credential_recovery_marker(identity)
+        except (RecordError, UnicodeError):
+            return _recovery_error(ErrorCode.ownership_mismatch)
+        async with self._lock:
+            try:
+                records = self._read_all()
+                pending = self._pending.get(identity.target)
+                if pending is not None:
+                    old, intended, payload = pending
+                    if (old is None or _marker_identity(old) != _marker_identity(identity)
+                            or old.marker_generation != expected_generation
+                            or update(old) != intended):
+                        return _recovery_error(ErrorCode.ownership_mismatch)
+                    visible = next((raw for item, raw in records if item.target == identity.target), None)
+                    if visible != payload:
+                        return _recovery_error()
+                    return self._publish(old, intended, payload)
+                if self._pending:
+                    return _recovery_error()
+                current = next((item for item, _ in records if item.target == identity.target), None)
+                if (current is None or _marker_identity(current) != _marker_identity(identity)
+                        or current.marker_generation != expected_generation):
+                    return _recovery_error(ErrorCode.ownership_mismatch)
+                next_marker = update(current)
+                if next_marker is None:
+                    return _recovery_error(ErrorCode.ownership_mismatch)
+                try:
+                    payload = encode_credential_recovery_marker(next_marker)
+                except RecordError:
+                    return _recovery_error(ErrorCode.ownership_mismatch)
+                return self._publish(current, next_marker, payload)
+            except (RecordError, StorageError, UnicodeError):
+                return _recovery_error()
+
+    async def mark_release_pending(self, identity, expected_generation):
+        def update(marker):
+            if marker.state == "retired":
+                return None
+            return replace(marker, state="release_pending", marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def dismiss(self, identity, expected_generation):
+        def update(marker):
+            if marker.state == "retired":
+                return None
+            return replace(marker, state="release_pending", automatic_status_checks=False,
+                           marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def record_release_attempt(self, identity, expected_generation, attempt):
+        def update(marker):
+            if marker.state != "release_pending" or type(attempt) is not ReleaseAttempt:
+                return None
+            previous = marker.release_attempt
+            if previous is None or previous.status == "terminal":
+                if attempt.status != "intended":
+                    return None
+                if previous is not None and (attempt.attempt_id == previous.attempt_id
+                        or attempt.replacement_runtime_directory == previous.replacement_runtime_directory
+                        or attempt.replacement_socket_path == previous.replacement_socket_path):
+                    return None
+            elif (previous.status != "intended" or attempt.status != "terminal"
+                  or (attempt.attempt_id, attempt.replacement_runtime_directory, attempt.replacement_socket_path)
+                  != (previous.attempt_id, previous.replacement_runtime_directory, previous.replacement_socket_path)):
+                return None
+            return replace(marker, release_attempt=attempt, marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def record_replacement_ready(self, identity, expected_generation, readiness):
+        def update(marker):
+            attempt = marker.release_attempt
+            if (marker.state != "release_pending" or attempt is None or attempt.status != "intended"
+                    or type(readiness) is not OwnedDaemonReadinessEvidence):
+                return None
+            ready = replace(attempt, status="ready", replacement_instance_uuid=readiness.instance_uuid,
+                            replacement_endpoint_generation=readiness.endpoint_generation, readiness=readiness)
+            return replace(marker, release_attempt=ready, marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def retire_no_spawn(self, identity, expected_generation, evidence):
+        def update(marker):
+            if marker.state != "watching" or type(evidence) is not NoSpawnRetirement:
+                return None
+            retirement = MarkerRetirement(kind="no_spawn", no_spawn=evidence, reply=None, release=None)
+            return replace(marker, state="retired", automatic_status_checks=False, retirement=retirement,
+                           marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def retire_after_reply(self, identity, expected_generation, evidence):
+        def update(marker):
+            if (marker.state != "watching" or type(evidence) is not TerminalReplyRetirement
+                    or evidence.stop_cleanup_settled is not True):
+                return None
+            retirement = MarkerRetirement(kind="terminal_reply", no_spawn=None, reply=evidence, release=None)
+            return replace(marker, state="retired", automatic_status_checks=False, retirement=retirement,
+                           marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+    async def retire_after_replacement(self, identity, expected_generation, evidence):
+        def update(marker):
+            if (marker.state != "release_pending" or marker.release_attempt is None
+                    or marker.release_attempt.status != "ready" or type(evidence) is not ReleaseEvidence):
+                return None
+            retirement = MarkerRetirement(kind="daemon_replaced", no_spawn=None, reply=None, release=evidence)
+            return replace(marker, state="retired", automatic_status_checks=False, retirement=retirement,
+                           marker_generation=marker.marker_generation + 1)
+        return await self._transition(identity, expected_generation, update)
+
+
 # --------------------------------------------------------------------------- preferences
 
 
@@ -687,6 +966,7 @@ class PreferenceAccess:
 
 
 __all__ = [
+    "JsonCredentialRecoveryMarkerStore", "CREDENTIAL_RECOVERY_DIRECTORY",
     "LAUNCH_RECEIPT_DIRECTORY", "DAEMON_CLEANUP_INTENT_DIRECTORY", "SUPERVISOR_RELEASE_INTENT_NAME",
     "JsonLaunchReceiptStore", "JsonDaemonCleanupIntentStore", "JsonSupervisorReleaseIntentStore",
     "DAEMON_DIRECTORY",

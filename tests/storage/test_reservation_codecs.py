@@ -235,7 +235,10 @@ def test_new_record_constructors_are_required_frozen_keyword_only_and_redacted()
     for item in (reservation(), *receipt_states().values(), *cleanup_documents(),
                  supervisor_document(), owner_document(), verdict_document()):
         for member in fields(item):
-            assert member.default is MISSING and member.default_factory is MISSING
+            if type(item).__name__ == "LaunchReceipt" and member.name == "recovery_attempt_id":
+                assert member.default is None and member.default_factory is MISSING
+            else:
+                assert member.default is MISSING and member.default_factory is MISSING
             assert member.kw_only
             if member.name in {
                 "launch_uuid", "instance_uuid", "daemon_instance_uuid", "app", "supervisor", "daemon",

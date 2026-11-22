@@ -22,7 +22,7 @@ def _safe_snapshot(state: SessionSnapshot) -> SessionSnapshot:
     # old stream authority, even when an injected store has no JSON codec. A
     # pending challenge becomes the durable receiver-scoped revocation barrier.
     clean = replace(
-        state, challenge=None, stream=None, transport_lease_id=None,
+        state, challenge=None, credential_prompt=None, stream=None, transport_lease_id=None,
         audio_operation_id=None, audio=AudioState.Disabled, muted=False, next_retry_at=None,
         remembered_volume=None, effective_volume=None, last_audible_volume=None,
         volume_state=None, audio_close_pending=False, volume_save_failed=False,
