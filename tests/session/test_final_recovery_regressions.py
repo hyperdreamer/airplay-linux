@@ -114,6 +114,136 @@ async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path, ma
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('dismiss_before_completion', [False, True], ids=['enabled', 'dismissed'])
+async def test_restored_checks_resume_after_release_advances_inflight_generation(
+    tmp_path, dismiss_before_completion,
+):
+    import asyncio
+    from dataclasses import replace
+    from pathlib import Path
+
+    from airplay_linux.diagnostics import diagnostic
+    from airplay_linux.domain.messages import RestartReceiverToRelease
+    from airplay_linux.domain.resources import Err, ErrorCode
+    from airplay_linux.process.ownership import DaemonRecoveryExemption
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+
+    h = await credential_rig(tmp_path, installed=True)
+    created = await h.coordinator.begin_submission_for(
+        h.destination.receiver_id, h.destination, h.event.context.operation_id,
+    )
+    assert isinstance(created, Ok)
+    pending = await h.coordinator.mark_release_pending_for(created.value[0], 1)
+    assert isinstance(pending, Ok)
+    marker = pending.value
+    h.coordinator.stop_automatic_checks()
+
+    async def authenticate(restored_marker):
+        assert restored_marker == marker
+        return Ok(value=DaemonRecoveryExemption(
+            marker_identity=restored_marker,
+            marker_generation=restored_marker.marker_generation,
+            kind='watching_original',
+            daemon_identity=restored_marker.original_daemon,
+        ))
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls, authorized, stale_fences, restart_attempts = [], [], [], []
+
+    async def stop_recovery_target(checked, target, context, fence):
+        assert target.canonical_host == marker.target
+        assert context.owner_daemon == marker.original_daemon
+        assert context.marker_generation == checked.marker_generation
+        assert fence() == Ok(value=None)
+        calls.append(checked.marker_generation)
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+            stale_fences.append(fence())
+        else:
+            assert fence() == Ok(value=None)
+            authorized.append((target.canonical_host, checked.marker_generation))
+        return Ok(value=None)
+
+    async def restart_with_new_endpoint(*args):
+        restart_attempts.append(args)
+        return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+
+    async def reconcile_previous(*, recovery_exemptions):
+        assert len(recovery_exemptions) == 1
+        assert recovery_exemptions[0].marker_identity == marker
+        return Ok(value=None)
+
+    h.registry.authenticate_recovery = authenticate
+    h.registry.stop_recovery_target = stop_recovery_target
+    h.registry._configured_runtime = Path(tmp_path) / 'replacement'
+    h.registry.authorize_recovery_attempt = lambda current, fence: fence()
+    h.registry.restart_with_new_endpoint = restart_with_new_endpoint
+    h.registry.reconcile_previous = reconcile_previous
+    rig = SessionRig()
+    restored = CredentialRecoveryCoordinator(h.store, h.registry, fences=rig.fences)
+    deps = replace(rig.deps, credential_recovery=restored)
+    manager = SessionManager(deps, build_recovery_handlers(deps))
+    assert await StartupRecovery(manager, deps, h.registry).run() == Ok(value=())
+    assert marker.receiver_id not in restored._automatic_dispatches
+
+    try:
+        rig.scheduler.advance(4.0)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        receipt = await manager.dispatch(RestartReceiverToRelease(
+            receiver_id=marker.receiver_id,
+            marker_generation=marker.marker_generation,
+            target=marker.target,
+        ))
+        assert receipt.accepted
+        for _ in range(30):
+            await asyncio.sleep(0)
+            await manager.drain()
+        assert len(restart_attempts) == 1
+        assert marker.receiver_id in restored._automatic_dispatches
+        newer = restored.markers[0]
+        assert newer.marker_generation == marker.marker_generation + 1
+        assert newer.state == 'release_pending' and newer.automatic_status_checks
+        assert newer.original_daemon == marker.original_daemon
+        assert newer.release_attempt is not None
+        assert await h.store.for_target(marker.target) == Ok(value=newer)
+        assert isinstance(restored.require_start_allowed(h.destination, marker.start_operation_id), Err)
+
+        rig.scheduler.advance(4.0)
+        for _ in range(10):
+            await asyncio.sleep(0)
+            await manager.drain()
+        assert calls == [marker.marker_generation]
+
+        if dismiss_before_completion:
+            dismissed = await restored.dismiss_for(newer, newer.marker_generation)
+            assert isinstance(dismissed, Ok)
+            newer = dismissed.value
+            assert not newer.automatic_status_checks
+            assert await h.store.for_target(marker.target) == Ok(value=newer)
+
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(stale_fences) == 1 and isinstance(stale_fences[0], Err)
+        for _ in range(3):
+            rig.scheduler.advance(4.0)
+            for _ in range(20):
+                await asyncio.sleep(0)
+                await manager.drain()
+        expected_generations = [] if dismiss_before_completion else [newer.marker_generation] * 3
+        assert calls == [marker.marker_generation, *expected_generations]
+        assert authorized == [(marker.target, generation) for generation in expected_generations]
+        assert restored.markers == (newer,)
+        assert await h.store.for_target(marker.target) == Ok(value=newer)
+    finally:
+        release.set()
+        restored.stop_automatic_checks()
+
+
+@pytest.mark.asyncio
 async def test_automatic_recovery_shutdown_fences_inflight_disconnect(tmp_path):
     import asyncio
 

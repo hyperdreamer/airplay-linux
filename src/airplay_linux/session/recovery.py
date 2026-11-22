@@ -187,9 +187,7 @@ class CredentialRecoveryCoordinator:
         task = asyncio.create_task(self._run_automatic_check(target, generation))
         self._automatic_tasks[target] = task
         task.add_done_callback(
-            lambda done, target=target, generation=generation: self._automatic_finished(
-                target, generation, done,
-            )
+            lambda done, target=target: self._automatic_finished(target, done)
         )
 
     async def _run_automatic_check(self, target: str, generation: int) -> None:
@@ -233,15 +231,14 @@ class CredentialRecoveryCoordinator:
         except Exception:
             return
 
-    def _automatic_finished(
-        self, target: str, generation: int, task: asyncio.Task[object],
-    ) -> None:
-        if self._automatic_tasks.get(target) is task:
-            self._automatic_tasks.pop(target, None)
+    def _automatic_finished(self, target: str, task: asyncio.Task[object]) -> None:
+        if self._automatic_tasks.get(target) is not task:
+            return
+        self._automatic_tasks.pop(target, None)
         if task.cancelled() or self._automatic_shutdown:
             return
         marker = self._markers.get(target)
-        if marker is not None and marker.marker_generation == generation:
+        if marker is not None:
             self._schedule_automatic_check(marker)
 
     @property
