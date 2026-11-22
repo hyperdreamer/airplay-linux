@@ -114,22 +114,26 @@ async def test_restart_restores_periodic_checks_for_retained_marker(tmp_path, ma
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize('dismiss_before_completion', [False, True], ids=['enabled', 'dismissed'])
+@pytest.mark.parametrize('completion_control', ['enabled', 'dismissed', 'shutdown'])
 async def test_restored_checks_resume_after_release_advances_inflight_generation(
-    tmp_path, dismiss_before_completion,
+    tmp_path, completion_control,
 ):
     import asyncio
     from dataclasses import replace
     from pathlib import Path
+    from uuid import uuid4
 
     from airplay_linux.diagnostics import diagnostic
     from airplay_linux.domain.messages import RestartReceiverToRelease
+    from airplay_linux.domain.operations import SensitiveText
     from airplay_linux.domain.resources import Err, ErrorCode
     from airplay_linux.process.ownership import DaemonRecoveryExemption
     from airplay_linux.session.engine import SessionManager
     from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
     from airplay_linux.session.testing import SessionRig
 
+    canary = 'recovery-generation-canary-' + uuid4().hex
+    transient = SensitiveText(canary)
     h = await credential_rig(tmp_path, installed=True)
     created = await h.coordinator.begin_submission_for(
         h.destination.receiver_id, h.destination, h.event.context.operation_id,
@@ -151,6 +155,7 @@ async def test_restored_checks_resume_after_release_advances_inflight_generation
 
     entered, release = asyncio.Event(), asyncio.Event()
     calls, authorized, stale_fences, restart_attempts = [], [], [], []
+    shutdown_reschedules = []
 
     async def stop_recovery_target(checked, target, context, fence):
         assert target.canonical_host == marker.target
@@ -160,7 +165,11 @@ async def test_restored_checks_resume_after_release_advances_inflight_generation
         calls.append(checked.marker_generation)
         if len(calls) == 1:
             entered.set()
-            await release.wait()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                stale_fences.append(fence())
+                raise
             stale_fences.append(fence())
         else:
             assert fence() == Ok(value=None)
@@ -217,12 +226,15 @@ async def test_restored_checks_resume_after_release_advances_inflight_generation
             await manager.drain()
         assert calls == [marker.marker_generation]
 
-        if dismiss_before_completion:
+        if completion_control == 'dismissed':
             dismissed = await restored.dismiss_for(newer, newer.marker_generation)
             assert isinstance(dismissed, Ok)
             newer = dismissed.value
             assert not newer.automatic_status_checks
             assert await h.store.for_target(marker.target) == Ok(value=newer)
+        elif completion_control == 'shutdown':
+            restored._automatic_shutdown = True
+            restored._schedule_automatic_check = shutdown_reschedules.append
 
         release.set()
         for _ in range(20):
@@ -233,11 +245,135 @@ async def test_restored_checks_resume_after_release_advances_inflight_generation
             for _ in range(20):
                 await asyncio.sleep(0)
                 await manager.drain()
-        expected_generations = [] if dismiss_before_completion else [newer.marker_generation] * 3
+        expected_generations = (
+            [newer.marker_generation] * 3 if completion_control == 'enabled' else []
+        )
         assert calls == [marker.marker_generation, *expected_generations]
         assert authorized == [(marker.target, generation) for generation in expected_generations]
+        if completion_control != 'enabled':
+            assert not restored._automatic_handles
+        if completion_control == 'shutdown':
+            assert shutdown_reschedules == []
         assert restored.markers == (newer,)
         assert await h.store.for_target(marker.target) == Ok(value=newer)
+        assert canary not in repr((transient, restored.markers, calls, authorized, restart_attempts))
+        assert all(
+            canary.encode() not in path.read_bytes()
+            for path in h.store._files.root.rglob('*.json')
+        )
+    finally:
+        release.set()
+        restored.stop_automatic_checks()
+
+
+@pytest.mark.asyncio
+async def test_stale_direct_recovery_completion_does_not_schedule_replacement_marker(tmp_path):
+    import asyncio
+    from dataclasses import replace
+    from pathlib import Path
+    from uuid import UUID, uuid4
+
+    from airplay_linux.diagnostics import diagnostic
+    from airplay_linux.domain.operations import InstanceId, OperationId, SensitiveText
+    from airplay_linux.domain.records import NoSpawnRetirement
+    from airplay_linux.domain.resources import Err, ErrorCode
+    from airplay_linux.process.ownership import DaemonRecoveryExemption
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+
+    canary = 'recovery-replacement-canary-' + uuid4().hex
+    transient = SensitiveText(canary)
+    h = await credential_rig(tmp_path, installed=True)
+    created = await h.coordinator.begin_submission_for(
+        h.destination.receiver_id, h.destination, h.event.context.operation_id,
+    )
+    assert isinstance(created, Ok)
+    marker = created.value[0]
+    h.coordinator.stop_automatic_checks()
+
+    async def authenticate(restored_marker):
+        assert restored_marker == marker
+        return Ok(value=DaemonRecoveryExemption(
+            marker_identity=restored_marker,
+            marker_generation=restored_marker.marker_generation,
+            kind='watching_original',
+            daemon_identity=restored_marker.original_daemon,
+        ))
+
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls, stale_fences = [], []
+
+    async def stop_recovery_target(checked, target, context, fence):
+        assert fence() == Ok(value=None)
+        calls.append(checked)
+        if len(calls) == 1:
+            entered.set()
+            await release.wait()
+            stale_fences.append(fence())
+        return Ok(value=None)
+
+    async def reconcile_previous(*, recovery_exemptions):
+        assert len(recovery_exemptions) == 1
+        return Ok(value=None)
+
+    h.registry.authenticate_recovery = authenticate
+    h.registry.stop_recovery_target = stop_recovery_target
+    h.registry.reconcile_previous = reconcile_previous
+    rig = SessionRig()
+    restored = CredentialRecoveryCoordinator(h.store, h.registry, fences=rig.fences)
+    deps = replace(rig.deps, credential_recovery=restored)
+    manager = SessionManager(deps, build_recovery_handlers(deps))
+    assert await StartupRecovery(manager, deps, h.registry).run() == Ok(value=())
+
+    try:
+        rig.scheduler.advance(4.0)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        retired = await restored.retire_no_spawn_for(
+            marker,
+            marker.marker_generation,
+            NoSpawnRetirement(
+                failure=ErrorCode.daemon_failed,
+                stop_cleanup_settled=True,
+                observed_at=1.0,
+            ),
+        )
+        assert isinstance(retired, Ok)
+        replacement_daemon = replace(
+            marker.original_daemon,
+            launch_uuid=UUID(int=9001),
+            instance_uuid=InstanceId(UUID(int=9002)),
+            endpoint_generation=marker.original_daemon.endpoint_generation + 1,
+            runtime_directory='/run/user/1000/replacement',
+            socket_path='/run/user/1000/replacement/control.sock',
+        )
+        replacement = replace(
+            marker,
+            start_operation_id=OperationId(UUID(int=9003)),
+            original_daemon=replacement_daemon,
+            marker_generation=retired.value.marker_generation + 1,
+            state='watching',
+            release_attempt=None,
+            retirement=None,
+        )
+        created = await restored.begin_submission(replacement)
+        assert created == Ok(value=replacement)
+
+        release.set()
+        for _ in range(30):
+            await asyncio.sleep(0)
+        assert len(stale_fences) == 1 and isinstance(stale_fences[0], Err)
+        rig.scheduler.advance(4.0)
+        for _ in range(20):
+            await asyncio.sleep(0)
+            await manager.drain()
+        assert calls == [marker]
+        assert not restored._automatic_handles
+        assert canary not in repr((transient, restored.markers, calls, stale_fences))
+        assert all(
+            canary.encode() not in path.read_bytes()
+            for path in h.store._files.root.rglob('*.json')
+        )
     finally:
         release.set()
         restored.stop_automatic_checks()

@@ -81,6 +81,7 @@ class CredentialRecoveryCoordinator:
         self._automatic_scheduler = None
         self._automatic_handles: dict[str, object] = {}
         self._automatic_tasks: dict[str, asyncio.Task[object]] = {}
+        self._automatic_task_markers: dict[str, CredentialRecoveryMarker | None] = {}
         self._automatic_generations: dict[str, int] = {}
         self._automatic_shutdown = False
         self._automatic_dispatches: dict[ReceiverId, Callable[[str, int], None]] = {}
@@ -121,6 +122,7 @@ class CredentialRecoveryCoordinator:
         for task in tuple(self._automatic_tasks.values()):
             task.cancel()
         self._automatic_tasks.clear()
+        self._automatic_task_markers.clear()
         self._automatic_generations.clear()
         self._automatic_dispatches.clear()
         self._automatic_requests.clear()
@@ -186,6 +188,7 @@ class CredentialRecoveryCoordinator:
             return
         task = asyncio.create_task(self._run_automatic_check(target, generation))
         self._automatic_tasks[target] = task
+        self._automatic_task_markers[target] = marker
         task.add_done_callback(
             lambda done, target=target: self._automatic_finished(target, done)
         )
@@ -235,10 +238,16 @@ class CredentialRecoveryCoordinator:
         if self._automatic_tasks.get(target) is not task:
             return
         self._automatic_tasks.pop(target, None)
+        scheduled_marker = self._automatic_task_markers.pop(target, None)
         if task.cancelled() or self._automatic_shutdown:
             return
         marker = self._markers.get(target)
-        if marker is not None:
+        if (
+            marker is not None
+            and scheduled_marker is not None
+            and marker.target == target
+            and _marker_identity(marker) == _marker_identity(scheduled_marker)
+        ):
             self._schedule_automatic_check(marker)
 
     @property
