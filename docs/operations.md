@@ -72,8 +72,15 @@ termination and replacement readiness are durably proven.
 
 On application restart, the recovery marker is confirmed before any Start or ordinary daemon
 reconciliation. The application resumes checks only after authenticating the recorded daemon
-identity and socket. If the application is stopped, no monitoring promise applies. A dismissed
-marker remains blocked until the recovery-specific restart completes.
+identity and socket. If a marker-owned check is already running, another check waits for that task
+to finish. Every status read and disconnect re-resolves the marker's canonical target, generation
+and original daemon. If an endpoint-changing `Restart receiver to release` advances the generation
+while a check is in flight, completion re-evaluates the current durable marker after the owned task
+exits and schedules its current generation when the existing eligibility checks pass. Dismissal,
+retirement, replacement and application shutdown stop future scheduling. The checks report only the
+exact target's observed status and never store or remember the credential. If the application is
+stopped, no monitoring promise applies. A dismissed marker remains blocked until the
+recovery-specific restart completes.
 
 
 ## Receiver volume and session mute
