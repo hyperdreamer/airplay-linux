@@ -85,13 +85,16 @@ def _plasma_wayland(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KDE_SESSION_VERSION", "6")
 
 
-def _proven_installation(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Install the real epoch with a proven credential service and no spawn."""
+def _proven_installation(
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: CredentialProofVerdict | None = None,
+) -> None:
+    """Install the real epoch with an injectable credential-service result."""
 
     install = composition._install_owned_daemon_epoch
 
     async def proven():
-        return Ok(value=CredentialProofVerdict(
+        return Ok(value=verdict or CredentialProofVerdict(
             service_leg="passed",
             backend_positive_leg="passed",
             backend_negative_leg="passed",
@@ -116,9 +119,12 @@ def _proven_installation(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(composition, "AzcMdnsClient", lambda clock: SimpleNamespace())
 
 
-async def _report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capabilities: str):
+async def _report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capabilities: str,
+    proof: CredentialProofVerdict | None = None,
+):
     _plasma_wayland(monkeypatch)
-    _proven_installation(monkeypatch)
+    _proven_installation(monkeypatch, proof)
     process = BackendProcess(capabilities)
     runtime_root = tmp_path / "runtime"
     runtime_root.mkdir(mode=0o700)
@@ -152,6 +158,13 @@ async def test_complete_source_and_proven_keyring_make_mirror_startable(
     assert features.physical_source is True
     assert features.source_reporting_complete is True
     assert features.keyring is True
+    assert features.credential_relay is True
+    assert (
+        features.target_bound_pairing,
+        features.provisional_commit,
+        features.cancel_pairing,
+        features.revoke_pairing,
+    ) == (False, False, False, False)
 
     assert report.environment == "kde-plasma-6-wayland"
     assert report.mirror is True
@@ -164,6 +177,25 @@ async def test_complete_source_and_proven_keyring_make_mirror_startable(
     assert report.remembered_pairing is False
     assert report.virtual_display is False
     assert not any("-daemonize" in argv for argv in process.argvs)
+
+
+@pytest.mark.asyncio
+async def test_credential_relay_does_not_replace_the_composed_keyring_start_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    proof = CredentialProofVerdict(
+        service_leg="failed",
+        backend_positive_leg="passed",
+        backend_negative_leg="passed",
+        failure=ErrorCode.keyring_unavailable,
+    )
+    report, features, _process = await _report(tmp_path, monkeypatch, COMPLETE, proof)
+
+    assert features.credential_relay is True
+    assert features.owned_daemon_control is True
+    assert features.keyring is False
+    assert report.mirror is False
+    assert report.remembered_pairing is False
 
 
 @pytest.mark.asyncio

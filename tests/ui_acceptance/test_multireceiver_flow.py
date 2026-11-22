@@ -15,20 +15,38 @@ never satisfy them.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Callable
+from uuid import UUID
 
 import pytest
 from PySide6.QtWidgets import QApplication, QLineEdit
 
 from airplay_linux import app as app_module
+from airplay_linux.backend.contract import BackendStream, StatusReply
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.identity import ReceiverId
+from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.messages import (
     ConfirmSwitch,
+    CredentialRequestPayload,
     SubmitPairing,
+    Stop,
+    TransportEvent,
     TransportEventKind,
 )
-from airplay_linux.domain.operations import SensitiveText
+from airplay_linux.domain.operations import (
+    InstanceId,
+    ProcessIdentity,
+    SensitiveText,
+    StreamHandle,
+)
+from airplay_linux.domain.records import (
+    DaemonRecord,
+    LaunchReceipt,
+    OriginalDaemonIdentity,
+)
+from airplay_linux.domain.relay import CredentialRequest, NoReply, RelayStartOptions, Submitted
 from airplay_linux.domain.resources import (
     Err,
     ErrorCode,
@@ -39,7 +57,10 @@ from airplay_linux.domain.resources import (
 )
 from airplay_linux.runtime import RuntimeConfig
 from airplay_linux.session import Route
+from airplay_linux.session.recovery import CredentialRecoveryCoordinator
 from airplay_linux.session.testing import SessionRig
+from airplay_linux.storage import AtomicFiles
+from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
 from airplay_linux.testing.adapters import Deferred
 from airplay_linux.testing.builders import target
 from airplay_linux.ui.state import Action
@@ -69,7 +90,542 @@ def shiboken_alive(widget: Any) -> bool:
     return shiboken6.isValid(widget)
 
 
-# ------------------------------------------------------------------ two sessions
+# ---------------------------------------------------------------- assembled credential relay
+
+
+class _AssemblyRegistry:
+    """Durable daemon identity seam for the real recovery coordinator."""
+
+    def __init__(self, runtime_directory: Path, instance_uuid: InstanceId) -> None:
+        runtime_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        app = ProcessIdentity(pid=100, start_ticks=1000)
+        supervisor = ProcessIdentity(pid=200, start_ticks=2000)
+        daemon = ProcessIdentity(pid=300, start_ticks=3000)
+        socket_path = str(runtime_directory / "daemon.sock")
+        self._record = DaemonRecord(
+            schema_version=1,
+            instance_uuid=instance_uuid,
+            owner_token="fake-owner-token",
+            app=app,
+            supervisor=supervisor,
+            daemon=daemon,
+            protocol_version="1",
+            socket_path=socket_path,
+            lifecycle="running",
+            runtime_directory=str(runtime_directory),
+        )
+        self._ready = True
+        self._receipt = LaunchReceipt(
+            schema_version=1,
+            launch_uuid=UUID(int=77),
+            instance_uuid=instance_uuid,
+            app=app,
+            owner_uid=1000,
+            boot_id="fake-boot-id",
+            runtime_directory=str(runtime_directory),
+            runtime_device=1,
+            runtime_inode=2,
+            endpoint_generation=1,
+            socket_name="daemon.sock",
+            protocol_version="1",
+            state="ready",
+            daemon_instance_uuid=instance_uuid,
+            supervisor=supervisor,
+            daemon=daemon,
+            entry_device=1,
+            entry_inode=3,
+            socket_inode=3,
+            peer_pid=daemon.pid,
+            peer_start_ticks=daemon.start_ticks,
+            peer_uid=1000,
+            status_state="idle",
+            credential_service="keyring_proven",
+            failure=None,
+            updated_at=0.0,
+            recovery_attempt_id=None,
+        )
+
+    async def _receipt_for(self, record):
+        if record != self._record:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        return Ok(value=self._receipt)
+
+    async def authenticate_exact_identity(self, identity):
+        expected = OriginalDaemonIdentity(
+            launch_uuid=self._receipt.launch_uuid,
+            instance_uuid=self._record.instance_uuid,
+            endpoint_generation=self._receipt.endpoint_generation,
+            daemon_process=self._record.daemon,
+            runtime_directory=self._record.runtime_directory,
+            socket_path=self._record.socket_path,
+        )
+        if identity != expected:
+            return Err(error=diagnostic(ErrorCode.ownership_mismatch))
+        return Ok(value=self._record)
+
+
+class _AssemblyCredentialTransport(AcceptanceTransport):
+    """Target-row fake which publishes a pending request before returning its handle."""
+
+    CANARY = "route-b-assembled-canary-7391"
+
+    def __init__(self, *, outcome=None, observed_state="streaming") -> None:
+        super().__init__(ready=False)
+        self.coordinator = None
+        self.events: list[str] = []
+        self.outcome = outcome or Ok(value=Submitted(reply_at=0.0, accepted=True, post_dispatch_error=None))
+        self.observed_state = observed_state
+        self.request_emitted_before_return = False
+        self.request_status: StatusReply | None = None
+        self.submission_target: ReceiverTarget | None = None
+        self.status_targets: list[ReceiverTarget] = []
+        self.canary_matched = False
+        self.hold_status = False
+        self.status_entered = asyncio.Event()
+        self.release_status = asyncio.Event()
+        self.submit_entered = asyncio.Event()
+        self.request_event: TransportEvent | None = None
+        self.hold_start = False
+        self.start_waiting = asyncio.Event()
+        self.release_start = asyncio.Event()
+        self.start_finished = asyncio.Event()
+        self.pending_handle: StreamHandle | None = None
+        self.pending_owner = None
+
+    async def start_stream(self, destination, source, audio, operation, *, initial_volume=None):
+        result = await super().start_stream(
+            destination, source, audio, operation, initial_volume=initial_volume,
+        )
+        if not isinstance(result, Ok):
+            return result
+        handle = result.value
+        self.pending_handle = handle
+        decoy = BackendStream(
+            device="TV B", target="192.0.2.20", state="pin_required",
+            has_audio=False, audio_muted=False, credential_kind="pin",
+        )
+        matching = BackendStream(
+            device="TV A", target=destination.canonical_host, state="pin_required",
+            has_audio=False, audio_muted=False, credential_kind="pin",
+        )
+        self.request_status = StatusReply(
+            state="pin_required", device="TV B", target="192.0.2.20",
+            has_audio=False, audio_muted=False, needs_credential=True,
+            credential_kind="pin", streams=(decoy, matching),
+        )
+        rows = tuple(
+            row for row in self.request_status.streams
+            if row.target == destination.canonical_host and row.state == "pin_required"
+            and row.credential_kind in {"pin", "password"}
+        )
+        if len(rows) == 1:
+            request = CredentialRequest(
+                receiver_id=destination.receiver_id,
+                target=destination,
+                credential_kind=rows[0].credential_kind,
+                start_operation_id=operation.operation_id,
+                endpoint_generation=destination.endpoint_generation,
+                session_generation=operation.session_generation,
+                owner_lease=handle.lease_id,
+                daemon_instance_uuid=handle.daemon_instance_uuid,
+                generation=1,
+                observed_at=0.0,
+                start_options=RelayStartOptions(
+                    target_volume_proven=False, audio=audio, initial_volume=initial_volume,
+                ),
+            )
+            event = TransportEvent(
+                kind=TransportEventKind.credential_request,
+                receiver_id=destination.receiver_id,
+                stream=handle,
+                endpoint_fingerprint=destination.endpoint_fingerprint,
+                endpoint_generation=destination.endpoint_generation,
+                daemon_instance_uuid=handle.daemon_instance_uuid,
+                context=operation,
+                payload=CredentialRequestPayload(request=request, lifecycle="live", reason=None),
+            )
+            self.request_event = event
+            self.emit(event)
+            self.request_emitted_before_return = True
+        try:
+            if self.hold_start:
+                self.start_waiting.set()
+                await self.release_start.wait()
+        finally:
+            self.start_finished.set()
+        return result
+
+    async def stop_pending_start(self, owner, stop_context):
+        self._record("stop_pending_start", owner=owner, stop_context=stop_context)
+        self.pending_owner = owner
+        self.release_start.set()
+        await self.start_finished.wait()
+        return Ok(value=self.pending_handle)
+
+    def end_credential_request(self) -> None:
+        event = self.request_event
+        if event is None:
+            raise AssertionError("the exact Start did not publish a credential request")
+        self.emit(replace(
+            event,
+            payload=CredentialRequestPayload(
+                request=event.payload.request, lifecycle="ended", reason="row_ended",
+            ),
+        ))
+
+    async def submit_credential(self, target, value, context, *, dispatch_fence):
+        self._record(
+            "submit_credential", target=target, value=value, context=context,
+            dispatch_fence=dispatch_fence is not None,
+        )
+        self.submission_target = target
+        self.canary_matched = value.reveal_for_backend() == self.CANARY
+        if not self.coordinator.markers or self.coordinator.markers[0].state != "watching":
+            return Err(error=diagnostic(ErrorCode.persistence_failed))
+        checked = dispatch_fence()
+        if isinstance(checked, Err):
+            return checked
+        self.events.append("credential_dispatch")
+        if isinstance(self.outcome, Deferred):
+            self.submit_entered.set()
+            return await self.outcome.wait()
+        return self.outcome
+
+    async def read_credential_status(self, target, context):
+        self._record("read_credential_status", target=target, context=context)
+        self.status_targets.append(target)
+        if self.hold_status:
+            self.status_entered.set()
+            await self.release_status.wait()
+        row = BackendStream(
+            device="TV A" if self.observed_state != "absent" else "TV B",
+            target=target.canonical_host if self.observed_state != "absent" else "192.0.2.20",
+            state=self.observed_state if self.observed_state != "absent" else "pin_required",
+            has_audio=False, audio_muted=False,
+            credential_kind="pin" if self.observed_state != "streaming" else None,
+        )
+        other = BackendStream(
+            device="TV B", target="192.0.2.20", state="pin_required",
+            has_audio=False, audio_muted=False, credential_kind="pin",
+        )
+        result = StatusReply(
+            state="pin_required", device="TV B", target="192.0.2.20",
+            has_audio=False, audio_muted=False, needs_credential=True,
+            credential_kind="pin", streams=(other, row),
+        )
+        return Ok(value=result)
+
+    async def record_credential_marker_generation(
+        self, target, context, *, submission_id, expected_generation, previous_generation,
+    ):
+        self._record(
+            "record_credential_marker_generation", target=target, context=context,
+            submission_id=submission_id, expected_generation=expected_generation,
+            previous_generation=previous_generation,
+        )
+        return Ok(value=None)
+
+
+def _install_assembly_recovery_rig(monkeypatch, tmp_path, transport) -> None:
+    import test_matrix
+
+    parent = test_matrix.SessionRig
+
+    class RecoverySessionRig(parent):
+        def __init__(self):
+            super().__init__()
+            events = transport.events
+            registry = _AssemblyRegistry(
+                tmp_path / "owned-runtime", transport.daemon_instance_uuid,
+            )
+            store = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path / "recovery-state"))
+            create = store.create
+
+            async def create_and_observe(marker):
+                result = await create(marker)
+                if isinstance(result, Ok):
+                    events.append("marker_published")
+                return result
+
+            store.create = create_and_observe
+            coordinator = CredentialRecoveryCoordinator(store, registry, fences=self.fences)
+            coordinator.events = events
+            startup_completed = coordinator._startup_completed
+
+            def record_startup_completion():
+                events.append("startup_complete")
+                startup_completed()
+
+            coordinator._startup_completed = record_startup_completion
+            transport.coordinator = coordinator
+            self.deps = replace(
+                self.deps, transport=transport, credential_recovery=coordinator,
+            )
+
+    monkeypatch.setattr(test_matrix, "SessionRig", RecoverySessionRig)
+
+
+async def _build_credential_app(
+    build, monkeypatch, tmp_path, *, outcome=None, observed_state="streaming", saved=(),
+):
+    root = tmp_path / "assembled-recovery"
+    root.mkdir(mode=0o700)
+    transport = _AssemblyCredentialTransport(
+        outcome=outcome, observed_state=observed_state,
+    )
+    _install_assembly_recovery_rig(monkeypatch, root, transport)
+    app = await build(transport=transport, saved=saved)
+    coordinator = app.manager.deps.credential_recovery
+    return app, coordinator, transport
+
+
+async def test_assembled_runtime_relays_a_matching_target_request_through_the_real_dialog(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
+    app.discover("a")
+    app.discover("b", address="192.0.2.20")
+    await app.settle()
+    app.select("a")
+    await app.settle()
+
+    app.click(Action.start)
+    await app.settle()
+
+    state = app.state("a")
+    prompt_state = state.credential_prompt
+    assert transport.request_emitted_before_return is True
+    assert isinstance(state.stream, StreamHandle)
+    assert prompt_state is not None
+    assert state.mode is Mode.MIRROR
+    assert len(transport.request_status.streams) == 2
+    assert transport.request_status.state == "pin_required"
+    assert transport.request_status.streams[0].target == "192.0.2.20"
+    assert transport.request_status.streams[0].state == "pin_required"
+    assert transport.request_status.streams[1].target == state.target.canonical_host
+    assert transport.request_status.streams[1].state == "pin_required"
+    assert not coordinator._startup_pending
+    assert app.manager.deps.credential_recovery is coordinator
+    assert [type(command).__name__ for command in app.dispatched] == ["Start"]
+
+    dialog = await app.prompt("pairingDialog")
+    canary = transport.CANARY
+    field = dialog.findChild(QLineEdit, "secretField")
+    field.insert(canary)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await app.settle()
+
+    assert transport.canary_matched
+    assert transport.submission_target == state.target
+    assert transport.status_targets == [state.target]
+    assert transport.events.index("marker_published") < transport.events.index("credential_dispatch")
+    assert coordinator.markers[0].state == "retired"
+    stored = await coordinator._store.for_target(state.target.canonical_host)
+    assert isinstance(stored, Ok) and stored.value.state == "retired"
+    assert app.state("a").credential_prompt.report == "connected"
+    app.select("a")
+    await app.settle()
+    assert app.notice == f"Connected to {app.title}."
+    assert app.error == ""
+    assert field.text() == ""
+    assert canary not in repr(app.state("a"))
+    assert canary not in repr(coordinator.markers)
+    assert canary not in repr(app.dispatched)
+    assert canary not in repr(app.journal)
+    assert canary not in app.activity_text
+
+
+async def test_assembled_matching_row_end_closes_prompt_without_a_result(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+
+    assert app.state("a").credential_prompt is not None
+    transport.end_credential_request()
+    await app.settle()
+
+    assert app.state("a").credential_prompt is None
+    assert app.state("a").intent_active
+    assert app.rig.journal.calls("transport.submit_credential") == []
+    assert coordinator.markers == ()
+
+
+async def test_assembled_dismissal_after_dispatch_suppresses_late_reporting(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    outcome = Deferred()
+    app, coordinator, transport = await _build_credential_app(
+        build, monkeypatch, tmp_path, outcome=outcome,
+    )
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+    dialog = await app.prompt("pairingDialog")
+    dialog.findChild(QLineEdit, "secretField").insert(transport.CANARY)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await asyncio.wait_for(transport.submit_entered.wait(), timeout=2)
+    await app.settle()
+
+    assert app.state("a").credential_prompt is not None
+    app.prompt_buttons(dialog)["pairingCancelButton"].click()
+    await app.settle()
+    assert app.state("a").credential_prompt is None
+    assert coordinator.markers[0].state == "watching"
+
+    outcome.resolve(Ok(value=NoReply(reason="incomplete_reply")))
+    await app.settle()
+    assert coordinator.markers[0].state == "release_pending"
+    assert "outcome is unknown" not in app.notice
+    assert "Connected to" not in app.notice
+
+
+async def test_assembled_stop_hands_off_a_pending_credential_start_without_submitting(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
+    transport.hold_start = True
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+
+    assert app.state("a").credential_prompt is not None
+    assert app.state("a").stream is None
+    await app.dispatchem(Stop(receiver_id=a()))
+
+    assert transport.start_finished.is_set()
+    assert transport.pending_owner is not None
+    assert transport.pending_owner.credential_submission_id is None
+    assert transport.pending_owner.marker_generation is None
+    assert coordinator.markers == ()
+    assert app.state("a").credential_prompt is None
+    assert app.rig.journal.calls("transport.submit_credential") == []
+    assert app.rig.journal.calls("transport.stop_pending_start")
+    assert app.rig.journal.calls("transport.stop_stream")
+    assert app.state("a").stream is None
+
+
+async def test_assembled_no_reply_reports_unknown_and_keeps_the_target_marker(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(
+        build, monkeypatch, tmp_path, outcome=Ok(value=NoReply(reason="service_shutdown")),
+    )
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+    dialog = await app.prompt("pairingDialog")
+    dialog.findChild(QLineEdit, "secretField").insert(transport.CANARY)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await app.settle()
+
+    marker, = coordinator.markers
+    stored = await coordinator._store.for_target(marker.target)
+    assert isinstance(stored, Ok) and stored.value == marker
+    assert marker.state == "release_pending"
+    assert marker.automatic_status_checks is True
+    assert app.state("a").credential_prompt.report == "outcome_unknown"
+    assert app.notice.split("\n\n", 1)[0] == "No complete command reply was received; the outcome is unknown."
+    assert "A delayed connection may still appear." in app.notice
+    assert transport.status_targets == []
+    assert transport.CANARY not in repr(marker)
+    assert transport.CANARY not in repr(app.journal)
+
+
+async def test_assembled_negative_reply_still_uses_target_status_observation(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    outcome = Ok(value=Submitted(reply_at=0.0, accepted=False, post_dispatch_error=None))
+    app, coordinator, transport = await _build_credential_app(
+        build, monkeypatch, tmp_path, outcome=outcome, observed_state="absent",
+    )
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+    dialog = await app.prompt("pairingDialog")
+    dialog.findChild(QLineEdit, "secretField").insert(transport.CANARY)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await app.settle()
+
+    assert transport.status_targets == [app.state("a").target]
+    assert app.state("a").credential_prompt.report == "not_observed_streaming"
+    assert app.notice.split("\n\n", 1)[0] == "The target was not observed streaming."
+    assert coordinator.markers[0].state == "retired"
+    assert "rejected" not in app.notice.lower()
+
+
+async def test_assembled_submitted_prompt_stays_read_only_until_status_arrives(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
+    transport.hold_status = True
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+    dialog = await app.prompt("pairingDialog")
+    field = dialog.findChild(QLineEdit, "secretField")
+    field.insert(transport.CANARY)
+    app.prompt_buttons(dialog)["pairingSubmitButton"].click()
+    await asyncio.wait_for(transport.status_entered.wait(), timeout=2)
+    await app.settle()
+
+    prompt = app.state("a").credential_prompt
+    assert prompt is not None and prompt.state == "observing" and prompt.report is None
+    assert field.isReadOnly()
+    assert coordinator.markers[0].state == "watching"
+    transport.release_status.set()
+    await app.settle()
+
+    assert app.state("a").credential_prompt.report == "connected"
+    assert coordinator.markers[0].state == "retired"
+
+
+async def test_assembled_cancel_sends_no_credential_command_or_later_report(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(build, monkeypatch, tmp_path)
+    app.discover("a")
+    await app.settle()
+    app.click(Action.start)
+    await app.settle()
+    dialog = await app.prompt("pairingDialog")
+    app.prompt_buttons(dialog)["pairingCancelButton"].click()
+    await app.settle()
+
+    assert app.state("a").credential_prompt is None
+    assert coordinator.markers == ()
+    assert not app.rig.journal.calls("transport.submit_credential")
+    assert transport.status_targets == []
+    assert app.notice == ""
+
+
+async def test_virtual_display_start_cannot_open_a_credential_prompt(
+    build: Callable[..., Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    app, coordinator, transport = await _build_credential_app(
+        build, monkeypatch, tmp_path, saved=(saved_receiver("a", resolution=remembered()),),
+    )
+    app.discover("a")
+    await app.settle()
+    await app.start_virtual()
+
+    assert app.state("a").mode is Mode.VIRTUAL
+    assert transport.request_emitted_before_return is True
+    assert app.state("a").credential_prompt is None
+    assert coordinator.markers == ()
+    assert app.presenter._relay_prompt_pending == {}
+    assert not app.rig.journal.calls("transport.submit_credential")
+
+
+# --------------------------------------------------------------------- two sessions
 
 
 async def test_two_receivers_render_their_own_rows_and_receive_their_own_commands(

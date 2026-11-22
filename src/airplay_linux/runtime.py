@@ -789,10 +789,10 @@ class Runtime:
         return self._diagnostics
 
     async def _start_once(self) -> Result[None]:
-        self.persistence.start()
         recovery = await self.startup_recovery.run()
         if isinstance(recovery, Err):
             return recovery
+        self.persistence.start()
         started = await self.deps.discovery.start()
         if isinstance(started, Err):
             return started
