@@ -7,7 +7,7 @@ from uuid import UUID
 import pytest
 
 from airplay_linux.domain.operations import ProcessIdentity
-from airplay_linux.domain.resources import ErrorCode, Ok
+from airplay_linux.domain.resources import Err, ErrorCode, Ok
 from airplay_linux.storage import AtomicFiles
 from airplay_linux.storage import repositories, codecs
 
@@ -374,14 +374,9 @@ def public_storage_graph(tmp_path, monkeypatch):
     from airplay_linux.policy.capabilities import EnvironmentProbe
     from airplay_linux.process.linux import LinuxProcessRunner
 
-    flags = "bitrate code cred-backend creds daemonize debug direct-key fps hwaccel no-audio no-cursor no-encrypt pair port port-range socket target target-latency-ms test video-codec x11-window-id x11-window-name capabilities".split()
-    sender = "Usage of doubletake:\n" + "".join(f"  -{name} string\n    \tvalue\n" for name in flags)
-    ctl = "Usage: doubletake-ctl command\nCommands:\n" + "\n".join((
-        "  status  Status", "  discover  Discover", "  devices  Devices",
-        "  connect [target] [PIN-or-password]  Connect only the given IP",
-        "  pin <PIN-or-password>  PIN", "  disconnect [target]  Disconnect only the given IP",
-        "  mute [target]  Mute only the given IP", "  unmute [target]  Unmute only the given IP",
-    ))
+    fixture_root = Path(__file__).parents[1] / "fixtures" / "backend"
+    sender = (fixture_root / "doubletake-0.5-source-help.txt").read_text()
+    ctl = (fixture_root / "doubletake-ctl-0.5-help.txt").read_text()
     class Recorder:
         def __init__(self):
             self.observations = []
@@ -558,3 +553,22 @@ async def test_production_composes_marker_coordinator_from_existing_atomic_root(
     assert await coordinator.load_before_startup() == Ok(value=None)
     assert coordinator.markers == (item,)
     assert not graph.recorder.launches and not graph.recorder.signals
+
+
+async def test_launch_receipt_recovery_attempt_identity_is_persisted_and_immutable(
+    tmp_path, receipt_generation_37,
+):
+    from uuid import UUID
+
+    item = receipt_generation_37
+    assert hasattr(item, "recovery_attempt_id")
+    attempt = replace(item, recovery_attempt_id=UUID(int=707))
+    payload = codecs.encode_launch_receipt(attempt)
+    assert json.loads(payload)["recovery_attempt_id"] == str(UUID(int=707))
+    assert codecs.decode_launch_receipt(payload) == attempt
+
+    store = store_at(tmp_path)
+    assert isinstance(await store.write(item), Ok)
+    refused = await store.write(replace(item, recovery_attempt_id=UUID(int=708)))
+    assert isinstance(refused, Err)
+    assert (await store.all()).value == (item,)

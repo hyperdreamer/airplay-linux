@@ -28,6 +28,14 @@ from virtual_scenarios import (
 )
 
 
+@pytest.fixture(autouse=True)
+def fake_kde_wayland_environment(monkeypatch):
+    # These tests use a fully fake display provider; do not inherit the host session.
+    monkeypatch.setenv('XDG_SESSION_TYPE', 'wayland')
+    monkeypatch.setenv('XDG_CURRENT_DESKTOP', 'KDE')
+    monkeypatch.setenv('XDG_SESSION_DESKTOP', 'KDE')
+
+
 def test_volume_transient_authority_is_stripped_before_custom_store():
     from airplay_linux.session.persistence import _safe_snapshot
     from airplay_linux.storage.codecs import encode_session, decode_session

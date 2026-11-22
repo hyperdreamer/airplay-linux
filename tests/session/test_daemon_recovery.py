@@ -548,8 +548,14 @@ async def test_credential_recovery_release_pending_never_exempts_or_admits_start
             raise AssertionError("release-pending marker attempted original-daemon observation")
 
     _, coordinator, startup = await credential_startup(tmp_path, store=store, registry=RegistryWithoutRelease([]))
-    assert isinstance(await startup.run(), Ok)
-    assert coordinator.markers == (pending,)
-    assert await coordinator.recover_before_registry_reconciliation() == Ok(value=())
+    if with_attempt:
+        # An unresolved attempt must be classified before registry reconciliation.
+        assert_recovery_blocked(await startup.run(), ErrorCode.ownership_mismatch)
+        assert coordinator.markers == (pending,)
+        assert_recovery_blocked(await coordinator.recover_before_registry_reconciliation(), ErrorCode.ownership_mismatch)
+    else:
+        assert isinstance(await startup.run(), Ok)
+        assert coordinator.markers == (pending,)
+        assert await coordinator.recover_before_registry_reconciliation() == Ok(value=())
     assert_recovery_blocked(coordinator.require_start_allowed(item.target, item.start_operation_id), ErrorCode.ownership_mismatch)
     assert_recovery_blocked(coordinator.credential_dispatch_fence(item, 1)(), ErrorCode.ownership_mismatch)

@@ -392,7 +392,7 @@ _LifecycleRecord = TypeVar("_LifecycleRecord", LaunchReceipt, DaemonCleanupInten
 _RESERVATION_IDENTITY = (
     "schema_version", "launch_uuid", "instance_uuid", "app", "owner_uid", "boot_id",
     "runtime_directory", "runtime_device", "runtime_inode", "endpoint_generation",
-    "socket_name", "protocol_version",
+    "socket_name", "protocol_version", "recovery_attempt_id",
 )
 _OBSERVED_IDENTITY = (
     "daemon_instance_uuid", "supervisor", "daemon", "entry_device", "entry_inode",

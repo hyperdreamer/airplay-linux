@@ -142,6 +142,7 @@ class LaunchReceipt(DaemonReservation):
     credential_service: Literal["keyring_proven", "file_refused", "unknown"]
     failure: ErrorCode | None
     updated_at: float
+    recovery_attempt_id: OperationId | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, kw_only=True)

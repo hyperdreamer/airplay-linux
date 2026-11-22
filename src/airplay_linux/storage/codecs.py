@@ -1273,6 +1273,7 @@ _NEW_RECEIPT_FIELDS = _NEW_RESERVATION_FIELDS + (
     ("credential_service", _plain(_frozen(frozenset({"keyring_proven", "file_refused", "unknown"})))),
     ("failure", _nullable(_ERROR_CODE)),
     ("updated_at", _plain(_new_time)),
+    ("recovery_attempt_id", _nullable(_NEW_UUID)),
 )
 
 
@@ -1395,17 +1396,22 @@ _NewRecord = TypeVar("_NewRecord")
 def _new_members(
     document: dict[str, object], schema: str,
     fields: tuple[tuple[str, _Codec], ...], envelope: bool,
+    optional_fields: frozenset[str] = frozenset(),
 ) -> dict[str, object]:
     expected = {name for name, _ in fields} | ({"schema", "version"} if envelope else set())
     if set(document) - expected:
         raise RecordError("unknown_field")
-    if expected - set(document):
+    missing = expected - set(document)
+    if missing - optional_fields:
         raise RecordError("missing_field")
     if type(document["schema"]) is not str or document["schema"] != schema:
         raise RecordError("unknown_schema")
     if "version" in expected and (type(document["version"]) is not int or document["version"] != 1):
         raise RecordError("unknown_version")
-    return _object({name: document[name] for name, _ in fields}, fields)
+    return _object(
+        {name: document.get(name) if name in optional_fields else document[name] for name, _ in fields},
+        fields,
+    )
 
 
 def _new_encode(
@@ -1435,9 +1441,10 @@ def _new_decode(
     payload: bytes, cls: type[_NewRecord], schema: str,
     fields: tuple[tuple[str, _Codec], ...], *, envelope: bool = True,
     consistency: Callable[[dict[str, object]], None] | None = None,
+    optional_fields: frozenset[str] = frozenset(),
 ) -> _NewRecord:
     document = _new_json(payload, bounded_verdict=cls is ProbeVerdict)
-    values = _new_members(document, schema, fields, envelope)
+    values = _new_members(document, schema, fields, envelope, optional_fields)
     if consistency is not None:
         consistency(values)
     return cls(**values)
@@ -1452,11 +1459,17 @@ def decode_daemon_reservation(payload: bytes) -> DaemonReservation:
 
 
 def encode_launch_receipt(record: LaunchReceipt) -> bytes:
-    return _new_encode(record, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+    if type(record) is not LaunchReceipt:
+        _invalid()
+    fields = _NEW_RECEIPT_FIELDS if record.recovery_attempt_id is not None else _NEW_RECEIPT_FIELDS[:-1]
+    return _new_encode(record, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, fields, consistency=_new_receipt_consistency)
 
 
 def decode_launch_receipt(payload: bytes) -> LaunchReceipt:
-    return _new_decode(payload, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS, consistency=_new_receipt_consistency)
+    return _new_decode(
+        payload, LaunchReceipt, LAUNCH_RECEIPT_SCHEMA, _NEW_RECEIPT_FIELDS,
+        consistency=_new_receipt_consistency, optional_fields=frozenset({"recovery_attempt_id"}),
+    )
 
 
 def encode_daemon_cleanup_intent(record: DaemonCleanupIntent) -> bytes:
