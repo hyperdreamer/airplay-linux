@@ -509,6 +509,50 @@ async def test_credential_recovery_failed_publication_cannot_commit_visible_mark
     assert coordinator.credential_dispatch_fence(item, 1)() == Ok(value=None)
 
 
+async def test_stop_credential_recovery_reaches_recorded_daemon_path(tmp_path):
+    from dataclasses import replace
+
+    from airplay_linux.domain.messages import StopCredentialRecovery
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, build_recovery_handlers
+    from airplay_linux.session.testing import SessionRig
+    from tests.storage.test_credential_recovery import marker as recovery_marker
+
+    rig = SessionRig()
+    destination = target()
+    rig.discovery.add_target(destination)
+    recorded = replace(
+        recovery_marker(target=destination.canonical_host),
+        receiver_id=destination.receiver_id,
+    )
+    calls = []
+
+    class Registry:
+        async def stop_recovery_target(self, marker, target, context, fence):
+            calls.append((marker, target, context))
+            assert fence() == Ok(value=None)
+            return Ok(value=None)
+
+    coordinator = CredentialRecoveryCoordinator(object(), Registry())
+    coordinator._markers[recorded.target] = recorded
+    coordinator._loaded = True
+    coordinator._store_blocked = False
+    rig.deps = replace(rig.deps, credential_recovery=coordinator)
+    rig.manager = SessionManager(rig.deps, build_recovery_handlers(rig.deps))
+
+    accepted = await rig.manager.dispatch(StopCredentialRecovery(
+        receiver_id=destination.receiver_id, marker_generation=recorded.marker_generation,
+    ))
+    await rig.manager.drain()
+
+    assert accepted.accepted
+    assert len(calls) == 1
+    assert calls[0][0] == recorded
+    assert calls[0][1] == destination
+    assert calls[0][2].owner_daemon == recorded.original_daemon
+    assert calls[0][2].marker_generation == recorded.marker_generation
+
+
 async def test_credential_recovery_start_fence_rechecks_receiver_endpoint(tmp_path):
     from test_startup_recovery import credential_startup
     from airplay_linux.trust.fences import TrustFence

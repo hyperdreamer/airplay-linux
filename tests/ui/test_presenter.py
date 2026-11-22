@@ -2833,6 +2833,22 @@ async def test_recovery_action_uses_marker_receiver_for_canonical_target_alias(
     assert Action.start in rig.offered()
 
 
+async def test_release_warning_shows_shared_daemon_impact_in_visible_notice(
+    rig: PresenterRig, credential_recovery: Any,
+) -> None:
+    coordinator, _, marker = credential_recovery
+    pending = await coordinator.mark_release_pending_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    rig.presenter._credential_recovery = coordinator
+    await started(rig)
+    rig.snapshot("a", operation_id=marker.start_operation_id, session_generation=1)
+    await rig.settle()
+
+    assert rig.window._notice.isVisibleTo(rig.window)
+    assert "disconnects every mirror owned by the shared daemon" in rig.window._notice.text().lower()
+    assert Action.restart_receiver_to_release in rig.offered()
+
+
 async def test_recovery_action_matrix_is_state_and_marker_bound(
     rig: PresenterRig, credential_recovery: Any,
 ) -> None:

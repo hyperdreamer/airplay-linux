@@ -696,6 +696,11 @@ class Presenter:
             if marker.automatic_status_checks else
             "This target remains fenced until the receiver restarts."
         )
+        if marker.state == "release_pending":
+            warning = (
+                f"{warning} Restart receiver to release disconnects every mirror owned "
+                "by the shared daemon."
+            )
         return CredentialRecoveryView(
             receiver_id=marker.receiver_id,
             target=marker.target,

@@ -27,10 +27,11 @@ from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from airplay_linux.backend.contract import BackendFeatures, StatusReply
 from airplay_linux.backend.control import (
-    BackendControl, BackendOperation, EmptyPayload, Handshake, OwnershipAuthority, OwnershipProof,
+    AckReply, BackendControl, BackendOperation, EmptyPayload, Handshake, OwnershipAuthority, OwnershipProof,
 )
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.operations import InstanceId, OperationId, ProcessIdentity, SensitiveText
+from airplay_linux.domain.identity import ReceiverTarget
+from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import (
     Clock, CommandSpec, DaemonCleanupIntentStore, DaemonStore, IdFactory,
     LaunchReceiptStore, ProcessExit, ProcessPort, Scheduler, Subscription,
@@ -105,6 +106,27 @@ def _error(code: ErrorCode) -> Err:
 
 def _token(value: SensitiveText | str) -> str:
     return value.reveal_for_backend() if isinstance(value, SensitiveText) else value
+
+
+def _accepts_dispatch_fence(control: object) -> bool:
+    method = getattr(control, 'request', None)
+    if method is None:
+        return False
+    try:
+        parameters = inspect.signature(getattr(method, '__func__', method)).parameters
+    except (TypeError, ValueError):
+        return False
+    candidate = parameters.get('dispatch_fence')
+    if candidate is not None and candidate.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.VAR_KEYWORD,
+    }:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _scan_owned(instance_uuid: UUID, runtime: str) -> OwnedProcessScan:
@@ -531,6 +553,123 @@ class DaemonRegistry:
                 return _error(ErrorCode.stale_event)
             return Ok(value=current[1])
 
+    async def stop_recovery_target(
+        self, marker: CredentialRecoveryMarker, target: ReceiverTarget,
+        context: OperationContext, fence: Callable[[], Result[None]],
+    ) -> Result[None]:
+        """Disconnect one marker target through the exact recorded daemon."""
+        if (
+            type(marker) is not CredentialRecoveryMarker
+            or marker.state == 'retired'
+            or type(target) is not ReceiverTarget
+            or target.receiver_id != marker.receiver_id
+            or target.canonical_host != marker.target
+            or type(context) is not OperationContext
+            or context.endpoint_generation != target.endpoint_generation
+            or context.owner_daemon != marker.original_daemon
+            or context.marker_generation != marker.marker_generation
+            or not callable(fence)
+        ):
+            return _error(ErrorCode.ownership_mismatch)
+        if fence() != Ok(value=None):
+            return _error(ErrorCode.ownership_mismatch)
+
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return obligations
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            receipts = tuple(
+                receipt for receipt in self._receipt_history
+                if receipt.launch_uuid == marker.original_daemon.launch_uuid
+            )
+            matching_records = tuple(
+                record for record in records.value
+                if record.instance_uuid == marker.original_daemon.instance_uuid
+            )
+            if len(receipts) != 1 or len(matching_records) != 1:
+                return _error(ErrorCode.ownership_mismatch)
+            receipt, record = receipts[0], matching_records[0]
+            if not recovery_identity_matches(marker.original_daemon, receipt, record):
+                return _error(ErrorCode.ownership_mismatch)
+            authenticated = await self._authenticate(record)
+            if isinstance(authenticated, Err):
+                return authenticated
+            if fence() != Ok(value=None):
+                return _error(ErrorCode.ownership_mismatch)
+
+            refreshed = await self._receipts.all()
+            current_records = await self._store.all()
+            if isinstance(refreshed, Err) or isinstance(current_records, Err):
+                return _error(ErrorCode.persistence_failed)
+            current_receipts = tuple(
+                item for item in refreshed.value
+                if item.launch_uuid == marker.original_daemon.launch_uuid
+            )
+            current_matches = tuple(
+                item for item in current_records.value
+                if item.instance_uuid == marker.original_daemon.instance_uuid
+            )
+            if (
+                current_receipts != (receipt,)
+                or current_matches != (record,)
+                or not recovery_identity_matches(marker.original_daemon, receipt, record)
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+
+            control = self._control_factory(record)
+            try:
+                request_kwargs: dict[str, object] = {}
+                if _accepts_ownership_proof(control):
+                    request_kwargs['ownership_proof'] = authenticated.value
+                status = await control.request(
+                    BackendOperation.status, None, EmptyPayload(), None, **request_kwargs,
+                )
+                if isinstance(status, Err):
+                    return status
+                if not isinstance(status.value, StatusReply):
+                    return _error(ErrorCode.transport_failed)
+                matching_rows = tuple(
+                    row for row in status.value.streams
+                    if row.target == marker.target
+                )
+                if not matching_rows:
+                    return Ok(value=None)
+                if len(matching_rows) != 1:
+                    return _error(ErrorCode.transport_failed)
+                if fence() != Ok(value=None):
+                    return _error(ErrorCode.ownership_mismatch)
+                if not _accepts_dispatch_fence(control):
+                    return _error(ErrorCode.dependency_incompatible)
+                request_kwargs = {'dispatch_fence': fence}
+                if _accepts_ownership_proof(control):
+                    request_kwargs['ownership_proof'] = authenticated.value
+                disconnected = await control.request(
+                    BackendOperation.disconnect, target, EmptyPayload(), context,
+                    **request_kwargs,
+                )
+                if isinstance(disconnected, Err):
+                    return disconnected
+                reply = disconnected.value
+                if (
+                    type(reply) is not AckReply
+                    or reply.operation != BackendOperation.disconnect.value
+                    or reply.target != marker.target
+                ):
+                    return _error(ErrorCode.transport_failed)
+                if fence() != Ok(value=None):
+                    return _error(ErrorCode.ownership_mismatch)
+                return Ok(value=None)
+            finally:
+                try:
+                    await asyncio.wait_for(control.close(), self._startup_timeout)
+                except Exception:
+                    pass
+
     async def _validate_recovery_exemptions(
         self, exemptions: tuple[DaemonRecoveryExemption, ...], history: tuple[LaunchReceipt, ...],
         records: tuple[DaemonRecord, ...], channels: dict[str, SupervisorReleaseIntent | None],
@@ -745,8 +884,13 @@ class DaemonRegistry:
                     or record.protocol_version != original.protocol_version
                 ):
                     return _error(ErrorCode.ownership_mismatch)
-                if original.state == 'ready' and record.lifecycle == 'running':
-                    if not recovery_identity_matches(expected_old, original, record):
+                if original.state == 'ready':
+                    # A ready receipt can only be released through its fully
+                    # authenticated running record. A contradictory starting
+                    # record must be refused before reconciliation can signal it.
+                    if record.lifecycle != 'running' or not recovery_identity_matches(
+                        expected_old, original, record,
+                    ):
                         return _error(ErrorCode.ownership_mismatch)
                     authenticated = await self._authenticate(record)
                     if isinstance(authenticated, Err):

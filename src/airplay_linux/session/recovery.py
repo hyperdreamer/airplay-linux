@@ -20,6 +20,7 @@ from airplay_linux.diagnostics import diagnostic
 from airplay_linux.domain.messages import (
     Cancel, ConfirmOrphanRemoval, ConfirmSwitch, DismissCredentialRecovery, EffectEvent, KeepCleanup,
     Pair, RestartReceiverToRelease, Retry, RetryCleanup, RetryRevocation, Start, Stop,
+    StopCredentialRecovery,
 )
 from airplay_linux.domain.identity import ReceiverId, ReceiverTarget
 from airplay_linux.domain.operations import OpaqueCredentialRef, OperationId
@@ -566,6 +567,66 @@ class RecoveryHandlers:
         self.approving: set[object] = set()
 
     def __call__(self, ctx: SessionContext, message: object) -> bool:
+        if isinstance(message, StopCredentialRecovery):
+            coordinator = self.deps.credential_recovery
+            matches = tuple(marker for marker in coordinator.markers if (
+                marker.receiver_id == message.receiver_id
+                and marker.marker_generation == message.marker_generation
+                and marker.state != 'retired'
+            )) if coordinator is not None else ()
+            target = ctx.state.target
+            if len(matches) != 1 or (
+                target is not None and target.canonical_host != matches[0].target
+            ):
+                ctx.apply(last_error=diagnostic(ErrorCode.stale_event, ctx.state.receiver_id))
+                return True
+            marker = matches[0]
+            owner_operation_id = ctx.state.operation_id
+            owner_session_generation = ctx.state.session_generation
+            owner_trust_generation = ctx.state.trust_generation
+            owner_state_target = target
+            if target is None:
+                target = ReceiverTarget(
+                    receiver_id=marker.receiver_id, service_records=(), canonical_host=marker.target,
+                    service_port=7000, protocol='airplay',
+                    endpoint_fingerprint=f'recovery:{marker.original_daemon.launch_uuid.hex}',
+                    endpoint_generation=0,
+                )
+            owner_target = target
+            registry = getattr(coordinator, '_registry', None)
+            stop_target = getattr(registry, 'stop_recovery_target', None)
+            if not callable(stop_target):
+                ctx.apply(last_error=diagnostic(ErrorCode.dependency_incompatible, ctx.state.receiver_id))
+                return True
+            operation = ctx.operation()
+            if owner_operation_id is not None:
+                operation = replace(operation, operation_id=owner_operation_id)
+            operation = replace(
+                operation,
+                marker_generation=marker.marker_generation,
+                owner_daemon=marker.original_daemon,
+            )
+
+            def still_current() -> Result[None]:
+                current = next((item for item in coordinator.markers if item.target == marker.target), None)
+                if (
+                    not coordinator._loaded or coordinator._store_blocked
+                    or current != marker
+                    or ctx.state.operation_id != owner_operation_id
+                    or ctx.state.session_generation != owner_session_generation
+                    or ctx.state.trust_generation != owner_trust_generation
+                    or ctx.state.target != owner_state_target
+                    or (owner_state_target is not None
+                        and owner_state_target.canonical_host != marker.target)
+                ):
+                    return _recovery_refusal(ErrorCode.ownership_mismatch)
+                return Ok(value=None)
+
+            ctx.launch(
+                Route.recovery, 'credential_stop', operation,
+                lambda: stop_target(marker, owner_target, operation, still_current),
+            )
+            return True
         if isinstance(message, DismissCredentialRecovery):
             coordinator = self.deps.credential_recovery
             matches = tuple(marker for marker in coordinator.markers if (
@@ -621,6 +682,26 @@ class RecoveryHandlers:
         if not isinstance(message, EffectEvent):
             return False
         kind = message.kind.split(":", 1)[-1]
+        if kind == 'credential_stop':
+            effect = ctx._manager._completed_effects.get((message.receiver_id, message.operation_id, message.kind))
+            if effect is None or effect.context.owner_daemon is None or effect.context.marker_generation is None:
+                return True
+            current = next((item for item in coordinator.markers if (
+                item.receiver_id == ctx.state.receiver_id
+                and item.original_daemon == effect.context.owner_daemon
+                and item.marker_generation == effect.context.marker_generation
+                and (
+                    ctx.state.target is None
+                    or item.target == ctx.state.target.canonical_host
+                )
+            )), None) if (coordinator := self.deps.credential_recovery) is not None else None
+            if current is None or (
+                ctx.state.target is not None
+                and ctx.state.target.canonical_host != current.target
+            ):
+                return True
+            ctx.apply(last_error=message.result.error if isinstance(message.result, Err) else None)
+            return True
         if kind in {'credential_release', 'credential_dismiss'}:
             ctx.apply(last_error=message.result.error if isinstance(message.result, Err) else None)
             return True

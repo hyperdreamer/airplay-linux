@@ -1223,6 +1223,140 @@ async def test_release_refuses_an_attempt_without_durable_marker_authority(
     assert not runtime.exists()
 
 
+async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_target(
+    application_daemon_identity_cases,
+):
+    from airplay_linux.backend.contract import AckReply, BackendStream
+    from airplay_linux.domain.operations import OperationContext, OperationId
+    from airplay_linux.domain.resources import Ok
+    from airplay_linux.testing.builders import target
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    destination = target("recovery", address=marker.target)
+    calls = []
+    disconnected = asyncio.Event()
+
+    class RecoveryControl:
+        def __init__(self, record):
+            self.record = record
+
+        async def request(
+            self, operation, requested_target, payload, context, *,
+            dispatch_fence=None, ownership_proof=None,
+        ):
+            calls.append((self.record.socket_path, operation, requested_target, context))
+            if operation is BackendOperation.status:
+                return Ok(value=StatusReply(
+                    state="pin_required", device=None, target=None, has_audio=False,
+                    audio_muted=False, needs_credential=True, credential_kind="pin",
+                    streams=(BackendStream(
+                        device="Receiver", target=marker.target, state="pin_required",
+                        credential_kind="pin", has_audio=False, audio_muted=False,
+                    ),),
+                ))
+            assert operation is BackendOperation.disconnect
+            assert requested_target.canonical_host == marker.target
+            assert callable(dispatch_fence) and dispatch_fence() == Ok(value=None)
+            assert ownership_proof is not None
+            disconnected.set()
+            return Ok(value=AckReply(
+                operation="disconnect", target=marker.target,
+            ))
+
+        async def close(self):
+            return None
+
+    c.registry._control_factory = RecoveryControl
+    operation = OperationContext(
+        operation_id=OperationId(UUID(int=731)), session_generation=4,
+        endpoint_generation=destination.endpoint_generation,
+        marker_generation=marker.marker_generation, owner_daemon=marker.original_daemon,
+    )
+    result = await c.registry.stop_recovery_target(
+        marker, destination, operation, lambda: Ok(value=None),
+    )
+
+    assert isinstance(result, Ok)
+    disconnects = tuple(call for call in calls if call[1] is BackendOperation.disconnect)
+    assert len(disconnects) == 1
+    assert disconnects[0][0] == marker.original_daemon.socket_path
+    assert disconnects[0][2] == destination
+    assert disconnects[0][3] == operation
+    assert c.process.terminated == []
+
+    from airplay_linux.domain.messages import StopCredentialRecovery
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, build_recovery_handlers
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    marker_store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await marker_store.create(marker), Ok)
+    session = SessionRig()
+    for subscription in session.manager._subscriptions:
+        subscription.close()
+    session.discovery.add_target(destination)
+    coordinator = CredentialRecoveryCoordinator(marker_store, c.registry, fences=session.fences)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+    deps = replace(session.deps, credential_recovery=coordinator)
+    manager = SessionManager(deps, build_recovery_handlers(deps))
+    disconnected.clear()
+    accepted = await manager.dispatch(StopCredentialRecovery(
+        receiver_id=marker.receiver_id, marker_generation=marker.marker_generation,
+    ))
+    assert accepted.accepted
+    await asyncio.wait_for(disconnected.wait(), 1.0)
+    await manager.drain()
+    routed = tuple(call for call in calls if call[1] is BackendOperation.disconnect)
+    assert len(routed) == 2
+    assert routed[-1][0] == marker.original_daemon.socket_path
+    assert routed[-1][2] == destination
+    assert coordinator.markers == (marker,)
+
+
+async def test_release_refuses_ready_receipt_with_starting_record_before_teardown(
+    application_daemon_identity_cases,
+):
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, marker.marker_generation)).value
+    attempt = UUID(int=730)
+    runtime = c.registry._configured_runtime / attempt.hex
+    pending = (await store.record_release_attempt(
+        pending, pending.marker_generation, ReleaseAttempt(
+            attempt_id=attempt, replacement_runtime_directory=str(runtime),
+            replacement_socket_path=str(runtime / "daemon.sock"), status="intended",
+            replacement_instance_uuid=None, replacement_endpoint_generation=None,
+            readiness=None, terminal_evidence=None,
+        ),
+    )).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    starting = replace(c.record, lifecycle="starting")
+    assert isinstance(await c.store.write(starting), Ok)
+    c.registry._record = starting
+    c.registry._ready = False
+
+    refused = await c.registry.restart_with_new_endpoint(
+        marker.original_daemon, attempt, runtime, runtime / "daemon.sock",
+    )
+
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+
+
 @pytest.fixture
 def release_socket_case(private_socket_root, monkeypatch):
     from test_owned_launcher import OwnedCase
