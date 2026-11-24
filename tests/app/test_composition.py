@@ -101,6 +101,50 @@ async def test_runtime_rejects_unknown_override_name(tmp_path: Path) -> None:
         await build_runtime(config, {"fake_everything": object()})
 
 
+@pytest.mark.asyncio
+async def test_runtime_keeps_startup_recovery_on_the_composed_manager(tmp_path: Path) -> None:
+    rig = SessionRig()
+    config = RuntimeConfig(
+        state_root=tmp_path / "state",
+        runtime_root=tmp_path / "runtime",
+        live=False,
+    )
+    result = await build_runtime(config, {"deps": rig.deps})
+    assert isinstance(result, Ok)
+    runtime = result.value
+
+    assert runtime.startup_recovery.manager is runtime.manager
+    assert runtime.startup_recovery.deps is runtime.deps
+    assert runtime.manager.deps is runtime.deps
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_runtime_validates_recovery_before_starting_session_persistence(tmp_path: Path) -> None:
+    """The recovery barrier is established before durable session publication."""
+    rig = SessionRig()
+    config = RuntimeConfig(
+        state_root=tmp_path / "state",
+        runtime_root=tmp_path / "runtime",
+        live=False,
+    )
+    result = await build_runtime(config, {"deps": rig.deps})
+    assert isinstance(result, Ok)
+    runtime = result.value
+    order: list[str] = []
+
+    async def recover_first():
+        order.append("recovery")
+        return Ok(value=())
+
+    runtime.startup_recovery.run = recover_first
+    runtime.persistence.start = lambda: order.append("persistence")
+    started = await runtime.start()
+    assert isinstance(started, Ok)
+    assert order == ["recovery", "persistence"]
+    await runtime.shutdown()
+
+
 def test_runtime_config_requires_absolute_roots(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         RuntimeConfig(state_root=Path("state"), runtime_root=tmp_path / "runtime")
@@ -208,6 +252,7 @@ async def test_production_preferences_share_one_writer_and_bridge_early_warnings
     from airplay_linux.storage import AtomicFiles, JsonReceiverStore, encode_receiver
     from airplay_linux.storage.repositories import ReceiverPreferenceWriter
     from airplay_linux.domain.records import SavedReceiver
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
     from airplay_linux.testing.adapters import FakeProcess
     from airplay_linux.testing.builders import target
 
@@ -239,10 +284,27 @@ async def test_production_preferences_share_one_writer_and_bridge_early_warnings
     monkeypatch.setattr(composition, "JsonReceiverStore", EarlyStore)
     monkeypatch.setattr(composition, "probe_backend", unavailable)
     monkeypatch.setattr(EnvironmentProbe, "check", report)
+    manager_inputs = []
+    compose = composition.compose_manager
+
+    def observe_manager_composition(deps):
+        coordinator = deps.credential_recovery
+        assert isinstance(coordinator, CredentialRecoveryCoordinator)
+        assert deps.transport._recovery_guard.__self__ is coordinator
+        manager_inputs.append(deps)
+        return compose(deps)
+
+    monkeypatch.setattr(composition, "compose_manager", observe_manager_composition)
     graph = await composition._compose_production(
         RuntimeConfig(state_root=tmp_path / "state", runtime_root=tmp_path / "run"),
         process=FakeProcess(),
     )
+    assert manager_inputs == [graph.deps]
+    assert graph.manager.deps is graph.deps
+    assert graph.startup.manager is graph.manager
+    assert graph.startup.deps is graph.deps
+    assert graph.startup.handler is graph.manager.handlers[Route.recovery]
+    assert graph.deps.credential_recovery._registry is graph.registry
     assert constructed == [graph.deps.preferences]
     assert graph.deps.preferences._store is graph.deps.receivers
     assert graph.deps.preferences._discovery is graph.deps.discovery

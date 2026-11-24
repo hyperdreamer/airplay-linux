@@ -175,10 +175,10 @@ def test_volume_profile_uses_exact_targeted_argv():
     profile = PublishedDoubletakeProfile(socket_path="/run/private/control.sock")
     profile = replace(profile, features=replace(profile.features, target_volume=True))
     receiver = target()
-    assert profile.argv(BackendOperation.volume, receiver, VolumePayload(level=VolumeLevel(value=30))) == (
+    assert profile.argv(BackendOperation.volume, receiver, VolumePayload(level=VolumeLevel(value=30))).argv == (
         "doubletake-ctl", "-socket", "/run/private/control.sock", "volume", "30", receiver.canonical_host,
     )
-    assert profile.argv(BackendOperation.audio_off, receiver, AudioGatePayload()) == (
+    assert profile.argv(BackendOperation.audio_off, receiver, AudioGatePayload()).argv == (
         "doubletake-ctl", "-socket", "/run/private/control.sock", "audio", "off", receiver.canonical_host,
     )
 
@@ -193,11 +193,11 @@ def test_volume_capable_connect_argv_and_legacy_refusal(audio, level, suffix):
     profile = volume_profile()
     payload = ConnectPayload(audio=audio, initial_volume=level)
     base = ("doubletake-ctl", "-socket", profile.socket_path, "connect", "192.0.2.10")
-    assert profile.argv(BackendOperation.connect, target(), payload) == base + suffix
+    assert profile.argv(BackendOperation.connect, target(), payload).argv == base + suffix
     legacy = replace(profile, features=replace(profile.features, target_volume=False))
     result = legacy.try_argv(BackendOperation.connect, target(), payload)
     if audio is None and level is None:
-        assert result == Ok(value=base)
+        assert isinstance(result, Ok) and result.value.argv == base
     else:
         assert isinstance(result, Err) and result.error.code is ErrorCode.unsupported_operation
 
@@ -602,16 +602,16 @@ def test_profile_maps_only_explicit_target_scoped_published_commands():
     profile = PublishedDoubletakeProfile(socket_path="/run/user/1000/airplay-linux/doubletake.sock")
     receiver = target()
 
-    assert profile.argv(BackendOperation.status, None, EmptyPayload()) == (
+    assert profile.argv(BackendOperation.status, None, EmptyPayload()).argv == (
         "doubletake-ctl", "-socket", profile.socket_path, "status"
     )
-    assert profile.argv(BackendOperation.disconnect, receiver, EmptyPayload())[-2:] == (
+    assert profile.argv(BackendOperation.disconnect, receiver, EmptyPayload()).argv[-2:] == (
         "disconnect", receiver.canonical_host
     )
-    assert profile.argv(BackendOperation.mute, receiver, EmptyPayload())[-2:] == (
+    assert profile.argv(BackendOperation.mute, receiver, EmptyPayload()).argv[-2:] == (
         "mute", receiver.canonical_host
     )
-    assert profile.argv(BackendOperation.unmute, receiver, EmptyPayload())[-2:] == (
+    assert profile.argv(BackendOperation.unmute, receiver, EmptyPayload()).argv[-2:] == (
         "unmute", receiver.canonical_host
     )
 

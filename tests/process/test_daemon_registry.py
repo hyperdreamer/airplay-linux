@@ -981,3 +981,1150 @@ async def test_every_owned_termination_passes_strict_true(private_socket_root, m
             c.close()
         elif path != "namespace_probe":
             c.close()
+
+
+def marker_for_receipt(receipt, *, target="192.0.2.41"):
+    from airplay_linux.domain.records import CredentialRecoveryMarker, OriginalDaemonIdentity
+
+    return CredentialRecoveryMarker(
+        schema_version=1, target=target, receiver_id="airplay-device:recovery",
+        start_operation_id=UUID(int=151), marker_generation=1, state="watching",
+        automatic_status_checks=True, release_attempt=None, retirement=None,
+        original_daemon=OriginalDaemonIdentity(
+            launch_uuid=receipt.launch_uuid, instance_uuid=receipt.daemon_instance_uuid,
+            endpoint_generation=receipt.endpoint_generation, daemon_process=receipt.daemon,
+            runtime_directory=receipt.runtime_directory,
+            socket_path=str(Path(receipt.runtime_directory) / receipt.socket_name),
+        ),
+    )
+
+
+async def test_authenticate_exact_identity_resolves_fresh_registry_record(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+
+    result = await c.registry.authenticate_exact_identity(marker.original_daemon)
+
+    assert result == Ok(value=replace(c.record, lifecycle="running"))
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("field", [
+    "launch_uuid", "instance_uuid", "endpoint_generation", "pid", "start_ticks",
+    "runtime_directory", "socket_path",
+])
+async def test_authenticate_exact_identity_rejects_each_mismatched_field(
+    application_daemon_identity_cases, field,
+):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    identity = marker_for_receipt(await c.current()).original_daemon
+    changed = {
+        "launch_uuid": UUID(int=801), "instance_uuid": InstanceId(UUID(int=802)),
+        "endpoint_generation": identity.endpoint_generation + 1,
+        "runtime_directory": identity.runtime_directory + "-other",
+        "socket_path": identity.runtime_directory + "/other.sock",
+    }
+    if field in {"pid", "start_ticks"}:
+        process = replace(identity.daemon_process, **{field: getattr(identity.daemon_process, field) + 1})
+        identity = replace(identity, daemon_process=process)
+    else:
+        identity = replace(identity, **{field: changed[field]})
+    c.reopen()
+
+    result = await c.registry.authenticate_exact_identity(identity)
+
+    assert isinstance(result, Err)
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize('state', ['watching', 'release_pending'])
+async def test_recovery_exemption_retains_authenticated_original_as_current(application_daemon_identity_cases, state):
+    # Breaks when reconciliation stops a marker-owned daemon or fails to adopt it.
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    marker = replace(marker_for_receipt(receipt), state=state)
+    c.reopen()
+    exempted = await c.registry.authenticate_recovery(marker)
+    assert isinstance(exempted, Ok) and exempted.value is not None
+    exemption = exempted.value
+    assert exemption.marker_identity == marker
+    assert exemption.marker_generation == 1
+    assert exemption.kind == "watching_original"
+    assert exemption.daemon_identity == marker.original_daemon
+    assert await c.registry.reconcile_previous(recovery_exemptions=(exemption,)) == Ok(value=None)
+    assert c.registry._record == replace(c.record, lifecycle="running")
+    assert c.registry._ready
+    assert (await c.current()) == receipt
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+    assert (await c.registry.ensure()).value.instance_uuid == marker.original_daemon.instance_uuid
+    assert len(c.process.spawned) == 1
+
+
+@pytest.mark.parametrize("field", ["launch_uuid", "instance_uuid", "endpoint_generation", "pid", "start_ticks", "runtime_directory", "socket_path"])
+async def test_recovery_original_requires_every_historical_identity_field(application_daemon_identity_cases, field):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old = marker.original_daemon
+    changed = {
+        "launch_uuid": UUID(int=170), "instance_uuid": InstanceId(UUID(int=171)),
+        "endpoint_generation": old.endpoint_generation + 1,
+        "runtime_directory": old.runtime_directory + "-other",
+        "socket_path": old.runtime_directory + "/other.sock",
+    }
+    if field in {"pid", "start_ticks"}:
+        identity = replace(old.daemon_process, **{field: getattr(old.daemon_process, field) + 1})
+        old = replace(old, daemon_process=identity)
+    else:
+        old = replace(old, **{field: changed[field]})
+    c.reopen()
+    c.events.clear()
+    result = await c.registry.authenticate_recovery(replace(marker, original_daemon=old))
+    assert isinstance(result, Ok) and result.value is None
+    assert "status-poll" not in c.events
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("change", ["same_address_process", "stale_socket", "missing_daemon", "supervisor_intent"])
+async def test_recovery_unavailable_original_is_never_contacted(application_daemon_identity_cases, change):
+    from airplay_linux.domain.records import SupervisorReleaseIntent
+    from test_owned_launcher import DAEMON
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    receipt = await c.current()
+    marker = marker_for_receipt(receipt)
+    if change == "same_address_process":
+        c.facts.peer_pid = 999
+    elif change == "stale_socket":
+        c.replace_entry()
+    elif change == "missing_daemon":
+        c.process.exit(DAEMON)
+    else:
+        intent = SupervisorReleaseIntent(
+            schema_version=1, launch_uuid=receipt.launch_uuid, instance_uuid=receipt.instance_uuid,
+            app=receipt.app, supervisor=receipt.supervisor, daemon=receipt.daemon,
+            reason="application-exited", intent_at=1.0,
+        )
+        assert isinstance(await c.supervisor_intents(receipt.runtime_directory).write(intent), Ok)
+    c.reopen()
+    c.events.clear()
+    result = await c.registry.authenticate_recovery(marker)
+    assert isinstance(result, Ok) and result.value is None
+    assert "status-poll" not in c.events
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize("change", ["launch_uuid", "process", "generation", "target", "marker_generation", "marker_bool", "socket"])
+async def test_registry_revalidates_exemption_before_any_cleanup(application_daemon_identity_cases, change):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+    result = await c.registry.authenticate_recovery(marker)
+    assert isinstance(result, Ok) and result.value is not None
+    exemption = result.value
+    if change == "launch_uuid":
+        exemption = replace(exemption, daemon_identity=replace(exemption.daemon_identity, launch_uuid=UUID(int=172)))
+    elif change == "process":
+        c.process.register(replace(marker.original_daemon.daemon_process, start_ticks=999), {})
+    elif change == "generation":
+        exemption = replace(exemption, daemon_identity=replace(exemption.daemon_identity, endpoint_generation=99))
+    elif change == "target":
+        exemption = replace(exemption, marker_identity=replace(marker, target="192.0.2.42"))
+    elif change == "marker_generation":
+        exemption = replace(exemption, marker_generation=2)
+    elif change == "marker_bool":
+        exemption = replace(exemption, marker_generation=True)
+    else:
+        c.facts.peer_pid = 999
+    c.events.clear()
+    refused = await c.registry.reconcile_previous(recovery_exemptions=(exemption,))
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert "status-poll" not in c.events
+    assert (await c.current()).state == "ready"
+
+
+async def test_recovery_exemption_still_reconciles_every_unrelated_receipt(application_daemon_identity_cases):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    c.reopen()
+    exemption = (await c.registry.authenticate_recovery(marker)).value
+    terminal = replace(await c.current(), launch_uuid=UUID(int=173), endpoint_generation=2,
+                       runtime_directory=str(c.root / "unrelated"), state="stopped",
+                       daemon_instance_uuid=InstanceId(UUID(int=174)), daemon=ProcessIdentity(pid=175, start_ticks=176),
+                       supervisor=ProcessIdentity(pid=177, start_ticks=178), peer_pid=175, peer_start_ticks=176)
+    Path(terminal.runtime_directory).mkdir(mode=0o700)
+    info = Path(terminal.runtime_directory).stat()
+    terminal = replace(terminal, runtime_device=info.st_dev, runtime_inode=info.st_ino)
+    from airplay_linux.storage.codecs import encode_launch_receipt
+    path = c.root / "daemon/receipts" / (str(terminal.launch_uuid) + ".json")
+    path.write_bytes(encode_launch_receipt(terminal))
+    assert await c.registry.reconcile_previous(recovery_exemptions=(exemption,)) == Ok(value=None)
+    assert any(intent.launch_uuid == terminal.launch_uuid for intent in (await c.cleanup.all()).value)
+    assert c.registry._record.instance_uuid == marker.original_daemon.instance_uuid
+    assert c.process.terminated == []
+
+
+@pytest.mark.parametrize('marker_state', ['watching', 'release_pending'])
+async def test_startup_restores_watching_marker_before_registry_can_stop_original(
+    application_daemon_identity_cases, marker_state,
+):
+    # Breaks if ordinary reconciliation runs before the marker's exemption is
+    # restored, or if its enabled periodic checks omit pre-outcome markers.
+    from airplay_linux.backend.contract import BackendStream
+    from airplay_linux.domain.records import SessionSnapshot
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.runtime import compose_manager
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from airplay_linux.testing.builders import target
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = replace(marker_for_receipt(await c.current()), receiver_id=target().receiver_id)
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    if marker_state == 'release_pending':
+        marker = (await store.mark_release_pending(marker, marker.marker_generation)).value
+    c.reopen()
+    rig = SessionRig()
+    assert await rig.sessions.save(SessionSnapshot.idle(marker.receiver_id)) == Ok(value=None)
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    coordinator = CredentialRecoveryCoordinator(store, c.registry, fences=rig.fences)
+    deps = replace(rig.deps, credential_recovery=coordinator)
+    manager = compose_manager(deps)
+    result = await StartupRecovery(manager, deps, c.registry).run()
+    assert isinstance(result, Ok)
+    assert c.process.terminated == []
+    assert (await c.current()).state == "ready"
+    assert c.registry._record.instance_uuid == marker.original_daemon.instance_uuid
+    assert coordinator.markers == (marker,)
+    calls = []
+    target_present = False
+
+    class RecoveryControl:
+        def __init__(self, record):
+            self.record = record
+
+        async def request(
+            self, operation, destination, payload, context, *,
+            dispatch_fence=None, ownership_proof=None,
+        ):
+            assert self.record.socket_path == marker.original_daemon.socket_path
+            assert ownership_proof.daemon == marker.original_daemon.daemon_process
+            assert ownership_proof.generation == marker.original_daemon.endpoint_generation
+            if operation is BackendOperation.status:
+                calls.append((operation, destination))
+                rows = (BackendStream(
+                    device='Other receiver', target='192.0.2.99', state='pin_required',
+                    has_audio=False, audio_muted=False, credential_kind='pin',
+                ),)
+                if target_present:
+                    rows += (BackendStream(
+                        device='Receiver', target=marker.target, state='streaming',
+                        has_audio=False, audio_muted=False,
+                    ),)
+                return Ok(value=StatusReply(
+                    state='pin_required', device=None, target=None, has_audio=False,
+                    audio_muted=False, needs_credential=True, credential_kind='pin',
+                    streams=rows,
+                ))
+            assert operation is BackendOperation.disconnect
+            assert destination.canonical_host == marker.target
+            assert destination.receiver_id == marker.receiver_id
+            assert context.operation_id == marker.start_operation_id
+            assert context.marker_generation == marker.marker_generation
+            assert context.owner_daemon == marker.original_daemon
+            assert callable(dispatch_fence) and dispatch_fence() == Ok(value=None)
+            calls.append((operation, destination))
+            return Ok(value=AckReply(operation='disconnect', target=marker.target))
+
+        async def close(self):
+            return None
+
+    c.registry._control_factory = RecoveryControl
+    try:
+        for interval, target_present in enumerate((False, True, True)):
+            rig.scheduler.advance(4.0)
+            for _ in range(50):
+                await asyncio.sleep(0)
+                await manager.drain()
+            assert any(operation is BackendOperation.status for operation, _ in calls)
+            disconnects = tuple(
+                destination.canonical_host for operation, destination in calls
+                if operation is BackendOperation.disconnect
+            )
+            assert disconnects == (marker.target,) * interval
+            assert coordinator.markers == (marker,)
+            assert await store.for_target(marker.target) == Ok(value=marker)
+            assert isinstance(coordinator.require_start_allowed(marker.target, UUID(int=991)), Err)
+        assert c.process.terminated == []
+    finally:
+        coordinator.stop_automatic_checks()
+
+
+async def test_registry_exposes_endpoint_changing_release_operation(
+    application_daemon_identity_cases,
+):
+    c = application_daemon_identity_cases
+    assert callable(getattr(c.registry, "restart_with_new_endpoint", None))
+
+
+async def test_release_refuses_an_attempt_without_durable_marker_authority(
+    application_daemon_identity_cases,
+):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    old = marker_for_receipt(await c.current()).original_daemon
+    attempt = UUID(int=705)
+    runtime = c.registry._configured_runtime / attempt.hex
+    refused = await c.registry.restart_with_new_endpoint(old, attempt, runtime, runtime / "daemon.sock")
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+    assert not runtime.exists()
+
+
+async def test_registry_recovery_stop_uses_only_the_recorded_daemon_and_exact_target(
+    application_daemon_identity_cases,
+):
+    from airplay_linux.backend.contract import AckReply, BackendStream
+    from airplay_linux.domain.operations import OperationContext, OperationId
+    from airplay_linux.domain.resources import Ok
+    from airplay_linux.testing.builders import target
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    destination = target("recovery", address=marker.target)
+    calls = []
+    disconnected = asyncio.Event()
+    late_target = {"present": True}
+
+    class RecoveryControl:
+        def __init__(self, record):
+            self.record = record
+
+        async def request(
+            self, operation, requested_target, payload, context, *,
+            dispatch_fence=None, ownership_proof=None,
+        ):
+            calls.append((self.record.socket_path, operation, requested_target, context))
+            if operation is BackendOperation.status:
+                return Ok(value=StatusReply(
+                    state="pin_required", device=None, target=None, has_audio=False,
+                    audio_muted=False, needs_credential=True, credential_kind="pin",
+                    streams=(BackendStream(
+                        device="Receiver", target=marker.target, state="pin_required",
+                        credential_kind="pin", has_audio=False, audio_muted=False,
+                    ),) if late_target["present"] else (),
+                ))
+            assert operation is BackendOperation.disconnect
+            assert requested_target.canonical_host == marker.target
+            assert callable(dispatch_fence) and dispatch_fence() == Ok(value=None)
+            assert ownership_proof is not None
+            disconnected.set()
+            return Ok(value=AckReply(
+                operation="disconnect", target=marker.target,
+            ))
+
+        async def close(self):
+            return None
+
+    c.registry._control_factory = RecoveryControl
+    operation = OperationContext(
+        operation_id=OperationId(UUID(int=731)), session_generation=4,
+        endpoint_generation=destination.endpoint_generation,
+        marker_generation=marker.marker_generation, owner_daemon=marker.original_daemon,
+    )
+    result = await c.registry.stop_recovery_target(
+        marker, destination, operation, lambda: Ok(value=None),
+    )
+
+    assert isinstance(result, Ok)
+    disconnects = tuple(call for call in calls if call[1] is BackendOperation.disconnect)
+    assert len(disconnects) == 1
+    assert disconnects[0][0] == marker.original_daemon.socket_path
+    assert disconnects[0][2] == destination
+    assert disconnects[0][3] == operation
+    assert c.process.terminated == []
+
+    from airplay_linux.domain.messages import StopCredentialRecovery
+    from airplay_linux.session.engine import SessionManager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, build_recovery_handlers
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    marker_store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await marker_store.create(marker), Ok)
+    session = SessionRig()
+    for subscription in session.manager._subscriptions:
+        subscription.close()
+    session.discovery.add_target(destination)
+    coordinator = CredentialRecoveryCoordinator(marker_store, c.registry, fences=session.fences)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+    deps = replace(session.deps, credential_recovery=coordinator)
+    manager = SessionManager(deps, build_recovery_handlers(deps))
+    disconnected.clear()
+    accepted = await manager.dispatch(StopCredentialRecovery(
+        receiver_id=marker.receiver_id, target=marker.target,
+        marker_generation=marker.marker_generation,
+    ))
+    assert accepted.accepted
+    await asyncio.wait_for(disconnected.wait(), 1.0)
+    await manager.drain()
+    routed = tuple(call for call in calls if call[1] is BackendOperation.disconnect)
+    assert len(routed) == 2
+    assert routed[-1][0] == marker.original_daemon.socket_path
+    assert routed[-1][2] == destination
+    assert coordinator.markers == (marker,)
+
+    pending = await coordinator.mark_release_pending_for(marker, marker.marker_generation)
+    assert isinstance(pending, Ok)
+    late_target["present"] = False
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await manager.drain()
+    assert any(call[1] is BackendOperation.status for call in calls)
+    assert not any(call[1] is BackendOperation.disconnect for call in calls)
+    assert coordinator.markers == (pending.value,)
+
+    late_target["present"] = True
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await manager.drain()
+    automatic_disconnects = [call for call in calls if call[1] is BackendOperation.disconnect]
+    assert len(automatic_disconnects) == 1
+    assert automatic_disconnects[0][0] == marker.original_daemon.socket_path
+    assert automatic_disconnects[0][2].canonical_host == marker.target
+    assert coordinator.markers == (pending.value,)
+    coordinator.stop_automatic_checks()
+
+    # Restore the durable marker and authenticate its original daemon before
+    # ordinary registry reconciliation, then observe a late target again.
+    c.reopen()
+    c.registry._control_factory = RecoveryControl
+    restored = CredentialRecoveryCoordinator(marker_store, c.registry, fences=session.fences)
+    restored_deps = replace(session.deps, credential_recovery=restored)
+    restored_manager = SessionManager(restored_deps, build_recovery_handlers(restored_deps))
+    assert await restored.load_before_startup() == Ok(value=None)
+    exemptions = await restored.recover_before_registry_reconciliation()
+    assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
+    assert await c.registry.reconcile_previous(recovery_exemptions=exemptions.value) == Ok(value=None)
+    restored._startup_completed()
+    calls.clear()
+    session.scheduler.advance(4.0)
+    for _ in range(50):
+        await asyncio.sleep(0)
+        await restored_manager.drain()
+    restored_disconnects = [call for call in calls if call[1] is BackendOperation.disconnect]
+    assert len(restored_disconnects) == 1
+    assert restored_disconnects[0][0] == marker.original_daemon.socket_path
+    assert restored_disconnects[0][2].canonical_host == marker.target
+    assert restored.markers == (pending.value,)
+    restored.stop_automatic_checks()
+
+
+async def test_release_refuses_ready_receipt_with_starting_record_before_teardown(
+    application_daemon_identity_cases,
+):
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, marker.marker_generation)).value
+    attempt = UUID(int=730)
+    runtime = c.registry._configured_runtime / attempt.hex
+    pending = (await store.record_release_attempt(
+        pending, pending.marker_generation, ReleaseAttempt(
+            attempt_id=attempt, replacement_runtime_directory=str(runtime),
+            replacement_socket_path=str(runtime / "daemon.sock"), status="intended",
+            replacement_instance_uuid=None, replacement_endpoint_generation=None,
+            readiness=None, terminal_evidence=None,
+        ),
+    )).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    starting = replace(c.record, lifecycle="starting")
+    assert isinstance(await c.store.write(starting), Ok)
+    c.registry._record = starting
+    c.registry._ready = False
+
+    refused = await c.registry.restart_with_new_endpoint(
+        marker.original_daemon, attempt, runtime, runtime / "daemon.sock",
+    )
+
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+
+
+@pytest.fixture
+def release_socket_case(private_socket_root, monkeypatch):
+    from test_owned_launcher import OwnedCase
+
+    case = OwnedCase(private_socket_root, monkeypatch, runtime_root=private_socket_root / 'r')
+    try:
+        yield case
+    finally:
+        case.close()
+
+
+async def test_endpoint_release_stops_old_and_publishes_correlated_replacement(
+    release_socket_case, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = release_socket_case
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old = marker.original_daemon
+    attempt = UUID(int=704)
+    runtime = c.registry._configured_runtime / attempt.hex
+    socket_path = runtime / "daemon.sock"
+    old_socket = old.socket_path
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, marker.marker_generation)).value
+    intended = (await store.record_release_attempt(pending, pending.marker_generation, ReleaseAttempt(
+        attempt_id=attempt, replacement_runtime_directory=str(runtime),
+        replacement_socket_path=str(socket_path), status="intended",
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(intended, lambda: Ok(value=None)) == Ok(value=None)
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, "SUPERVISOR", ProcessIdentity(pid=220, start_ticks=21))
+        monkeypatch.setattr(fixture_module, "DAEMON", ProcessIdentity(pid=230, start_ticks=31))
+        c.facts.peer_pid = 230
+
+    c.hooks["exit-proof"] = new_processes
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError('ordinary restart was used')
+
+    monkeypatch.setattr(c.registry, 'restart', forbidden)
+    result = await asyncio.wait_for(
+        c.registry.restart_with_new_endpoint(old, attempt, runtime, socket_path), 2.0,
+    )
+    assert isinstance(result, Ok)
+    restart = result.value
+    assert restart.old_daemon_termination.launch_uuid == old.launch_uuid
+    assert restart.record.socket_path == str(socket_path)
+    assert restart.record.socket_path != old_socket
+    with socket.socket(socket.AF_UNIX) as stale_client:
+        import errno
+        assert stale_client.connect_ex(old_socket) == errno.ENOENT
+    assert restart.receipt.recovery_attempt_id == attempt
+    assert restart.readiness.recovery_attempt_id == attempt
+    assert restart.readiness.launch_uuid == restart.receipt.launch_uuid
+    assert restart.receipt.state == "ready"
+    assert len(c.process.spawned) == 2
+    repeated = await c.registry.restart_with_new_endpoint(old, attempt, runtime, socket_path)
+    assert isinstance(repeated, Ok)
+    assert repeated.value.receipt == restart.receipt
+    assert len(c.process.spawned) == 2
+
+
+@pytest.mark.parametrize('mismatch', [
+    'launch', 'instance', 'generation', 'pid', 'start_ticks', 'old_socket',
+    'old_runtime', 'attempt', 'new_runtime', 'new_socket', 'reused_path', 'same_address',
+])
+async def test_release_refuses_mismatched_identity_or_endpoint_before_teardown(
+    application_daemon_identity_cases, mismatch,
+):
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old = marker.original_daemon
+    attempt = UUID(int=706)
+    runtime = c.registry._configured_runtime / attempt.hex
+    endpoint = runtime / 'daemon.sock'
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=attempt, replacement_runtime_directory=str(runtime),
+        replacement_socket_path=str(endpoint), status='intended', replacement_instance_uuid=None,
+        replacement_endpoint_generation=None, readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+    if mismatch == 'launch':
+        old = replace(old, launch_uuid=UUID(int=1))
+    elif mismatch == 'instance':
+        old = replace(old, instance_uuid=InstanceId(UUID(int=2)))
+    elif mismatch == 'generation':
+        old = replace(old, endpoint_generation=old.endpoint_generation + 1)
+    elif mismatch in {'pid', 'start_ticks'}:
+        old = replace(old, daemon_process=replace(old.daemon_process, **{
+            mismatch: getattr(old.daemon_process, mismatch) + 1,
+        }))
+    elif mismatch == 'old_socket':
+        old = replace(old, socket_path=old.socket_path + '-changed')
+    elif mismatch == 'old_runtime':
+        old = replace(old, runtime_directory=old.runtime_directory + '-changed')
+    elif mismatch == 'attempt':
+        attempt = UUID(int=707)
+    elif mismatch == 'new_runtime':
+        runtime = c.registry._configured_runtime / 'other'
+        endpoint = runtime / 'daemon.sock'
+    elif mismatch == 'new_socket':
+        endpoint = runtime / 'other.sock'
+    elif mismatch == 'reused_path':
+        runtime.mkdir(mode=0o700)
+    else:
+        c.facts.peer_pid = 999
+    refused = await c.registry.restart_with_new_endpoint(old, attempt, runtime, endpoint)
+    assert isinstance(refused, Err)
+    assert c.process.terminated == []
+    assert len(c.process.spawned) == 1
+
+
+async def test_coordinator_retires_only_after_durable_replacement_readiness(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    original = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(original), Ok)
+    pending = (await store.dismiss(original, 1)).value
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+    order = []
+    for name in ("record_release_attempt", "record_replacement_ready", "retire_after_replacement"):
+        original_method = getattr(store, name)
+
+        async def observed(*args, method=original_method, label=name):
+            result = await method(*args)
+            if isinstance(result, Ok):
+                order.append(label)
+            return result
+
+        monkeypatch.setattr(store, name, observed)
+
+    def new_processes():
+        assert order == ["record_release_attempt"]
+        monkeypatch.setattr(fixture_module, "SUPERVISOR", ProcessIdentity(pid=240, start_ticks=41))
+        monkeypatch.setattr(fixture_module, "DAEMON", ProcessIdentity(pid=250, start_ticks=51))
+        c.facts.peer_pid = 250
+
+    c.hooks["exit-proof"] = new_processes
+    released = await coordinator.restart_receiver_to_release(pending, pending.marker_generation)
+    assert isinstance(released, Ok)
+    marker = released.value
+    assert marker.state == "retired"
+    assert marker.retirement.kind == "daemon_replaced"
+    assert marker.release_attempt.readiness.recovery_attempt_id == marker.release_attempt.attempt_id
+    assert order == ["record_release_attempt", "record_replacement_ready", "retire_after_replacement"]
+    assert await store.for_target(marker.target) == Ok(value=marker)
+    assert coordinator.require_start_allowed(marker.target, UUID(int=888)) == Ok(value=None)
+    assert len(c.process.spawned) == 2
+
+
+async def test_startup_adopts_interrupted_ready_release_before_ordinary_reconciliation(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.process.launcher import ProductionLaunchCapability
+    from airplay_linux.runtime import compose_manager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old_runtime = c.registry._configured_runtime
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    attempt_id = UUID(int=715)
+    new_runtime = old_runtime / attempt_id.hex
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=attempt_id, replacement_runtime_directory=str(new_runtime),
+        replacement_socket_path=str(new_runtime / 'daemon.sock'), status='intended',
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=260, start_ticks=61))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=270, start_ticks=71))
+        c.facts.peer_pid = 270
+
+    c.hooks['exit-proof'] = new_processes
+    replacement = await c.registry.restart_with_new_endpoint(
+        marker.original_daemon, attempt_id, new_runtime, new_runtime / 'daemon.sock',
+    )
+    assert isinstance(replacement, Ok)
+    c.reopen()
+    c.registry._configured_runtime = old_runtime
+    c.registry._launcher = ProductionLaunchCapability(
+        fixture_module.FEATURES, old_runtime, production_graph=True,
+    )
+    rig = SessionRig()
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    coordinator = CredentialRecoveryCoordinator(store, c.registry, fences=rig.fences)
+    deps = replace(rig.deps, credential_recovery=coordinator)
+    manager = compose_manager(deps)
+    result = await StartupRecovery(manager, deps, c.registry).run()
+    assert isinstance(result, Ok)
+    assert coordinator.markers[0].state == 'retired'
+    assert c.registry._record.instance_uuid == replacement.value.record.instance_uuid
+    assert c.registry._ready
+    assert c.process.identity(270) == ProcessIdentity(pid=270, start_ticks=71)
+    assert len(c.process.spawned) == 2
+
+
+async def test_operator_restart_command_runs_endpoint_release_through_session_manager(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.messages import DismissCredentialRecovery, RestartReceiverToRelease
+    from airplay_linux.domain.records import SessionSnapshot
+    from airplay_linux.runtime import compose_manager
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+    rig = SessionRig()
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    manager = compose_manager(replace(rig.deps, credential_recovery=coordinator))
+    original_operation = UUID(int=777)
+    manager.install(replace(SessionSnapshot.idle(marker.receiver_id), operation_id=original_operation))
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=280, start_ticks=81))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=290, start_ticks=91))
+        c.facts.peer_pid = 290
+
+    c.hooks['exit-proof'] = new_processes
+    dismissed = await manager.dispatch(DismissCredentialRecovery(
+        receiver_id=marker.receiver_id, target=marker.target,
+        marker_generation=marker.marker_generation,
+    ))
+    assert dismissed.accepted
+    assert manager.snapshot(marker.receiver_id).operation_id == original_operation
+    for _ in range(100):
+        await manager.drain()
+        if coordinator.markers[0].state == 'release_pending':
+            break
+        await asyncio.sleep(0.01)
+    pending = coordinator.markers[0]
+    assert pending.state == 'release_pending'
+    accepted = await manager.dispatch(RestartReceiverToRelease(
+        receiver_id=pending.receiver_id, target=pending.target,
+        marker_generation=pending.marker_generation,
+    ))
+    assert accepted.accepted
+    assert manager.snapshot(marker.receiver_id).operation_id == original_operation
+    for _ in range(100):
+        await manager.drain()
+        if coordinator.markers[0].state == 'retired':
+            break
+        await asyncio.sleep(0.01)
+    assert coordinator.markers[0].state == 'retired'
+    assert len(c.process.spawned) == 2
+
+
+@pytest.mark.parametrize('failed_transition', ['ready', 'retired'])
+async def test_release_retries_visible_but_unconfirmed_marker_bytes(
+    application_daemon_identity_cases, monkeypatch, failed_transition,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles, StorageError
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+
+    class Files(AtomicFiles):
+        fail = False
+
+        def write(self, path, payload):
+            super().write(path, payload)
+            if self.fail and path.startswith('credential-recovery/'):
+                value = json.loads(payload)
+                attempt = value.get('release_attempt')
+                is_failure = (value['state'] == 'retired' if failed_transition == 'retired'
+                              else value['state'] == 'release_pending' and attempt is not None
+                              and attempt['status'] == 'ready')
+                if is_failure:
+                    raise StorageError('directory_fsync', path)
+
+    files = Files(c.root)
+    store = JsonCredentialRecoveryMarkerStore(files)
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=310, start_ticks=101))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=320, start_ticks=111))
+        c.facts.peer_pid = 320
+
+    c.hooks['exit-proof'] = new_processes
+    files.fail = True
+    result = await coordinator.restart_receiver_to_release(pending, pending.marker_generation)
+    assert isinstance(result, Err)
+    cached = coordinator.markers[0]
+    visible = (await store.for_target(marker.target)).value
+    assert visible.marker_generation == cached.marker_generation + 1
+    assert isinstance(coordinator.require_start_allowed(marker.target, UUID(int=999)), Err)
+    assert len(c.process.spawned) == 2
+    files.fail = False
+    c.status = 'streaming'  # An unrelated target may already use the authenticated daemon.
+    retried = await coordinator.restart_receiver_to_release(cached, cached.marker_generation)
+    assert isinstance(retried, Ok)
+    assert retried.value.state == 'retired'
+    assert coordinator.require_start_allowed(marker.target, UUID(int=999)) == Ok(value=None)
+    assert len(c.process.spawned) == 2
+
+
+async def test_interrupted_attempt_without_reservation_uses_a_fresh_attempt(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    old_attempt = UUID(int=721)
+    old_path = c.registry._configured_runtime / old_attempt.hex
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=old_attempt, replacement_runtime_directory=str(old_path),
+        replacement_socket_path=str(old_path / 'daemon.sock'), status='intended',
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=330, start_ticks=121))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=340, start_ticks=131))
+        c.facts.peer_pid = 340
+
+    c.hooks['exit-proof'] = new_processes
+    exemptions = await coordinator.recover_before_registry_reconciliation()
+    assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
+    retired = coordinator.markers[0]
+    assert retired.state == 'retired'
+    assert retired.release_attempt.attempt_id != old_attempt
+    assert retired.release_attempt.replacement_runtime_directory != str(old_path)
+    assert old_path.is_dir()
+    assert not tuple(old_path.iterdir())
+    assert await c.registry.reconcile_previous(recovery_exemptions=exemptions.value) == Ok(value=None)
+    assert c.registry._record.instance_uuid == retired.release_attempt.replacement_instance_uuid
+    assert len(c.process.spawned) == 2
+
+
+@pytest.mark.parametrize('boundary', ['reservation-write', 'after-detached-write'])
+async def test_interrupted_partial_release_stays_fenced_without_second_launch(
+    application_daemon_identity_cases, monkeypatch, boundary,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    attempt = UUID(int=722)
+    runtime = c.registry._configured_runtime / attempt.hex
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=attempt, replacement_runtime_directory=str(runtime),
+        replacement_socket_path=str(runtime / 'daemon.sock'), status='intended',
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=350, start_ticks=141))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=360, start_ticks=151))
+        c.facts.peer_pid = 360
+
+    c.hooks['exit-proof'] = new_processes
+    c.hooks[boundary] = lambda: (_ for _ in ()).throw(fixture_module.Crash())
+    with pytest.raises(fixture_module.Crash):
+        await c.registry.restart_with_new_endpoint(marker.original_daemon, attempt, runtime, runtime / 'daemon.sock')
+    spawned_before = len(c.process.spawned)
+    terminated_before = list(c.process.terminated)
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    recovered = await coordinator.recover_before_registry_reconciliation()
+    if boundary == 'reservation-write':
+        assert isinstance(recovered, Ok)
+        assert coordinator.markers[0].state == 'retired'
+        assert coordinator.markers[0].release_attempt.attempt_id != attempt
+        assert len(c.process.spawned) == spawned_before + 1
+    else:
+        assert isinstance(recovered, Err)
+        assert coordinator.markers == (pending,)
+        assert len(c.process.spawned) == spawned_before
+    assert isinstance(coordinator.require_start_allowed(marker.target, UUID(int=723)), Err)
+    assert c.process.terminated == terminated_before
+
+
+async def test_startup_finishes_interrupted_running_publication_after_ready_receipt(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.process.launcher import ProductionLaunchCapability
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    old_runtime = c.registry._configured_runtime
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    attempt = UUID(int=724)
+    runtime = old_runtime / attempt.hex
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=attempt, replacement_runtime_directory=str(runtime),
+        replacement_socket_path=str(runtime / 'daemon.sock'), status='intended',
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=370, start_ticks=161))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=380, start_ticks=171))
+        c.facts.peer_pid = 380
+
+    c.hooks['exit-proof'] = new_processes
+    c.hooks['after-ready-write'] = lambda: (_ for _ in ()).throw(fixture_module.Crash())
+    with pytest.raises(fixture_module.Crash):
+        await c.registry.restart_with_new_endpoint(marker.original_daemon, attempt, runtime, runtime / 'daemon.sock')
+    assert (await c.current()).state == 'ready'
+    assert next(iter((await c.store.all()).value)).lifecycle == 'starting'
+    c.reopen()
+    c.registry._configured_runtime = old_runtime
+    c.registry._launcher = ProductionLaunchCapability(fixture_module.FEATURES, old_runtime, production_graph=True)
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    exemptions = await coordinator.recover_before_registry_reconciliation()
+    assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
+    assert coordinator.markers[0].state == 'retired'
+    assert await c.registry.reconcile_previous(recovery_exemptions=exemptions.value) == Ok(value=None)
+    assert c.registry._record.lifecycle == 'running'
+    assert len(c.process.spawned) == 2
+
+
+@pytest.mark.parametrize('changed', ['attempt', 'socket', 'ownership'])
+async def test_coordinator_rejects_mismatched_restart_evidence(
+    application_daemon_identity_cases, monkeypatch, changed,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    coordinator._startup_completed()
+
+    def new_processes():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=430, start_ticks=221))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=440, start_ticks=231))
+        c.facts.peer_pid = 440
+
+    c.hooks['exit-proof'] = new_processes
+    actual_restart = c.registry.restart_with_new_endpoint
+
+    async def altered(*args):
+        result = await actual_restart(*args)
+        assert isinstance(result, Ok)
+        restart = result.value
+        if changed == 'attempt':
+            restart = replace(restart, readiness=replace(restart.readiness, recovery_attempt_id=UUID(int=998)))
+        elif changed == 'socket':
+            restart = replace(restart, readiness=replace(restart.readiness, socket_inode=restart.readiness.socket_inode + 1))
+        else:
+            restart = replace(restart, ownership_proof=replace(
+                restart.ownership_proof, daemon=ProcessIdentity(pid=999, start_ticks=1),
+            ))
+        return Ok(value=restart)
+
+    monkeypatch.setattr(c.registry, 'restart_with_new_endpoint', altered)
+    result = await coordinator.restart_receiver_to_release(pending, pending.marker_generation)
+    assert isinstance(result, Err)
+    assert coordinator.markers[0].state == 'release_pending'
+    assert isinstance(coordinator.require_start_allowed(marker.target, UUID(int=999)), Err)
+
+
+async def test_terminal_interrupted_replacement_is_closed_before_fresh_attempt(
+    application_daemon_identity_cases, monkeypatch,
+):
+    import test_owned_launcher as fixture_module
+    from airplay_linux.domain.records import ReleaseAttempt
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    marker = marker_for_receipt(await c.current())
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(c.root))
+    assert isinstance(await store.create(marker), Ok)
+    pending = (await store.dismiss(marker, 1)).value
+    first_id = UUID(int=725)
+    first_path = c.registry._configured_runtime / first_id.hex
+    pending = (await store.record_release_attempt(pending, 2, ReleaseAttempt(
+        attempt_id=first_id, replacement_runtime_directory=str(first_path),
+        replacement_socket_path=str(first_path / 'daemon.sock'), status='intended',
+        replacement_instance_uuid=None, replacement_endpoint_generation=None,
+        readiness=None, terminal_evidence=None,
+    ))).value
+    assert c.registry.authorize_recovery_attempt(pending, lambda: Ok(value=None)) == Ok(value=None)
+
+    def first_replacement():
+        monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=390, start_ticks=181))
+        monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=400, start_ticks=191))
+        c.facts.peer_pid = 400
+        c.bind_on_spawn = False
+
+    c.hooks['exit-proof'] = first_replacement
+    failed = await c.registry.restart_with_new_endpoint(
+        marker.original_daemon, first_id, first_path, first_path / 'daemon.sock',
+    )
+    assert isinstance(failed, Err)
+    first_receipt = next(r for r in (await c.receipts.all()).value if r.recovery_attempt_id == first_id)
+    assert first_receipt.state == 'failed'
+    assert any(i.launch_uuid == first_receipt.launch_uuid and i.outcome == 'stopped'
+               for i in (await c.cleanup.all()).value)
+    c.bind_on_spawn = True
+    monkeypatch.setattr(fixture_module, 'SUPERVISOR', ProcessIdentity(pid=410, start_ticks=201))
+    monkeypatch.setattr(fixture_module, 'DAEMON', ProcessIdentity(pid=420, start_ticks=211))
+    c.facts.peer_pid = 420
+    coordinator = CredentialRecoveryCoordinator(store, c.registry)
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    exemptions = await coordinator.recover_before_registry_reconciliation()
+    assert isinstance(exemptions, Ok) and len(exemptions.value) == 1
+    replacement = coordinator.markers[0].release_attempt
+    assert replacement.attempt_id != first_id
+    assert replacement.replacement_runtime_directory != str(first_path)
+    assert coordinator.markers[0].state == 'retired'
+    assert len(c.process.spawned) == 3
+
+
+async def test_legacy_stopped_receipt_query_preserves_its_original_proof_shape(
+    application_daemon_identity_cases,
+):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    record = c.registry._record
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert (await c.cleanup.all()).value
+    proof = await c.registry.termination_proof(record)
+    assert isinstance(proof, Ok)
+    assert proof.value.cleanup_outcome is None
+    assert proof.value.cleanup_completed_at is None
+
+
+async def test_exact_historical_termination_proof_survives_registry_reconciliation(
+    application_daemon_identity_cases,
+):
+    c = application_daemon_identity_cases
+    assert isinstance(await c.launch(), Ok)
+    old = marker_for_receipt(await c.current()).original_daemon
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert await c.registry.reconcile_previous() == Ok(value=None)
+    assert c.registry._record is None
+    c.reopen()
+    async with c.registry._lock:
+        waiting = asyncio.create_task(c.registry.termination_proof(old))
+        await asyncio.sleep(0)
+        assert not waiting.done()
+    proof = await asyncio.wait_for(waiting, 1.0)
+    assert isinstance(proof, Ok)
+    assert (proof.value.launch_uuid, proof.value.daemon_instance_uuid, proof.value.daemon) == (
+        old.launch_uuid, old.instance_uuid, old.daemon_process,
+    )
+    for changed in (
+        replace(old, launch_uuid=UUID(int=701)),
+        replace(old, endpoint_generation=old.endpoint_generation + 1),
+        replace(old, daemon_process=replace(old.daemon_process, start_ticks=999)),
+        replace(old, socket_path=old.socket_path + "-wrong"),
+    ):
+        assert isinstance(await c.registry.termination_proof(changed), Err)

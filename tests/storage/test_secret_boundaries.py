@@ -26,6 +26,8 @@ import pytest
 
 from airplay_linux.domain.identity import ReceiverId
 from airplay_linux.domain.operations import (
+    ChallengeId,
+    ChallengeView,
     InstanceId,
     LeaseId,
     OpaqueBackendToken,
@@ -43,6 +45,7 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
+from airplay_linux.domain.relay import CredentialRequest, CredentialPromptState, RelayStartOptions
 from airplay_linux.domain.resources import (
     ErrorCode,
     PhysicalMonitorSource,
@@ -187,9 +190,49 @@ def daemon_record() -> DaemonRecord:
 # --------------------------------------------------------------------------- record shapes
 
 
-def test_the_session_disk_shape_has_no_challenge_or_secret():
-    state = replace(SessionSnapshot.idle(target().receiver_id), target=target())
+def test_a_credential_prompt_is_removed_before_snapshot_retention():
+    receiver_target = target()
+    request = CredentialRequest(
+        receiver_id=receiver_target.receiver_id,
+        target=receiver_target,
+        credential_kind="pin",
+        start_operation_id=OperationId(UUID(int=51)),
+        endpoint_generation=receiver_target.endpoint_generation,
+        session_generation=2,
+        owner_lease=LeaseId(UUID(int=52)),
+        daemon_instance_uuid=InstanceId(UUID(int=53)),
+        generation=1,
+        observed_at=12.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=ChallengeView(
+            challenge_id=ChallengeId(UUID(int=54)),
+            receiver_id=request.receiver_id,
+            endpoint_fingerprint=receiver_target.endpoint_fingerprint,
+            endpoint_generation=receiver_target.endpoint_generation,
+            operation_id=request.start_operation_id,
+            session_generation=request.session_generation,
+            trust_generation=3,
+            created_at=12.0,
+            expires_at=72.0,
+            credential_kind="pin",
+        ),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+    from airplay_linux.session.persistence import _safe_snapshot
+
+    state = replace(SessionSnapshot.idle(request.receiver_id), credential_prompt=prompt)
+    safe = _safe_snapshot(state)
     payload = encode_session(state)
+    assert safe.credential_prompt is None
+    assert b"credential_prompt" not in payload
+    assert b"start_operation_id" not in payload
     assert b"backend_token" not in payload
     assert b"portal_restore_token" not in payload
     assert b"password" not in payload

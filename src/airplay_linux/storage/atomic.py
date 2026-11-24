@@ -358,8 +358,8 @@ class AtomicFiles:
                 # presence, is only a durable fact once the entry is synced.
                 self._confirm(located)
 
-    def names(self, relative: str) -> tuple[str, ...]:
-        """Settled record names in ``relative``, sorted, without temporary artifacts."""
+    def names(self, relative: str, *, include_hidden: bool = False) -> tuple[str, ...]:
+        """List record names, optionally including hidden and temporary entries."""
         parts = self._components(relative)
         with self._directory(parts, create=False) as located:
             if located.parent is None or located.missing:
@@ -368,7 +368,7 @@ class AtomicFiles:
                 entries = self._filesystem.names(located.parent)
             except OSError:
                 raise StorageError("read") from None
-        return tuple(sorted(name for name in entries if not name.startswith(".")))
+        return tuple(sorted(name for name in entries if include_hidden or not name.startswith(".")))
 
     # -------------------------------------------------------------------- paths
 

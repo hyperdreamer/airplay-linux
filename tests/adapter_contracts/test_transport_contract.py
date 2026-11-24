@@ -103,6 +103,91 @@ if str(PROCESS_FIXTURES) not in sys.path:
 import fake_doubletake  # noqa: E402
 
 
+def test_fake_control_redacts_credential_in_failed_capture(tmp_path, monkeypatch, capsys):
+    canary = "fake-control-credential-f7-canary"
+    capture = tmp_path / "capture"
+    monkeypatch.setenv(fake_doubletake.CTL_MODE_ENV, "malformed")
+    monkeypatch.setenv(fake_doubletake.CTL_CAPTURE_ENV, str(capture))
+    result = fake_doubletake._ctl([
+        "-socket", str(tmp_path / "daemon.sock"), "connect", "192.0.2.1",
+        "--audio", "on", "--volume", "20", canary,
+    ])
+    assert result == 0
+    retained = fake_doubletake.daemon_journal_path(tmp_path).read_text()
+    capture_record = json.loads((capture / "ctl-argv-env.jsonl").read_text().splitlines()[0])
+    assert capture_record["argv"][-5:] == ["--audio", "on", "--volume", "20", "<redacted>"]
+    retained += repr(capture_record)
+    captured = capsys.readouterr()
+    if canary in retained or canary in captured.out + captured.err:
+        import pytest
+        pytest.fail("fake control retained a credential", pytrace=False)
+
+
+def test_fake_control_redacts_credential_in_successful_capture(tmp_path, monkeypatch, capsys):
+    import socket
+    import threading
+
+    canary = "fake-control-credential-f7-success-canary"
+    capture = tmp_path / "capture"
+    socket_path = tmp_path / "daemon.sock"
+    monkeypatch.setenv(fake_doubletake.CTL_MODE_ENV, "normal")
+    monkeypatch.setenv(fake_doubletake.CTL_CAPTURE_ENV, str(capture))
+    monkeypatch.setenv(fake_doubletake.DAEMON_CAPTURE_ENV, str(capture))
+    (tmp_path / fake_doubletake.TOKEN_NAME).write_text("owner")
+    (tmp_path / fake_doubletake.INSTANCE_NAME).write_text("instance")
+    daemon = fake_doubletake._Daemon(
+        {"owner_token": "owner", "instance_uuid": "instance"}, str(socket_path),
+    )
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    server.listen(1)
+
+    def serve_one():
+        connection, _ = server.accept()
+        with connection:
+            daemon._serve_connection(connection)
+
+    serving = threading.Thread(target=serve_one, daemon=True)
+    serving.start()
+    try:
+        result = fake_doubletake._ctl([
+            "-socket", str(socket_path), "connect", "192.0.2.1",
+            "--audio", "on", "--volume", "20", canary,
+        ])
+    finally:
+        serving.join(timeout=5)
+        server.close()
+    assert result == 0
+    assert not serving.is_alive()
+    retained = fake_doubletake.daemon_journal_path(tmp_path).read_text()
+    retained += "".join(path.read_text() for path in capture.iterdir())
+    capture_record = json.loads((capture / "ctl-argv-env.jsonl").read_text().splitlines()[0])
+    assert capture_record["argv"][-5:] == ["--audio", "on", "--volume", "20", "<redacted>"]
+    captured = capsys.readouterr()
+    if canary in retained or canary in captured.out + captured.err:
+        import pytest
+        pytest.fail("fake control retained a credential", pytrace=False)
+
+
+def test_transport_dismiss_credential_prompt_contract():
+    import inspect
+
+    from airplay_linux.domain.operations import OperationContext
+    from airplay_linux.domain.ports import TransportPort
+
+    protocol_method = TransportPort.dismiss_credential_prompt
+    implementation_method = DoubleTakeTransport.dismiss_credential_prompt
+    assert tuple(inspect.signature(protocol_method).parameters) == (
+        "self", "target", "context",
+    )
+    assert protocol_method.__annotations__["return"] == "None"
+    assert tuple(inspect.signature(implementation_method).parameters) == (
+        "self", "target", "context",
+    )
+    assert "marker_generation" in OperationContext.__dataclass_fields__
+    assert "owner_daemon" in OperationContext.__dataclass_fields__
+
+
 class _Clock:
     now = staticmethod(time.monotonic)
 

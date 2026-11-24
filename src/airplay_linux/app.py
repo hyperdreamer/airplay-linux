@@ -30,7 +30,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser = argparse.ArgumentParser(
         prog="airplay-linux",
-        description="Mirror Linux physical monitors to AirPlay receivers, or give a TV its own virtual display.",
+        description=(
+            "Mirror Linux physical monitors to AirPlay receivers, give a TV its own virtual "
+            "display, and relay a target PIN or password during an operator-started Mirror."
+        ),
     )
     parser.add_argument(
         "--diagnostics",

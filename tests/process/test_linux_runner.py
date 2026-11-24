@@ -140,6 +140,162 @@ async def wait_gone(pid: int, timeout: float = 10.0) -> bool:
 # --------------------------------------------------------------------------- run
 
 
+def test_run_credential_refuses_before_child_creation_when_fence_is_stale():
+    runner = LinuxProcessRunner()
+    calls = []
+
+    def fence():
+        calls.append("fence")
+        return Err(error=diagnostic(ErrorCode.stale_target))
+
+    result = run(
+        runner.run_credential(
+            ports.CommandSpec(
+                argv=python("-c", "raise SystemExit(0)"),
+                env={},
+                secret_indices=(2,),
+            ),
+            5.0,
+            fence,
+        )
+    )
+
+    assert isinstance(result, ports.CredentialProcessNotSpawned)
+    assert result.diagnostic.code is ErrorCode.stale_target
+    assert calls == ["fence"]
+    assert runner.retained_reapers == 0
+
+
+def test_run_credential_rejects_a_forged_nonfinal_secret_index_before_spawn(monkeypatch):
+    runner = LinuxProcessRunner()
+    calls = []
+    argv = python("-c", "print('must not run')", "credential-canary")
+    command = ports.CommandSpec(
+        argv=argv,
+        env={},
+        secret_indices=(len(argv) - 1,),
+    )
+    object.__setattr__(command, "secret_indices", (len(argv) - 2,))
+
+    async def forbidden_exec(*args, **kwargs):
+        calls.append("exec")
+        raise AssertionError("invalid credential command reached process creation")
+
+    monkeypatch.setattr(runner, "_exec", forbidden_exec)
+    result = run(runner.run_credential(command, 5.0, lambda: Ok(value=None)))
+
+    assert isinstance(result, ports.CredentialProcessNotSpawned)
+    assert result.diagnostic.code is ErrorCode.invalid_input
+    assert calls == []
+
+
+def test_run_credential_reports_missing_executable_as_not_spawned():
+    runner = LinuxProcessRunner()
+    result = run(runner.run_credential(
+        ports.CommandSpec(
+            argv=("/definitely/missing/ap-relay-credential-command", "credential"),
+            env={},
+            secret_indices=(1,),
+        ),
+        5.0,
+        lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, ports.CredentialProcessNotSpawned)
+    assert result.diagnostic.code is ErrorCode.dependency_missing
+
+
+def test_run_credential_reports_ambiguous_creation_as_uncertain(monkeypatch):
+    runner = LinuxProcessRunner()
+    argv = python("-c", "pass")
+
+    async def ambiguous_exec(*args, **kwargs):
+        raise OSError("ambiguous subprocess creation")
+
+    monkeypatch.setattr(runner, "_exec", ambiguous_exec)
+    result = run(runner.run_credential(
+        ports.CommandSpec(argv=argv, env={}, secret_indices=(len(argv) - 1,)),
+        5.0,
+        lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, ports.CredentialProcessUncertain)
+    assert result.reason == "child_cleanup_uncertain"
+
+
+
+    runner = LinuxProcessRunner()
+    canary = "credential-process-canary-7f2a"
+    argv = python("-c", f"print({canary!r})")
+    result = run(
+        runner.run_credential(
+            ports.CommandSpec(argv=argv, env={}, secret_indices=(len(argv) - 1,)),
+            5.0,
+            lambda: Ok(value=None),
+        )
+    )
+
+    assert isinstance(result, ports.CredentialProcessCompleted)
+    assert result.output.exit_code == 0
+    assert canary.encode() in result.output.stdout
+    assert canary not in repr(result)
+
+
+def test_run_credential_returns_uncertain_when_output_is_truncated():
+    runner = LinuxProcessRunner()
+    prefix = b'{"ok":true}'
+    script = (
+        "import sys; "
+        f"sys.stdout.buffer.write({prefix!r} + b' ' * ({OUTPUT_LIMIT} - len({prefix!r})) + b'!')"
+    )
+    argv = python("-c", script)
+    result = run(runner.run_credential(
+        ports.CommandSpec(
+            argv=argv,
+            env={},
+            secret_indices=(len(argv) - 1,),
+        ),
+        10.0,
+        lambda: Ok(value=None),
+    ))
+
+    assert isinstance(result, ports.CredentialProcessUncertain)
+    assert result.reason == "incomplete_reply"
+
+
+def test_run_credential_classifies_timeout_after_admission_as_uncertain():
+    runner = LinuxProcessRunner()
+    argv = python("-c", "import time; time.sleep(60)")
+    result = run(
+        runner.run_credential(
+            ports.CommandSpec(argv=argv, env={}, secret_indices=(len(argv) - 1,)),
+            0.05,
+            lambda: Ok(value=None),
+        )
+    )
+
+    assert isinstance(result, ports.CredentialProcessUncertain)
+    assert result.reason == "command_timeout"
+
+
+def test_run_credential_classifies_cancellation_after_admission_as_uncertain():
+    async def scenario():
+        runner = LinuxProcessRunner()
+        argv = python("-c", "import time; time.sleep(60)")
+        task = asyncio.create_task(runner.run_credential(
+            ports.CommandSpec(argv=argv, env={}, secret_indices=(len(argv) - 1,)),
+            60.0,
+            lambda: Ok(value=None),
+        ))
+        await asyncio.sleep(0.05)
+        task.cancel()
+        return await task
+
+    result = run(scenario())
+    assert isinstance(result, ports.CredentialProcessUncertain)
+    assert result.reason == "dispatch_cancelled"
+
+
 def test_run_returns_exact_exit_code_and_both_streams():
     runner = LinuxProcessRunner()
     output = run(

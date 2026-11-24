@@ -119,6 +119,12 @@ class ErrorCode(StrEnum):
     pairing_expired = "pairing_expired"
 
 
+NoReplyReason = Literal[
+    "command_timeout", "service_shutdown", "child_cleanup_uncertain",
+    "incomplete_reply", "malformed_reply", "dispatch_cancelled",
+]
+
+
 class RecoveryAction(StrEnum):
     retry = "retry"
     stop = "stop"

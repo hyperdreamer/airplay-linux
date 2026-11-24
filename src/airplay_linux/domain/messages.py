@@ -10,20 +10,25 @@ from .identity import _validate_generation
 from .resources import VolumeLevel
 
 if TYPE_CHECKING:
-    from .identity import ReceiverId, ReceiverView
+    from airplay_linux.backend.contract import StatusReply
+
+    from .identity import ReceiverId, ReceiverTarget, ReceiverView
     from .operations import (
         ChallengeId,
         ChallengeView,
         DisplayHandle,
         InstanceId,
+        LeaseId,
         OperationContext,
         OperationId,
         OwnerId,
+        PairingResult,
         ProcessIdentity,
         SensitiveText,
         StreamHandle,
     )
-    from .resources import Diagnostic, PhysicalMonitorSource, ResolutionDecision, Result, Size, StartRequest
+    from .relay import CredentialRequest, NoReply, Submitted
+    from .resources import Diagnostic, Err, PhysicalMonitorSource, ResolutionDecision, Result, Size, StartRequest
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -52,6 +57,40 @@ class SubmitPairing:
     receiver_id: ReceiverId
     challenge_id: ChallengeId
     value: SensitiveText
+
+
+@dataclass(frozen=True, kw_only=True)
+class SubmitCredential:
+    receiver_id: ReceiverId
+    challenge_id: ChallengeId
+    value: SensitiveText
+
+
+@dataclass(frozen=True, kw_only=True)
+class DismissCredentialPrompt:
+    receiver_id: ReceiverId
+    challenge_id: ChallengeId
+
+
+@dataclass(frozen=True, kw_only=True)
+class StopCredentialRecovery:
+    receiver_id: ReceiverId
+    marker_generation: int
+    target: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class DismissCredentialRecovery:
+    receiver_id: ReceiverId
+    marker_generation: int
+    target: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class RestartReceiverToRelease:
+    receiver_id: ReceiverId
+    marker_generation: int
+    target: str
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -137,7 +176,9 @@ class ConfirmOrphanRemoval:
 
 
 Command: TypeAlias = (
-    Start | Stop | Cancel | Retry | SubmitPairing | Pair | Forget
+    Start | Stop | Cancel | Retry | SubmitPairing | SubmitCredential
+    | DismissCredentialPrompt | StopCredentialRecovery | DismissCredentialRecovery
+    | RestartReceiverToRelease | Pair | Forget
     | ChooseResolution | ChangeResolution | RecreateAccepted | SetMuted | SetVolume
     | RetryAudio | StartVideoOnly | RetryCleanup | RetryRevocation
     | KeepCleanup | ConfirmSwitch | ConfirmOrphanRemoval
@@ -158,6 +199,7 @@ class TransportEventKind(StrEnum):
     stopped = "stopped"
     network_lost = "network_lost"
     pairing_required = "pairing_required"
+    credential_request = "credential_request"
     credential_invalid = "credential_invalid"
     audio_start_failed = "audio_start_failed"
     audio_failed = "audio_failed"
@@ -228,9 +270,24 @@ class ChallengePayload:
     challenge: ChallengeView
 
 
+@dataclass(frozen=True, kw_only=True)
+class CredentialRequestPayload:
+    request: CredentialRequest
+    lifecycle: Literal["live", "ended"]
+    reason: Literal["row_ended"] | None
+
+    def __post_init__(self) -> None:
+        if self.lifecycle == "live" and self.reason is not None:
+            raise ValueError("live credential requests have no ending reason")
+        if self.lifecycle == "ended" and self.reason != "row_ended":
+            raise ValueError("ended credential requests require row_ended")
+        if self.lifecycle not in ("live", "ended"):
+            raise ValueError("invalid credential request lifecycle")
+
+
 TransportPayload: TypeAlias = (
     EmptyPayload | FailurePayload | ModePayload | MutePayload | VolumePayload | ChallengePayload
-    | SourceVerificationPayload
+    | SourceVerificationPayload | CredentialRequestPayload
 )
 
 
@@ -247,6 +304,91 @@ class TransportEvent:
 
     def __post_init__(self) -> None:
         _validate_generation("endpoint_generation", self.endpoint_generation)
+        if self.kind is TransportEventKind.credential_request:
+            if type(self.payload) is not CredentialRequestPayload:
+                raise TypeError("credential_request requires CredentialRequestPayload")
+            request = self.payload.request
+            if (
+                request.start_operation_id != self.context.operation_id
+                or request.receiver_id != self.receiver_id
+                or request.endpoint_generation != self.endpoint_generation
+                or request.target.endpoint_generation != self.endpoint_generation
+                or request.target.endpoint_fingerprint != self.endpoint_fingerprint
+                or request.daemon_instance_uuid != self.daemon_instance_uuid
+                or request.session_generation != self.context.session_generation
+                or request.owner_lease != self.context.transport_lease_id
+            ):
+                raise ValueError("credential request identity does not match its event envelope")
+
+
+@dataclass(frozen=True, kw_only=True)
+class RelaySubmitCompletion:
+    """One actor-allocated relay submission result with its admitted identity."""
+
+    submission_id: OperationId
+    challenge_id: ChallengeId
+    receiver_id: ReceiverId
+    endpoint_generation: int
+    session_generation: int
+    owner_lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    generation: int
+    result: PairingResult
+
+    def __post_init__(self) -> None:
+        _validate_generation("endpoint_generation", self.endpoint_generation)
+        _validate_generation("session_generation", self.session_generation)
+        _validate_generation("generation", self.generation)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialSubmissionCompletion:
+    submission_id: OperationId
+    challenge_id: ChallengeId
+    receiver_id: ReceiverId
+    target: ReceiverTarget
+    start_operation_id: OperationId
+    endpoint_fingerprint: str
+    endpoint_generation: int
+    session_generation: int
+    trust_generation: int
+    owner_lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    relay_generation: int
+    marker_generation: int
+    outcome: Submitted | NoReply | Err
+
+    def __post_init__(self) -> None:
+        _validate_generation("endpoint_generation", self.endpoint_generation)
+        _validate_generation("session_generation", self.session_generation)
+        _validate_generation("trust_generation", self.trust_generation)
+        _validate_generation("relay_generation", self.relay_generation)
+        _validate_generation("marker_generation", self.marker_generation)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CredentialStatusCompletion:
+    read_id: OperationId
+    challenge_id: ChallengeId
+    receiver_id: ReceiverId
+    target: ReceiverTarget
+    start_operation_id: OperationId
+    endpoint_fingerprint: str
+    endpoint_generation: int
+    session_generation: int
+    trust_generation: int
+    owner_lease: LeaseId
+    daemon_instance_uuid: InstanceId
+    relay_generation: int
+    marker_generation: int
+    result: Result[StatusReply]
+
+    def __post_init__(self) -> None:
+        _validate_generation("endpoint_generation", self.endpoint_generation)
+        _validate_generation("session_generation", self.session_generation)
+        _validate_generation("trust_generation", self.trust_generation)
+        _validate_generation("relay_generation", self.relay_generation)
+        _validate_generation("marker_generation", self.marker_generation)
 
 
 @dataclass(frozen=True, kw_only=True)

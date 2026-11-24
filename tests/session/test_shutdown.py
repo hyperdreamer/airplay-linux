@@ -87,9 +87,12 @@ async def test_idle_coordinator_shutdown_flushes_and_shuts_registry_once():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_reuses_ordered_cleanup_and_persists_confirmed_release(tmp_path):
+async def test_shutdown_reuses_ordered_cleanup_and_persists_confirmed_release(tmp_path, monkeypatch):
     from airplay_linux.storage import AtomicFiles, JsonSessionStore
 
+    monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+    monkeypatch.setenv("XDG_CURRENT_DESKTOP", "KDE")
+    monkeypatch.setenv("XDG_SESSION_DESKTOP", "KDE")
     rig, process, ownerships, handle = await prepared(tmp_path, online=True)
     await recover(rig)
     await rig.manager.dispatch(Retry(receiver_id=rig.receiver_id))

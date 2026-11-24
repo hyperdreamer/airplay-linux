@@ -12,6 +12,7 @@ import asyncio
 import errno
 import inspect
 import os
+import select
 import socket
 import stat
 import sys
@@ -19,29 +20,35 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextlib import asynccontextmanager
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import AsyncIterator, Literal
 from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from airplay_linux.backend.contract import BackendFeatures, StatusReply
 from airplay_linux.backend.control import (
-    BackendControl, BackendOperation, EmptyPayload, Handshake, OwnershipAuthority, OwnershipProof,
+    AckReply, BackendControl, BackendOperation, EmptyPayload, Handshake, OwnershipAuthority, OwnershipProof,
 )
 from airplay_linux.diagnostics import diagnostic
-from airplay_linux.domain.operations import InstanceId, ProcessIdentity, SensitiveText
+from airplay_linux.domain.identity import ReceiverTarget
+from airplay_linux.domain.operations import InstanceId, OperationContext, OperationId, ProcessIdentity, SensitiveText
 from airplay_linux.domain.ports import (
     Clock, CommandSpec, DaemonCleanupIntentStore, DaemonStore, IdFactory,
     LaunchReceiptStore, ProcessExit, ProcessPort, Scheduler, Subscription,
     SupervisorReleaseIntentStore,
 )
 from airplay_linux.domain.records import (
-    AuthorityOwner, DaemonCleanupIntent, DaemonRecord, LaunchReceipt, SupervisorReleaseIntent,
+    AuthorityOwner, CredentialRecoveryMarker, DaemonCleanupIntent, DaemonRecord,
+    LaunchReceipt, OriginalDaemonIdentity, OwnedDaemonReadinessEvidence,
+    ReleaseAttemptTerminalEvidence, SupervisorReleaseIntent,
 )
+from airplay_linux.domain.relay import TerminationProof
 from airplay_linux.domain.resources import Diagnostic, Err, ErrorCode, Ok, Result
 from airplay_linux.process.authority import AuthorityLease, SharedRootAuthority
 from airplay_linux.process.launcher import LaunchCapability
-from airplay_linux.process.ownership import verify_owned_endpoint
+from airplay_linux.process.ownership import (
+    DaemonRecoveryExemption, recovery_identity_matches, verify_owned_endpoint,
+)
 from airplay_linux.process.teardown import CleanupOutcomeWriter
 from airplay_linux.process.procfs import (
     OWNER_TOKEN_ENV, RUNTIME_DIRECTORY_ENV, IdentityEvidence, IdentityState, OwnedProcessScan, owned_processes,
@@ -51,9 +58,11 @@ from airplay_linux.process.supervisor import (
     TERMINATION_GRACE, config_pipe, module_environment, private_directory,
     socket_info, unlink_stale_socket,
 )
-from airplay_linux.storage import AtomicFiles, StorageError
+from airplay_linux.storage import AtomicFiles, RecordError, StorageError
+from airplay_linux.storage.codecs import encode_credential_recovery_marker
 from airplay_linux.storage.repositories import (
-    JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore, JsonSupervisorReleaseIntentStore,
+    JsonCredentialRecoveryMarkerStore, JsonDaemonCleanupIntentStore, JsonLaunchReceiptStore,
+    JsonSupervisorReleaseIntentStore,
 )
 
 
@@ -62,6 +71,15 @@ class DaemonNotice:
     kind: Literal['ready', 'exit', 'cleanup_required']
     instance_uuid: InstanceId
     diagnostic: Diagnostic | None = None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OwnedDaemonRecoveryRestart:
+    old_daemon_termination: TerminationProof
+    record: DaemonRecord = field(repr=False)
+    receipt: LaunchReceipt = field(repr=False)
+    ownership_proof: OwnershipProof = field(repr=False)
+    readiness: OwnedDaemonReadinessEvidence = field(repr=False)
 
 
 @dataclass
@@ -88,6 +106,27 @@ def _error(code: ErrorCode) -> Err:
 
 def _token(value: SensitiveText | str) -> str:
     return value.reveal_for_backend() if isinstance(value, SensitiveText) else value
+
+
+def _accepts_dispatch_fence(control: object) -> bool:
+    method = getattr(control, 'request', None)
+    if method is None:
+        return False
+    try:
+        parameters = inspect.signature(getattr(method, '__func__', method)).parameters
+    except (TypeError, ValueError):
+        return False
+    candidate = parameters.get('dispatch_fence')
+    if candidate is not None and candidate.kind in {
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+        inspect.Parameter.VAR_KEYWORD,
+    }:
+        return True
+    return any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
 
 
 def _scan_owned(instance_uuid: UUID, runtime: str) -> OwnedProcessScan:
@@ -202,6 +241,8 @@ class DaemonRegistry:
         self._accepted_status: StatusReply | None = None
         self._endpoint_generations: dict[tuple[str, str], int] = {}
         self._current_receipts: dict[tuple[str, str], LaunchReceipt] = {}
+        self._issued_recovery_exemptions: dict[str, DaemonRecoveryExemption] = {}
+        self._authorized_recovery_attempts: dict[UUID, tuple[CredentialRecoveryMarker, Callable[[], Result[None]]]] = {}
         self._restarts: deque[float] = deque()
         self._has_launched = False
         self._record: DaemonRecord | None = None
@@ -320,11 +361,368 @@ class DaemonRegistry:
                 return reconciled
             return await self._launch()
 
-    async def reconcile_previous(self) -> Result[None]:
+    async def reconcile_previous(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         async with self._operation() as acquired:
             if isinstance(acquired, Err):
                 return acquired
-            return await self._reconcile_locked()
+            return await self._reconcile_locked(recovery_exemptions=recovery_exemptions)
+
+    def _watching_recovery_record(
+        self, marker: CredentialRecoveryMarker, history: tuple[LaunchReceipt, ...],
+        records: tuple[DaemonRecord, ...], channels: dict[str, SupervisorReleaseIntent | None],
+    ) -> tuple[LaunchReceipt, DaemonRecord] | None:
+        old = marker.original_daemon
+        receipts = tuple(r for r in history if r.launch_uuid == old.launch_uuid)
+        matches = tuple(r for r in records if r.instance_uuid == old.instance_uuid)
+        if len(receipts) != 1 or len(matches) != 1:
+            return None
+        receipt, record = receipts[0], matches[0]
+        if not recovery_identity_matches(old, receipt, record):
+            return None
+        endpoint = tuple(r for r in history if (
+            r.runtime_directory == old.runtime_directory
+            and str(Path(r.runtime_directory) / r.socket_name) == old.socket_path
+        ))
+        if (
+            not endpoint or max(r.endpoint_generation for r in endpoint) != old.endpoint_generation
+            or sum(r.state not in {'failed', 'stopped'} for r in endpoint) != 1
+            or channels.get(old.runtime_directory) is not None
+            or not self._exact_process(record.supervisor, receipt.owner_uid)
+            or not self._exact_process(record.daemon, receipt.owner_uid)
+            or self._inspect(record.daemon.pid).parent != record.supervisor.pid
+        ):
+            return None
+        verified = verify_owned_endpoint(receipt, current_generation=max(r.endpoint_generation for r in endpoint))
+        if not isinstance(verified, Ok):
+            return None
+        return receipt, record
+
+    async def authenticate_recovery(
+        self, marker: CredentialRecoveryMarker,
+    ) -> Result[DaemonRecoveryExemption | None]:
+        """Authenticate one retained marker identity before any status request."""
+        try:
+            encode_credential_recovery_marker(marker)
+        except (RecordError, UnicodeError):
+            return Ok(value=None)
+        if marker.state not in {'watching', 'release_pending'} or not marker.automatic_status_checks or not self._public_lifecycle():
+            return Ok(value=None)
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            checked = await self._receipt_obligations_locked()
+            if isinstance(checked, Err):
+                return checked
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            channels = await self._owned_runtime_channels(self._receipt_history, records.value)
+            if isinstance(channels, Err):
+                return channels
+            intents = await self._cleanup_intents.all()
+            if isinstance(intents, Err):
+                return intents
+            if any(intent.launch_uuid == marker.original_daemon.launch_uuid for intent in intents.value):
+                return Ok(value=None)
+            selected = self._watching_recovery_record(marker, self._receipt_history, records.value, channels.value)
+            if selected is None:
+                return Ok(value=None)
+            receipt, record = selected
+            proof = await self._authenticate(record)
+            if isinstance(proof, Err):
+                return Ok(value=None)
+            # Ownership work awaited external adapters. Re-read the durable
+            # channels and re-probe the exact process/socket before issuing.
+            history = await self._receipts.all()
+            records = await self._store.all()
+            intents = await self._cleanup_intents.all()
+            if isinstance(history, Err) or isinstance(records, Err) or isinstance(intents, Err):
+                return _error(ErrorCode.persistence_failed)
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return channels
+            if (any(intent.launch_uuid == receipt.launch_uuid for intent in intents.value)
+                    or self._watching_recovery_record(marker, history.value, records.value, channels.value) != selected):
+                return Ok(value=None)
+            exemption = DaemonRecoveryExemption(
+                marker_identity=marker, marker_generation=marker.marker_generation,
+                kind='watching_original', daemon_identity=marker.original_daemon,
+            )
+            self._issued_recovery_exemptions[marker.target] = exemption
+            return Ok(value=exemption)
+
+    async def authenticate_exact_identity(
+        self, identity: OriginalDaemonIdentity,
+    ) -> Result[DaemonRecord]:
+        """Resolve and authenticate one marker-bound daemon identity.
+
+        Recovery status reads must not reuse an in-memory record or call
+        ``ensure`` because either can point at a replacement endpoint. This
+        query joins the launch receipt, daemon record, ownership channels,
+        process identities and endpoint proof before authenticating the exact
+        record, then repeats the durable join after that awaited work.
+        """
+        if (
+            type(identity) is not OriginalDaemonIdentity
+            or identity.daemon_process is None
+            or identity.endpoint_generation <= 0
+        ):
+            return _error(ErrorCode.stale_event)
+        if not self._public_lifecycle():
+            return _error(ErrorCode.dependency_incompatible)
+
+        def select(
+            history: tuple[LaunchReceipt, ...],
+            records: tuple[DaemonRecord, ...],
+            channels: dict[str, SupervisorReleaseIntent | None],
+        ) -> tuple[LaunchReceipt, DaemonRecord] | None:
+            receipts = tuple(item for item in history if item.launch_uuid == identity.launch_uuid)
+            matches = tuple(item for item in records if item.instance_uuid == identity.instance_uuid)
+            if len(receipts) != 1 or len(matches) != 1:
+                return None
+            receipt, record = receipts[0], matches[0]
+            if not recovery_identity_matches(identity, receipt, record):
+                return None
+            endpoint = tuple(
+                item for item in history
+                if item.runtime_directory == identity.runtime_directory
+                and str(Path(item.runtime_directory) / item.socket_name) == identity.socket_path
+            )
+            if (
+                not endpoint
+                or max(item.endpoint_generation for item in endpoint) != identity.endpoint_generation
+                or sum(item.state not in {"failed", "stopped"} for item in endpoint) != 1
+                or channels.get(identity.runtime_directory) is not None
+            ):
+                return None
+            try:
+                if (
+                    not self._exact_process(record.supervisor, receipt.owner_uid)
+                    or not self._exact_process(record.daemon, receipt.owner_uid)
+                    or self._inspect(record.daemon.pid).parent != record.supervisor.pid
+                ):
+                    return None
+                verified = verify_owned_endpoint(
+                    receipt, current_generation=identity.endpoint_generation,
+                )
+            except (OSError, ValueError):
+                return None
+            return (receipt, record) if isinstance(verified, Ok) else None
+
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return obligations
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            channels = await self._owned_runtime_channels(
+                self._receipt_history, records.value,
+            )
+            if isinstance(channels, Err):
+                return channels
+            selected = select(self._receipt_history, records.value, channels.value)
+            if selected is None:
+                return _error(ErrorCode.stale_event)
+            authenticated = await self._authenticate(selected[1])
+            if isinstance(authenticated, Err):
+                return authenticated
+
+            history = await self._receipts.all()
+            records = await self._store.all()
+            intents = await self._cleanup_intents.all()
+            if (
+                isinstance(history, Err)
+                or isinstance(records, Err)
+                or isinstance(intents, Err)
+            ):
+                return _error(ErrorCode.persistence_failed)
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return channels
+            current = select(history.value, records.value, channels.value)
+            if current is None or current != selected:
+                return _error(ErrorCode.stale_event)
+            if any(
+                intent.launch_uuid == identity.launch_uuid for intent in intents.value
+            ):
+                return _error(ErrorCode.stale_event)
+            return Ok(value=current[1])
+
+    async def stop_recovery_target(
+        self, marker: CredentialRecoveryMarker, target: ReceiverTarget,
+        context: OperationContext, fence: Callable[[], Result[None]],
+    ) -> Result[None]:
+        """Disconnect one marker target through the exact recorded daemon."""
+        if (
+            type(marker) is not CredentialRecoveryMarker
+            or marker.state == 'retired'
+            or type(target) is not ReceiverTarget
+            or target.receiver_id != marker.receiver_id
+            or target.canonical_host != marker.target
+            or type(context) is not OperationContext
+            or context.endpoint_generation != target.endpoint_generation
+            or context.owner_daemon != marker.original_daemon
+            or context.marker_generation != marker.marker_generation
+            or not callable(fence)
+        ):
+            return _error(ErrorCode.ownership_mismatch)
+        if fence() != Ok(value=None):
+            return _error(ErrorCode.ownership_mismatch)
+
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return obligations
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            receipts = tuple(
+                receipt for receipt in self._receipt_history
+                if receipt.launch_uuid == marker.original_daemon.launch_uuid
+            )
+            matching_records = tuple(
+                record for record in records.value
+                if record.instance_uuid == marker.original_daemon.instance_uuid
+            )
+            if len(receipts) != 1 or len(matching_records) != 1:
+                return _error(ErrorCode.ownership_mismatch)
+            receipt, record = receipts[0], matching_records[0]
+            if not recovery_identity_matches(marker.original_daemon, receipt, record):
+                return _error(ErrorCode.ownership_mismatch)
+            authenticated = await self._authenticate(record)
+            if isinstance(authenticated, Err):
+                return authenticated
+            if fence() != Ok(value=None):
+                return _error(ErrorCode.ownership_mismatch)
+
+            refreshed = await self._receipts.all()
+            current_records = await self._store.all()
+            if isinstance(refreshed, Err) or isinstance(current_records, Err):
+                return _error(ErrorCode.persistence_failed)
+            current_receipts = tuple(
+                item for item in refreshed.value
+                if item.launch_uuid == marker.original_daemon.launch_uuid
+            )
+            current_matches = tuple(
+                item for item in current_records.value
+                if item.instance_uuid == marker.original_daemon.instance_uuid
+            )
+            if (
+                current_receipts != (receipt,)
+                or current_matches != (record,)
+                or not recovery_identity_matches(marker.original_daemon, receipt, record)
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+
+            control = self._control_factory(record)
+            try:
+                request_kwargs: dict[str, object] = {}
+                if _accepts_ownership_proof(control):
+                    request_kwargs['ownership_proof'] = authenticated.value
+                status = await control.request(
+                    BackendOperation.status, None, EmptyPayload(), None, **request_kwargs,
+                )
+                if isinstance(status, Err):
+                    return status
+                if not isinstance(status.value, StatusReply):
+                    return _error(ErrorCode.transport_failed)
+                matching_rows = tuple(
+                    row for row in status.value.streams
+                    if row.target == marker.target
+                )
+                if not matching_rows:
+                    return Ok(value=None)
+                if len(matching_rows) != 1:
+                    return _error(ErrorCode.transport_failed)
+                if fence() != Ok(value=None):
+                    return _error(ErrorCode.ownership_mismatch)
+                if not _accepts_dispatch_fence(control):
+                    return _error(ErrorCode.dependency_incompatible)
+                request_kwargs = {'dispatch_fence': fence}
+                if _accepts_ownership_proof(control):
+                    request_kwargs['ownership_proof'] = authenticated.value
+                disconnected = await control.request(
+                    BackendOperation.disconnect, target, EmptyPayload(), context,
+                    **request_kwargs,
+                )
+                if isinstance(disconnected, Err):
+                    return disconnected
+                reply = disconnected.value
+                if (
+                    type(reply) is not AckReply
+                    or reply.operation != BackendOperation.disconnect.value
+                    or reply.target != marker.target
+                ):
+                    return _error(ErrorCode.transport_failed)
+                if fence() != Ok(value=None):
+                    return _error(ErrorCode.ownership_mismatch)
+                return Ok(value=None)
+            finally:
+                try:
+                    await asyncio.wait_for(control.close(), self._startup_timeout)
+                except Exception:
+                    pass
+
+    async def _validate_recovery_exemptions(
+        self, exemptions: tuple[DaemonRecoveryExemption, ...], history: tuple[LaunchReceipt, ...],
+        records: tuple[DaemonRecord, ...], channels: dict[str, SupervisorReleaseIntent | None],
+    ) -> Result[dict[UUID, DaemonRecord]]:
+        if type(exemptions) is not tuple:
+            return _error(ErrorCode.ownership_mismatch)
+        intents = await self._cleanup_intents.all()
+        if isinstance(intents, Err):
+            return intents
+        retained: dict[UUID, DaemonRecord] = {}
+        targets: set[str] = set()
+        for exemption in exemptions:
+            if type(exemption) is not DaemonRecoveryExemption:
+                return _error(ErrorCode.ownership_mismatch)
+            marker = exemption.marker_identity
+            if (
+                type(marker) is not CredentialRecoveryMarker or marker.target in targets
+                or self._issued_recovery_exemptions.get(marker.target) != exemption
+                or type(exemption.marker_generation) is not int
+                or exemption.marker_generation != marker.marker_generation
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+            if exemption.kind == 'watching_original':
+                if (marker.state not in {'watching', 'release_pending'} or not marker.automatic_status_checks
+                        or exemption.daemon_identity != marker.original_daemon
+                        or any(intent.launch_uuid == marker.original_daemon.launch_uuid for intent in intents.value)):
+                    return _error(ErrorCode.ownership_mismatch)
+                selected = self._watching_recovery_record(marker, history, records, channels)
+                if selected is None:
+                    return _error(ErrorCode.ownership_mismatch)
+                receipt, record = selected
+            elif exemption.kind == 'release_replacement':
+                if (marker.state != 'retired' or marker.retirement is None
+                        or marker.retirement.kind != 'daemon_replaced' or marker.release_attempt is None
+                        or exemption.daemon_identity != marker.release_attempt.readiness):
+                    return _error(ErrorCode.ownership_mismatch)
+                expected = marker.release_attempt.readiness
+                originals = tuple(r for r in history if r.launch_uuid == marker.original_daemon.launch_uuid)
+                candidates = tuple(r for r in history if r.recovery_attempt_id == expected.recovery_attempt_id)
+                if len(originals) != 1 or len(candidates) != 1:
+                    return _error(ErrorCode.ownership_mismatch)
+                adopted = await self._adopt_recovery_attempt_locked(marker.original_daemon, originals[0], candidates[0])
+                if (isinstance(adopted, Err)
+                        or replace(adopted.value.readiness, verified_at=expected.verified_at) != expected):
+                    return _error(ErrorCode.ownership_mismatch)
+                receipt, record = adopted.value.receipt, adopted.value.record
+            else:
+                return _error(ErrorCode.ownership_mismatch)
+            retained[receipt.launch_uuid] = record
+            targets.add(marker.target)
+        if len(retained) > 1:
+            return _error(ErrorCode.ownership_mismatch)
+        return Ok(value=retained)
 
     async def restart(self) -> Result[DaemonRecord]:
         async with self._operation() as acquired:
@@ -339,6 +737,447 @@ class DaemonRegistry:
                 return stopped
             return await self._launch()
 
+    def authorize_recovery_attempt(
+        self, marker: CredentialRecoveryMarker, fence: Callable[[], Result[None]],
+    ) -> Result[None]:
+        try:
+            encode_credential_recovery_marker(marker)
+            attempt = marker.release_attempt
+            if (marker.state != 'release_pending' or attempt is None
+                    or attempt.status not in {'intended', 'ready'} or not callable(fence)
+                    or fence() != Ok(value=None)):
+                return _error(ErrorCode.ownership_mismatch)
+            self._authorized_recovery_attempts[attempt.attempt_id] = (marker, fence)
+            return Ok(value=None)
+        except Exception:
+            return _error(ErrorCode.ownership_mismatch)
+
+    async def _recovery_attempt_authorized(
+        self, expected_old: OriginalDaemonIdentity, attempt_id: OperationId,
+        runtime: Path, endpoint: Path, *, allow_visible_successor: bool = False,
+    ) -> Result[None]:
+        authorized = self._authorized_recovery_attempts.get(attempt_id)
+        if authorized is None:
+            return _error(ErrorCode.ownership_mismatch)
+        marker, fence = authorized
+        attempt = marker.release_attempt
+        if (attempt is None or marker.original_daemon != expected_old
+                or attempt.replacement_runtime_directory != str(runtime)
+                or attempt.replacement_socket_path != str(endpoint)):
+            return _error(ErrorCode.ownership_mismatch)
+        store = JsonCredentialRecoveryMarkerStore(AtomicFiles(self._record_root))
+        current = await store.for_target(marker.target)
+        try:
+            visible = current.value if isinstance(current, Ok) else None
+            if visible != marker:
+                successor = False
+                if allow_visible_successor and type(visible) is CredentialRecoveryMarker:
+                    if (marker.release_attempt.status == 'intended' and visible.state == 'release_pending'
+                            and visible.release_attempt is not None and visible.release_attempt.status == 'ready'):
+                        successor = replace(
+                            visible, marker_generation=marker.marker_generation,
+                            release_attempt=marker.release_attempt,
+                        ) == marker
+                    elif (marker.release_attempt.status == 'ready' and visible.state == 'retired'
+                            and visible.retirement is not None
+                            and visible.retirement.kind == 'daemon_replaced'):
+                        successor = replace(
+                            visible, marker_generation=marker.marker_generation,
+                            state=marker.state, automatic_status_checks=marker.automatic_status_checks,
+                            retirement=None,
+                        ) == marker
+                    successor = successor and visible.marker_generation == marker.marker_generation + 1
+                if not successor:
+                    return _error(ErrorCode.ownership_mismatch)
+            if fence() != Ok(value=None):
+                return _error(ErrorCode.ownership_mismatch)
+        except Exception:
+            return _error(ErrorCode.ownership_mismatch)
+        return Ok(value=None)
+
+    async def restart_with_new_endpoint(
+        self, expected_old: OriginalDaemonIdentity, attempt_id: OperationId,
+        runtime_directory: Path | str, socket_path: Path | str,
+    ) -> Result[OwnedDaemonRecoveryRestart]:
+        """Release one exact daemon and launch or adopt one attempt-bound endpoint."""
+        if type(expected_old) is not OriginalDaemonIdentity or type(attempt_id) is not UUID:
+            return _error(ErrorCode.ownership_mismatch)
+        try:
+            runtime = Path(runtime_directory)
+            endpoint = Path(socket_path)
+            if (
+                not runtime.is_absolute() or runtime.parent != self._configured_runtime
+                or runtime == Path(expected_old.runtime_directory)
+                or endpoint != runtime / 'daemon.sock' or str(endpoint) == expected_old.socket_path
+                or len(os.fsencode(endpoint)) >= 108
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+            self._launcher.argv(str(endpoint))
+        except (TypeError, ValueError, OSError, AttributeError):
+            return _error(ErrorCode.ownership_mismatch)
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            if not self._compatible():
+                return _error(ErrorCode.dependency_incompatible)
+            authorized = await self._recovery_attempt_authorized(
+                expected_old, attempt_id, runtime, endpoint, allow_visible_successor=True,
+            )
+            if isinstance(authorized, Err):
+                return authorized
+            obligations = await self._receipt_obligations_locked()
+            if isinstance(obligations, Err):
+                return obligations
+            history = self._receipt_history
+            originals = tuple(r for r in history if r.launch_uuid == expected_old.launch_uuid)
+            attempts = tuple(r for r in history if r.recovery_attempt_id == attempt_id)
+            if len(originals) != 1 or len(attempts) > 1:
+                return _error(ErrorCode.ownership_mismatch)
+            original = originals[0]
+            old_endpoint = tuple(r for r in history if (
+                r.runtime_directory == expected_old.runtime_directory
+                and str(Path(r.runtime_directory) / r.socket_name) == expected_old.socket_path
+            ))
+            if (len(tuple(r for r in old_endpoint if r.endpoint_generation == expected_old.endpoint_generation)) != 1
+                    or any(r.endpoint_generation > expected_old.endpoint_generation for r in old_endpoint)):
+                return _error(ErrorCode.ownership_mismatch)
+            if (
+                original.daemon_instance_uuid != expected_old.instance_uuid
+                or original.endpoint_generation != expected_old.endpoint_generation
+                or original.daemon != expected_old.daemon_process
+                or original.runtime_directory != expected_old.runtime_directory
+                or str(Path(original.runtime_directory) / original.socket_name) != expected_old.socket_path
+                or type(original.supervisor) is not ProcessIdentity
+                or any(getattr(original, name) is None for name in (
+                    'entry_device', 'entry_inode', 'socket_inode', 'peer_pid', 'peer_start_ticks', 'peer_uid',
+                ))
+                or (original.peer_pid, original.peer_start_ticks, original.peer_uid) != (
+                    expected_old.daemon_process.pid, expected_old.daemon_process.start_ticks, original.owner_uid,
+                )
+            ):
+                return _error(ErrorCode.ownership_mismatch)
+            if attempts:
+                if (attempts[0].runtime_directory, attempts[0].socket_name) != (str(runtime), endpoint.name):
+                    return _error(ErrorCode.ownership_mismatch)
+                return await self._adopt_recovery_attempt_locked(expected_old, original, attempts[0])
+            if any(r.runtime_directory == str(runtime) or r.recovery_attempt_id == attempt_id for r in history):
+                return _error(ErrorCode.ownership_mismatch)
+            try:
+                if runtime.exists() or runtime.is_symlink():
+                    return _error(ErrorCode.ownership_mismatch)
+            except OSError:
+                return _error(ErrorCode.ownership_mismatch)
+            records = await self._store.all()
+            if isinstance(records, Err):
+                return records
+            matches = tuple(r for r in records.value if r.instance_uuid == expected_old.instance_uuid)
+            if len(matches) > 1:
+                return _error(ErrorCode.ownership_mismatch)
+            if self._record is not None and (not matches or self._record != matches[0]):
+                return _error(ErrorCode.ownership_mismatch)
+            if matches:
+                record = matches[0]
+                if (
+                    record.app != original.app or record.supervisor != original.supervisor
+                    or record.daemon != original.daemon or record.runtime_directory != original.runtime_directory
+                    or record.socket_path != expected_old.socket_path
+                    or record.protocol_version != original.protocol_version
+                ):
+                    return _error(ErrorCode.ownership_mismatch)
+                if original.state == 'ready':
+                    # A ready receipt can only be released through its fully
+                    # authenticated running record. A contradictory starting
+                    # record must be refused before reconciliation can signal it.
+                    if record.lifecycle != 'running' or not recovery_identity_matches(
+                        expected_old, original, record,
+                    ):
+                        return _error(ErrorCode.ownership_mismatch)
+                    authenticated = await self._authenticate(record)
+                    if isinstance(authenticated, Err):
+                        return authenticated
+                    refreshed = await self._receipts.all()
+                    records_after = await self._store.all()
+                    if (isinstance(refreshed, Err) or isinstance(records_after, Err)
+                            or tuple(r for r in refreshed.value if r.launch_uuid == original.launch_uuid) != (original,)
+                            or tuple(r for r in records_after.value if r.instance_uuid == record.instance_uuid) != (record,)):
+                        return _error(ErrorCode.ownership_mismatch)
+            elif original.state not in {'failed', 'stopped'} and not self._receipt_absent(original):
+                return _error(ErrorCode.ownership_mismatch)
+            if original.state in {'failed', 'stopped'}:
+                historical = matches[0] if matches else DaemonRecord(
+                    schema_version=1, instance_uuid=expected_old.instance_uuid, owner_token='unused',
+                    app=original.app, supervisor=original.supervisor, daemon=original.daemon,
+                    protocol_version=original.protocol_version, socket_path=expected_old.socket_path,
+                    lifecycle='stopping', runtime_directory=original.runtime_directory,
+                )
+                if not self._receipt_absent(original):
+                    return _error(ErrorCode.ownership_mismatch)
+                cleaned = await self._cleanup_terminal(original, historical)
+                if isinstance(cleaned, Err):
+                    return cleaned
+                historical_proof = await self._termination_proof_locked(expected_old, original)
+                if isinstance(historical_proof, Err):
+                    return historical_proof
+            authorized = await self._recovery_attempt_authorized(expected_old, attempt_id, runtime, endpoint)
+            if isinstance(authorized, Err):
+                return authorized
+            stopped = await self._reconcile_owned_locked()
+            if isinstance(stopped, Err):
+                return stopped
+            # A stopped receipt becomes a completed durable cleanup intent on
+            # the second reconciliation before it can be used as proof.
+            completed = await self._reconcile_owned_locked()
+            if isinstance(completed, Err):
+                return completed
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            originals = tuple(r for r in history.value if r.launch_uuid == expected_old.launch_uuid)
+            if len(originals) != 1:
+                return _error(ErrorCode.ownership_mismatch)
+            proof = await self._termination_proof_locked(expected_old, originals[0])
+            if isinstance(proof, Err):
+                return proof
+            authorized = await self._recovery_attempt_authorized(expected_old, attempt_id, runtime, endpoint)
+            if isinstance(authorized, Err):
+                return authorized
+            launched = await self._launch_owned(recovery_attempt_id=attempt_id, recovery_runtime=runtime)
+            if isinstance(launched, Err):
+                return launched
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            attempts = tuple(r for r in history.value if r.recovery_attempt_id == attempt_id)
+            if len(attempts) != 1:
+                return _error(ErrorCode.ownership_mismatch)
+            return await self._adopt_recovery_attempt_locked(expected_old, originals[0], attempts[0])
+
+    async def _adopt_recovery_attempt_locked(
+        self, expected_old: OriginalDaemonIdentity, original: LaunchReceipt, receipt: LaunchReceipt,
+    ) -> Result[OwnedDaemonRecoveryRestart]:
+        proof = await self._termination_proof_locked(expected_old, original)
+        if isinstance(proof, Err):
+            return proof
+        if (
+            receipt.state != 'ready' or receipt.recovery_attempt_id is None
+            or receipt.daemon is None or receipt.supervisor is None or receipt.daemon_instance_uuid is None
+            or receipt.daemon_instance_uuid == expected_old.instance_uuid
+            or receipt.launch_uuid == expected_old.launch_uuid
+            or receipt.daemon == expected_old.daemon_process
+            or receipt.runtime_directory == expected_old.runtime_directory
+            or str(Path(receipt.runtime_directory) / receipt.socket_name) == expected_old.socket_path
+        ):
+            return _error(ErrorCode.ownership_mismatch)
+        records = await self._store.all()
+        if isinstance(records, Err):
+            return records
+        matches = tuple(r for r in records.value if r.instance_uuid == receipt.daemon_instance_uuid)
+        if len(matches) != 1:
+            return _error(ErrorCode.ownership_mismatch)
+        record = matches[0]
+        if record.lifecycle not in {'starting', 'running'}:
+            return _error(ErrorCode.ownership_mismatch)
+        running_record = replace(record, lifecycle='running')
+        replacement = OriginalDaemonIdentity(
+            launch_uuid=receipt.launch_uuid, instance_uuid=receipt.daemon_instance_uuid,
+            endpoint_generation=receipt.endpoint_generation, daemon_process=receipt.daemon,
+            runtime_directory=receipt.runtime_directory, socket_path=record.socket_path,
+        )
+        if (not recovery_identity_matches(replacement, receipt, running_record)
+                or not self._runtime_matches(receipt)
+                or not self._exact_process(receipt.supervisor, receipt.owner_uid)
+                or not self._exact_process(receipt.daemon, receipt.owner_uid)
+                or self._inspect(receipt.daemon.pid).parent != receipt.supervisor.pid):
+            return _error(ErrorCode.ownership_mismatch)
+        generation = await self._current_generation(receipt)
+        if isinstance(generation, Err):
+            return generation
+        endpoint = verify_owned_endpoint(receipt, current_generation=generation.value)
+        if isinstance(endpoint, Err):
+            return endpoint
+        authenticated = await self._authenticate(record)
+        if isinstance(authenticated, Err):
+            return authenticated
+        if (record.lifecycle == 'starting'
+                and (self._accepted_status is None or self._accepted_status.state != 'idle')):
+            return _error(ErrorCode.ownership_mismatch)
+        confirmed_receipt = await self._receipts.write(receipt)
+        if isinstance(confirmed_receipt, Err):
+            return confirmed_receipt
+        checked = await self._ownership.confirm(record, authenticated.value)
+        if (isinstance(checked, Err) or not self._exact_process(receipt.daemon, receipt.owner_uid)
+                or not self._exact_process(receipt.supervisor, receipt.owner_uid)):
+            return _error(ErrorCode.ownership_mismatch)
+        if record.lifecycle == 'starting':
+            published = await self._store.write(running_record)
+            if isinstance(published, Err):
+                return published
+            record = running_record
+        history = await self._receipts.all()
+        records = await self._store.all()
+        if isinstance(history, Err) or isinstance(records, Err):
+            return _error(ErrorCode.persistence_failed)
+        if (tuple(r for r in history.value if r.recovery_attempt_id == receipt.recovery_attempt_id) != (receipt,)
+                or tuple(r for r in history.value if r.launch_uuid == original.launch_uuid) != (original,)
+                or tuple(r for r in records.value if r.instance_uuid == record.instance_uuid) != (record,)):
+            return _error(ErrorCode.ownership_mismatch)
+        checked = await self._ownership.confirm(record, authenticated.value)
+        if isinstance(checked, Err):
+            return checked
+        proof = await self._termination_proof_locked(expected_old, original)
+        if isinstance(proof, Err):
+            return proof
+        readiness = OwnedDaemonReadinessEvidence(
+            launch_uuid=receipt.launch_uuid, recovery_attempt_id=receipt.recovery_attempt_id,
+            instance_uuid=record.instance_uuid, endpoint_generation=receipt.endpoint_generation,
+            runtime_directory=receipt.runtime_directory, socket_path=record.socket_path,
+            daemon_pid=receipt.daemon.pid, daemon_start_ticks=receipt.daemon.start_ticks,
+            socket_device=receipt.entry_device, socket_inode=receipt.entry_inode,
+            verified_at=self._clock.now(),
+        )
+        return Ok(value=OwnedDaemonRecoveryRestart(
+            old_daemon_termination=proof.value, record=record, receipt=receipt,
+            ownership_proof=authenticated.value, readiness=readiness,
+        ))
+
+    async def inspect_recovery_attempt(
+        self, marker: CredentialRecoveryMarker,
+    ) -> Result[Literal['ready'] | ReleaseAttemptTerminalEvidence]:
+        """Classify an interrupted attempt before ordinary reconciliation."""
+        if type(marker) is not CredentialRecoveryMarker or marker.release_attempt is None:
+            return _error(ErrorCode.ownership_mismatch)
+        attempt = marker.release_attempt
+        if attempt.status not in {'intended', 'ready'}:
+            return _error(ErrorCode.ownership_mismatch)
+        runtime = Path(attempt.replacement_runtime_directory)
+        endpoint = Path(attempt.replacement_socket_path)
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            authorized = await self._recovery_attempt_authorized(
+                marker.original_daemon, attempt.attempt_id, runtime, endpoint,
+            )
+            if isinstance(authorized, Err):
+                return authorized
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            candidates = tuple(r for r in history.value if r.recovery_attempt_id == attempt.attempt_id)
+            assigned = tuple(r for r in history.value if r.runtime_directory == str(runtime))
+            if len(candidates) > 1 or (assigned and assigned != candidates):
+                return _error(ErrorCode.ownership_mismatch)
+            if not candidates:
+                if (attempt.status != 'intended' or runtime.parent != self._configured_runtime
+                        or endpoint != runtime / 'daemon.sock'
+                        or runtime == Path(marker.original_daemon.runtime_directory)):
+                    return _error(ErrorCode.ownership_mismatch)
+                records = await self._store.all()
+                if isinstance(records, Err):
+                    return records
+                if any(record.runtime_directory == str(runtime) for record in records.value):
+                    return _error(ErrorCode.ownership_mismatch)
+                from airplay_linux.process import ownership
+                try:
+                    if ownership._observations.unix_inodes(str(endpoint)) != ():
+                        return _error(ErrorCode.ownership_mismatch)
+                    with private_directory(self._configured_runtime) as parent:
+                        try:
+                            os.mkdir(runtime.name, 0o700, dir_fd=parent)
+                        except FileExistsError:
+                            pass
+                        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+                        descriptor = os.open(runtime.name, flags, dir_fd=parent)
+                        try:
+                            info = os.fstat(descriptor)
+                            if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                                return _error(ErrorCode.ownership_mismatch)
+                            with os.scandir(descriptor) as entries:
+                                if any(True for _ in entries):
+                                    return _error(ErrorCode.ownership_mismatch)
+                            os.fsync(descriptor)
+                            os.fsync(parent)
+                        finally:
+                            os.close(descriptor)
+                except OSError:
+                    return _error(ErrorCode.persistence_failed)
+                return Ok(value=ReleaseAttemptTerminalEvidence(
+                    outcome='not_spawned', replacement_launch_uuid=None,
+                    process_evidence='no_child', verified_at=self._clock.now(),
+                ))
+            receipt = candidates[0]
+            if (receipt.runtime_directory != str(runtime)
+                    or str(Path(receipt.runtime_directory) / receipt.socket_name) != str(endpoint)):
+                return _error(ErrorCode.ownership_mismatch)
+            if receipt.state == 'ready':
+                return Ok(value='ready')
+            if receipt.state not in {'failed', 'stopped'} or attempt.status != 'intended':
+                return _error(ErrorCode.ownership_mismatch)
+            if not self._receipt_absent(receipt):
+                return _error(ErrorCode.cleanup_timeout)
+            from airplay_linux.process import ownership
+            try:
+                if endpoint.exists() or endpoint.is_symlink() or ownership._observations.unix_inodes(str(endpoint)) != ():
+                    return _error(ErrorCode.cleanup_timeout)
+            except (OSError, ValueError):
+                return _error(ErrorCode.cleanup_timeout)
+            intents = await self._cleanup_intents.all()
+            if isinstance(intents, Err):
+                return intents
+            completed = tuple(i for i in intents.value if i.launch_uuid == receipt.launch_uuid)
+            if (len(completed) != 1 or completed[0].outcome != 'stopped'
+                    or completed[0].completed_at is None
+                    or completed[0].completed_at < completed[0].intent_at):
+                return _error(ErrorCode.cleanup_timeout)
+            if receipt.daemon is None:
+                return Ok(value=ReleaseAttemptTerminalEvidence(
+                    outcome='not_spawned', replacement_launch_uuid=None,
+                    process_evidence='no_child', verified_at=self._clock.now(),
+                ))
+            death = self._exit_evidence(receipt.daemon)
+            if isinstance(death, Err):
+                return death
+            return Ok(value=ReleaseAttemptTerminalEvidence(
+                outcome='replacement_terminated', replacement_launch_uuid=receipt.launch_uuid,
+                process_evidence=death.value[0], verified_at=self._clock.now(),
+            ))
+
+    async def authenticate_release_replacement(
+        self, marker: CredentialRecoveryMarker,
+    ) -> Result[DaemonRecoveryExemption | None]:
+        """Issue an exemption only for a revalidated, durably retired attempt."""
+        try:
+            encode_credential_recovery_marker(marker)
+        except (RecordError, UnicodeError):
+            return _error(ErrorCode.ownership_mismatch)
+        if (marker.state != 'retired' or marker.retirement is None
+                or marker.retirement.kind != 'daemon_replaced' or marker.release_attempt is None
+                or marker.release_attempt.readiness is None):
+            return _error(ErrorCode.ownership_mismatch)
+        expected = marker.release_attempt.readiness
+        async with self._operation() as acquired:
+            if isinstance(acquired, Err):
+                return acquired
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            originals = tuple(r for r in history.value if r.launch_uuid == marker.original_daemon.launch_uuid)
+            candidates = tuple(r for r in history.value if r.recovery_attempt_id == expected.recovery_attempt_id)
+            if len(originals) != 1 or len(candidates) != 1:
+                return _error(ErrorCode.ownership_mismatch)
+            if candidates[0].state in {'stopped', 'failed'}:
+                return Ok(value=None)
+            adopted = await self._adopt_recovery_attempt_locked(marker.original_daemon, originals[0], candidates[0])
+            if isinstance(adopted, Err):
+                return adopted
+            if replace(adopted.value.readiness, verified_at=expected.verified_at) != expected:
+                return _error(ErrorCode.ownership_mismatch)
+            exemption = DaemonRecoveryExemption(
+                marker_identity=marker, marker_generation=marker.marker_generation,
+                kind='release_replacement', daemon_identity=expected,
+            )
+            self._issued_recovery_exemptions[marker.target] = exemption
+            return Ok(value=exemption)
+
     async def shutdown(self) -> Result[None]:
         if (self._features.profile in {'doubletake-0.5', 'doubletake-0.5+source'}
                 and not self._compatible() and not self._has_launched and self._record is None):
@@ -350,6 +1189,137 @@ class DaemonRegistry:
             if isinstance(acquired, Err):
                 return acquired
             return await self._reconcile_locked()
+
+    async def termination_proof(
+        self, identity: OriginalDaemonIdentity | DaemonRecord,
+    ) -> Result[TerminationProof]:
+        """Resolve the historical receipt under the lifecycle lock."""
+        async with self._lock:
+            history = await self._receipts.all()
+            if isinstance(history, Err):
+                return history
+            if type(identity) is OriginalDaemonIdentity:
+                matches = tuple(r for r in history.value if r.launch_uuid == identity.launch_uuid)
+            elif type(identity) is DaemonRecord and identity.daemon is not None:
+                matches = tuple(r for r in history.value if r.daemon_instance_uuid == identity.instance_uuid)
+            else:
+                return _error(ErrorCode.stale_event)
+            if len(matches) != 1:
+                return _error(ErrorCode.stale_event)
+            return await self._termination_proof_locked(identity, matches[0])
+
+    async def _termination_proof_locked(
+        self, identity: OriginalDaemonIdentity | DaemonRecord, matching_receipt: LaunchReceipt,
+    ) -> Result[TerminationProof]:
+        """Verify terminal evidence without reacquiring the lifecycle lock."""
+        receipt = matching_receipt
+        if type(identity) is OriginalDaemonIdentity:
+            if (
+                receipt.launch_uuid != identity.launch_uuid
+                or receipt.daemon_instance_uuid != identity.instance_uuid
+                or receipt.endpoint_generation != identity.endpoint_generation
+                or receipt.daemon != identity.daemon_process
+                or receipt.runtime_directory != identity.runtime_directory
+                or str(Path(receipt.runtime_directory) / receipt.socket_name) != identity.socket_path
+                or type(receipt.supervisor) is not ProcessIdentity
+                or any(getattr(receipt, name) is None for name in (
+                    'entry_device', 'entry_inode', 'socket_inode', 'peer_pid', 'peer_start_ticks', 'peer_uid',
+                ))
+                or (receipt.peer_pid, receipt.peer_start_ticks, receipt.peer_uid) != (
+                    identity.daemon_process.pid, identity.daemon_process.start_ticks, receipt.owner_uid,
+                )
+            ):
+                return _error(ErrorCode.stale_event)
+            if not self._receipt_absent(receipt):
+                return _error(ErrorCode.cleanup_timeout)
+            from airplay_linux.process import ownership
+            try:
+                if (Path(identity.socket_path).exists() or Path(identity.socket_path).is_symlink()
+                        or ownership._observations.unix_inodes(identity.socket_path) != ()):
+                    return _error(ErrorCode.cleanup_timeout)
+            except (OSError, ValueError):
+                return _error(ErrorCode.cleanup_timeout)
+            daemon = identity.daemon_process
+            instance_uuid = identity.instance_uuid
+        else:
+            if (
+                receipt.daemon != identity.daemon
+                or receipt.runtime_directory != identity.runtime_directory
+                or str(Path(receipt.runtime_directory) / receipt.socket_name) != identity.socket_path
+            ):
+                return _error(ErrorCode.stale_event)
+            daemon = identity.daemon
+            instance_uuid = identity.instance_uuid
+        intents = await self._cleanup_intents.all()
+        if isinstance(intents, Err):
+            return intents
+        selected = tuple(item for item in intents.value if item.launch_uuid == receipt.launch_uuid)
+        if len(selected) > 1:
+            return _error(ErrorCode.cleanup_timeout)
+        intent = selected[0] if selected else None
+        if receipt.state not in {'failed', 'stopped'}:
+            return _error(ErrorCode.cleanup_timeout)
+        if type(identity) is DaemonRecord and receipt.state == 'stopped':
+            intent = None
+        elif receipt.state == 'failed' or type(identity) is OriginalDaemonIdentity:
+            if (intent is None or intent.outcome != 'stopped' or intent.completed_at is None
+                    or intent.completed_at < intent.intent_at):
+                return _error(ErrorCode.cleanup_timeout)
+        elif intent is not None and (
+            intent.outcome != 'stopped' or intent.completed_at is None or intent.completed_at < intent.intent_at
+        ):
+            return _error(ErrorCode.cleanup_timeout)
+        evidence = self._exit_evidence(daemon)
+        if isinstance(evidence, Err):
+            return evidence
+        process_evidence, identity_verified_at = evidence.value
+        return Ok(value=TerminationProof(
+            daemon_instance_uuid=instance_uuid,
+            daemon=daemon,
+            runtime_directory=receipt.runtime_directory,
+            launch_uuid=receipt.launch_uuid,
+            receipt_state=receipt.state,
+            cleanup_outcome=intent.outcome if intent is not None else None,
+            cleanup_completed_at=intent.completed_at if intent is not None else None,
+            process_evidence=process_evidence,
+            identity_verified_at=identity_verified_at,
+            observed_at=self._clock.now(),
+        ))
+
+    def _exit_evidence(self, daemon: ProcessIdentity) -> Result[tuple[str, float]]:
+        """The recorded process's authoritative absence or exact pidfd exit.
+
+        A cached ``alive`` flag, a missing socket, a finished client task or an
+        unreadable procfs entry is never evidence. The pidfd branch binds the
+        observed start time to the recorded identity twice around the open and
+        closes the descriptor on every path.
+        """
+        try:
+            observed = self._inspect(daemon.pid)
+        except (OSError, ValueError):
+            return _error(ErrorCode.cleanup_timeout)
+        if observed.state is IdentityState.absent:
+            return Ok(value=('pid_absent', self._clock.now()))
+        if observed.state is not IdentityState.present or observed.identity != daemon:
+            return _error(ErrorCode.cleanup_timeout)
+        pidfd = self._open_pidfd(daemon.pid)
+        if pidfd is None:
+            return _error(ErrorCode.cleanup_timeout)
+        try:
+            try:
+                revalidated = self._inspect(daemon.pid)
+            except (OSError, ValueError):
+                return _error(ErrorCode.cleanup_timeout)
+            if (
+                revalidated.identity != daemon
+                or revalidated.state not in {IdentityState.present, IdentityState.terminated}
+                or not self._pidfd_exited(pidfd)
+            ):
+                return _error(ErrorCode.cleanup_timeout)
+            verified_at = self._clock.now()
+        finally:
+            self._close_pidfd(pidfd)
+        return Ok(value=('pidfd_exited', verified_at))
 
     async def _pause(self) -> None:
         if self._scheduler is None:
@@ -376,7 +1346,9 @@ class DaemonRegistry:
     def _now(self) -> float:
         return time.time()
 
-    def _new_receipt(self, launch_uuid: UUID, generation: int) -> LaunchReceipt:
+    def _new_receipt(
+        self, launch_uuid: UUID, generation: int, recovery_attempt_id: OperationId | None = None,
+    ) -> LaunchReceipt:
         info = os.lstat(self.runtime_directory)
         return LaunchReceipt(
             schema_version=1, launch_uuid=launch_uuid, instance_uuid=self._app_instance_uuid,
@@ -388,6 +1360,7 @@ class DaemonRegistry:
             entry_device=None, entry_inode=None, socket_inode=None, peer_pid=None,
             peer_start_ticks=None, peer_uid=None, status_state=None,
             credential_service='unknown', failure=None, updated_at=self._now(),
+            recovery_attempt_id=recovery_attempt_id,
         )
 
     async def _receipt_for(self, record: DaemonRecord) -> Result[LaunchReceipt]:
@@ -418,6 +1391,38 @@ class DaemonRegistry:
             )
         except (OSError, ValueError):
             return False
+
+    @staticmethod
+    def _open_pidfd(pid: int) -> int | None:
+        """Open one process descriptor, or report that the kernel cannot."""
+        opener = getattr(os, 'pidfd_open', None)
+        if opener is None:
+            return None
+        try:
+            return opener(pid, 0)
+        except OSError:
+            return None
+
+    @staticmethod
+    def _pidfd_exited(pidfd: int) -> bool:
+        """Whether this descriptor reports the process's exit now.
+
+        A pidfd becomes readable on exit. A zero timeout keeps the historical
+        query non-blocking: a still-live process is not exit evidence.
+        """
+        poller = select.poll()
+        poller.register(pidfd, select.POLLIN)
+        try:
+            return any(events & select.POLLIN for _, events in poller.poll(0))
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _close_pidfd(pidfd: int) -> None:
+        try:
+            os.close(pidfd)
+        except OSError:
+            pass
 
     def _exact_process(self, identity: ProcessIdentity | None, uid: int) -> bool:
         if identity is None:
@@ -493,25 +1498,30 @@ class DaemonRegistry:
         written = await self._receipts.write(bound)
         return written if isinstance(written, Err) else Ok(value=bound)
 
-    async def _launch_owned(self) -> Result[DaemonRecord]:
+    async def _launch_owned(
+        self, *, recovery_attempt_id: OperationId | None = None,
+        recovery_runtime: Path | None = None,
+    ) -> Result[DaemonRecord]:
         if not self._public_lifecycle() or self._authority_lease is None:
             return _error(ErrorCode.dependency_incompatible)
-        obligations = await self._reconcile_owned_locked()
-        if isinstance(obligations, Err):
-            return obligations
+        if recovery_attempt_id is None:
+            obligations = await self._reconcile_owned_locked()
+            if isinstance(obligations, Err):
+                return obligations
         history = await self._receipts.all()
         if isinstance(history, Err):
             return history
         launch_uuid = self._ids.new()
-        runtime = self._configured_runtime
+        runtime = recovery_runtime if recovery_runtime is not None else self._configured_runtime
         try:
-            previous = await self._supervisor_intents(str(runtime)).read()
-            if isinstance(previous, Err):
-                return self._cleanup_required(previous)
-            # The old supervisor's one publication is immutable. Give the next
-            # instance a separate channel instead of overwriting or reusing it.
-            if previous.value is not None:
-                runtime = runtime / launch_uuid.hex
+            if recovery_runtime is None:
+                previous = await self._supervisor_intents(str(runtime)).read()
+                if isinstance(previous, Err):
+                    return self._cleanup_required(previous)
+                # The old supervisor's one publication is immutable. Give the next
+                # instance a separate channel instead of overwriting or reusing it.
+                if previous.value is not None:
+                    runtime = runtime / launch_uuid.hex
             argv = self._launcher.argv(str(runtime / 'daemon.sock'))
         except (ValueError, OSError, StorageError):
             return self._cleanup_required(_error(ErrorCode.dependency_incompatible))
@@ -532,7 +1542,7 @@ class DaemonRegistry:
         daemon_id = InstanceId(self._ids.new())
         self._launch_correlation = (launch_uuid, generation, daemon_id)
         try:
-            receipt = self._new_receipt(launch_uuid, generation)
+            receipt = self._new_receipt(launch_uuid, generation, recovery_attempt_id)
         except (OSError, ValueError):
             return _error(ErrorCode.persistence_failed)
         reserved = await self._receipts.write(receipt)
@@ -890,7 +1900,9 @@ class DaemonRegistry:
             channels[runtime] = intent
         return Ok(value=channels)
 
-    async def _reconcile_owned_locked(self) -> Result[None]:
+    async def _reconcile_owned_locked(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         checked = await self._receipt_obligations_locked()
         if isinstance(checked, Err):
             return self._cleanup_required(checked)
@@ -901,7 +1913,12 @@ class DaemonRegistry:
         channels = await self._owned_runtime_channels(history, records.value)
         if isinstance(channels, Err):
             return self._cleanup_required(channels)
+        retained = await self._validate_recovery_exemptions(recovery_exemptions, history, records.value, channels.value)
+        if isinstance(retained, Err):
+            return self._cleanup_required(retained)
         for receipt in history:
+            if receipt.launch_uuid in retained.value:
+                continue
             endpoint = tuple(r for r in history if r.runtime_directory == receipt.runtime_directory)
             newest = max(r.endpoint_generation for r in endpoint)
             if (sum(r.endpoint_generation == newest for r in endpoint) != 1
@@ -934,6 +1951,21 @@ class DaemonRegistry:
         if any(not any(r.runtime_directory == record.runtime_directory for r in history)
                for record in records.value):
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
+        if retained.value:
+            history = await self._receipts.all()
+            records = await self._store.all()
+            if isinstance(history, Err) or isinstance(records, Err):
+                return self._cleanup_required(_error(ErrorCode.persistence_failed))
+            channels = await self._owned_runtime_channels(history.value, records.value)
+            if isinstance(channels, Err):
+                return self._cleanup_required(channels)
+            retained = await self._validate_recovery_exemptions(recovery_exemptions, history.value, records.value, channels.value)
+            if isinstance(retained, Err):
+                return self._cleanup_required(retained)
+            self._record = next(iter(retained.value.values()))
+            self.runtime_directory = Path(self._record.runtime_directory)
+            self._ready, self._exited = True, False
+            return Ok(value=None)
         if history:
             owner = self._authority.owner
             cleared = await self._authority.clear_owner(owner) if owner is not None else Ok(value=None)
@@ -1219,11 +2251,15 @@ class DaemonRegistry:
         """Retain the delivered fixture seam inside the operation's shared lease."""
         return await self._reconcile_locked()
 
-    async def _reconcile_locked(self) -> Result[None]:
+    async def _reconcile_locked(
+        self, *, recovery_exemptions: tuple[DaemonRecoveryExemption, ...] = (),
+    ) -> Result[None]:
         if self._authority_lease is None or self._authority_lease._unlocked:
             return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         if self._public_lifecycle():
-            return await self._reconcile_owned_locked()
+            return await self._reconcile_owned_locked(recovery_exemptions=recovery_exemptions)
+        if recovery_exemptions:
+            return self._cleanup_required(_error(ErrorCode.ownership_mismatch))
         obligations = await self._receipt_obligations_locked()
         if isinstance(obligations, Err):
             return self._cleanup_required(obligations)

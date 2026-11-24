@@ -81,23 +81,28 @@ complete build *and* a passing runtime chain: private runtime root, private user
 the credential witness, a Secret Service provider, one physical KScreen inventory and a fresh source
 verification. A host without a Secret Service keeps Mirror gated with the credential leg named.
 
-Before publishing a stream, the application matches that target's reported
-monitor type, complete size and signed position against one fresh KScreen inventory of the requested
-physical output. Window/virtual sources, missing position, a different monitor or ambiguous geometry
-produce `unsupported_source`. Source acquisition and credential-challenge polling share one 5.0 s
-deadline. A challenge from the connect acknowledgement or status stops only that exact target and
-returns `dependency_incompatible`; unconfirmed target cleanup takes `cleanup_timeout` precedence.
-No credential prompt or pairing operation is offered by this public profile.
+Before publishing a Mirror stream, the application matches that target's reported monitor type,
+complete size and signed position against one fresh KScreen inventory of the requested physical
+output. Window or virtual sources, missing position, a different monitor or ambiguous geometry
+produce `unsupported_source`.
+
+During an operator-started Mirror, a proven `credential_relay` profile can present a PIN/password
+prompt for the started target. The application reports success only when that target's status reports
+`streaming`. A command reply alone does not establish success, and a non-streaming result does not
+identify why the target did not stream. The application never stores or remembers the entered
+credential. Virtual-display starts do not produce a credential prompt.
 
 The public backend still withholds `foreground_control`, `owner_handshake`, `target_bound_pairing`,
-`provisional_commit`, `cancel_pairing`, `revoke_pairing`, `audio_restart` and `query_modes`. Startup
-diagnostics name the selected authority, failed credential leg, missing complete-source or inventory
-evidence and withheld flags. The fixture-only application-contract profile retains its original
-handshake and pairing prerequisites.
+`provisional_commit`, `cancel_pairing`, `revoke_pairing`, `audio_restart` and `query_modes`. The
+credential relay is separate from transactional pairing. Startup diagnostics name the selected
+authority, failed credential leg, missing complete-source or inventory evidence and withheld flags.
+The fixture-only application-contract profile retains its original handshake and pairing
+prerequisites.
 
-Verification used deterministic external boundaries; no live receiver streaming session was attempted.
-Virtual display has its own helper, source and output-association prerequisites and is not enabled by
-this activation.
+Routine tests use fake process, control, runtime, clock, scheduler, ownership and filesystem
+boundaries. They do not use a live receiver, production daemon or KDE session. The vendored receiver
+requires Go 1.22 or newer to build. The host Go 1.14.2 toolchain is below that prerequisite, and no
+host receiver build is part of routine verification.
 
 `--check-environment` reports capability evidence; [docs/operations.md](docs/operations.md) has the
 operator checks and [docs/backend-compatibility.md](docs/backend-compatibility.md) records the backend

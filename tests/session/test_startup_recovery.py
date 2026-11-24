@@ -1,8 +1,9 @@
 """Startup uses durable intent and the display provider's ownership proof."""
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -25,6 +26,14 @@ from airplay_linux.testing.builders import context, target
 from virtual_scenarios import (
     decision, make_rig, production_display, settle, stream_event, virtual_handlers,
 )
+
+
+@pytest.fixture(autouse=True)
+def fake_kde_wayland_environment(monkeypatch):
+    # These tests use a fully fake display provider; do not inherit the host session.
+    monkeypatch.setenv('XDG_SESSION_TYPE', 'wayland')
+    monkeypatch.setenv('XDG_CURRENT_DESKTOP', 'KDE')
+    monkeypatch.setenv('XDG_SESSION_DESKTOP', 'KDE')
 
 
 def test_volume_transient_authority_is_stripped_before_custom_store():
@@ -111,7 +120,7 @@ class Registry:
         self.failure = None
         self.shutdowns = 0
 
-    async def reconcile_previous(self):
+    async def reconcile_previous(self, *, recovery_exemptions=()):
         self.journal.append("registry.reconcile_previous")
         return self.failure or Ok(value=None)
 
@@ -662,3 +671,244 @@ async def test_disk_persistence_roundtrip_keeps_intent_and_trust_tombstone(tmp_p
     assert state.trust is TrustState.RevocationPending
     assert state.session_generation == 4
     assert state.challenge is None
+
+
+def assert_recovery_blocked(result, code=ErrorCode.persistence_failed):
+    from airplay_linux.domain.resources import RecoveryAction
+
+    assert isinstance(result, Err)
+    assert result.error.code is code
+    assert result.error.message == "Recovery state could not be verified."
+    assert result.error.recovery == (RecoveryAction.keep_blocked,)
+    assert result.error.detail is None
+
+
+async def credential_startup(tmp_path, *, store=None, registry=None):
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator, StartupRecovery
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.runtime import compose_manager
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+
+    rig = SessionRig()
+    for subscription in rig.manager._subscriptions:
+        subscription.close()
+    store = store or JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    registry = registry or Registry([])
+    coordinator = CredentialRecoveryCoordinator(store, registry, fences=rig.fences)
+    rig.deps = replace(rig.deps, credential_recovery=coordinator)
+    rig.manager = compose_manager(rig.deps)
+    startup = StartupRecovery(rig.manager, rig.deps, registry)
+    return rig, coordinator, startup
+
+
+async def test_credential_startup_confirms_before_fences_registry_or_startup_events(tmp_path):
+    # Breaks when confirmation is skipped, fences become visible early, or the
+    # registry runs before marker restoration and exact recovery authentication.
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    events = []
+    item = marker()
+    backing = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    assert isinstance(await backing.create(item), Ok)
+    confirmed = False
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class Store:
+        async def read_all(self):
+            events.append("marker_validation")
+            return await backing.read_all()
+
+        async def confirm_all_durable(self):
+            nonlocal confirmed
+            events.append("confirm_all_durable")
+            assert_recovery_blocked(coordinator.require_start_allowed("192.0.2.99", UUID(int=90)))
+            assert coordinator.markers == ()
+            entered.set()
+            await release.wait()
+            result = await backing.confirm_all_durable()
+            confirmed = isinstance(result, Ok)
+            return result
+
+    class RecoveryRegistry(Registry):
+        async def authenticate_recovery(self, restored):
+            assert confirmed
+            assert coordinator.markers == (item,)
+            assert restored == item
+            events.append("authenticate_original")
+            return Ok(value=None)
+
+        async def reconcile_previous(self, *, recovery_exemptions):
+            assert confirmed
+            assert recovery_exemptions == ()
+            assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=91)), ErrorCode.ownership_mismatch)
+            events.append("reconcile_previous")
+            return Ok(value=None)
+
+    rig, coordinator, startup = await credential_startup(tmp_path, store=Store(), registry=RecoveryRegistry([]))
+    rig.discovery.add_target(target())
+    rig.sessions.saved[rig.receiver_id] = SessionSnapshot.idle(rig.receiver_id)
+    rig.manager.subscribe(lambda state: events.append("startup_event"))
+    load = coordinator.load_before_startup
+    recover_markers = coordinator.recover_before_registry_reconciliation
+
+    async def observed_load():
+        events.append("load_before_startup")
+        result = await load()
+        if isinstance(result, Ok):
+            assert coordinator.markers == (item,)
+            events.append("fence_population")
+        return result
+
+    async def observed_recover():
+        events.append("recover_before_registry_reconciliation")
+        return await recover_markers()
+
+    coordinator.load_before_startup = observed_load
+    coordinator.recover_before_registry_reconciliation = observed_recover
+    running = asyncio.create_task(startup.run())
+    await asyncio.wait_for(entered.wait(), 1)
+    receipt = await rig.manager.dispatch(Start(receiver_id=rig.receiver_id, request=StartRequest(mode=Mode.MIRROR)))
+    assert not receipt.accepted
+    assert "startup_event" not in events
+    assert "reconcile_previous" not in events
+    release.set()
+    assert isinstance(await running, Ok)
+    assert events[:8] == [
+        "load_before_startup", "marker_validation", "confirm_all_durable",
+        "marker_validation", "fence_population", "recover_before_registry_reconciliation",
+        "authenticate_original", "reconcile_previous",
+    ]
+    assert events.index("reconcile_previous") < events.index("startup_event")
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=92)), ErrorCode.ownership_mismatch)
+    assert coordinator.require_start_allowed("192.0.2.99", UUID(int=92)) == Ok(value=None)
+
+
+@pytest.mark.parametrize("problem", ["unreadable", "malformed", "duplicate", "ambiguous", "durability"])
+async def test_credential_startup_store_failures_keep_global_admission_closed(tmp_path, problem):
+    from airplay_linux.domain.resources import Diagnostic
+    from tests.storage.test_credential_recovery import marker
+
+    canary = "startup-store-canary-" + str(uuid4())
+    events = []
+    item = marker()
+    unsafe = Err(error=Diagnostic(code=ErrorCode.persistence_failed, message=canary, recovery=()))
+
+    class Store:
+        async def read_all(self):
+            if problem == "unreadable":
+                raise OSError(canary)
+            if problem == "malformed":
+                return Ok(value=(replace(item, marker_generation=0),))
+            if problem == "duplicate":
+                return Ok(value=(item, item))
+            if problem == "ambiguous":
+                return unsafe
+            return Ok(value=(item,))
+
+        async def confirm_all_durable(self):
+            events.append("confirm")
+            return unsafe
+
+    registry = Registry(events)
+    rig, coordinator, startup = await credential_startup(tmp_path, store=Store(), registry=registry)
+    result = await startup.run()
+    assert_recovery_blocked(result)
+    assert_recovery_blocked(coordinator.require_start_allowed("192.0.2.99", UUID(int=92)))
+    assert coordinator.markers == ()
+    assert "registry.reconcile_previous" not in events
+    assert (canary in repr(result)) is False
+    assert not rig.manager._effects
+
+
+async def test_credential_startup_retired_tombstone_requires_successful_confirmation_retry(tmp_path):
+    from airplay_linux.domain.records import NoSpawnRetirement
+    from airplay_linux.storage import AtomicFiles, StorageError
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    class Files(AtomicFiles):
+        fail = False
+
+        def write(self, path, payload):
+            super().write(path, payload)
+            if self.fail:
+                raise StorageError("write_failed", path)
+
+    files = Files(tmp_path)
+    store = JsonCredentialRecoveryMarkerStore(files)
+    item = marker()
+    assert isinstance(await store.create(item), Ok)
+    evidence = NoSpawnRetirement(failure=ErrorCode.daemon_failed, stop_cleanup_settled=True, observed_at=1.0)
+    retired = (await store.retire_no_spawn(item, 1, evidence)).value
+    files.fail = True
+    _, coordinator, startup = await credential_startup(tmp_path, store=store)
+    assert_recovery_blocked(await coordinator.load_before_startup())
+    assert coordinator.markers == ()
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=92)))
+    files.fail = False
+    assert await coordinator.load_before_startup() == Ok(value=None)
+    assert coordinator.markers == (retired,)
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=92)), ErrorCode.ownership_mismatch)
+    assert isinstance(await startup.run(), Ok)
+    assert coordinator.require_start_allowed(item.target, UUID(int=92)) == Ok(value=None)
+
+
+async def test_runtime_preserves_explicit_recovery_dependency_bundle(tmp_path):
+    from airplay_linux.runtime import RuntimeConfig, build_runtime
+    from airplay_linux.session.recovery import CredentialRecoveryCoordinator
+    from airplay_linux.session.testing import SessionRig
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path / "state"))
+    item = marker()
+    assert isinstance(await store.create(item), Ok)
+    deps = replace(SessionRig().deps, credential_recovery=CredentialRecoveryCoordinator(store, Registry([])))
+    built = await build_runtime(RuntimeConfig(state_root=tmp_path / "state", runtime_root=tmp_path / "runtime", live=False), {"deps": deps})
+    assert isinstance(built, Ok)
+    runtime = built.value
+    assert runtime.deps is deps
+    coordinator = runtime.deps.credential_recovery
+    assert coordinator is not None
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=92)))
+    assert isinstance(await runtime.startup_recovery.run(), Ok)
+    assert coordinator.markers == (item,)
+    assert_recovery_blocked(coordinator.require_start_allowed(item.target, UUID(int=92)), ErrorCode.ownership_mismatch)
+    assert coordinator.require_start_allowed("192.0.2.99", UUID(int=92)) == Ok(value=None)
+
+
+async def test_startup_keeps_empty_exemption_registry_test_double_compatible(tmp_path):
+    class EmptyRegistry:
+        async def reconcile_previous(self):
+            return Ok(value=None)
+
+    _, _, startup = await credential_startup(tmp_path, registry=EmptyRegistry())
+    assert isinstance(await startup.run(), Ok)
+
+
+async def test_start_admission_blocks_canonical_target_across_receiver_ids(tmp_path):
+    from airplay_linux.storage import AtomicFiles
+    from airplay_linux.storage.repositories import JsonCredentialRecoveryMarkerStore
+    from tests.storage.test_credential_recovery import marker
+
+    store = JsonCredentialRecoveryMarkerStore(AtomicFiles(tmp_path))
+    item = marker()
+    assert isinstance(await store.create(item), Ok)
+    rig, _, startup = await credential_startup(tmp_path, store=store)
+    assert isinstance(await startup.run(), Ok)
+    for name in ("a", "b"):
+        destination = target(name, address=item.target)
+        rig.discovery.add_target(destination)
+        receipt = await rig.manager.dispatch(Start(receiver_id=destination.receiver_id, request=StartRequest(mode=Mode.MIRROR)))
+        assert not receipt.accepted
+        assert receipt.diagnostic.code is ErrorCode.ownership_mismatch
+    assert not rig.manager._effects
+    destination = target("c", address="192.0.2.99")
+    rig.discovery.add_target(destination)
+    receipt = await rig.manager.dispatch(Start(receiver_id=destination.receiver_id, request=StartRequest(mode=Mode.MIRROR)))
+    assert receipt.accepted
+    await rig.manager.drain()

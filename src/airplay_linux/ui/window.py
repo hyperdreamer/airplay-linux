@@ -102,6 +102,14 @@ _COMMAND_LABELS: Final[Mapping[Action, tuple[str, str]]] = MappingProxyType(
             "Submit PIN",
             "Submit the PIN or password the receiver is showing",
         ),
+        Action.submit_credential: (
+            "Submit PIN",
+            "Submit the PIN or password the receiver is showing",
+        ),
+        Action.dismiss_credential_prompt: (
+            "Cancel",
+            "Cancel this credential prompt without sending a receiver command",
+        ),
         Action.cancel: ("Cancel", "Cancel the current step and release what it holds"),
         Action.remove_metadata: (
             "Remove saved receiver",
@@ -149,6 +157,18 @@ _COMMAND_LABELS: Final[Mapping[Action, tuple[str, str]]] = MappingProxyType(
             "Keep orphan output",
             "Keep the orphan output; it is never removed automatically",
         ),
+        Action.stop_credential_recovery: (
+            "Stop",
+            "Check this target again and disconnect it on the recorded receiver daemon",
+        ),
+        Action.dismiss_credential_recovery: (
+            "Dismiss recovery warning",
+            "Stop automatic checks; this target stays blocked until the receiver restarts",
+        ),
+        Action.restart_receiver_to_release: (
+            "Restart receiver to release",
+            "Stops every mirror owned by this app before it releases the target",
+        ),
     }
 )
 
@@ -164,8 +184,9 @@ _ACTION_ROWS: Final[tuple[tuple[Action, ...], ...]] = (
     (Action.retry_cleanup, Action.keep_cleanup),
     (Action.retry_revocation, Action.keep_blocked, Action.remove_metadata),
     (Action.choose_resolution, Action.change_resolution, Action.recreate),
-    (Action.retry, Action.submit_pairing),
+    (Action.retry, Action.submit_pairing, Action.submit_credential, Action.dismiss_credential_prompt),
     (Action.confirm_orphan, Action.keep_orphan),
+    (Action.stop_credential_recovery, Action.dismiss_credential_recovery, Action.restart_receiver_to_release),
 )
 
 #: Primary labels the projection uses for the start command.
@@ -880,7 +901,6 @@ class MainWindow(QMainWindow):
         receiver_id = self._model.receiver_id(current)
         if receiver_id is None or receiver_id == self._selected:
             return
-        self._dismiss_tracked_prompt()
         self._selected = receiver_id
         self.receiver_selected.emit(str(receiver_id))
 
@@ -944,6 +964,8 @@ _BUTTON_NAMES: Final[Mapping[Action, str]] = MappingProxyType(
         Action.pair: "pairButton",
         Action.scan: "scanButton",
         Action.submit_pairing: "submitPairingButton",
+        Action.submit_credential: "submitCredentialButton",
+        Action.dismiss_credential_prompt: "dismissCredentialPromptButton",
         Action.cancel: "cancelButton",
         Action.remove_metadata: "removeMetadataButton",
         Action.retry: "retryButton",
@@ -958,6 +980,9 @@ _BUTTON_NAMES: Final[Mapping[Action, str]] = MappingProxyType(
         Action.keep_blocked: "keepBlockedButton",
         Action.confirm_orphan: "confirmOrphanButton",
         Action.keep_orphan: "keepOrphanButton",
+        Action.stop_credential_recovery: "stopCredentialRecoveryButton",
+        Action.dismiss_credential_recovery: "dismissCredentialRecoveryButton",
+        Action.restart_receiver_to_release: "restartReceiverToReleaseButton",
     }
 )
 

@@ -41,6 +41,7 @@ from airplay_linux.domain.records import (
     SavedReceiver,
     SessionSnapshot,
 )
+from airplay_linux.domain.relay import CredentialPromptState, CredentialRequest, RelayStartOptions
 from airplay_linux.domain.resources import (
     AudioPolicy,
     AudioState,
@@ -61,6 +62,7 @@ from airplay_linux.testing.builders import physical, service, target, virtual_ha
 from airplay_linux.ui.state import (
     Action,
     Badge,
+    CredentialRecoveryView,
     PaneState,
     ReceiverRow,
     ViewInputs,
@@ -1918,3 +1920,265 @@ def test_a_captured_source_ends_the_pending_prompt() -> None:
 
     assert pane.awaiting_capture is False
     assert pane.captured_connector == "DP-3"
+
+
+def test_relay_prompt_is_transient_and_blocks_transactional_challenge() -> None:
+    start_operation = OperationId(UUID(int=71))
+    request = CredentialRequest(
+        receiver_id=RECEIVER,
+        target=target(),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=72)),
+        daemon_instance_uuid=InstanceId(UUID(int=73)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=challenge(operation_id=start_operation),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+
+    pane = project(
+        idle(
+            operation_id=start_operation,
+            session_generation=1,
+            credential_prompt=prompt,
+        ),
+        inputs(),
+    )
+
+    assert pane.credential_prompt == prompt.challenge
+    assert pane.challenge is None
+
+
+def test_recovery_view_blocks_start_and_exposes_only_recovery_actions() -> None:
+    recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
+        target=target().canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=4,
+        title="Target blocked",
+        warning="This target remains blocked until the receiver restarts.",
+        actions=frozenset({Action.stop_credential_recovery, Action.restart_receiver_to_release}),
+    )
+
+    pane = project(idle(), inputs(credential_recovery=recovery))
+
+    assert pane.phase_label == "Target blocked"
+    assert pane.notice == recovery.warning
+    assert Action.start not in pane.actions
+    assert pane.actions == recovery.actions
+    assert pane.credential_recovery == recovery
+
+
+def test_relay_prompt_requires_exact_canonical_target() -> None:
+    start_operation = OperationId(UUID(int=74))
+    destination = target()
+    request = CredentialRequest(
+        receiver_id=RECEIVER,
+        target=replace(destination, canonical_host="192.0.2.250"),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=75)),
+        daemon_instance_uuid=InstanceId(UUID(int=76)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(challenge(operation_id=start_operation), challenge_id=ChallengeId(UUID(int=77))),
+        state="editing",
+        submission_id=None,
+        report=None,
+    )
+
+    pane = project(
+        idle(
+            operation_id=start_operation,
+            session_generation=1,
+            credential_prompt=prompt,
+        ),
+        inputs(),
+    )
+
+    assert pane.credential_prompt is None
+
+
+def test_offline_saved_target_retains_release_recovery_view() -> None:
+    recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
+        target=target().canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=5,
+        title="Target blocked",
+        warning="This target remains fenced until the receiver restarts.",
+        actions=frozenset({Action.stop_credential_recovery, Action.restart_receiver_to_release}),
+    )
+
+    pane = project(
+        idle(online=False, target=None, phase=SessionPhase.Offline),
+        inputs(receiver=None, saved=saved_receiver(), credential_recovery=recovery),
+    )
+
+    assert pane.credential_recovery == recovery
+    assert pane.phase_label == "Target blocked"
+    assert Action.restart_receiver_to_release in pane.actions
+
+
+def test_unknown_relay_report_survives_recovery_overlay() -> None:
+    start_operation = OperationId(UUID(int=78))
+    request = CredentialRequest(
+        receiver_id=RECEIVER,
+        target=target(),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=79)),
+        daemon_instance_uuid=InstanceId(UUID(int=80)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(challenge(operation_id=start_operation), challenge_id=ChallengeId(UUID(int=81))),
+        state="submitting",
+        submission_id=OperationId(UUID(int=82)),
+        report="outcome_unknown",
+    )
+    recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
+        target=target().canonical_host,
+        state="release_pending",
+        automatic_status_checks=False,
+        marker_generation=6,
+        title="Target blocked",
+        warning="This target remains fenced until the receiver restarts.",
+        actions=frozenset({Action.stop_credential_recovery, Action.restart_receiver_to_release}),
+    )
+
+    pane = project(
+        idle(
+            operation_id=start_operation,
+            session_generation=1,
+            intent_active=True,
+            intent_stage=IntentStage.starting,
+            phase=SessionPhase.Connecting,
+            transport=TransportState.Connecting,
+            credential_prompt=prompt,
+        ),
+        inputs(credential_recovery=recovery),
+    )
+
+    assert pane.credential_prompt is None
+    assert pane.credential_report == "outcome_unknown"
+    assert pane.notice == (
+        "No complete command reply was received; the outcome is unknown.\n\n"
+        "This target remains fenced until the receiver restarts."
+    )
+    assert Action.restart_receiver_to_release in pane.actions
+
+
+def test_watching_recovery_preserves_ordinary_stop_for_pending_relay_start() -> None:
+    start_operation = OperationId(UUID(int=83))
+    request = CredentialRequest(
+        receiver_id=RECEIVER,
+        target=target(),
+        credential_kind="pin",
+        start_operation_id=start_operation,
+        endpoint_generation=1,
+        session_generation=1,
+        owner_lease=LeaseId(UUID(int=84)),
+        daemon_instance_uuid=InstanceId(UUID(int=85)),
+        generation=1,
+        observed_at=10.0,
+        start_options=RelayStartOptions(
+            target_volume_proven=False, audio=None, initial_volume=None,
+        ),
+    )
+    prompt = CredentialPromptState(
+        request=request,
+        challenge=replace(challenge(operation_id=start_operation), challenge_id=ChallengeId(UUID(int=86))),
+        state="submitting",
+        submission_id=OperationId(UUID(int=87)),
+        report=None,
+    )
+    recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
+        target=target().canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=7,
+        title="Cleanup pending",
+        warning="A delayed connection may still appear.",
+        actions=frozenset({Action.stop_credential_recovery, Action.dismiss_credential_recovery}),
+    )
+
+    pane = project(
+        idle(
+            operation_id=start_operation,
+            session_generation=1,
+            intent_active=True,
+            intent_stage=IntentStage.starting,
+            phase=SessionPhase.Connecting,
+            transport=TransportState.Connecting,
+            credential_prompt=prompt,
+        ),
+        inputs(credential_recovery=recovery),
+    )
+
+    assert Action.stop in pane.actions
+    assert Action.restart_receiver_to_release not in pane.actions
+
+
+def test_watching_recovery_preserves_stop_after_prompt_dismissal() -> None:
+    recovery = CredentialRecoveryView(
+        receiver_id=RECEIVER,
+        target=target().canonical_host,
+        state="watching",
+        automatic_status_checks=True,
+        marker_generation=8,
+        title="Cleanup pending",
+        warning="A delayed connection may still appear.",
+        actions=frozenset({Action.stop_credential_recovery, Action.dismiss_credential_recovery}),
+    )
+
+    pane = project(
+        idle(
+            operation_id=OperationId(UUID(int=89)),
+            intent_active=True,
+            intent_stage=IntentStage.starting,
+            phase=SessionPhase.Connecting,
+            transport=TransportState.Connecting,
+            credential_prompt=None,
+        ),
+        inputs(credential_recovery=recovery),
+    )
+
+    assert Action.stop in pane.actions
+
+
+    pane = project(idle(), inputs(recovery_store_blocked=True))
+
+    assert pane.recovery_store_blocked is True
+    assert Action.start not in pane.actions
+    assert "recovery" in (pane.notice or "").lower()
