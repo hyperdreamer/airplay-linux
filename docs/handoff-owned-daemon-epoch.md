@@ -24,9 +24,9 @@ toolchain       /home/henry-arch/.local/go  (Go 1.27.3, for rebuilding the patch
 ```
 
 `source_reporting=True` means the backend *reports* which display each stream captured. It does **not** mean
-the capture is the physical monitor we asked for — consuming it is task **T5a** (observe only), and only T7 may
-act on the result. `docs/backend-fork.md` records the field's limits: `type` is the portal's classification, size
-and position are compositor coordinates, and `has_position` distinguishes an unknown position from a real origin.
+the capture is the physical monitor we asked for — consumption is delivered (T5a), and only T7 may act on the result.
+`docs/backend-fork.md` records the field's limits: `type` is the portal's classification, size and position are
+compositor coordinates, and `has_position` distinguishes an unknown position from a real origin.
 
 ## What the epoch must deliver
 
@@ -37,7 +37,7 @@ Follow the contract plan exactly. Its activation invariant is the point of the w
 > spawn occurs.
 
 Five phases: (1) capability plumbing and receipt codecs, switch closed; (2) verifier, pidfd-only
-teardown, cross-process authority, source identity verification (T5a, observe only); (3) isolated idle
+teardown, cross-process authority, source identity verification (T5a, delivered); (3) isolated idle
 launcher with every crash window tested; (4) the single activation commit — gate migration, acting on
 source verification, credential-service proof, operator-visible disclosure; (5) offline acceptance with
 negative tripwires. The plan's P1 is satisfied; P2 (credential service proof) still blocks phase 4.
